@@ -7,7 +7,7 @@ ARG DEBIAN_RELEASE=trixie
 FROM lukemathwalker/cargo-chef:latest-rust-${RUST_VERSION}-slim-${DEBIAN_RELEASE} AS chef
 
 # No extra build packages: the only native build in the dependency graph is `ring`, which uses
-# the image's cc. The reth integration will need clang/libclang (bindgen for MDBX) here.
+# the image's cc.
 WORKDIR /app
 
 # ---- Planner: compute the dependency recipe ----------------------------------
@@ -37,7 +37,7 @@ COPY --from=builder /app/target/release/op-indexer /usr/local/bin/op-indexer
 
 USER indexer
 
-# Node state (`node.redb`: the node identity and known peers). Mount a volume here to keep the
+# Node state (`node/`: the node identity and known peers; `archive/`: the block archive). Mount a volume here to keep the
 # peer id across container recreation.
 ENV OP_INDEXER_DATA_DIR=/data
 VOLUME /data

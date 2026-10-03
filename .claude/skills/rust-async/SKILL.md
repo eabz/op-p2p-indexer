@@ -1,16 +1,17 @@
 ---
 name: rust-async
-description: Async and concurrency conventions for op-p2p-indexer (tokio, libp2p, reth). Load when writing or reviewing async code, spawning tasks, using channels or select!, building the libp2p swarm event loop, handling gossipsub validation, adding timeouts or retries, or wiring shutdown and cancellation.
+description: Async and concurrency conventions for op-p2p-indexer (tokio, libp2p). Load when writing or reviewing async code, spawning tasks, using channels or select!, building the libp2p swarm event loop, handling gossipsub validation, adding timeouts or retries, or wiring shutdown and cancellation.
 ---
 
 # Rust async
 
 Runtime: **tokio** (multi-threaded). `#[tokio::main]` appears only in `main.rs`.
 
-## Undecided host: standalone binary vs reth ExEx
+## Components and the edge
 
-We haven't decided whether we run as our own binary or inside op-reth as an Execution Extension.
-Keep components neutral to that choice:
+The indexer is a standalone binary (see `docs/roadmap.md`; it does not embed a node). Components
+still do not own their own top-level task, so the binary decides how they are spawned,
+supervised and shut down:
 
 - A component is a struct built with its dependencies and run by a single method:
   ```rust
@@ -19,10 +20,9 @@ Keep components neutral to that choice:
       pub async fn run(self, cancel: CancellationToken) -> Result<(), IndexerError> { /* ... */ }
   }
   ```
-- Components never call `tokio::spawn` for their *own* top-level task. The edge (`main.rs` today,
-  possibly an ExEx's `TaskExecutor` later) decides how to spawn and supervise them.
+- Components never call `tokio::spawn` for their *own* top-level task. The edge (`main.rs`)
+  decides how to spawn and supervise them.
 - Inside a component, spawn children into a `JoinSet` that the component owns and drains on shutdown.
-- Don't depend on reth node lifecycle types outside a thin adapter module.
 
 ## Never block the runtime
 

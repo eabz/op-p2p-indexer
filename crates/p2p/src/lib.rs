@@ -10,7 +10,7 @@
 //! ```
 //!
 //! [`NodeStore`] persists node state (the identity key and known good peers) in an embedded
-//! redb file.
+//! fjall database, a directory of its own.
 //! Knows nothing about block storage; consumers receive [`UnsafeBlock`]s over a channel.
 //!
 //! [`UnsafeBlock`]: op_indexer_primitives::UnsafeBlock

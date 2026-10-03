@@ -32,7 +32,7 @@ allow = [
 ignore = true
 
 [bans]
-# The reth / alloy / libp2p tree carries many duplicate versions; surface, don't fail.
+# The alloy / libp2p tree carries many duplicate versions; surface, don't fail.
 multiple-versions = "warn"
 wildcards = "deny"
 # Internal workspace crates are path dependencies without versions.
@@ -46,7 +46,7 @@ deny = [
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# Git dependencies (reth, op-reth) must be pinned to a tag or rev, never a branch.
+# Git dependencies, if one is ever needed, must be pinned to a tag or rev, never a branch.
 required-git-spec = "tag"
 
 [sources.allow-org]

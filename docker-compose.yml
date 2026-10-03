@@ -1,7 +1,7 @@
 # Local test stack: the indexer plus its two storage layers.
 #
-#   Redis      — hot data: unsafe blocks received over gossip, not yet derived from L1.
-#   ClickHouse — cold data: safe/finalized blocks, whose batches are on L1.
+#   Redis      — unsafe blocks: received over gossip, not yet committed to L1.
+#   ClickHouse — committed blocks: safe/finalized, whose batches are on L1.
 #
 # Credentials below are for local testing only. Override them via environment or a `.env` file.
 #
@@ -20,22 +20,27 @@ services:
         condition: service_healthy
     environment:
       RUST_LOG: ${RUST_LOG:-info}
-      # Read by the binary today; empty means "use the default".
+      # Empty means "use the default".
       OP_INDEXER_CHAIN_ID: ${OP_INDEXER_CHAIN_ID:-}
       OP_INDEXER_LISTEN_ADDR: ${OP_INDEXER_LISTEN_ADDR:-}
       OP_INDEXER_BOOTNODES: ${OP_INDEXER_BOOTNODES:-}
       OP_INDEXER_MAX_PEERS: ${OP_INDEXER_MAX_PEERS:-}
-      # Reserved for the storage crate: not read by the binary yet.
+      # Storage: at startup the binary connects to both stores, checks the Redis key-layout
+      # version and runs the ClickHouse migrations, and exits if either store is unreachable.
       OP_INDEXER_REDIS_URL: redis://redis:6379
       OP_INDEXER_CLICKHOUSE_URL: http://clickhouse:8123
       OP_INDEXER_CLICKHOUSE_DATABASE: ${CLICKHOUSE_DB:-op_indexer}
       OP_INDEXER_CLICKHOUSE_USER: ${CLICKHOUSE_USER:-indexer}
       OP_INDEXER_CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-indexer}
+      # Blocks kept in the local archive (the archive directory in the data volume): a block
+      # count, `all` to keep every block, or 0 to disable it. Empty means 30 days.
+      OP_INDEXER_ARCHIVE_RETENTION_BLOCKS: ${OP_INDEXER_ARCHIVE_RETENTION_BLOCKS:-}
     ports:
       - "9222:9222/tcp"
       - "9222:9222/udp"
     volumes:
-      # Node identity and known peers (the image sets OP_INDEXER_DATA_DIR=/data).
+      # The data directory (the image sets OP_INDEXER_DATA_DIR=/data): `node/` holds the node
+      # identity and known peers, `archive/` the local block archive.
       - indexer-data:/data
 
   redis:

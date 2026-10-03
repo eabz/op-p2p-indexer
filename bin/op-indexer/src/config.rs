@@ -7,17 +7,33 @@ use std::path::PathBuf;
 use eyre::{WrapErr, eyre};
 use op_indexer_chainspec::{ChainSpec, OP_MAINNET};
 use op_indexer_p2p::{Bootnode, NetworkConfig};
+use op_indexer_storage::{
+    ArchiveConfig, ArchiveRetention, ClickHouseConfig, RedisConfig, StorageConfig,
+};
 
 const DEFAULT_CHAIN_ID: u64 = OP_MAINNET.chain_id;
 const DEFAULT_LISTEN_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9222);
 const DEFAULT_MAX_PEERS: u32 = 30;
 const DEFAULT_DATA_DIR: &str = "data";
+const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:6379";
+const DEFAULT_CLICKHOUSE_URL: &str = "http://127.0.0.1:8123";
+const DEFAULT_CLICKHOUSE_DATABASE: &str = "op_indexer";
+const DEFAULT_CLICKHOUSE_USER: &str = "indexer";
+/// 30 days of 2-second blocks (1296000).
+const DEFAULT_ARCHIVE_RETENTION_BLOCKS: u64 = 30 * 24 * 60 * 60 / 2;
+/// Directory of the local block archive, inside the data directory.
+const ARCHIVE_DIR: &str = "archive";
+const ARCHIVE_RETENTION_VAR: &str = "OP_INDEXER_ARCHIVE_RETENTION_BLOCKS";
+/// Value of [`ARCHIVE_RETENTION_VAR`] that keeps every block.
+const ARCHIVE_RETENTION_ALL: &str = "all";
 
 /// Process configuration.
 #[derive(Debug)]
 pub(crate) struct Config {
     pub(crate) network: NetworkConfig,
-    /// Directory for node state (`node.redb`).
+    /// Unsafe store (Redis), committed store (ClickHouse) and local block archive (fjall).
+    pub(crate) storage: StorageConfig,
+    /// Directory for local state: the node store (`node/`) and the block archive (`archive/`).
     pub(crate) data_dir: PathBuf,
 }
 
@@ -30,6 +46,15 @@ impl Config {
     ///   chain's bootnodes).
     /// - `OP_INDEXER_MAX_PEERS`: maximum connections, inbound and outbound (default 30).
     /// - `OP_INDEXER_DATA_DIR`: node state directory (default `data`).
+    /// - `OP_INDEXER_REDIS_URL`: unsafe store (default `redis://127.0.0.1:6379`).
+    /// - `OP_INDEXER_CLICKHOUSE_URL`: committed store, HTTP interface (default
+    ///   `http://127.0.0.1:8123`).
+    /// - `OP_INDEXER_CLICKHOUSE_DATABASE`: ClickHouse database (default `op_indexer`).
+    /// - `OP_INDEXER_CLICKHOUSE_USER`: ClickHouse user (default `indexer`).
+    /// - `OP_INDEXER_CLICKHOUSE_PASSWORD`: ClickHouse password (default: none). Never logged.
+    /// - `OP_INDEXER_ARCHIVE_RETENTION_BLOCKS`: blocks kept in the local archive, the
+    ///   `archive` directory inside the data directory: a block count (default 1296000, 30
+    ///   days), `all` to keep every block, or `0` to disable the archive.
     pub(crate) fn from_env() -> eyre::Result<Self> {
         let chain_id = parse_var("OP_INDEXER_CHAIN_ID")?.unwrap_or(DEFAULT_CHAIN_ID);
         let chain = ChainSpec::by_chain_id(chain_id)
@@ -43,6 +68,12 @@ impl Config {
         .map(parse_bootnode)
         .collect::<eyre::Result<Vec<Bootnode>>>()?;
 
+        let data_dir = PathBuf::from(var_or("OP_INDEXER_DATA_DIR", DEFAULT_DATA_DIR));
+        let archive = archive_retention()?.map(|retention| ArchiveConfig {
+            path: data_dir.join(ARCHIVE_DIR),
+            retention,
+        });
+
         Ok(Self {
             network: NetworkConfig {
                 chain,
@@ -50,15 +81,49 @@ impl Config {
                 bootnodes,
                 max_peers: parse_var("OP_INDEXER_MAX_PEERS")?.unwrap_or(DEFAULT_MAX_PEERS),
             },
-            data_dir: var("OP_INDEXER_DATA_DIR")
-                .unwrap_or_else(|| DEFAULT_DATA_DIR.to_owned())
-                .into(),
+            storage: StorageConfig {
+                redis: RedisConfig {
+                    url: var_or("OP_INDEXER_REDIS_URL", DEFAULT_REDIS_URL),
+                },
+                clickhouse: ClickHouseConfig {
+                    url: var_or("OP_INDEXER_CLICKHOUSE_URL", DEFAULT_CLICKHOUSE_URL),
+                    database: var_or(
+                        "OP_INDEXER_CLICKHOUSE_DATABASE",
+                        DEFAULT_CLICKHOUSE_DATABASE,
+                    ),
+                    user: var_or("OP_INDEXER_CLICKHOUSE_USER", DEFAULT_CLICKHOUSE_USER),
+                    password: var("OP_INDEXER_CLICKHOUSE_PASSWORD"),
+                },
+                archive,
+                chain_id,
+            },
+            data_dir,
         })
     }
 }
 
 fn var(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+/// Reads the archive retention: a block count, `all`, or `0` for no archive (`None`).
+fn archive_retention() -> eyre::Result<Option<ArchiveRetention>> {
+    let Some(value) = var(ARCHIVE_RETENTION_VAR) else {
+        return Ok(Some(ArchiveRetention::Blocks(
+            DEFAULT_ARCHIVE_RETENTION_BLOCKS,
+        )));
+    };
+    if value.eq_ignore_ascii_case(ARCHIVE_RETENTION_ALL) {
+        return Ok(Some(ArchiveRetention::All));
+    }
+    let blocks: u64 = value.parse().wrap_err_with(|| {
+        format!("{ARCHIVE_RETENTION_VAR} is invalid: {value} (expected a block count, `all` or 0)")
+    })?;
+    Ok((blocks > 0).then_some(ArchiveRetention::Blocks(blocks)))
+}
+
+fn var_or(name: &str, default: &str) -> String {
+    var(name).unwrap_or_else(|| default.to_owned())
 }
 
 fn parse_bootnode(bootnode: &str) -> eyre::Result<Bootnode> {
