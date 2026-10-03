@@ -3,11 +3,13 @@ name = "op-indexer"
 description = "Binary: configuration, tracing, and wiring of the indexer components"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [dependencies]
 op-indexer-chainspec.workspace = true
 op-indexer-p2p.workspace = true
+op-indexer-storage.workspace = true
 
 eyre.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync"] }

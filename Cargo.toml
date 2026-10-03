@@ -5,6 +5,7 @@ resolver = "3"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 publish = false
 
 [workspace.dependencies]
@@ -19,6 +20,16 @@ op-indexer-storage = { path = "crates/storage" }
 alloy-primitives = { version = "1.7", default-features = false, features = ["std", "k256"] }
 # Cheaply cloneable payload buffers passed between tasks.
 bytes = "1"
+# Block, transaction and receipt types, so no crate redefines them. The storage crate adds
+# `serde` for the JSON it keeps in Redis.
+alloy-consensus = { version = "2", default-features = false, features = ["std"] }
+op-alloy-consensus = { version = "2", default-features = false, features = ["std"] }
+# RLP of headers, bodies and receipts in the block archive, the encoding peers ask for
+# (already in the tree through alloy).
+alloy-rlp = { version = "0.3", default-features = false, features = ["std"] }
+# `Encodable2718` for the raw transaction bytes stored in ClickHouse, and `Withdrawals` to
+# rebuild a block body read back from Redis.
+alloy-eips = { version = "2", default-features = false, features = ["std"] }
 
 # TCP + Noise + yamux transport with a secp256k1 identity, gossipsub for block gossip,
 # `macros` to compose gossipsub with connection limits.
@@ -31,16 +42,33 @@ enr = { version = "0.14", default-features = false, features = ["k256"] }
 # Already in the tree via multiaddr; used for the `opstack` ENR entry.
 unsigned-varint = "0.8"
 
-# Embedded node-state store: pure Rust, ACID, single file.
-redb = "4.3"
+# Embedded store for the node state (p2p) and the local block archive (storage): pure Rust,
+# log-structured, one directory per store. Its only default feature, `lz4`, is off: archived
+# values are already snappy-compressed and the node state is tiny.
+fjall = { version = "3.1", default-features = false }
 # OP execution payload SSZ types and the sequencer signing message.
 op-alloy-rpc-types-engine = { version = "2", default-features = false, features = ["std"] }
 alloy-rpc-types-engine = { version = "2", default-features = false, features = ["ssz"] }
 # The `Decode` trait and error for the payload SSZ types (same version op-alloy uses).
 ethereum_ssz = { version = "0.10", default-features = false }
-# Gossip payloads are snappy block-compressed; message IDs are SHA-256 based (0.10, as op-alloy).
+# Gossip payloads and archived blocks are snappy block-compressed; message IDs and ClickHouse
+# migration checksums are SHA-256 (0.10, as op-alloy).
 sha2 = "0.10"
 snap = "1.1"
+
+# Unsafe store client: `tokio-comp` and `connection-manager` for one multiplexed connection that
+# reconnects on its own, `script` to run the Lua fork-choice scripts by hash.
+redis = { version = "1", default-features = false, features = ["tokio-comp", "connection-manager", "script"] }
+# Committed store: the official ClickHouse client (HTTP). The `Row` derive and batched inserts are
+# built in; `lz4` for request compression.
+clickhouse = { version = "0.15", default-features = false, features = ["lz4"] }
+# Redis values are JSON; ClickHouse rows are serde structs.
+serde = { version = "1", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+# ClickHouse row encoding, as the client's README prescribes: `Enum8` columns through
+# `serde_repr`, byte-string columns through `serde_bytes`.
+serde_repr = "0.1"
+serde_bytes = { version = "0.11", default-features = false, features = ["std"] }
 
 # Async runtime; each crate enables only the features it uses.
 tokio = { version = "1", default-features = false }

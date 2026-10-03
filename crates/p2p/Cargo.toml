@@ -3,6 +3,7 @@ name = "op-indexer-p2p"
 description = "OP Stack p2p: discv5 discovery, gossipsub block gossip, and unsafe-block validation"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [dependencies]
@@ -15,10 +16,10 @@ bytes.workspace = true
 discv5.workspace = true
 enr.workspace = true
 ethereum_ssz.workspace = true
+fjall.workspace = true
 libp2p.workspace = true
 metrics.workspace = true
 op-alloy-rpc-types-engine.workspace = true
-redb.workspace = true
 sha2.workspace = true
 snap.workspace = true
 thiserror.workspace = true

@@ -1,37 +1,45 @@
 # op-p2p-indexer
 
 A Rust indexer for the OP Stack peer-to-peer network. It joins the libp2p gossip network,
-validates and decodes payloads with alloy / op-alloy types, and indexes them. It integrates with
-reth / op-reth; whether it runs as a **standalone binary or a reth ExEx is not decided yet**, so
-keep core logic neutral to that choice (see `rust-async`).
+validates and decodes payloads with alloy / op-alloy types, and indexes them. It is a
+**standalone, lightweight binary with no external services**: no L1 or L2 RPC and no embedded
+node. Receipts and logs are planned to come from L2 execution peers, verified against the block
+header (see the roadmap; pending a viability test).
+
+Scope, decisions and the order of work are in [`docs/roadmap.md`](docs/roadmap.md); each crate's
+spec is linked from there (storage: [`docs/storage.md`](docs/storage.md)). Read the roadmap
+before proposing a design, and record new decisions there.
 
 ## Layout (Cargo workspace)
 
 | Path | Package | Role | Internal deps |
 |---|---|---|---|
-| `bin/op-indexer` | `op-indexer` | Thin binary: config, tracing, wiring, shutdown | chainspec, p2p (storage and pipeline once they exist) |
-| `crates/primitives` | `op-indexer-primitives` | Shared domain types (alloy and `bytes` only) | none |
+| `bin/op-indexer` | `op-indexer` | Thin binary: config, tracing, wiring, shutdown | chainspec, p2p, storage (pipeline once it exists) |
+| `crates/primitives` | `op-indexer-primitives` | Shared domain types (alloy, op-alloy and `bytes` only) | none |
 | `crates/chainspec` | `op-indexer-chainspec` | Static chain parameters (chain id, sequencer signer, bootnodes) | none |
-| `crates/p2p` | `op-indexer-p2p` | discv5 discovery, gossipsub block gossip (scoring, connection limits), unsafe-block validation, redb node state | primitives, chainspec |
-| `crates/storage` | `op-indexer-storage` | Hot (Redis) / cold (ClickHouse) stores | primitives |
-| `crates/pipeline` | `op-indexer-pipeline` | Unsafe → hot store; promote safe/finalized → cold | primitives, storage |
+| `crates/p2p` | `op-indexer-p2p` | discv5 discovery, gossipsub block gossip (scoring, connection limits), unsafe-block validation, fjall node state | primitives, chainspec |
+| `crates/storage` | `op-indexer-storage` | Unsafe store (Redis, fork choice) / committed store (ClickHouse, migrations) / local block archive (fjall), their traits and metrics | primitives |
+| `crates/pipeline` | `op-indexer-pipeline` | Unsafe blocks → unsafe store; promote safe/finalized → committed store | primitives, storage |
 
 - Keep these edges: `p2p` and `storage` never depend on each other, and `pipeline` doesn't depend
   on `p2p`. `p2p` depends on `chainspec` (it is chain-specific); the binary parses overrides (e.g.
   bootnodes) at the edge. The binary wires them together with channels.
-- Safe/finalized status will come from L1 via reth (likely an ExEx); that integration gets its own crate when it starts.
+- Safe/finalized status will come from an L1 p2p crate, not from reth or an RPC (see `docs/roadmap.md`).
 - New crates go in `crates/<name>` as package `op-indexer-<name>`, inherit `[workspace.package]`,
   and set `lints.workspace = true`. All dependency versions live in root `[workspace.dependencies]`.
 
 ## Storage
 
-- **Redis**: hot data. Unsafe blocks received over gossip and not yet derived from L1.
-- **ClickHouse**: cold data. Safe/finalized blocks, whose batches are on L1.
+- **Redis**: the unsafe store. Blocks received over gossip and not yet committed to L1, with fork choice.
+- **ClickHouse**: the committed store. Safe/finalized blocks, whose batches are on L1, and backfill.
+- **fjall** (`archive/` in the data dir): a window of committed blocks, or optionally all of them,
+  in their consensus encoding, for serving peers later. Embedded; needs no service.
 
 `docker compose up -d redis clickhouse` starts both locally; `docker compose up --build` also runs
-the indexer image. The storage crate is still a stub, so the binary does not read the Redis and
-ClickHouse `OP_INDEXER_*` variables in `docker-compose.yml` yet; the ones it reads are documented
-on `Config::from_env` in `bin/op-indexer/src/config.rs`.
+the indexer image. The binary needs both stores to start: it connects, checks the Redis key-layout
+version and runs the ClickHouse migrations, and exits if either store is unreachable. Every
+`OP_INDEXER_*` variable it reads is documented on `Config::from_env` in
+`bin/op-indexer/src/config.rs`.
 
 ## Project skills
 

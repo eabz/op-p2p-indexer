@@ -1,21 +1,35 @@
-//! Persistent node state, stored in an embedded [redb](https://docs.rs/redb) database.
+//! Persistent node state, stored in an embedded [fjall](https://docs.rs/fjall) database.
 //!
 //! Holds the node's secp256k1 identity, so it keeps a stable peer id across restarts, and the
 //! peers that recently delivered valid blocks, so a restart can reconnect without waiting for
 //! discovery.
+//!
+//! This is a second fjall database next to the block archive's, on purpose: the archive lives
+//! in the storage crate, and p2p and storage must not depend on each other. It holds one key
+//! and a few dozen small entries, far below every size limit fjall has, so the only setting
+//! that matters is the number of background threads.
 
+use std::cmp::Reverse;
+use std::collections::BTreeMap;
+use std::fmt;
 use std::path::Path;
+use std::sync::{Mutex, PoisonError};
 
+use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 use libp2p::Multiaddr;
 use libp2p::identity::{DecodingError, secp256k1};
-use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 
-const NODE: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("node");
+const NODE: &str = "node";
 const IDENTITY_KEY: &str = "secp256k1_secret";
-/// Known good peers: multiaddr bytes -> last time (Unix seconds) they delivered a valid block.
-const PEERS: TableDefinition<'_, &[u8], u64> = TableDefinition::new("known_peers");
+/// Known good peers: multiaddr bytes -> last time (Unix seconds, big-endian) they delivered a
+/// valid block.
+const PEERS: &str = "known_peers";
 /// Peers kept; the least recently seen is evicted beyond this.
-const MAX_KNOWN_PEERS: u64 = 64;
+const MAX_KNOWN_PEERS: usize = 64;
+
+/// Background threads for flushes and compactions (fjall starts up to four by default); there
+/// is almost nothing for them to do.
+const WORKER_THREADS: usize = 1;
 
 /// Errors from the node store.
 #[derive(Debug, thiserror::Error)]
@@ -23,8 +37,11 @@ const MAX_KNOWN_PEERS: u64 = 64;
 pub enum StoreError {
     /// The database could not be opened, read, or written.
     #[error("node store database error")]
-    Database(#[from] redb::Error),
-    /// The store file's permissions could not be restricted to its owner.
+    Database(#[from] fjall::Error),
+    /// The store directory could not be created.
+    #[error("failed to create the node store directory")]
+    CreateDir(#[source] std::io::Error),
+    /// The store directory's permissions could not be restricted to its owner.
     #[error("failed to restrict node store permissions")]
     Permissions(#[source] std::io::Error),
     /// The persisted identity key could not be decoded.
@@ -32,36 +49,56 @@ pub enum StoreError {
     InvalidIdentity(#[source] DecodingError),
 }
 
-/// Node state backed by a single redb file.
+/// Node state backed by a fjall database, which is a directory.
 ///
-/// The file holds the node's secret key, so on Unix it is made readable by its owner only (0600).
+/// The directory holds the node's secret key, so on Unix it is made accessible by its owner
+/// only (0700). Every write is synced to disk before it returns.
 ///
 /// All methods do blocking disk I/O: call them during startup or from
 /// [`tokio::task::spawn_blocking`], never directly from async code.
-#[derive(Debug)]
 pub struct NodeStore {
     db: Database,
+    node: Keyspace,
+    peers: Keyspace,
+    /// Serializes the read-then-write of [`Self::identity`] and [`Self::save_peer`].
+    write: Mutex<()>,
+}
+
+// fjall's handles are not `Debug`.
+impl fmt::Debug for NodeStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NodeStore").finish_non_exhaustive()
+    }
 }
 
 impl NodeStore {
-    /// Opens the store at `path`, creating the file and its tables if they do not exist.
+    /// Opens the store in the directory `path`, creating it and its keyspaces if they do not
+    /// exist.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Database`] if the file cannot be created or opened, and
-    /// [`StoreError::Permissions`] if its permissions cannot be restricted.
+    /// Returns [`StoreError::CreateDir`] if the directory cannot be created,
+    /// [`StoreError::Permissions`] if its permissions cannot be restricted, and
+    /// [`StoreError::Database`] if the database in it cannot be opened.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
-        let db = Database::create(path).map_err(redb::Error::from)?;
+        // Restricted before fjall writes anything into it.
+        std::fs::create_dir_all(path).map_err(StoreError::CreateDir)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
                 .map_err(StoreError::Permissions)?;
         }
-        let store = Self { db };
-        store.create_tables()?;
-        Ok(store)
+        let db = Database::builder(path)
+            .worker_threads(WORKER_THREADS)
+            .open()?;
+        Ok(Self {
+            node: db.keyspace(NODE, KeyspaceCreateOptions::default)?,
+            peers: db.keyspace(PEERS, KeyspaceCreateOptions::default)?,
+            db,
+            write: Mutex::new(()),
+        })
     }
 
     /// Returns the node's secp256k1 identity, generating and persisting one on first use.
@@ -73,13 +110,16 @@ impl NodeStore {
     /// Returns [`StoreError::Database`] if reading or writing fails, and
     /// [`StoreError::InvalidIdentity`] if the stored key cannot be decoded.
     pub fn identity(&self) -> Result<secp256k1::Keypair, StoreError> {
-        if let Some(mut secret) = self.read_node(IDENTITY_KEY)? {
-            let secret = secp256k1::SecretKey::try_from_bytes(&mut secret)
+        let _write = self.write.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(secret) = self.node.get(IDENTITY_KEY)? {
+            let secret = secp256k1::SecretKey::try_from_bytes(secret.to_vec())
                 .map_err(StoreError::InvalidIdentity)?;
             return Ok(secret.into());
         }
         let keypair = secp256k1::Keypair::generate();
-        self.write_node(IDENTITY_KEY, &keypair.secret().to_bytes())?;
+        let mut batch = self.durable_batch();
+        batch.insert(&self.node, IDENTITY_KEY, keypair.secret().to_bytes());
+        batch.commit()?;
         Ok(keypair)
     }
 
@@ -89,7 +129,14 @@ impl NodeStore {
     ///
     /// Returns [`StoreError::Database`] if reading fails.
     pub fn known_peers(&self) -> Result<Vec<Multiaddr>, StoreError> {
-        Ok(self.read_peers()?)
+        let mut peers: Vec<(u64, Multiaddr)> = self
+            .read_peers()?
+            .into_iter()
+            // Skip entries that no longer parse rather than failing startup.
+            .filter_map(|(addr, seen_secs)| Some((seen_secs, Multiaddr::try_from(addr).ok()?)))
+            .collect();
+        peers.sort_unstable_by_key(|(seen_secs, _)| Reverse(*seen_secs));
+        Ok(peers.into_iter().map(|(_, addr)| addr).collect())
     }
 
     /// Records that the peer at `addr` delivered a valid block at `seen_secs` (Unix seconds),
@@ -99,63 +146,44 @@ impl NodeStore {
     ///
     /// Returns [`StoreError::Database`] if writing fails.
     pub fn save_peer(&self, addr: &Multiaddr, seen_secs: u64) -> Result<(), StoreError> {
-        Ok(self.write_peer(addr, seen_secs)?)
-    }
+        let _write = self.write.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut peers = self.read_peers()?;
+        peers.insert(addr.to_vec(), seen_secs);
+        let evicted = if peers.len() > MAX_KNOWN_PEERS {
+            let oldest = peers.iter().min_by_key(|(_, seen_secs)| **seen_secs);
+            oldest.map(|(addr, _)| addr.as_slice())
+        } else {
+            None
+        };
+        // The new peer is itself the least recently seen: nothing changes.
+        if evicted == Some(addr.as_ref()) {
+            return Ok(());
+        }
 
-    fn create_tables(&self) -> Result<(), redb::Error> {
-        let tx = self.db.begin_write()?;
-        tx.open_table(NODE)?;
-        tx.open_table(PEERS)?;
-        tx.commit()?;
+        let mut batch = self.durable_batch();
+        batch.insert(&self.peers, addr.as_ref(), seen_secs.to_be_bytes());
+        if let Some(evicted) = evicted {
+            batch.remove(&self.peers, evicted);
+        }
+        batch.commit()?;
         Ok(())
     }
 
-    fn read_node(&self, key: &str) -> Result<Option<Vec<u8>>, redb::Error> {
-        let tx = self.db.begin_read()?;
-        let table = tx.open_table(NODE)?;
-        Ok(table.get(key)?.map(|value| value.value().to_vec()))
-    }
-
-    fn write_node(&self, key: &str, value: &[u8]) -> Result<(), redb::Error> {
-        let tx = self.db.begin_write()?;
-        tx.open_table(NODE)?.insert(key, value)?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    fn read_peers(&self) -> Result<Vec<Multiaddr>, redb::Error> {
-        let tx = self.db.begin_read()?;
-        let mut peers = Vec::new();
-        for entry in tx.open_table(PEERS)?.iter()? {
-            let (addr, seen_secs) = entry?;
-            // Skip entries that no longer parse rather than failing startup.
-            if let Ok(addr) = Multiaddr::try_from(addr.value().to_vec()) {
-                peers.push((seen_secs.value(), addr));
+    /// Returns the stored peers: multiaddr bytes and when each was last seen.
+    fn read_peers(&self) -> Result<BTreeMap<Vec<u8>, u64>, fjall::Error> {
+        let mut peers = BTreeMap::new();
+        for entry in self.peers.iter() {
+            let (addr, seen_secs) = entry.into_inner()?;
+            // An entry of another shape was not written by this code; skip it.
+            if let Ok(seen_secs) = <[u8; 8]>::try_from(seen_secs.as_ref()) {
+                peers.insert(addr.to_vec(), u64::from_be_bytes(seen_secs));
             }
         }
-        peers.sort_unstable_by(|(a, _), (b, _)| b.cmp(a));
-        Ok(peers.into_iter().map(|(_, addr)| addr).collect())
+        Ok(peers)
     }
 
-    fn write_peer(&self, addr: &Multiaddr, seen_secs: u64) -> Result<(), redb::Error> {
-        let tx = self.db.begin_write()?;
-        {
-            let mut table = tx.open_table(PEERS)?;
-            table.insert(addr.as_ref(), seen_secs)?;
-            if table.len()? > MAX_KNOWN_PEERS {
-                let mut oldest: Option<(Vec<u8>, u64)> = None;
-                for entry in table.iter()? {
-                    let (key, value) = entry?;
-                    if oldest.as_ref().is_none_or(|(_, at)| value.value() < *at) {
-                        oldest = Some((key.value().to_vec(), value.value()));
-                    }
-                }
-                if let Some((key, _)) = oldest {
-                    table.remove(key.as_slice())?;
-                }
-            }
-        }
-        tx.commit()?;
-        Ok(())
+    /// A write batch that is synced to disk before `commit` returns.
+    fn durable_batch(&self) -> fjall::OwnedWriteBatch {
+        self.db.batch().durability(Some(PersistMode::SyncAll))
     }
 }

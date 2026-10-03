@@ -3,11 +3,13 @@ name = "op-indexer-primitives"
 description = "Domain types shared by every op-p2p-indexer crate"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [dependencies]
 alloy-primitives.workspace = true
 bytes.workspace = true
+op-alloy-consensus.workspace = true
 
 [lints]
 workspace = true

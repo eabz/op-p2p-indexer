@@ -1,8 +1,9 @@
 [package]
 name = "op-indexer-pipeline"
-description = "Indexing pipeline: stores unsafe blocks hot and promotes them to cold storage once safe"
+description = "Indexing pipeline: writes unsafe blocks to the unsafe store and promotes them to the committed store once safe"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [dependencies]

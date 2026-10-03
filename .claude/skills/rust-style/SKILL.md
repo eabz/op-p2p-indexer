@@ -11,7 +11,7 @@ enforced by `[lints]` in `Cargo.toml`, `clippy.toml`, and `deny.toml`. This skil
 ## Layout
 
 - Keep the binary thin: parse config, set up `tracing`, build components, run, map the exit code.
-  Logic lives in the `crates/` libraries, so it can be tested and reused if we move to a reth ExEx.
+  Logic lives in the `crates/` libraries, so the binary stays a thin edge and the crates can be reused.
 - One concept per module. Split files that grow past roughly 500 lines, or that hold more than one main type.
 - Order inside a file: imports, constants, public types, impls, then private helpers.
 
@@ -81,5 +81,5 @@ fn topic_regex() -> Regex { Regex::new(TOPIC_PATTERN).expect("valid regex") }
 ## Dependencies
 
 - Declare versions once in the root `[workspace.dependencies]`; crates use `dep.workspace = true`.
-- Use `default-features = false` and enable only the features you need, especially for reth, alloy, and libp2p.
+- Use `default-features = false` and enable only the features you need, especially for alloy and libp2p.
 - Every new crate needs a one-line justification in the commit.
