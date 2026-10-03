@@ -42,14 +42,22 @@ Anything from a peer (gossip messages, req/resp, ENRs, RLP/SSZ bytes) is hostile
 
   | Class | Example | Response |
   |---|---|---|
-  | Peer fault | bad signature, malformed payload, wrong chain id | reject the message, penalize or score the peer |
-  | Ignorable | duplicate, too old, too far in the future | ignore without penalty |
+  | Peer fault | bad signature, malformed payload, wrong chain id, block outside the timestamp window | reject the message, penalize or score the peer |
+  | Ignorable | a valid block already seen | ignore without penalty |
   | Transient local | DB busy, RPC timeout | retry with backoff |
   | Fatal local | corrupted store, bad config | cancel the root token, shut down cleanly |
 
   Expose this on the error type (`fn is_peer_fault(&self) -> bool`, or a `Severity` enum) instead
   of string-matching at the call site. For gossipsub it maps directly to
   `MessageAcceptance::{Reject, Ignore, Accept}`.
+
+- **The OP Stack specs outrank this skill.** Where a spec says how a message is treated, follow
+  the spec and link it; the table above only covers what the specs leave open. For block gossip,
+  [block validation](https://specs.optimism.io/protocol/rollup-node-p2p.html#block-validation)
+  makes these a `REJECT`: invalid snappy or SSZ, a timestamp more than 60 seconds old or more than
+  5 seconds in the future, a block hash that does not match the payload, more than 5 distinct
+  blocks at one height, and an invalid sequencer signature. Only a block already seen is an
+  `IGNORE`. If a spec and this skill disagree, fix the skill.
 
 ## Propagation rules
 
