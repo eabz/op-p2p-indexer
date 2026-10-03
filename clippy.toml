@@ -1,0 +1,12 @@
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+
+# Identifiers that `doc_markdown` should not demand backticks for.
+doc-valid-idents = ["..", "ExEx", "GossipSub", "OpStack"]
+
+disallowed-methods = [
+    { path = "std::thread::sleep", reason = "blocks the async runtime; use tokio::time::sleep" },
+    { path = "tokio::sync::mpsc::unbounded_channel", reason = "channels must be bounded", allow-invalid = true },
+]
