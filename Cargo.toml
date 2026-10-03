@@ -9,10 +9,53 @@ publish = false
 
 [workspace.dependencies]
 # Internal crates.
+op-indexer-chainspec = { path = "crates/chainspec" }
 op-indexer-p2p = { path = "crates/p2p" }
 op-indexer-pipeline = { path = "crates/pipeline" }
 op-indexer-primitives = { path = "crates/primitives" }
 op-indexer-storage = { path = "crates/storage" }
+
+# Ethereum types; `k256` for sequencer signature recovery.
+alloy-primitives = { version = "1.7", default-features = false, features = ["std", "k256"] }
+# Cheaply cloneable payload buffers passed between tasks.
+bytes = "1"
+
+# TCP + Noise + yamux transport with a secp256k1 identity, gossipsub for block gossip,
+# `macros` to compose gossipsub with connection limits.
+libp2p = { version = "0.57", default-features = false, features = ["tcp", "tokio", "noise", "yamux", "secp256k1", "gossipsub", "macros"] }
+# Node discovery (same protocol and crate as Lighthouse and reth); `libp2p` to request the ENR
+# of `enode://` bootnodes by their multiaddr.
+discv5 = { version = "0.12", features = ["libp2p"] }
+# ENR key types for our own record (discv5 re-exports only the `Enr` alias).
+enr = { version = "0.14", default-features = false, features = ["k256"] }
+# Already in the tree via multiaddr; used for the `opstack` ENR entry.
+unsigned-varint = "0.8"
+
+# Embedded node-state store: pure Rust, ACID, single file.
+redb = "4.3"
+# OP execution payload SSZ types and the sequencer signing message.
+op-alloy-rpc-types-engine = { version = "2", default-features = false, features = ["std"] }
+alloy-rpc-types-engine = { version = "2", default-features = false, features = ["ssz"] }
+# The `Decode` trait and error for the payload SSZ types (same version op-alloy uses).
+ethereum_ssz = { version = "0.10", default-features = false }
+# Gossip payloads are snappy block-compressed; message IDs are SHA-256 based (0.10, as op-alloy).
+sha2 = "0.10"
+snap = "1.1"
+
+# Async runtime; each crate enables only the features it uses.
+tokio = { version = "1", default-features = false }
+# `CancellationToken` for shutdown.
+tokio-util = { version = "0.7", default-features = false }
+
+# Errors: `eyre` in the binary, `thiserror` in the libraries.
+eyre = "0.6"
+thiserror = "2"
+# Structured logging.
+tracing = "0.1"
+# Metrics facade (as in reth): recording is a no-op until the binary installs a recorder.
+metrics = { version = "0.24", default-features = false }
+# Log output in the binary; `chrono` for the short UTC timestamps.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi", "chrono"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -31,7 +74,7 @@ unescaped_backticks = "warn"
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 
-# Panics on untrusted (network) input are bugs. Allowed in tests via clippy.toml.
+# Panics on untrusted (network) input are bugs.
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "warn"

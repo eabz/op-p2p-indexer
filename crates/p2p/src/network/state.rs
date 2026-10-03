@@ -1,0 +1,460 @@
+//! Mutable state of the running node and its handlers for swarm events and validation results.
+//!
+//! Kept apart from the swarm so handlers can borrow both; [`super::Network::run`] owns one
+//! [`State`] and one swarm and drives them from its event loop.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
+use std::time::{Duration, Instant, UNIX_EPOCH};
+
+use alloy_primitives::BlockNumber;
+use libp2p::gossipsub::{self, MessageAcceptance, MessageId, TopicHash};
+use libp2p::multiaddr::Protocol;
+use libp2p::swarm::SwarmEvent;
+use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
+use libp2p::{Multiaddr, PeerId, Swarm};
+use op_indexer_primitives::{PayloadVersion, UnsafeBlock};
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinSet;
+use tracing::{debug, info, trace, warn};
+
+use super::{Behaviour, BehaviourEvent};
+use crate::block::{BlockError, BlockValidator, SeenBlocks};
+use crate::gossip;
+use crate::metrics::{self, DialOutcome};
+use crate::peers::ConnectedPeers;
+use crate::{NodeStore, StoreError};
+
+/// Minimum time between dials to the same peer, so unreachable peers aren't re-dialed every lookup.
+const DIAL_BACKOFF: Duration = Duration::from_secs(120);
+/// Most peers in dial backoff at once. Expired entries are pruned when it fills; if it is still
+/// full, further dials wait for entries to expire.
+const MAX_DIAL_BACKOFF_ENTRIES: usize = 1024;
+/// How long an evicted peer is not dialed again; discovery keeps reporting it.
+const EVICTED_PEER_BACKOFF: Duration = Duration::from_secs(600);
+/// Blocks arrive every ~2s and duplicates are dropped by gossipsub before validation, so a few
+/// in flight is normal; beyond this, messages are ignored rather than queued without bound.
+const MAX_PENDING_VALIDATIONS: usize = 32;
+/// Minimum time between warnings that the local clock looks slow.
+const CLOCK_SKEW_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Mutable state of the running node, separate from the swarm so handlers can borrow both.
+pub(super) struct State {
+    topics: HashMap<TopicHash, PayloadVersion>,
+    validator: BlockValidator,
+    blocks: mpsc::Sender<UnsafeBlock>,
+    pub(super) validations: JoinSet<Validated>,
+    /// Valid blocks seen per height, for the per-height limit and duplicates.
+    seen: SeenBlocks,
+    /// Connection times, to evict peers that never subscribe to our block topics.
+    peers: ConnectedPeers,
+    /// Earliest time each recently dialed peer may be dialed again. Pruned when it grows.
+    next_dial: HashMap<PeerId, Instant>,
+    /// Messages ignored because too many validations were already in flight.
+    ignored_overload: u64,
+    /// Accepted blocks dropped because the consumer channel was full.
+    dropped_blocks: u64,
+    /// Set when the block consumer dropped its receiver; the node then shuts down.
+    consumer_closed: bool,
+    /// Known good peers from the node store still to dial, most recently seen first; drained as
+    /// pending-connection slots free up.
+    known_peers: VecDeque<Multiaddr>,
+    /// When the slow-clock warning was last logged.
+    clock_skew_warned: Option<Instant>,
+    store: Arc<NodeStore>,
+    /// Dial addresses of connected outbound peers not yet saved as known good (inbound peers
+    /// have ephemeral ports, so they cannot be re-dialed).
+    outbound: HashMap<PeerId, Multiaddr>,
+    pub(super) persists: JoinSet<Result<(), StoreError>>,
+    /// Connected peers subscribed to our block topics, read by discovery to pace itself.
+    peer_count: watch::Sender<usize>,
+    /// Highest accepted block number in this run; the first block sets it, so a restart is not
+    /// seen as a gap.
+    highest: Option<BlockNumber>,
+    /// Highest L2 block committed to L1. Missing blocks at or below it are not a gap. Until an L1
+    /// source feeds it, it stays 0 and every in-process gap counts as unsafe.
+    safe_head: watch::Receiver<BlockNumber>,
+}
+
+/// Result of validating one message on a blocking thread.
+pub(super) struct Validated {
+    id: MessageId,
+    source: PeerId,
+    result: Result<UnsafeBlock, BlockError>,
+}
+
+impl State {
+    pub(super) fn new(
+        topics: HashMap<TopicHash, PayloadVersion>,
+        validator: BlockValidator,
+        blocks: mpsc::Sender<UnsafeBlock>,
+        store: Arc<NodeStore>,
+        peer_count: watch::Sender<usize>,
+        safe_head: watch::Receiver<BlockNumber>,
+    ) -> Self {
+        Self {
+            topics,
+            validator,
+            blocks,
+            validations: JoinSet::new(),
+            seen: SeenBlocks::default(),
+            peers: ConnectedPeers::default(),
+            next_dial: HashMap::new(),
+            ignored_overload: 0,
+            dropped_blocks: 0,
+            consumer_closed: false,
+            known_peers: VecDeque::new(),
+            clock_skew_warned: None,
+            store,
+            outbound: HashMap::new(),
+            persists: JoinSet::new(),
+            peer_count,
+            highest: None,
+            safe_head,
+        }
+    }
+
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "SwarmEvent and gossipsub::Event are non_exhaustive; the rest are only logged"
+    )]
+    pub(super) fn on_swarm_event(
+        &mut self,
+        swarm: &mut Swarm<Behaviour>,
+        event: SwarmEvent<BehaviourEvent>,
+    ) {
+        match event {
+            SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                propagation_source,
+                message_id,
+                message,
+            })) => {
+                let Some(&version) = self.topics.get(&message.topic) else {
+                    return;
+                };
+                if let Err(err) = BlockValidator::precheck(version, &message.data) {
+                    reject(swarm, &message_id, propagation_source, &err);
+                    return;
+                }
+                if self.validations.len() >= MAX_PENDING_VALIDATIONS {
+                    self.ignored_overload += 1;
+                    metrics::block_ignored_backlog();
+                    // Logged at 1, 2, 4, 8, ... so a flooding peer can't control our log volume.
+                    if self.ignored_overload.is_power_of_two() {
+                        warn!(
+                            ignored_total = self.ignored_overload,
+                            "validation backlog full, ignoring block message"
+                        );
+                    }
+                    report(
+                        swarm,
+                        &message_id,
+                        &propagation_source,
+                        MessageAcceptance::Ignore,
+                    );
+                    return;
+                }
+                let validator = self.validator;
+                let now = unix_now_secs();
+                self.validations.spawn_blocking(move || Validated {
+                    id: message_id,
+                    source: propagation_source,
+                    result: metrics::timed_validation(|| {
+                        validator.validate(version, message.data, now)
+                    }),
+                });
+                metrics::validations_pending(self.validations.len());
+            }
+            SwarmEvent::ConnectionEstablished {
+                peer_id, endpoint, ..
+            } => {
+                debug!(peer = %peer_id, addr = %endpoint.get_remote_address(), "peer connected");
+                metrics::peer_connected(&endpoint);
+                self.peers.connected(peer_id, Instant::now());
+                if endpoint.is_dialer()
+                    && let Ok(addr) = endpoint.get_remote_address().clone().with_p2p(peer_id)
+                {
+                    self.outbound.insert(peer_id, addr);
+                }
+                self.dial_queued_known_peers(swarm);
+            }
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                endpoint,
+                cause,
+                ..
+            } => {
+                debug!(peer = %peer_id, ?cause, "peer disconnected");
+                metrics::peer_disconnected(&endpoint);
+                self.outbound.remove(&peer_id);
+                self.peers.disconnected(&peer_id);
+                self.update_peer_count(swarm);
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
+                gossipsub::Event::Subscribed { .. } | gossipsub::Event::Unsubscribed { .. },
+            )) => self.update_peer_count(swarm),
+            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                debug!(peer = ?peer_id, err = %error, "dial failed");
+                metrics::dial(DialOutcome::Failed);
+                self.dial_queued_known_peers(swarm);
+            }
+            SwarmEvent::NewListenAddr { address, .. } => info!(addr = %address, "listening"),
+            other => trace!(event = ?other, "swarm event"),
+        }
+    }
+
+    pub(super) fn on_validated(
+        &mut self,
+        swarm: &mut Swarm<Behaviour>,
+        Validated { id, source, result }: Validated,
+    ) {
+        metrics::validations_pending(self.validations.len());
+        // A valid block is still rejected past the per-height limit; one already seen is `None`.
+        let result = result.and_then(|block| {
+            let is_new = self.seen.observe(block.number, block.hash)?;
+            Ok(is_new.then_some(block))
+        });
+        match result {
+            Ok(None) => {
+                report(swarm, &id, &source, MessageAcceptance::Ignore);
+                debug!(peer = %source, "ignored duplicate block");
+                metrics::block_duplicate();
+            }
+            Ok(Some(block)) => {
+                report(swarm, &id, &source, MessageAcceptance::Accept);
+                debug!(number = block.number, hash = %block.hash, version = ?block.version, "received unsafe block");
+                metrics::block_accepted(&block, unix_now_secs());
+                self.check_gap(block.number);
+                self.remember(source, block.timestamp);
+                match self.blocks.try_send(block) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(block)) => {
+                        self.dropped_blocks += 1;
+                        metrics::block_dropped();
+                        // Logged at 1, 2, 4, 8, ... drops, like the validation backlog warning.
+                        if self.dropped_blocks.is_power_of_two() {
+                            warn!(
+                                number = block.number,
+                                hash = %block.hash,
+                                dropped_total = self.dropped_blocks,
+                                "block consumer is not keeping up, dropped block"
+                            );
+                        }
+                    }
+                    Err(TrySendError::Closed(_)) => self.consumer_closed = true,
+                }
+            }
+            // Every block validation failure is a REJECT in the spec.
+            Err(err) => {
+                if let Some(ahead_secs) = err.local_clock_lag_secs() {
+                    self.warn_clock_skew(ahead_secs);
+                }
+                reject(swarm, &id, source, &err);
+            }
+        }
+    }
+
+    /// Warns once when accepted block `number` skips unsafe blocks: heights above both the
+    /// highest accepted block and the L2 safe head. Blocks at or below the highest (reorgs, late
+    /// delivery) and heights L1 already has are not a gap. Nothing is fetched.
+    fn check_gap(&mut self, number: BlockNumber) {
+        let previous = self.highest;
+        if previous.is_some_and(|highest| number <= highest) {
+            return;
+        }
+        self.highest = Some(number);
+        let Some(highest) = previous else {
+            return;
+        };
+        let from = highest.max(*self.safe_head.borrow()).saturating_add(1);
+        if from >= number {
+            return;
+        }
+        let missed = number.saturating_sub(from);
+        warn!(
+            from,
+            to = number.saturating_sub(1),
+            missed,
+            "missed unsafe blocks"
+        );
+        metrics::gap_detected(missed);
+    }
+
+    /// Warns, at most once per [`CLOCK_SKEW_WARN_INTERVAL`], that the local clock looks slow: the
+    /// sequencer signed a block dated `ahead_secs` in our future. Such blocks are rejected, which
+    /// penalizes the honest peers that relay them, so a slow clock ends with no peers.
+    fn warn_clock_skew(&mut self, ahead_secs: u64) {
+        let now = Instant::now();
+        let due = self
+            .clock_skew_warned
+            .is_none_or(|at| now.duration_since(at) >= CLOCK_SKEW_WARN_INTERVAL);
+        if due {
+            self.clock_skew_warned = Some(now);
+            metrics::clock_skew_warned();
+            warn!(
+                ahead_secs,
+                "sequencer block is dated in the future, check the local clock"
+            );
+        }
+    }
+
+    /// Whether the block consumer dropped its receiver, so the node should shut down.
+    pub(super) const fn consumer_closed(&self) -> bool {
+        self.consumer_closed
+    }
+
+    /// Loads the peers that delivered valid blocks before and starts dialing them, to reconnect
+    /// without waiting for discovery.
+    pub(super) async fn dial_known_peers(&mut self, swarm: &mut Swarm<Behaviour>) {
+        let store = Arc::clone(&self.store);
+        match tokio::task::spawn_blocking(move || store.known_peers()).await {
+            Ok(Ok(peers)) => {
+                info!(known_peers = peers.len(), "dialing known peers");
+                self.known_peers = peers.into();
+                self.dial_queued_known_peers(swarm);
+            }
+            Ok(Err(err)) => warn!(%err, "failed to load known peers"),
+            Err(err) => warn!(%err, "known peers task failed"),
+        }
+    }
+
+    /// Dials queued known peers while pending outgoing connections are below the limit, so peers
+    /// past the first [`super::MAX_PENDING_CONNECTIONS`] are dialed as slots free up instead of
+    /// being refused.
+    pub(super) fn dial_queued_known_peers(&mut self, swarm: &mut Swarm<Behaviour>) {
+        while swarm
+            .network_info()
+            .connection_counters()
+            .num_pending_outgoing()
+            < super::MAX_PENDING_CONNECTIONS
+        {
+            let Some(addr) = self.known_peers.pop_front() else {
+                return;
+            };
+            self.dial(swarm, addr);
+        }
+    }
+
+    /// Publishes the number of connected peers subscribed to our block topics.
+    fn update_peer_count(&self, swarm: &Swarm<Behaviour>) {
+        let subscribed = self.subscribed_peers(swarm).count();
+        metrics::peers_subscribed(subscribed);
+        self.peer_count.send_replace(subscribed);
+    }
+
+    /// Connected peers subscribed to at least one of our block topics.
+    fn subscribed_peers<'a>(
+        &'a self,
+        swarm: &'a Swarm<Behaviour>,
+    ) -> impl Iterator<Item = &'a PeerId> {
+        swarm
+            .behaviour()
+            .gossipsub
+            .all_peers()
+            .filter(|(_, topics)| topics.iter().any(|topic| self.topics.contains_key(topic)))
+            .map(|(peer, _)| peer)
+    }
+
+    /// Disconnects peers that hold a slot without subscribing to our block topics (see
+    /// [`ConnectedPeers::idle`]) and keeps them out of dialing for [`EVICTED_PEER_BACKOFF`].
+    pub(super) fn evict_idle_peers(&mut self, swarm: &mut Swarm<Behaviour>) {
+        let now = Instant::now();
+        let subscribed: HashSet<PeerId> = self.subscribed_peers(swarm).copied().collect();
+        for peer in self.peers.idle(now, |peer| subscribed.contains(peer)) {
+            debug!(%peer, "disconnecting peer not subscribed to block topics");
+            metrics::peer_evicted();
+            // `Err` only means the peer was already disconnected, which is what we want.
+            let _disconnected = swarm.disconnect_peer_id(peer);
+            self.back_off(peer, now + EVICTED_PEER_BACKOFF, now);
+        }
+    }
+
+    /// Saves `peer` as known good when it first delivers a valid block on a connection we dialed.
+    fn remember(&mut self, peer: PeerId, seen_secs: u64) {
+        if let Some(addr) = self.outbound.remove(&peer) {
+            let store = Arc::clone(&self.store);
+            self.persists
+                .spawn_blocking(move || store.save_peer(&addr, seen_secs));
+        }
+    }
+
+    /// Dials `addr` unless its peer is connected, being dialed, in backoff, or the backoff map is
+    /// full. A dial refused up front (e.g. by connection limits) sets no backoff, so the peer is
+    /// retried when discovery reports it again.
+    pub(super) fn dial(&mut self, swarm: &mut Swarm<Behaviour>, addr: Multiaddr) {
+        let Some(Protocol::P2p(peer)) = addr.iter().last() else {
+            return;
+        };
+        let now = Instant::now();
+        if self.next_dial.get(&peer).is_some_and(|&next| next > now) || !self.has_backoff_room(now)
+        {
+            metrics::dial(DialOutcome::Skipped);
+            return;
+        }
+        let opts = DialOpts::peer_id(peer)
+            .addresses(vec![addr])
+            .condition(PeerCondition::DisconnectedAndNotDialing)
+            .build();
+        match swarm.dial(opts) {
+            Ok(()) => {
+                self.back_off(peer, now + DIAL_BACKOFF, now);
+                metrics::dial(DialOutcome::Started);
+            }
+            Err(err) => {
+                debug!(%peer, %err, "skipped dial");
+                metrics::dial(DialOutcome::Skipped);
+            }
+        }
+    }
+
+    /// Keeps `peer` out of dialing until `until`, unless the backoff map is full even after
+    /// pruning expired entries.
+    fn back_off(&mut self, peer: PeerId, until: Instant, now: Instant) {
+        if self.next_dial.contains_key(&peer) || self.has_backoff_room(now) {
+            self.next_dial.insert(peer, until);
+        }
+    }
+
+    /// Whether the backoff map can take another peer, pruning expired entries if it is full.
+    fn has_backoff_room(&mut self, now: Instant) -> bool {
+        if self.next_dial.len() >= MAX_DIAL_BACKOFF_ENTRIES {
+            self.next_dial.retain(|_, next| *next > now);
+        }
+        self.next_dial.len() < MAX_DIAL_BACKOFF_ENTRIES
+    }
+}
+
+/// Reports `id` from `source` as failing validation with `err`. A rejected peer whose score
+/// falls below the graylist threshold, where gossipsub ignores its RPCs anyway, is disconnected
+/// to free its connection slot.
+fn reject(swarm: &mut Swarm<Behaviour>, id: &MessageId, source: PeerId, err: &BlockError) {
+    debug!(peer = %source, %err, "rejected block message");
+    metrics::block_rejected(err);
+    let acceptance = err.acceptance();
+    let rejected = matches!(acceptance, MessageAcceptance::Reject);
+    report(swarm, id, &source, acceptance);
+    let score = swarm.behaviour().gossipsub.peer_score(&source);
+    if rejected && score.is_some_and(|score| score < gossip::GRAYLIST_THRESHOLD) {
+        debug!(peer = %source, ?score, "disconnecting graylisted peer");
+        // `Err` only means the peer was already disconnected, which is what we want.
+        let _disconnected = swarm.disconnect_peer_id(source);
+    }
+}
+
+fn report(
+    swarm: &mut Swarm<Behaviour>,
+    id: &MessageId,
+    source: &PeerId,
+    acceptance: MessageAcceptance,
+) {
+    swarm
+        .behaviour_mut()
+        .gossipsub
+        .report_message_validation_result(id, source, acceptance);
+}
+
+/// Current Unix time in seconds; protocol timestamps are wall-clock.
+fn unix_now_secs() -> u64 {
+    UNIX_EPOCH.elapsed().map_or(0, |elapsed| elapsed.as_secs())
+}

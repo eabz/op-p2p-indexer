@@ -6,11 +6,8 @@ ARG DEBIAN_RELEASE=trixie
 # ---- Chef: toolchain + cargo-chef --------------------------------------------
 FROM lukemathwalker/cargo-chef:latest-rust-${RUST_VERSION}-slim-${DEBIAN_RELEASE} AS chef
 
-# clang/libclang: bindgen for reth's MDBX bindings. pkg-config: native deps.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends clang libclang-dev pkg-config \
-    && rm -rf /var/lib/apt/lists/*
-
+# No extra build packages: the only native build in the dependency graph is `ring`, which uses
+# the image's cc. The reth integration will need clang/libclang (bindgen for MDBX) here.
 WORKDIR /app
 
 # ---- Planner: compute the dependency recipe ----------------------------------
@@ -25,7 +22,7 @@ COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --locked --recipe-path recipe.json
 
 COPY . .
-RUN cargo build --release --locked --bin op-p2p-indexer
+RUN cargo build --release --locked --bin op-indexer
 
 # ---- Runtime ----------------------------------------------------------------
 FROM debian:${DEBIAN_RELEASE}-slim AS runtime
@@ -33,13 +30,19 @@ FROM debian:${DEBIAN_RELEASE}-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --uid 10001 --home-dir /nonexistent --shell /usr/sbin/nologin indexer
+    && useradd --system --uid 10001 --home-dir /nonexistent --shell /usr/sbin/nologin indexer \
+    && install -d -o indexer -g indexer /data
 
-COPY --from=builder /app/target/release/op-p2p-indexer /usr/local/bin/op-p2p-indexer
+COPY --from=builder /app/target/release/op-indexer /usr/local/bin/op-indexer
 
 USER indexer
+
+# Node state (`node.redb`: the node identity and known peers). Mount a volume here to keep the
+# peer id across container recreation.
+ENV OP_INDEXER_DATA_DIR=/data
+VOLUME /data
 
 # OP Stack p2p (libp2p TCP + discv5 UDP).
 EXPOSE 9222/tcp 9222/udp
 
-ENTRYPOINT ["/usr/local/bin/op-p2p-indexer"]
+ENTRYPOINT ["/usr/local/bin/op-indexer"]

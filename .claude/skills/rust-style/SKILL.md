@@ -13,7 +13,7 @@ enforced by `[lints]` in `Cargo.toml`, `clippy.toml`, and `deny.toml`. This skil
 - Keep the binary thin: parse config, set up `tracing`, build components, run, map the exit code.
   Logic lives in the `crates/` libraries, so it can be tested and reused if we move to a reth ExEx.
 - One concept per module. Split files that grow past roughly 500 lines, or that hold more than one main type.
-- Order inside a file: imports, constants, public types, impls, private helpers, then `#[cfg(test)] mod tests`.
+- Order inside a file: imports, constants, public types, impls, then private helpers.
 
 ## Visibility
 
@@ -74,7 +74,7 @@ Use `#[expect(lint, reason = "...")]` on the narrowest item. `#[allow]` is linte
 For an invariant that truly cannot fail:
 
 ```rust
-#[expect(clippy::expect_used, reason = "regex literal is validated by tests")]
+#[expect(clippy::expect_used, reason = "TOPIC_PATTERN is a valid regex literal")]
 fn topic_regex() -> Regex { Regex::new(TOPIC_PATTERN).expect("valid regex") }
 ```
 

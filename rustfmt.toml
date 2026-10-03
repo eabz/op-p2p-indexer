@@ -1,4 +1,3 @@
-# `edition` is needed because the format-on-edit hook runs bare `rustfmt`, which doesn't read Cargo.toml.
 edition = "2024"
 newline_style = "Unix"
 use_field_init_shorthand = true
