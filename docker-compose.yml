@@ -20,6 +20,12 @@ services:
         condition: service_healthy
     environment:
       RUST_LOG: ${RUST_LOG:-info}
+      # Read by the binary today; empty means "use the default".
+      OP_INDEXER_CHAIN_ID: ${OP_INDEXER_CHAIN_ID:-}
+      OP_INDEXER_LISTEN_ADDR: ${OP_INDEXER_LISTEN_ADDR:-}
+      OP_INDEXER_BOOTNODES: ${OP_INDEXER_BOOTNODES:-}
+      OP_INDEXER_MAX_PEERS: ${OP_INDEXER_MAX_PEERS:-}
+      # Reserved for the storage crate: not read by the binary yet.
       OP_INDEXER_REDIS_URL: redis://redis:6379
       OP_INDEXER_CLICKHOUSE_URL: http://clickhouse:8123
       OP_INDEXER_CLICKHOUSE_DATABASE: ${CLICKHOUSE_DB:-op_indexer}
@@ -28,6 +34,9 @@ services:
     ports:
       - "9222:9222/tcp"
       - "9222:9222/udp"
+    volumes:
+      # Node identity and known peers (the image sets OP_INDEXER_DATA_DIR=/data).
+      - indexer-data:/data
 
   redis:
     image: redis:8-alpine
@@ -65,5 +74,6 @@ services:
       retries: 20
 
 volumes:
+  indexer-data:
   redis-data:
   clickhouse-data:

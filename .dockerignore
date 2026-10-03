@@ -1,4 +1,8 @@
 target/
+# Local node state (holds the node's private key) and generated output.
+data/
+graphify-out/
+.DS_Store
 .git/
 .claude/
 .serena/

@@ -3,6 +3,13 @@
 [graph]
 all-features = true
 
+[advisories]
+ignore = [
+    # `paste` is unmaintained (no vulnerability) and has no replacement upstream yet; it is a
+    # build-time macro pulled in by alloy-primitives.
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained build-time macro, transitive via alloy-primitives" },
+]
+
 [licenses]
 allow = [
     "MIT",
@@ -31,7 +38,8 @@ wildcards = "deny"
 # Internal workspace crates are path dependencies without versions.
 allow-wildcard-paths = true
 deny = [
-    { name = "anyhow", reason = "use thiserror in libraries and eyre in the binary" },
+    # Banned for our code; allowed only as a build-time dependency of prost's derive macro (libp2p).
+    { name = "anyhow", wrappers = ["prost-derive"], reason = "use thiserror in libraries and eyre in the binary" },
     { name = "ethers", reason = "use alloy" },
 ]
 
