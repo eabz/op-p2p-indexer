@@ -4,7 +4,7 @@ allow-panic-in-tests = true
 allow-indexing-slicing-in-tests = true
 
 # Identifiers that `doc_markdown` should not demand backticks for.
-doc-valid-idents = ["..", "ExEx", "GossipSub", "OpStack"]
+doc-valid-idents = ["..", "ClickHouse", "ExEx", "GossipSub", "OpStack"]
 
 disallowed-methods = [
     { path = "std::thread::sleep", reason = "blocks the async runtime; use tokio::time::sleep" },

@@ -3,5 +3,37 @@
 version = 4
 
 [[package]]
+name = "op-indexer-p2p"
+version = "0.1.0"
+dependencies = [
+ "op-indexer-primitives",
+]
+
+[[package]]
+name = "op-indexer-pipeline"
+version = "0.1.0"
+dependencies = [
+ "op-indexer-primitives",
+ "op-indexer-storage",
+]
+
+[[package]]
+name = "op-indexer-primitives"
+version = "0.1.0"
+
+[[package]]
+name = "op-indexer-storage"
+version = "0.1.0"
+dependencies = [
+ "op-indexer-primitives",
+]
+
+[[package]]
 name = "op-p2p-indexer"
 version = "0.1.0"
+dependencies = [
+ "op-indexer-p2p",
+ "op-indexer-pipeline",
+ "op-indexer-primitives",
+ "op-indexer-storage",
+]

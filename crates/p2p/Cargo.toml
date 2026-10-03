@@ -1,0 +1,12 @@
+[package]
+name = "op-indexer-p2p"
+description = "OP Stack gossip: libp2p swarm, payload decoding, and validation"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+op-indexer-primitives.workspace = true
+
+[lints]
+workspace = true

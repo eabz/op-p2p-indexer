@@ -1,0 +1,12 @@
+[package]
+name = "op-indexer-storage"
+description = "Hot (Redis) and cold (ClickHouse) block storage"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+op-indexer-primitives.workspace = true
+
+[lints]
+workspace = true

@@ -1,12 +1,20 @@
-[package]
-name = "op-p2p-indexer"
+[workspace]
+members = ["bin/*", "crates/*"]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 publish = false
 
-[dependencies]
+[workspace.dependencies]
+# Internal crates.
+op-indexer-p2p = { path = "crates/p2p" }
+op-indexer-pipeline = { path = "crates/pipeline" }
+op-indexer-primitives = { path = "crates/primitives" }
+op-indexer-storage = { path = "crates/storage" }
 
-[lints.rust]
+[workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
 missing_debug_implementations = "warn"
@@ -14,13 +22,13 @@ unreachable_pub = "warn"
 unused_qualifications = "warn"
 rust_2018_idioms = { level = "warn", priority = -1 }
 
-[lints.rustdoc]
+[workspace.lints.rustdoc]
 broken_intra_doc_links = "deny"
 private_intra_doc_links = "warn"
 bare_urls = "warn"
 unescaped_backticks = "warn"
 
-[lints.clippy]
+[workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 
 # Panics on untrusted (network) input are bugs. Allowed in tests via clippy.toml.

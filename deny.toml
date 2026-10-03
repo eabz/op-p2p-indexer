@@ -28,6 +28,8 @@ ignore = true
 # The reth / alloy / libp2p tree carries many duplicate versions; surface, don't fail.
 multiple-versions = "warn"
 wildcards = "deny"
+# Internal workspace crates are path dependencies without versions.
+allow-wildcard-paths = true
 deny = [
     { name = "anyhow", reason = "use thiserror in libraries and eyre in the binary" },
     { name = "ethers", reason = "use alloy" },

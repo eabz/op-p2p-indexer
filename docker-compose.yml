@@ -1,0 +1,69 @@
+# Local test stack: the indexer plus its two storage layers.
+#
+#   Redis      — hot data: unsafe blocks received over gossip, not yet derived from L1.
+#   ClickHouse — cold data: safe/finalized blocks, whose batches are on L1.
+#
+# Credentials below are for local testing only. Override them via environment or a `.env` file.
+#
+#   docker compose up -d redis clickhouse    # storage only, run the indexer with `cargo run`
+#   docker compose up --build                # everything in containers
+
+name: op-p2p-indexer
+
+services:
+  indexer:
+    build: .
+    depends_on:
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+      OP_INDEXER_REDIS_URL: redis://redis:6379
+      OP_INDEXER_CLICKHOUSE_URL: http://clickhouse:8123
+      OP_INDEXER_CLICKHOUSE_DATABASE: ${CLICKHOUSE_DB:-op_indexer}
+      OP_INDEXER_CLICKHOUSE_USER: ${CLICKHOUSE_USER:-indexer}
+      OP_INDEXER_CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-indexer}
+    ports:
+      - "9222:9222/tcp"
+      - "9222:9222/udp"
+
+  redis:
+    image: redis:8-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-op_indexer}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-indexer}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-indexer}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "8123:8123" # HTTP
+      - "9000:9000" # native protocol
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --user \"$$CLICKHOUSE_USER\" --password \"$$CLICKHOUSE_PASSWORD\" --query 'SELECT 1'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  redis-data:
+  clickhouse-data:

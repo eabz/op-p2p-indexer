@@ -5,6 +5,30 @@ validates and decodes payloads with alloy / op-alloy types, and indexes them. It
 reth / op-reth; whether it runs as a **standalone binary or a reth ExEx is not decided yet**, so
 keep core logic neutral to that choice (see `rust-async`).
 
+## Layout (Cargo workspace)
+
+| Path | Package | Role | Internal deps |
+|---|---|---|---|
+| `bin/op-p2p-indexer` | `op-p2p-indexer` | Thin binary: config, tracing, wiring, shutdown | all |
+| `crates/primitives` | `op-indexer-primitives` | Shared domain types (alloy only) | none |
+| `crates/p2p` | `op-indexer-p2p` | OP gossip: libp2p swarm, decoding, validation | primitives |
+| `crates/storage` | `op-indexer-storage` | Hot (Redis) / cold (ClickHouse) stores | primitives |
+| `crates/pipeline` | `op-indexer-pipeline` | Unsafe → hot store; promote safe/finalized → cold | primitives, storage |
+
+- Keep these edges: `p2p` and `storage` never depend on each other, and `pipeline` doesn't depend
+  on `p2p`. The binary wires them together with channels.
+- Safe/finalized status will come from L1 via reth (likely an ExEx); that integration gets its own crate when it starts.
+- New crates go in `crates/<name>` as package `op-indexer-<name>`, inherit `[workspace.package]`,
+  and set `lints.workspace = true`. All dependency versions live in root `[workspace.dependencies]`.
+
+## Storage
+
+- **Redis**: hot data. Unsafe blocks received over gossip and not yet derived from L1.
+- **ClickHouse**: cold data. Safe/finalized blocks, whose batches are on L1.
+
+`docker compose up -d redis clickhouse` starts both locally (see `docker-compose.yml` for the
+`OP_INDEXER_*` connection variables); `docker compose up --build` also runs the indexer image.
+
 ## Project skills
 
 Before writing, editing, or reviewing Rust, load **`rust-style`** with the Skill tool. Also load
