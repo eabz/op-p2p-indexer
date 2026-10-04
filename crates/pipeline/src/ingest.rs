@@ -42,6 +42,7 @@ pub(crate) async fn run<U: UnsafeStore>(
     cancel: CancellationToken,
 ) -> Result<(), PipelineError> {
     let (receipts, head) = (receipts.as_ref(), head.as_ref());
+
     loop {
         tokio::select! {
             biased;
@@ -50,17 +51,16 @@ pub(crate) async fn run<U: UnsafeStore>(
                 // A closed channel is the network shutting down.
                 let Some(block) = block else { return Ok(()) };
                 metrics::channel_depth(blocks.len());
-                if ingest(&store, block, receipts, head, &cancel).await?.is_break() {
+                let ingested = ingest(&store, block, receipts, head, &cancel);
+                if ingested.await?.is_break() {
                     return Ok(());
                 }
             }
         }
     }
     while let Ok(block) = blocks.try_recv() {
-        if ingest(&store, block, receipts, head, &cancel)
-            .await?
-            .is_break()
-        {
+        let ingested = ingest(&store, block, receipts, head, &cancel);
+        if ingested.await?.is_break() {
             break;
         }
     }

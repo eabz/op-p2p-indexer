@@ -36,10 +36,6 @@ use tracing::{debug, info, warn};
 use crate::session::SessionContext;
 use crate::{ElError, metrics};
 
-/// Node record key of op-geth's fork id entry (the Ethereum one).
-const ETH_ENR_KEY: &str = "eth";
-/// Node record key of op-reth's fork id entry.
-const OPEL_ENR_KEY: &str = "opel";
 /// Time between lookup rounds after the fast phase. The viability test found about one new
 /// peer every two minutes at this pace.
 const LOOKUP_INTERVAL: Duration = Duration::from_secs(10);
@@ -85,7 +81,6 @@ pub(crate) struct Candidate {
 pub(crate) struct Discovery {
     discv5: Discv5,
     ctx: Arc<SessionContext>,
-    bootnodes: Vec<String>,
     /// Peers of our chain found so far, at most [`MAX_KNOWN_PEERS`].
     known: HashMap<NodeId, Candidate>,
     /// What the node record advertised when it was last logged.
@@ -117,7 +112,6 @@ impl Discovery {
         ctx: Arc<SessionContext>,
         listen: SocketAddr,
         advertised: Option<SocketAddr>,
-        bootnodes: Vec<String>,
     ) -> Result<Self, ElError> {
         let mut secret = ctx.key().secret_bytes();
         let key =
@@ -142,8 +136,9 @@ impl Discovery {
                 builder.udp4(listen.port()).tcp4(listen.port());
             }
         }
-        builder.add_value(OPEL_ENR_KEY, &fork_entry);
-        builder.add_value(ETH_ENR_KEY, &fork_entry);
+        for key in ctx.spec().record_keys {
+            builder.add_value(*key, &fork_entry);
+        }
         let enr = builder.build(&key).map_err(ElError::Enr)?;
 
         let mut config = ConfigBuilder::new(ListenConfig::from(listen));
@@ -157,7 +152,6 @@ impl Discovery {
         Ok(Self {
             discv5,
             ctx,
-            bootnodes,
             known: HashMap::new(),
             advertised: None,
             fork_id,
@@ -180,7 +174,7 @@ impl Discovery {
         let added = self.add_bootnodes().await;
         info!(
             added,
-            bootnodes = self.bootnodes.len(),
+            bootnodes = self.ctx.spec().bootnodes.len(),
             "execution discovery started"
         );
         self.log_advertised();
@@ -247,7 +241,8 @@ impl Discovery {
     /// Seeds the routing table: `enr:` records directly, `enode://` bootnodes after asking
     /// them for their record. Returns how many were added.
     async fn add_bootnodes(&self) -> usize {
-        let resolved = join_all(self.bootnodes.iter().map(|bootnode| self.resolve(bootnode))).await;
+        let bootnodes = &self.ctx.spec().bootnodes;
+        let resolved = join_all(bootnodes.iter().map(|bootnode| self.resolve(bootnode))).await;
         let mut added = 0;
         for enr in resolved.into_iter().flatten() {
             match self.discv5.add_enr(enr) {
@@ -316,7 +311,7 @@ impl Discovery {
             return;
         }
         let entry = vec![current];
-        for key in [OPEL_ENR_KEY, ETH_ENR_KEY] {
+        for key in self.ctx.spec().record_keys.iter().copied() {
             if let Err(err) = self.discv5.enr_insert(key, &entry) {
                 warn!(
                     key,
@@ -341,8 +336,8 @@ impl Discovery {
             warn!(
                 our_fork_hash = ?self.fork_id.hash,
                 other_forks,
-                "execution discovery knows no peer on this build's fork, only OP Stack nodes \
-                 on other forks; if the chain activated a hardfork this build does not know, \
+                "execution discovery knows no peer on this build's fork, only nodes on other \
+                 forks; if the chain activated a hardfork this build does not know, \
                  update the fork activations"
             );
         }
@@ -371,19 +366,21 @@ impl Discovery {
     /// Reports the peers of our chain and fork among `found` that were not known yet.
     fn consider(&mut self, found: &[Enr], candidates: &mpsc::Sender<Candidate>) {
         let ours = self.fork_id;
+        let keys = self.ctx.spec().record_keys;
+        let preferred = keys.first().copied();
         let mut new_peers = 0;
         for enr in found {
-            let Some(fork_id) = fork_id(enr) else {
+            let Some(fork_id) = fork_id(enr, keys) else {
                 continue;
             };
             if fork_id.hash != ours.hash {
-                if enr.get_raw_rlp(OPEL_ENR_KEY).is_some() {
+                if preferred.is_some_and(|key| enr.get_raw_rlp(key).is_some()) {
                     self.other_forks = self.other_forks.saturating_add(1);
                 }
                 continue;
             }
             // A node on our fork announcing a next fork we do not know: this build is behind.
-            if fork_id.next != 0 && !self.ctx.chain().knows_fork_time(fork_id.next) {
+            if fork_id.next != 0 && !self.ctx.spec().knows_fork_time(fork_id.next) {
                 self.ctx.warn_build_behind(fork_id, "node record");
             }
             let Some(candidate) = candidate(enr) else {
@@ -398,7 +395,7 @@ impl Discovery {
                 .is_none()
             {
                 new_peers += 1;
-                metrics::candidate_discovered();
+                metrics::candidate_discovered(self.ctx.spec().label);
                 // A full channel means the peer set is busy; the next report sends it.
                 let _sent = candidates.try_send(candidate);
             }
@@ -417,11 +414,11 @@ impl Discovery {
     }
 }
 
-/// Returns the fork id a node record carries, from the `opel` entry or else the `eth` one. Both
-/// hold a list with one fork id.
-fn fork_id(enr: &Enr) -> Option<ForkId> {
-    [OPEL_ENR_KEY, ETH_ENR_KEY].into_iter().find_map(|key| {
-        let mut raw = enr.get_raw_rlp(key)?;
+/// Returns the fork id a node record carries under the first of `keys` it has. Each entry
+/// holds a list with one fork id.
+fn fork_id(enr: &Enr, keys: &[&str]) -> Option<ForkId> {
+    keys.iter().find_map(|key| {
+        let mut raw = enr.get_raw_rlp(*key)?;
         Vec::<ForkId>::decode(&mut raw).ok()?.into_iter().next()
     })
 }

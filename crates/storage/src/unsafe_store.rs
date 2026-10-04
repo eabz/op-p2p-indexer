@@ -380,6 +380,28 @@ impl UnsafeStore for RedisStore {
         .await
     }
 
+    async fn canonical(&self, number: BlockNumber) -> Result<Option<DecodedBlock>, StorageError> {
+        metrics::timed(Store::Unsafe, Operation::Block, async {
+            let mut connection = self.connection.clone();
+            // The canonical chain is a sorted set scored by number: at most one hash per height.
+            let hashes: Vec<String> = request(
+                "canonical",
+                redis::cmd("ZRANGEBYSCORE")
+                    .arg(self.keys.canonical())
+                    .arg(number)
+                    .arg(number)
+                    .query_async(&mut connection),
+            )
+            .await?;
+            let Some(hash) = hashes.first() else {
+                return Ok(None);
+            };
+            self.stored_block("canonical", codec::parse_hash(hash)?)
+                .await
+        })
+        .await
+    }
+
     /// A `None` head is unknown, not absent: its stored key is left as it is.
     async fn set_l1_heads(&self, heads: L1Heads) -> Result<(), StorageError> {
         metrics::timed(Store::Unsafe, Operation::SetL1Heads, async {

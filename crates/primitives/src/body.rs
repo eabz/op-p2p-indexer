@@ -198,6 +198,23 @@ fn without_deposit_fields(receipt: &OpReceiptEnvelope) -> OpReceiptEnvelope {
     hashed
 }
 
+/// Cuts an RLP list into its items, each with its own header. Only the headers are read, so
+/// nothing is allocated for what the items hold. `None` if `list` is not exactly one list.
+#[must_use]
+pub fn rlp_list_items(list: &[u8]) -> Option<Vec<&[u8]>> {
+    let mut rest = list;
+    let outer = item(&mut rest).filter(|outer| outer.list)?;
+    if !rest.is_empty() {
+        return None;
+    }
+    let mut payload = outer.payload;
+    let mut items = Vec::new();
+    while !payload.is_empty() {
+        items.push(item(&mut payload)?.whole);
+    }
+    Some(items)
+}
+
 /// One RLP item at the start of a buffer.
 struct Item<'a> {
     list: bool,

@@ -10,8 +10,11 @@
 //!
 //! [EIP-2124]: https://eips.ethereum.org/EIPS/eip-2124
 
-use alloy_eip2124::{ForkFilter, ForkFilterKey, Head};
+mod game;
+
 use alloy_primitives::{Address, B256, BlockNumber, ChainId, address, b256};
+
+pub use game::{Claim, ClaimError, CreatedGame, created_topic};
 
 /// Static parameters of one OP Stack chain.
 #[derive(Debug)]
@@ -117,24 +120,6 @@ impl ChainSpec {
     /// Every supported chain.
     pub const ALL: &'static [&'static Self] = &[&OP_MAINNET];
 
-    /// The EIP-2124 fork filter for a node whose head is at `head_number` and
-    /// `head_timestamp` (seconds): it yields our fork id and validates a peer's.
-    #[must_use]
-    pub fn fork_filter(&self, head_number: BlockNumber, head_timestamp: u64) -> ForkFilter {
-        let head = Head {
-            number: head_number,
-            timestamp: head_timestamp,
-            ..Head::default()
-        };
-        let forks = self
-            .fork_blocks
-            .iter()
-            .map(|block| ForkFilterKey::Block(*block))
-            .chain(self.fork_times().into_iter().map(ForkFilterKey::Time));
-        // OP Mainnet's genesis timestamp is 0; time forks are all later.
-        ForkFilter::new(head, self.genesis_hash, 0, forks)
-    }
-
     /// The hardforks that activate at a timestamp and change the fork id, ascending. Regolith
     /// is not one of them: it has no activation of its own in the fork id.
     #[must_use]
@@ -151,47 +136,11 @@ impl ChainSpec {
         ]
     }
 
-    /// Whether `time` is a hardfork activation this build knows.
-    #[must_use]
-    pub fn knows_fork_time(&self, time: u64) -> bool {
-        self.fork_times().contains(&time)
-    }
-
     /// Returns the spec for `chain_id`, if supported.
     pub fn by_chain_id(chain_id: ChainId) -> Option<&'static Self> {
         Self::ALL
             .iter()
             .copied()
             .find(|spec| spec.chain_id == chain_id)
-    }
-}
-
-/// How a dispute game on L1 states the L2 block it is about and the output root it claims.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClaimFormat {
-    /// A fault dispute game: its extra data is one word, the L2 block number, and its root
-    /// claim is that block's output root.
-    OutputRoot,
-    /// A super fault dispute game: its extra data is the preimage of a super root (a timestamp
-    /// and one output root per chain) and its root claim is the hash of that preimage.
-    SuperRoot,
-}
-
-/// The claim format of the dispute games of `game_type`, or `None` for a type this build does
-/// not know how to read.
-///
-/// Game types are the same on every OP Stack chain: `GameTypes` in
-/// `packages/contracts-bedrock/src/dispute/lib/Types.sol` of the Optimism monorepo (read on
-/// its `develop` branch). The fault dispute games are `CANNON` (0), `PERMISSIONED_CANNON` (1),
-/// `ASTERISC` (2), `ASTERISC_KONA` (3) and `CANNON_KONA` (8); the super ones are `SUPER_CANNON`
-/// (4), `SUPER_PERMISSIONED` (5), `SUPER_ASTERISC_KONA` (7) and `SUPER_CANNON_KONA` (9), which
-/// OP Mainnet creates as of 2026-10. The validity-proof games (6, 10) and the test games are
-/// not listed: their claims were not read.
-#[must_use]
-pub const fn claim_format(game_type: u32) -> Option<ClaimFormat> {
-    match game_type {
-        0..=3 | 8 => Some(ClaimFormat::OutputRoot),
-        4 | 5 | 7 | 9 => Some(ClaimFormat::SuperRoot),
-        _ => None,
     }
 }

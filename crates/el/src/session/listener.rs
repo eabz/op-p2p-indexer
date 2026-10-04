@@ -100,12 +100,12 @@ pub(crate) async fn listen(
                         Ok((handle, driver)) => {
                             if let Err(refused) = accepted.try_send(Accepted { handle, driver }) {
                                 let Accepted { driver, .. } = refused.into_inner();
-                                metrics::inbound_refused();
+                                metrics::inbound_refused(ctx.spec().label);
                                 driver.reject(DisconnectReason::TooManyPeers).await;
                             }
                         }
                         Err(err) => {
-                            metrics::inbound_handshake_failed(err.stage());
+                            metrics::inbound_handshake_failed(ctx.spec().label, err.stage());
                             debug!(addr = %peer_addr, %err, "inbound handshake failed");
                         }
                     }

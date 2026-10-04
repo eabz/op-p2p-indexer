@@ -12,6 +12,7 @@ alloy-eips.workspace = true
 alloy-primitives.workspace = true
 alloy-rlp.workspace = true
 op-alloy-consensus.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true

@@ -4618,6 +4618,7 @@ dependencies = [
  "eyre",
  "op-indexer-chainspec",
  "op-indexer-el",
+ "op-indexer-l1",
  "op-indexer-p2p",
  "op-indexer-pipeline",
  "op-indexer-primitives",
@@ -4632,8 +4633,8 @@ dependencies = [
 name = "op-indexer-chainspec"
 version = "0.1.0"
 dependencies = [
- "alloy-eip2124",
  "alloy-primitives",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -4694,6 +4695,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "op-indexer-l1"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-hardforks",
+ "alloy-primitives",
+ "alloy-rlp",
+ "fastrand",
+ "op-indexer-chainspec",
+ "op-indexer-el",
+ "op-indexer-primitives",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "op-indexer-p2p"
 version = "0.1.0"
 dependencies = [
@@ -4726,6 +4746,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
+ "alloy-rlp",
  "metrics",
  "op-alloy-consensus",
  "op-indexer-primitives",
@@ -4745,6 +4766,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "op-alloy-consensus",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

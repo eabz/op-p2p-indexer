@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 op-indexer-chainspec.workspace = true
 op-indexer-el.workspace = true
+op-indexer-l1.workspace = true
 op-indexer-p2p.workspace = true
 op-indexer-pipeline.workspace = true
 op-indexer-primitives.workspace = true

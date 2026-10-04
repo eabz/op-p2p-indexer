@@ -10,6 +10,7 @@ use alloy_consensus::TxReceipt;
 use alloy_primitives::{B256, Bytes};
 use alloy_rlp::{Decodable, Encodable};
 use op_alloy_consensus::{OpReceipt, OpReceiptEnvelope};
+use op_indexer_primitives::rlp_list_items;
 use reth_eth_wire_types::message::RequestPair;
 use reth_eth_wire_types::{
     BlockRangeUpdate, GetBlockBodies, GetBlockHeaders, GetReceipts, HeadersDirection,
@@ -92,47 +93,13 @@ impl Request {
 /// received.
 pub(crate) fn decode_items(body: &Bytes) -> alloy_rlp::Result<Vec<Bytes>> {
     let mut buf: &[u8] = body;
-    list(&mut buf)?;
-    let _request_id = u64::decode(&mut buf)?;
-    let payload = list(&mut buf)?;
-    Ok(items(payload)?
-        .into_iter()
-        .map(|item| body.slice_ref(item))
-        .collect())
-}
-
-/// Reads the header of an RLP list at the start of `buf` and returns its payload, leaving
-/// `buf` after it.
-fn list<'a>(buf: &mut &'a [u8]) -> alloy_rlp::Result<&'a [u8]> {
-    let header = alloy_rlp::Header::decode(buf)?;
-    if !header.list {
+    if !alloy_rlp::Header::decode(&mut buf)?.list {
         return Err(alloy_rlp::Error::UnexpectedString);
     }
-    let (payload, rest) = buf
-        .split_at_checked(header.payload_length)
-        .ok_or(alloy_rlp::Error::InputTooShort)?;
-    *buf = rest;
-    Ok(payload)
-}
-
-/// Cuts the payload of an RLP list into its items, each with its own header. Only the
-/// headers are read.
-fn items(mut payload: &[u8]) -> alloy_rlp::Result<Vec<&[u8]>> {
-    let mut items = Vec::new();
-    while !payload.is_empty() {
-        let mut after_header = payload;
-        let header = alloy_rlp::Header::decode(&mut after_header)?;
-        let length = payload
-            .len()
-            .saturating_sub(after_header.len())
-            .saturating_add(header.payload_length);
-        let (item, rest) = payload
-            .split_at_checked(length)
-            .ok_or(alloy_rlp::Error::InputTooShort)?;
-        items.push(item);
-        payload = rest;
-    }
-    Ok(items)
+    let _request_id = u64::decode(&mut buf)?;
+    // What is left is the list of items.
+    let items = rlp_list_items(buf).ok_or(alloy_rlp::Error::UnexpectedLength)?;
+    Ok(items.into_iter().map(|item| body.slice_ref(item)).collect())
 }
 
 /// Returns the request id of a request or response body (the message without its id byte).
@@ -179,7 +146,9 @@ pub(crate) fn decode_receipts(
     mut item: &[u8],
     expected: usize,
 ) -> Result<Vec<OpReceiptEnvelope>, ReceiptsError> {
-    let got = items(list(&mut &*item)?)?.len();
+    let got = rlp_list_items(item)
+        .ok_or(alloy_rlp::Error::UnexpectedLength)?
+        .len();
     if got == 0 {
         return Ok(Vec::new());
     }

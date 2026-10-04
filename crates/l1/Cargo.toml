@@ -1,0 +1,26 @@
+[package]
+name = "op-indexer-l1"
+description = "L1 over p2p: dispute games of the chain read from Ethereum execution peers and verified against trusted L1 block hashes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+op-indexer-chainspec.workspace = true
+op-indexer-el.workspace = true
+op-indexer-primitives.workspace = true
+
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+alloy-hardforks.workspace = true
+alloy-primitives.workspace = true
+alloy-rlp.workspace = true
+fastrand.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+tokio-util.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

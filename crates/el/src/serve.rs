@@ -112,6 +112,16 @@ pub(crate) fn new<P: BlockProvider>(provider: Option<P>) -> (Server<P>, Serving)
     (server, serving)
 }
 
+/// What sessions use when nothing serves: every request is answered empty and no range is
+/// held, so the tip alone is advertised.
+pub(crate) fn disabled() -> Serving {
+    // The receivers are dropped at once: a request finds the queue closed, and the range
+    // keeps its initial "nothing held".
+    let (requests, _) = mpsc::channel(1);
+    let (_, range) = watch::channel(None);
+    Serving { requests, range }
+}
+
 impl<P: BlockProvider> Server<P> {
     /// Answers requests until `cancel` fires. Requests being answered then are dropped: their
     /// sessions are ending too.

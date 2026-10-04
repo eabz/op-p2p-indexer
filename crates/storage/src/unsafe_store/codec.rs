@@ -169,7 +169,7 @@ fn decode_event(fields: &HashMap<String, String>) -> Result<UnsafeEvent, Storage
     }
 }
 
-fn parse_hash(hash: &str) -> Result<BlockHash, StorageError> {
+pub(super) fn parse_hash(hash: &str) -> Result<BlockHash, StorageError> {
     hash.parse::<BlockHash>()
         .map_err(|err| invalid("block hash", None, Some(ParseError::from(err))))
 }

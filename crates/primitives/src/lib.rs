@@ -5,6 +5,7 @@
 //! redefines them.
 
 mod body;
+mod game;
 
 use std::net::SocketAddr;
 
@@ -16,8 +17,10 @@ use alloy_rlp::Header;
 use op_alloy_consensus::{OpBlock, OpReceiptEnvelope, OpTxEnvelope};
 
 pub use body::{
-    BodyParts, decode_block, encode_body, receipts_root, split_body, transactions_root,
+    BodyParts, decode_block, encode_body, receipts_root, rlp_list_items, split_body,
+    transactions_root,
 };
+pub use game::{ClaimMismatch, L1Games, VerifiedGame, check_claim, output_root};
 
 /// Execution payload version a block was gossiped as, which is also the fork it belongs to.
 ///

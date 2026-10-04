@@ -82,11 +82,12 @@ pub(crate) struct TransactionRow {
     pub(crate) max_priority_fee_per_gas: Option<U128>,
     /// Parity of a typed transaction's signature, where the service gives it apart from `v`.
     pub(crate) y_parity: Option<U256>,
-    /// The access list in the Ethereum RPC's JSON form; parsed when the transaction is rebuilt,
-    /// so an unexpected form fails that transaction's check, not the whole file.
-    pub(crate) access_list: Option<serde_json::Value>,
+    /// The access list: the bytes of the service's binary column, which it sends as a hex
+    /// string. Decoded when the transaction is rebuilt (`verify::lists`), so an unexpected
+    /// content fails that transaction's check, not the whole file.
+    pub(crate) access_list: Option<Bytes>,
     /// The EIP-7702 authorizations, as the access list.
-    pub(crate) authorization_list: Option<serde_json::Value>,
+    pub(crate) authorization_list: Option<Bytes>,
     /// Deposit transactions: the hash that identifies the deposit's origin.
     pub(crate) source_hash: Option<B256>,
     /// Deposit transactions: ETH minted on L2.

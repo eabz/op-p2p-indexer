@@ -5,13 +5,13 @@ use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use alloy_eip2124::{ForkFilter, ForkId};
-use alloy_primitives::{BlockNumber, Bytes};
-use op_indexer_chainspec::ChainSpec;
+use alloy_primitives::Bytes;
 use op_indexer_primitives::BlockRef;
 use secp256k1::SecretKey;
 use tokio::sync::{mpsc, watch};
 use tracing::warn;
 
+use crate::network::NetworkSpec;
 use crate::serve::{Serving, SessionServing};
 
 /// Shortest time between two "this build looks behind" warnings.
@@ -21,7 +21,7 @@ const BEHIND_WARN_INTERVAL: Duration = Duration::from_mins(10);
 #[derive(Debug)]
 pub(crate) struct SessionContext {
     key: SecretKey,
-    chain: &'static ChainSpec,
+    spec: NetworkSpec,
     listen_port: u16,
     /// The way to the server that answers peers' requests, and the range it holds.
     serving: Serving,
@@ -34,14 +34,14 @@ pub(crate) struct SessionContext {
 impl SessionContext {
     pub(crate) fn new(
         key: SecretKey,
-        chain: &'static ChainSpec,
+        spec: NetworkSpec,
         listen_port: u16,
         serving: Serving,
         tip: watch::Receiver<Option<BlockRef>>,
     ) -> Self {
         Self {
             key,
-            chain,
+            spec,
             listen_port,
             serving,
             tip,
@@ -65,8 +65,9 @@ impl SessionContext {
         &self.key
     }
 
-    pub(crate) const fn chain(&self) -> &'static ChainSpec {
-        self.chain
+    /// The network these sessions are on.
+    pub(crate) const fn spec(&self) -> &NetworkSpec {
+        &self.spec
     }
 
     /// The port sessions and discovery listen on, advertised in the hello.
@@ -81,14 +82,8 @@ impl SessionContext {
     }
 
     /// The fork filter now: yields our fork id and validates a peer's.
-    ///
-    /// By wall-clock time, with every fork that activates at a block number taken as passed.
-    /// The node may know no head yet, and a fork id computed at block 0 names the first block
-    /// fork as "next": a peer checking it against its own head would reject us as stale. On an
-    /// OP Stack chain the block forks are years old; what changes the fork id while the node
-    /// runs is a time fork activating.
     pub(crate) fn fork_filter(&self) -> ForkFilter {
-        self.chain.fork_filter(BlockNumber::MAX, unix_now())
+        self.spec.fork_filter()
     }
 
     /// Warns, at most once per [`BEHIND_WARN_INTERVAL`], that peers are on a fork this build

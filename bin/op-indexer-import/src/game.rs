@@ -55,26 +55,11 @@ mod anchor;
 
 use std::collections::BTreeMap;
 
-use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
-use op_indexer_chainspec::{ChainSpec, ClaimFormat, claim_format};
+use alloy_primitives::{Address, B256, Bytes};
+use op_indexer_chainspec::{ChainSpec, ClaimError, CreatedGame, created_topic};
 
 pub(crate) use self::anchor::GameAnchor;
 use crate::source::{HyperSync, SourceError};
-
-/// `DisputeGameFactory.create`.
-const CREATE_SIGNATURE: &str = "create(uint32,bytes32,bytes)";
-/// The factory's event for a new game.
-const CREATED_SIGNATURE: &str = "DisputeGameCreated(address,uint32,bytes32)";
-
-/// An ABI word.
-const WORD: usize = 32;
-/// Bytes of `create`'s calldata before the extra data: the selector, the game type, the root
-/// claim, the offset of the extra data and its length.
-const CREATE_HEAD_BYTES: usize = 4 + 4 * WORD;
-/// The version byte of a super root's preimage.
-const SUPER_ROOT_VERSION: u8 = 1;
-/// Bytes of a super root's preimage before its chains: the version and the timestamp.
-const SUPER_ROOT_HEAD_BYTES: usize = 1 + 8;
 
 /// L1 blocks searched back from the head for the newest game: a day of 12-second blocks.
 /// OP Mainnet's proposer creates a game every hour or few.
@@ -135,21 +120,8 @@ pub(crate) enum GameError {
         game: Address,
         game_type: u32,
         l1_block: u64,
-        reason: Unreadable,
+        reason: ClaimError,
     },
-}
-
-/// Why a game's L2 block could not be read from the transaction that created it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum Unreadable {
-    #[error("it was not created by a plain call of the factory's `create` for this game")]
-    NotPlainCall,
-    #[error("its extra data is not what a game of its type carries")]
-    ExtraData,
-    #[error("its super root has no entry for chain {0}")]
-    ChainMissing(u64),
-    #[error("its timestamp is before the chain's Bedrock block")]
-    BeforeBedrock,
 }
 
 /// Finds the newest game `chain`'s factory created on L1, whatever its type.
@@ -174,145 +146,57 @@ pub(crate) async fn newest_game(
     // Every type is fetched, so the error can say which types the chain uses.
     let created = LogFilter {
         addresses: vec![factory],
-        topic0: keccak256(CREATED_SIGNATURE),
+        topic0: created_topic(),
         topic1: None,
         topic2: None,
         from_block,
     };
     let logs = l1.logs(&created).await.map_err(GameError::L1)?;
-    let games: Vec<Created<'_>> = logs.iter().filter_map(Created::from_log).collect();
-    let newest = games
+    let games: Vec<(CreatedGame, &L1Log)> = logs
         .iter()
-        .max_by_key(|game| (game.log.block_number, game.log.log_index))
+        .filter_map(|log| {
+            let topics: Vec<B256> = log.topics.iter().copied().flatten().collect();
+            Some((CreatedGame::from_topics(&topics)?, log))
+        })
+        .collect();
+    let (created, log) = games
+        .iter()
+        .max_by_key(|(_, log)| (log.block_number, log.log_index))
         .ok_or(GameError::NoGame { factory })?;
-    let (game, game_type, l1_block) = (newest.address, newest.game_type, newest.log.block_number);
-    let format = claim_format(game_type).ok_or_else(|| GameError::UnknownGameType {
-        game,
-        game_type,
-        l1_block,
-        seen: types_seen(&games),
-    })?;
-    newest
-        .anchor(chain, format)
-        .map_err(|reason| GameError::UnreadableCreation {
+    let (game, game_type, l1_block) = (created.game, created.game_type, log.block_number);
+    match chain.game_claim(created, log.transaction_to, &log.transaction_input) {
+        Ok(claim) => Ok(GameAnchor {
+            game,
+            game_type,
+            l2_block: claim.l2_block,
+            output_root: claim.output_root,
+            timestamp: claim.timestamp,
+            l1_block,
+        }),
+        Err(ClaimError::UnknownGameType(_)) => Err(GameError::UnknownGameType {
+            game,
+            game_type,
+            l1_block,
+            seen: types_seen(&games),
+        }),
+        Err(
+            reason @ (ClaimError::NotPlainCall
+            | ClaimError::ExtraData
+            | ClaimError::ChainMissing(_)
+            | ClaimError::BeforeBedrock),
+        ) => Err(GameError::UnreadableCreation {
             game,
             game_type,
             l1_block,
             reason,
-        })
-}
-
-/// A `DisputeGameCreated` log, with its indexed fields read.
-#[derive(Debug, Clone, Copy)]
-struct Created<'a> {
-    address: Address,
-    game_type: u32,
-    root_claim: B256,
-    log: &'a L1Log,
-}
-
-impl<'a> Created<'a> {
-    /// Reads the event's three indexed fields: the game, its type and its root claim.
-    fn from_log(log: &'a L1Log) -> Option<Self> {
-        let [_, Some(proxy), Some(game_type), Some(root_claim)] = log.topics else {
-            return None;
-        };
-        Some(Self {
-            address: Address::from_word(proxy),
-            game_type: u32::try_from(U256::from_be_bytes(game_type.0)).ok()?,
-            root_claim,
-            log,
-        })
+        }),
     }
-
-    /// Reads the game's L2 block and output root from the transaction that created it, which
-    /// must be a plain call of the factory's `create` for this game: same game type and root
-    /// claim as the log. Anything else (a game created through another contract, or extra data
-    /// that is not of `format`) is an error rather than a block number misread.
-    fn anchor(&self, chain: &ChainSpec, format: ClaimFormat) -> Result<GameAnchor, Unreadable> {
-        let input = self.log.transaction_input.as_ref();
-        let selector = keccak256(CREATE_SIGNATURE);
-        let length = argument(input, 3).and_then(|length| usize::try_from(length).ok());
-        let plain_call = self.log.transaction_to == Some(chain.dispute_game_factory)
-            && input.get(..4) == selector.get(..4)
-            && argument(input, 0) == Some(U256::from(self.game_type))
-            && argument(input, 1) == Some(U256::from_be_bytes(self.root_claim.0))
-            && argument(input, 2) == Some(U256::from(3 * WORD));
-        let extra = length
-            .filter(|_| plain_call)
-            .and_then(|length| input.get(CREATE_HEAD_BYTES..)?.get(..length))
-            .ok_or(Unreadable::NotPlainCall)?;
-
-        let (l2_block, output_root, timestamp) = match format {
-            // The block number, and the root claim is its output root.
-            ClaimFormat::OutputRoot => {
-                let number = <[u8; WORD]>::try_from(extra)
-                    .ok()
-                    .and_then(|word| u64::try_from(U256::from_be_bytes(word)).ok())
-                    .ok_or(Unreadable::ExtraData)?;
-                (number, self.root_claim, None)
-            }
-            ClaimFormat::SuperRoot => {
-                let (at, root) = super_root_claim(extra, self.root_claim, chain.chain_id)?;
-                let blocks = at
-                    .checked_sub(chain.bedrock_time)
-                    .and_then(|elapsed| elapsed.checked_div(chain.block_time_secs))
-                    .ok_or(Unreadable::BeforeBedrock)?;
-                // The chain's block at a time is its last block not after it.
-                let timestamp = blocks
-                    .saturating_mul(chain.block_time_secs)
-                    .saturating_add(chain.bedrock_time);
-                (
-                    chain.bedrock_block.saturating_add(blocks),
-                    root,
-                    Some(timestamp),
-                )
-            }
-        };
-        Ok(GameAnchor {
-            game: self.address,
-            game_type: self.game_type,
-            l2_block,
-            output_root,
-            timestamp,
-            l1_block: self.log.block_number,
-        })
-    }
-}
-
-/// Reads a super root's preimage, which must hash to `root_claim`: its timestamp and the
-/// output root it holds for `chain_id`.
-fn super_root_claim(
-    preimage: &[u8],
-    root_claim: B256,
-    chain_id: u64,
-) -> Result<(u64, B256), Unreadable> {
-    let (head, chains) = preimage
-        .split_at_checked(SUPER_ROOT_HEAD_BYTES)
-        .ok_or(Unreadable::ExtraData)?;
-    let (entries, rest) = chains.as_chunks::<{ 2 * WORD }>();
-    let Some((&SUPER_ROOT_VERSION, timestamp)) = head.split_first() else {
-        return Err(Unreadable::ExtraData);
-    };
-    let timestamp = <[u8; 8]>::try_from(timestamp).map_err(|_length| Unreadable::ExtraData)?;
-    if entries.is_empty() || !rest.is_empty() || keccak256(preimage) != root_claim {
-        return Err(Unreadable::ExtraData);
-    }
-    let wanted = B256::from(U256::from(chain_id));
-    entries
-        .iter()
-        .find_map(|entry| {
-            let (chain, root) = entry.split_at_checked(WORD)?;
-            (chain == wanted.as_slice()).then(|| B256::try_from(root).ok())?
-        })
-        .map(|root| (u64::from_be_bytes(timestamp), root))
-        .ok_or(Unreadable::ChainMissing(chain_id))
 }
 
 /// The game types among `games` with how many games each has, for an error message.
-fn types_seen(games: &[Created<'_>]) -> String {
+fn types_seen(games: &[(CreatedGame, &L1Log)]) -> String {
     let mut counts = BTreeMap::<u32, usize>::new();
-    for game in games {
+    for (game, _) in games {
         *counts.entry(game.game_type).or_default() += 1;
     }
     let seen: Vec<String> = counts
@@ -320,14 +204,4 @@ fn types_seen(games: &[Created<'_>]) -> String {
         .map(|(game_type, games)| format!("{game_type} ({games})"))
         .collect();
     seen.join(", ")
-}
-
-/// The ABI word at position `index` after the selector.
-fn argument(input: &[u8], index: usize) -> Option<U256> {
-    let start = index.checked_mul(WORD)?.checked_add(4)?;
-    let bytes: [u8; WORD] = input
-        .get(start..start.checked_add(WORD)?)?
-        .try_into()
-        .ok()?;
-    Some(U256::from_be_bytes(bytes))
 }

@@ -4,7 +4,8 @@
 //! Does not find the game (the parent module does) and does not read headers: the caller hands
 //! the fields in.
 
-use alloy_primitives::{Address, B256, keccak256};
+use alloy_primitives::{Address, B256};
+use op_indexer_primitives::{ClaimMismatch, check_claim};
 use serde::{Deserialize, Serialize};
 
 /// The game that anchors the top of the range: what `download` records and `verify` reads.
@@ -25,34 +26,13 @@ pub(crate) struct GameAnchor {
     pub(crate) l1_block: u64,
 }
 
-/// Why a downloaded block is not the one a game claims.
+/// A downloaded block is not the one a game claims.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum AnchorError {
-    #[error(
-        "block {block} has no withdrawals root in its header (it is before Isthmus), so its \
-         output root cannot be computed and game {game} cannot anchor the range"
-    )]
-    NoStorageRoot { block: u64, game: Address },
-    #[error(
-        "block {block} has timestamp {found}, and game {game} is about the block at {claimed}; \
-         the chain's Bedrock block, its time or the block time is configured wrongly"
-    )]
-    Timestamp {
-        block: u64,
-        game: Address,
-        claimed: u64,
-        found: u64,
-    },
-    #[error(
-        "block {block}: the output root of the downloaded block is {computed}, game {game} on \
-         L1 claims {claimed}"
-    )]
-    Mismatch {
-        block: u64,
-        game: Address,
-        claimed: B256,
-        computed: B256,
-    },
+#[error("game {game} on L1 cannot anchor the range: {mismatch}")]
+pub(crate) struct AnchorError {
+    game: Address,
+    #[source]
+    mismatch: ClaimMismatch,
 }
 
 impl GameAnchor {
@@ -62,9 +42,9 @@ impl GameAnchor {
     ///
     /// # Errors
     ///
-    /// Returns [`AnchorError::Timestamp`] if the game names its block by a time the block does
-    /// not have, [`AnchorError::NoStorageRoot`] if the header has no withdrawals root, and
-    /// [`AnchorError::Mismatch`], with both roots, if the output roots differ.
+    /// Returns [`AnchorError`] with the [`ClaimMismatch`]: the game names its block by a time
+    /// the block does not have, the header has no withdrawals root (a block before Isthmus),
+    /// or the output roots differ (both are in the error).
     pub(crate) fn check(
         &self,
         hash: B256,
@@ -72,28 +52,16 @@ impl GameAnchor {
         state_root: B256,
         withdrawals_root: Option<B256>,
     ) -> Result<(), AnchorError> {
-        let (block, game) = (self.l2_block, self.game);
-        if let Some(claimed) = self.timestamp
-            && claimed != timestamp
-        {
-            return Err(AnchorError::Timestamp {
-                block,
-                game,
-                claimed,
-                found: timestamp,
-            });
-        }
-        let storage_root = withdrawals_root.ok_or(AnchorError::NoStorageRoot { block, game })?;
-        // The version-0 output root.
-        let computed = keccak256([B256::ZERO, state_root, storage_root, hash].concat());
-        if computed != self.output_root {
-            return Err(AnchorError::Mismatch {
-                block,
-                game,
-                claimed: self.output_root,
-                computed,
-            });
-        }
-        Ok(())
+        check_claim(
+            self.l2_block,
+            (self.output_root, self.timestamp),
+            hash,
+            timestamp,
+            (state_root, withdrawals_root),
+        )
+        .map_err(|mismatch| AnchorError {
+            game: self.game,
+            mismatch,
+        })
     }
 }

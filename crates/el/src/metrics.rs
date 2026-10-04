@@ -4,19 +4,23 @@
 //! installs one every call here is a no-op, and [`describe`] must run after that. Call sites use
 //! the typed helpers below, so metric names and labels live in this file only.
 //!
+//! The metrics of discovery, dials and sessions carry a `network` label (`op` for the chain's
+//! execution network, `l1` for Ethereum's), because both can run in one process; the rest are
+//! the chain's own.
+//!
 //! Labels are low-cardinality by construction: a direction, an outcome or a reason from a fixed
 //! set. Peer ids, addresses and block numbers are never labels.
 //!
 //! | Metric | Type | Labels | Meaning |
 //! |---|---|---|---|
-//! | `op_indexer_el_candidates_discovered_total` | counter | | Peers of our chain and fork handed to the peer set by discovery, repeats included. |
-//! | `op_indexer_el_dials_total` | counter | `outcome` | Dial attempts: `connected`, `too_many_peers`, `handshake_dropped`, `unreachable`, `timeout`, `wrong_fork`, `incompatible` or `failed`. |
-//! | `op_indexer_el_inbound_handshakes_failed_total` | counter | `stage` | Inbound connections that did not become a session. |
-//! | `op_indexer_el_inbound_refused_total` | counter | | Inbound sessions refused by the peer set: over the limit, already connected, or banned. |
-//! | `op_indexer_el_sessions_opened_total` | counter | `direction` | Sessions kept after the handshake: `outbound` or `inbound`. |
-//! | `op_indexer_el_sessions_ended_total` | counter | `reason` | Sessions that ended: `cancelled`, `too_many_peers`, `useless_peer`, `disconnected`, `closed`, `io`, `protocol` or `stalled` (did not read what it asked for). |
-//! | `op_indexer_el_session_duration_seconds` | histogram | | How long a session lasted. |
-//! | `op_indexer_el_peers_dropped_total` | counter | `reason` | Peers this node disconnected: `bad_data` (also banned), `undecodable` or `unresponsive`. |
+//! | `op_indexer_el_candidates_discovered_total` | counter | `network` | Peers of our chain and fork handed to the peer set by discovery, repeats included. |
+//! | `op_indexer_el_dials_total` | counter | `network`, `outcome` | Dial attempts: `connected`, `too_many_peers`, `handshake_dropped`, `unreachable`, `timeout`, `wrong_fork`, `incompatible` or `failed`. |
+//! | `op_indexer_el_inbound_handshakes_failed_total` | counter | `network`, `stage` | Inbound connections that did not become a session. |
+//! | `op_indexer_el_inbound_refused_total` | counter | `network` | Inbound sessions refused by the peer set: over the limit, already connected, or banned. |
+//! | `op_indexer_el_sessions_opened_total` | counter | `network`, `direction` | Sessions kept after the handshake: `outbound` or `inbound`. |
+//! | `op_indexer_el_sessions_ended_total` | counter | `network`, `reason` | Sessions that ended: `cancelled`, `too_many_peers`, `useless_peer`, `disconnected`, `closed`, `io`, `protocol` or `stalled` (did not read what it asked for). |
+//! | `op_indexer_el_session_duration_seconds` | histogram | `network` | How long a session lasted. |
+//! | `op_indexer_el_peers_dropped_total` | counter | `network`, `reason` | Peers this node disconnected: `bad_data` (also banned), `undecodable` or `unresponsive`. |
 //! | `op_indexer_el_requests_total` | counter | `outcome` | Receipts requests sent to a peer: `verified`, `empty`, `timeout`, `closed`, `malformed` or `invalid`. |
 //! | `op_indexer_el_verification_failures_total` | counter | `kind` | Answers that failed verification: `count` or `root`. |
 //! | `op_indexer_el_receipts_delivered_total` | counter | | Receipts in those blocks. |
@@ -341,43 +345,43 @@ pub(crate) fn describe() {
 }
 
 /// Records a candidate handed to the peer set by discovery.
-pub(crate) fn candidate_discovered() {
-    counter!(CANDIDATES_DISCOVERED).increment(1);
+pub(crate) fn candidate_discovered(network: &'static str) {
+    counter!(CANDIDATES_DISCOVERED, "network" => network).increment(1);
 }
 
 /// Records a dial attempt.
-pub(crate) fn dial(outcome: DialOutcome) {
-    counter!(DIALS, "outcome" => outcome.as_str()).increment(1);
+pub(crate) fn dial(network: &'static str, outcome: DialOutcome) {
+    counter!(DIALS, "network" => network, "outcome" => outcome.as_str()).increment(1);
 }
 
 /// Records an inbound connection whose handshake failed at `stage`.
-pub(crate) fn inbound_handshake_failed(stage: &'static str) {
-    counter!(INBOUND_HANDSHAKES_FAILED, "stage" => stage).increment(1);
+pub(crate) fn inbound_handshake_failed(network: &'static str, stage: &'static str) {
+    counter!(INBOUND_HANDSHAKES_FAILED, "network" => network, "stage" => stage).increment(1);
 }
 
 /// Records an inbound session the peer set refused.
-pub(crate) fn inbound_refused() {
-    counter!(INBOUND_REFUSED).increment(1);
+pub(crate) fn inbound_refused(network: &'static str) {
+    counter!(INBOUND_REFUSED, "network" => network).increment(1);
 }
 
 /// Records a session kept after its handshake.
-pub(crate) fn session_opened(direction: Direction) {
+pub(crate) fn session_opened(network: &'static str, direction: Direction) {
     let direction = match direction {
         Direction::Inbound => "inbound",
         Direction::Outbound => "outbound",
     };
-    counter!(SESSIONS_OPENED, "direction" => direction).increment(1);
+    counter!(SESSIONS_OPENED, "network" => network, "direction" => direction).increment(1);
 }
 
 /// Records a session that ended after `lasted`.
-pub(crate) fn session_ended(reason: EndLabel, lasted: Duration) {
-    counter!(SESSIONS_ENDED, "reason" => reason.as_str()).increment(1);
-    histogram!(SESSION_DURATION).record(lasted);
+pub(crate) fn session_ended(network: &'static str, reason: EndLabel, lasted: Duration) {
+    counter!(SESSIONS_ENDED, "network" => network, "reason" => reason.as_str()).increment(1);
+    histogram!(SESSION_DURATION, "network" => network).record(lasted);
 }
 
 /// Records a peer this node disconnected.
-pub(crate) fn peer_dropped(reason: DropReason) {
-    counter!(PEERS_DROPPED, "reason" => reason.as_str()).increment(1);
+pub(crate) fn peer_dropped(network: &'static str, reason: DropReason) {
+    counter!(PEERS_DROPPED, "network" => network, "reason" => reason.as_str()).increment(1);
 }
 
 /// Records how a receipts request to one peer ended; `outcome` is the label

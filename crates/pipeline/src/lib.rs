@@ -21,6 +21,7 @@
 //! or verify receipts, it asks for them and stores the answers; it does not fetch missing
 //! blocks; and nothing produces the L1 heads yet. The design is in `docs/pipeline.md`.
 
+mod commit;
 mod error;
 mod ingest;
 pub mod metrics;
@@ -33,7 +34,7 @@ mod retry;
 use std::fmt;
 
 use alloy_primitives::BlockNumber;
-use op_indexer_primitives::{BlockRef, EncodedBlock, L1Heads, UnsafeBlock};
+use op_indexer_primitives::{BlockRef, EncodedBlock, L1Games, L1Heads, UnsafeBlock};
 use op_indexer_storage::{ArchiveRetention, ArchiveStore, CommittedStore, UnsafeStore};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
@@ -57,6 +58,7 @@ pub struct Pipeline<U, C, A> {
     receipts: Option<ReceiptsChannels>,
     range: Option<mpsc::Receiver<Vec<EncodedBlock>>>,
     head: Option<watch::Sender<Option<BlockRef>>>,
+    games: Option<(watch::Receiver<L1Games>, watch::Sender<L1Heads>)>,
 }
 
 /// One of the pipeline's tasks.
@@ -66,6 +68,7 @@ enum Task {
     Promote,
     Receipts,
     Range,
+    Commit,
 }
 
 impl<U, C, A> Pipeline<U, C, A>
@@ -109,6 +112,7 @@ where
             receipts,
             range: None,
             head: None,
+            games: None,
         }
     }
 
@@ -117,6 +121,21 @@ where
     #[must_use]
     pub fn with_head(mut self, head: watch::Sender<Option<BlockRef>>) -> Self {
         self.head = Some(head);
+        self
+    }
+
+    /// Adds the dispute games verified on L1 (the newest one seen and the newest one in a
+    /// finalized L1 block): each is checked against our own block at its height, and a match
+    /// is published on `heads` as the safe or the finalized head. `heads`
+    /// is what feeds the `l1_heads` given to [`Self::new`], directly or through whatever
+    /// decides when promotion may act on them.
+    #[must_use]
+    pub fn with_l1_games(
+        mut self,
+        games: watch::Receiver<L1Games>,
+        heads: watch::Sender<L1Heads>,
+    ) -> Self {
+        self.games = Some((games, heads));
         self
     }
 
@@ -165,6 +184,16 @@ where
             stop.clone(),
         );
         tasks.spawn(async move { (Task::Ingest, ingest.await) });
+        if let Some((games, heads)) = self.games {
+            let commit = commit::run(
+                self.unsafe_store.clone(),
+                self.archive.clone(),
+                games,
+                heads,
+                stop.clone(),
+            );
+            tasks.spawn(async move { (Task::Commit, commit.await) });
+        }
         if let Some(channels) = self.range {
             let range = range::run(self.committed, self.archive.clone(), channels, stop.clone());
             tasks.spawn(async move { (Task::Range, range.await) });
@@ -184,7 +213,7 @@ where
                 // Promotion ends alone only when nothing sends L1 heads any more, the receipts
                 // task when the fetcher has stopped, and the range task when its range is
                 // done or cannot be stored; ingest carries on without them.
-                Ok((Task::Promote | Task::Receipts | Task::Range, Ok(()))) => {}
+                Ok((Task::Promote | Task::Receipts | Task::Range | Task::Commit, Ok(()))) => {}
                 Ok((_, Err(err))) => {
                     stop.cancel();
                     first_error.get_or_insert(err);

@@ -12,25 +12,28 @@ mod config;
 mod provider;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use alloy_primitives::BlockNumber;
 use eyre::WrapErr;
+use op_indexer_chainspec::ChainSpec;
 use op_indexer_el::{ExecutionNetwork, RangeSync, SyncPlan};
+use op_indexer_l1::{L1Config, L1Network, TrustedL1Block};
 use op_indexer_p2p::{Network, NodeStore};
 use op_indexer_pipeline::{Pipeline, ReceiptsChannels};
-use op_indexer_primitives::{BlockRef, EncodedBlock, ExecutionPeer, L1Heads, SyncRange};
+use op_indexer_primitives::{BlockRef, EncodedBlock, ExecutionPeer, L1Games, L1Heads, SyncRange};
 use op_indexer_storage::archive_store::FjallArchive;
 use op_indexer_storage::committed_store::ClickHouseStore;
 use op_indexer_storage::unsafe_store::RedisStore;
 use op_indexer_storage::{ArchiveRetention, ArchiveStore, StorageConfig};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::time::ChronoUtc;
 
-use crate::config::{Config, ElSettings};
+use crate::config::{Config, ElSettings, L1Settings};
 use crate::provider::ArchiveProvider;
 
 /// Unsafe blocks waiting for the pipeline. Blocks arrive every ~2s; this absorbs a store that
@@ -46,9 +49,19 @@ const VERIFIED_RECEIPTS_CAPACITY: usize = 64;
 /// Execution peers waiting to be saved. One is reported per dialed session, so a handful at a
 /// time; the execution network drops a report when this is full.
 const SERVED_PEERS_CAPACITY: usize = 32;
+/// L1 blocks the light client vouches for, waiting for the L1 network: a head every 12 s and
+/// a finalized block every few minutes.
+const TRUSTED_L1_BLOCKS_CAPACITY: usize = 16;
 /// Batches of a range sync waiting for the pipeline. A batch is up to 256 blocks, so this is
 /// kept small; the sync waits when it is full.
 const SYNC_BATCH_CAPACITY: usize = 2;
+/// How close to the unsafe head a round of the range sync has to end for the archive to
+/// count as caught up. Promotion reads at most 4,096 blocks back from a safe head, and the
+/// first one it appends must be at or below the archive's last block: this leaves room for
+/// the safe head to be a few thousand blocks further on when it arrives.
+const CAUGHT_UP_BLOCKS: u64 = 1024;
+/// How often the archive is asked whether a round of the range sync has reached its end.
+const SYNC_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Verified checkpoints of a range sync waiting to be saved; the sync waits when it is full.
 const SYNC_CHECKPOINT_CAPACITY: usize = 16;
 
@@ -80,7 +93,9 @@ async fn main() -> eyre::Result<()> {
     let (blocks_tx, blocks_rx) = mpsc::channel(BLOCK_CHANNEL_CAPACITY);
     // Nothing produces the L1 heads until the L1 crate exists (docs/roadmap.md); the sender is
     // kept so the pipeline sees a quiet source, not a closed one.
-    let (_l1_heads_tx, l1_heads_rx) = watch::channel(L1Heads::default());
+    let (l1_source_tx, l1_source_rx) = watch::channel(L1Heads::default());
+    // What promotion acts on: the L1 heads, once the archive is ready to be extended by it.
+    let (l1_heads_tx, l1_heads_rx) = watch::channel(L1Heads::default());
     // The pipeline publishes the safe block number once its blocks are committed; the network
     // ignores gaps at or below it.
     let (safe_number_tx, safe_number_rx) = watch::channel(0);
@@ -89,15 +104,28 @@ async fn main() -> eyre::Result<()> {
     let (head_tx, head_rx) = watch::channel(stores.archive_range.map(|(_, tip)| tip));
     // Taken before anything is published, so its first change is the first gossiped head.
     let gossip_head = head_rx.clone();
+    // Whether promotion may act: at once, unless a range sync has to bring the archive up to
+    // the chain first. Promotion only appends blocks that extend the archive's last one, so
+    // if it ran ahead of the sync the archive would stop where the sync ends.
+    let sync_archive = stores
+        .archive
+        .as_ref()
+        .filter(|_| config.sync)
+        .map(|(archive, _)| archive.clone());
+    let (caught_up_tx, caught_up_rx) = watch::channel(sync_archive.is_none());
 
     let execution = config
         .el
         .map(|el| {
-            let sync = config.sync.then_some(gossip_head);
+            let sync = sync_archive.map(|archive| SyncInputs {
+                archive,
+                gossip_head,
+                caught_up: caught_up_tx,
+            });
             execution_network(el, sync, &store, &stores, head_rx)
         })
         .transpose()?;
-    let (execution, receipts, range, saves) = execution.map_or_else(
+    let (execution, receipts, range, mut saves) = execution.map_or_else(
         || (None, None, None, Vec::new()),
         |parts| {
             (
@@ -123,8 +151,74 @@ async fn main() -> eyre::Result<()> {
         Some(range) => pipeline.with_range(range),
         None => pipeline,
     };
+    saves.push(tokio::spawn(forward_l1_heads(
+        l1_source_rx,
+        caught_up_rx,
+        l1_heads_tx,
+    )));
+    // The L1 side, which turns dispute games into the heads; without it nothing writes them
+    // and the sender is only kept alive, so promotion sees a quiet source, not a closed one.
+    let (l1, pipeline, _idle) = match config.l1 {
+        Some(settings) => {
+            let (l1, games, idle) = l1_network(settings, config.network.chain, &store)?;
+            saves.push(idle.served);
+            let pipeline = pipeline.with_l1_games(games, l1_source_tx);
+            (Some(l1), pipeline, (Some(idle.trusted), None))
+        }
+        None => (None, pipeline, (None, Some(l1_source_tx))),
+    };
     let network = Network::new(config.network, keypair, store, blocks_tx, safe_number_rx);
-    run(network, execution, pipeline, saves).await
+    run(network, execution, l1, pipeline, saves).await
+}
+
+/// What the L1 side leaves in the binary's hands until its inputs exist.
+struct L1Idle {
+    /// Where the beacon light client will send the L1 blocks it vouches for. Kept open: the
+    /// L1 network stops when it closes.
+    trusted: mpsc::Sender<TrustedL1Block>,
+    /// Drains the L1 peers worth saving, which are not stored yet.
+    served: JoinHandle<()>,
+}
+
+/// Builds the L1 network: an execution p2p node on Ethereum L1 that reads the chain's
+/// dispute games from L1 blocks it is told to trust, and publishes them for the pipeline.
+fn l1_network(
+    settings: L1Settings,
+    chain: &'static ChainSpec,
+    store: &NodeStore,
+) -> eyre::Result<(L1Network, watch::Receiver<L1Games>, L1Idle)> {
+    // A key of its own, like the execution network's.
+    let key = store
+        .l1_key()
+        .wrap_err("failed to load the L1 network key")?;
+    let (trusted_tx, trusted_rx) = mpsc::channel(TRUSTED_L1_BLOCKS_CAPACITY);
+    let (games_tx, games_rx) = watch::channel(L1Games::default());
+    let (served_tx, mut served_rx) = mpsc::channel(SERVED_PEERS_CAPACITY);
+    let config = L1Config {
+        chain,
+        listen_addr: settings.listen_addr,
+        advertised_addr: None,
+        bootnodes: Vec::new(),
+        saved_peers: Vec::new(),
+    };
+    let l1 = L1Network::new(config, key, trusted_rx, games_tx, served_tx)
+        .wrap_err("failed to create the L1 network")?;
+    // TODO: start the beacon light client from this checkpoint and give it `trusted_tx`
+    // (docs/l1.md part 1); it is not built yet, so no L1 block is trusted and no head moves.
+    warn!(
+        checkpoint = %settings.checkpoint,
+        "the L1 side is enabled but its beacon light client is not built yet: no L1 block is \
+         trusted, so no safe or finalized head is published"
+    );
+    let served = tokio::spawn(async move { while served_rx.recv().await.is_some() {} });
+    Ok((
+        l1,
+        games_rx,
+        L1Idle {
+            trusted: trusted_tx,
+            served,
+        },
+    ))
 }
 
 /// Runs the components until one stops or a signal arrives, then stops the others in order:
@@ -133,6 +227,7 @@ async fn main() -> eyre::Result<()> {
 async fn run(
     network: Network,
     execution: Option<ExecutionNetwork<ArchiveProvider>>,
+    l1: Option<L1Network>,
     pipeline: Pipeline<RedisStore, ClickHouseStore, FjallArchive>,
     saves: Vec<JoinHandle<()>>,
 ) -> eyre::Result<()> {
@@ -141,6 +236,7 @@ async fn run(
     let mut network = Some(tokio::spawn(network.run(networks_cancel.clone())));
     let mut execution =
         execution.map(|execution| tokio::spawn(execution.run(networks_cancel.clone())));
+    let mut l1 = l1.map(|l1| tokio::spawn(l1.run(networks_cancel.clone())));
     let mut pipeline = Some(tokio::spawn(pipeline.run(cancel.clone())));
 
     // Any component stopping ends the process; the others are stopped and waited for.
@@ -154,6 +250,10 @@ async fn run(
             warn!("execution network stopped unexpectedly");
             result.wrap_err("execution network failed")
         }
+        result = finished(&mut l1) => {
+            warn!("L1 network stopped unexpectedly");
+            result.wrap_err("L1 network failed")
+        }
         result = finished(&mut pipeline) => {
             warn!("pipeline stopped unexpectedly");
             result.wrap_err("pipeline failed")
@@ -163,6 +263,7 @@ async fn run(
     networks_cancel.cancel();
     let network = join(network).await.wrap_err("network failed");
     let execution = join(execution).await.wrap_err("execution network failed");
+    let l1 = join(l1).await.wrap_err("L1 network failed");
     cancel.cancel();
     let pipeline = join(pipeline).await.wrap_err("pipeline failed");
     // Their senders are gone with the execution network, so they end.
@@ -172,7 +273,7 @@ async fn run(
         }
     }
     // The reason the process stopped comes first, then whatever failed while shutting down.
-    stopped.and(network).and(execution).and(pipeline)
+    stopped.and(network).and(execution).and(l1).and(pipeline)
 }
 
 /// Waits for `task` to finish and clears it, so it is not awaited again. Never resolves when
@@ -213,11 +314,11 @@ struct Execution {
 
 /// Builds the execution network from its settings and what the node store has saved for it.
 /// Peers are served from the archive; without one the node serves nothing. `head` is the
-/// newest block the node knows. With `sync`, a receiver whose first change is the first
-/// gossiped head, the blocks between the archive and that head are fetched from peers.
+/// newest block the node knows. With `sync`, the blocks between the archive and the chain's
+/// head are fetched from peers.
 fn execution_network(
     el: ElSettings,
-    sync: Option<watch::Receiver<Option<BlockRef>>>,
+    sync: Option<SyncInputs>,
     store: &Arc<NodeStore>,
     stores: &Stores,
     head: watch::Receiver<Option<BlockRef>>,
@@ -252,26 +353,17 @@ fn execution_network(
     ))];
 
     let (network, range) = match sync {
-        Some(gossip_head) => {
-            // The sync continues the archive: after its last block, or from block 0.
-            let from = stores
-                .archive_range
-                .map_or(0, |(_, tip)| tip.number.saturating_add(1));
-            let (plan_tx, plan_rx) = oneshot::channel();
+        Some(inputs) => {
+            let (plans_tx, plans_rx) = mpsc::channel(1);
             let (blocks_tx, batches) = mpsc::channel(SYNC_BATCH_CAPACITY);
             let (checkpoints_tx, checkpoints_rx) = mpsc::channel(SYNC_CHECKPOINT_CAPACITY);
-            saves.push(tokio::spawn(plan_sync(
-                Arc::clone(store),
-                from,
-                gossip_head,
-                plan_tx,
-            )));
+            saves.push(tokio::spawn(plan_sync(Arc::clone(store), inputs, plans_tx)));
             saves.push(tokio::spawn(save_sync_checkpoints(
                 Arc::clone(store),
                 checkpoints_rx,
             )));
             let network = network.with_sync(RangeSync {
-                plan: plan_rx,
+                plans: plans_rx,
                 blocks: blocks_tx,
                 verified: checkpoints_tx,
             });
@@ -290,70 +382,159 @@ fn execution_network(
     })
 }
 
-/// Decides what the range sync fetches and hands it to the execution network: from block
-/// `from` up to an anchor, a block whose hash is trusted because the sequencer signed it.
+/// What planning the range sync needs.
+struct SyncInputs {
+    /// The archive the sync fills: its last block is where each round starts.
+    archive: FjallArchive,
+    /// The unsafe head; its first change is the first head gossip delivers in this run.
+    gossip_head: watch::Receiver<Option<BlockRef>>,
+    /// Set once the archive has caught up with the chain: promotion may then act.
+    caught_up: watch::Sender<bool>,
+}
+
+/// Plans the range sync, round by round, and hands each plan to the execution network: from
+/// the block after the archive's last one up to an anchor, a block whose hash is trusted
+/// because the sequencer signed it.
 ///
-/// The anchor is the one an unfinished sync of an earlier run was working towards, so its
-/// verified checkpoints are kept; otherwise the first head gossip delivers after the start.
-/// Sends nothing, so nothing is fetched, when the archive already reaches the anchor or the
-/// node stops before a head arrives.
-async fn plan_sync(
-    store: Arc<NodeStore>,
-    from: BlockNumber,
-    mut gossip_head: watch::Receiver<Option<BlockRef>>,
-    plan: oneshot::Sender<SyncPlan>,
-) {
-    let saved = {
+/// The first anchor is the one an unfinished sync of an earlier run was working towards, so
+/// its verified checkpoints are kept; otherwise it is the unsafe head gossip delivered. A
+/// round that ends more than [`CAUGHT_UP_BLOCKS`] behind the head is followed by another to
+/// the head of that moment; rounds get shorter each time. `caught_up` is set when a round to
+/// a head of this run ends within that distance: from that block on the unsafe store holds
+/// the chain, so promotion can extend the archive.
+///
+/// Ends, and with it the sync, when it has caught up or the node stops.
+async fn plan_sync(store: Arc<NodeStore>, inputs: SyncInputs, plans: mpsc::Sender<SyncPlan>) {
+    let SyncInputs {
+        archive,
+        mut gossip_head,
+        caught_up,
+    } = inputs;
+    let mut resume = {
         let store = Arc::clone(&store);
-        tokio::task::spawn_blocking(move || store.sync_anchor()).await
-    };
-    let unfinished = match saved {
-        Ok(Ok(anchor)) => anchor.filter(|anchor| anchor.number >= from),
-        Ok(Err(err)) => {
-            return warn!(%err, "range sync not started: its saved anchor cannot be read");
+        match tokio::task::spawn_blocking(move || store.sync_anchor()).await {
+            Ok(Ok(anchor)) => anchor,
+            Ok(Err(err)) => return warn!(%err, "range sync not started: cannot read its anchor"),
+            Err(err) => return warn!(%err, "range sync not started: reading its anchor failed"),
         }
-        Err(err) => return warn!(%err, "range sync not started: reading its saved anchor failed"),
     };
-    let anchor = match unfinished {
-        Some(anchor) => anchor,
-        None => loop {
+    let mut gossip_seen = false;
+    loop {
+        let Some(from) = archive_next(&archive).await else {
+            return;
+        };
+        // An unfinished sync is finished first; its anchor is not a head of this run.
+        let unfinished = resume.take().filter(|anchor| anchor.number >= from);
+        let anchor = if let Some(anchor) = unfinished {
+            anchor
+        } else {
             // A closed channel is the pipeline stopping: the node is shutting down.
-            if gossip_head.changed().await.is_err() {
+            if !gossip_seen && gossip_head.changed().await.is_err() {
                 return;
             }
-            if let Some(head) = *gossip_head.borrow_and_update() {
-                break head;
+            gossip_seen = true;
+            let Some(head) = *gossip_head.borrow_and_update() else {
+                continue;
+            };
+            head
+        };
+        if anchor.number >= from {
+            let checkpoints = {
+                let store = Arc::clone(&store);
+                tokio::task::spawn_blocking(move || store.sync_checkpoints(anchor)).await
+            };
+            let checkpoints = match checkpoints {
+                Ok(Ok(checkpoints)) => checkpoints,
+                Ok(Err(err)) => return warn!(%err, "range sync stopped: cannot read checkpoints"),
+                Err(err) => return warn!(%err, "range sync stopped: reading checkpoints failed"),
+            };
+            info!(
+                from,
+                to = anchor.number,
+                anchor = %anchor.hash,
+                resumed = unfinished.is_some(),
+                "range sync planned: fetching these blocks from execution peers"
+            );
+            let plan = SyncPlan {
+                range: SyncRange { from, anchor },
+                checkpoints,
+            };
+            // The execution network is gone if this fails: the node is shutting down.
+            if plans.send(plan).await.is_err() {
+                return;
             }
-        },
-    };
-    if anchor.number < from {
-        info!(
-            archive_next = from,
-            head = anchor.number,
-            "range sync has nothing to fetch: the archive reaches the head"
-        );
-        return;
-    }
-    let checkpoints = tokio::task::spawn_blocking(move || store.sync_checkpoints(anchor)).await;
-    let checkpoints = match checkpoints {
-        Ok(Ok(checkpoints)) => checkpoints,
-        Ok(Err(err)) => {
-            return warn!(%err, "range sync not started: its checkpoints cannot be read");
+            // The round is over when the archive holds its last block.
+            while archive_next(&archive)
+                .await
+                .is_some_and(|next| next <= anchor.number)
+            {
+                tokio::select! {
+                    () = plans.closed() => return,
+                    () = tokio::time::sleep(SYNC_POLL_INTERVAL) => {}
+                }
+            }
         }
-        Err(err) => return warn!(%err, "range sync not started: reading its checkpoints failed"),
-    };
-    info!(
-        from,
-        to = anchor.number,
-        anchor = %anchor.hash,
-        resumed = unfinished.is_some(),
-        "range sync planned: fetching these blocks from execution peers"
-    );
-    // The execution network is gone if this fails: the node is shutting down.
-    let _sent = plan.send(SyncPlan {
-        range: SyncRange { from, anchor },
-        checkpoints,
-    });
+        // Only a round to a head of this run leaves the archive at a block the unsafe store
+        // holds the chain from.
+        if unfinished.is_some() {
+            continue;
+        }
+        let head = gossip_head
+            .borrow()
+            .map_or(anchor.number, |head| head.number);
+        let behind = head.saturating_sub(anchor.number);
+        if behind <= CAUGHT_UP_BLOCKS {
+            info!(
+                archive_tip = anchor.number.max(from.saturating_sub(1)),
+                head, "range sync done: the archive has caught up with the chain"
+            );
+            caught_up.send_replace(true);
+            return;
+        }
+    }
+}
+
+/// Hands the L1 heads to promotion, from the moment the archive has caught up with the chain
+/// (`caught_up`; at once when no range sync runs). Until then promotion sees no heads and
+/// promotes nothing, so the unsafe store keeps the blocks the archive still has to connect
+/// to. Ends when the pipeline or the L1 source is gone, or the sync ended without catching
+/// up.
+async fn forward_l1_heads(
+    mut heads: watch::Receiver<L1Heads>,
+    mut caught_up: watch::Receiver<bool>,
+    promotion: watch::Sender<L1Heads>,
+) {
+    tokio::select! {
+        () = promotion.closed() => return,
+        opened = caught_up.wait_for(|caught_up| *caught_up) => {
+            if opened.is_err() {
+                return;
+            }
+        }
+    }
+    loop {
+        promotion.send_replace(*heads.borrow_and_update());
+        tokio::select! {
+            () = promotion.closed() => return,
+            changed = heads.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// The block after the archive's last one, 0 for an empty archive; `None`, logged, if the
+/// archive cannot be read.
+async fn archive_next(archive: &FjallArchive) -> Option<BlockNumber> {
+    match archive.range().await {
+        Ok(range) => Some(range.map_or(0, |(_, tip)| tip.number.saturating_add(1))),
+        Err(err) => {
+            warn!(%err, "range sync stopped: the block archive cannot be read");
+            None
+        }
+    }
 }
 
 /// Saves the execution peers that served us, so the next run dials them first. Ends when the

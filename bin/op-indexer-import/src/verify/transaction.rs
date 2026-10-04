@@ -5,7 +5,8 @@
 //! rebuilt header, whose hash must be the block's, so a wrong field in any row shows there.
 //!
 //! - Legacy, EIP-2930, EIP-1559 and EIP-7702 transactions are built from their fields and
-//!   signature.
+//!   signature; the access list and the authorization list come in the service's own binary
+//!   form (`lists`).
 //! - A legacy transaction signed with all zeros (an L1-to-L2 message of OP Mainnet's client
 //!   before Bedrock) is encoded with those zeros; it has no signer.
 //! - A deposit (type `0x7E`) is built from the source hash and mint the service reports. Its
@@ -20,18 +21,19 @@
 //! [L1 attributes deposited transaction]: https://specs.optimism.io/protocol/deposits.html#l1-attributes-deposited-transaction
 //! [Regolith]: https://specs.optimism.io/protocol/regolith/overview.html
 
+use super::{Check, lists};
+use crate::rows::TransactionRow;
 use alloy_consensus::transaction::from_eip155_value;
 use alloy_consensus::{Signed, TxEip1559, TxEip2930, TxEip7702, TxLegacy};
 use alloy_eips::eip2718::Encodable2718;
 use alloy_eips::eip2930::AccessList;
 use alloy_eips::eip7702::SignedAuthorization;
-use alloy_primitives::{Address, Signature, TxKind, U256, normalize_v};
+use alloy_primitives::{Address, Bytes, Signature, TxKind, U256, hex, normalize_v};
 use op_alloy_consensus::{DEPOSIT_TX_TYPE_ID, OpTxEnvelope, TxDeposit};
 use op_indexer_primitives::encode_transaction;
-use serde::de::DeserializeOwned;
 
-use super::Check;
-use crate::rows::TransactionRow;
+/// Bytes of a field's value shown when it cannot be decoded: 200 characters of hex.
+const SHOWN_BYTES: usize = 100;
 
 /// Appends the consensus encoding of the transaction of `row`, the `index`-th of its block,
 /// to `out`, and returns its sender as the service reports it: the zero address, with `true`,
@@ -112,23 +114,41 @@ impl Fields<'_> {
     }
 
     fn access_list(&self) -> Result<AccessList, Check> {
-        self.list("access_list", self.row.access_list.as_ref())
+        self.list(
+            "access_list",
+            self.row.access_list.as_ref(),
+            lists::access_list,
+        )
     }
 
-    /// Reads a list field the service gives as JSON in the Ethereum RPC's form; absent means
-    /// empty.
-    fn list<T: DeserializeOwned + Default>(
+    fn authorization_list(&self) -> Result<Vec<SignedAuthorization>, Check> {
+        let list = self.row.authorization_list.as_ref();
+        self.list("authorization_list", list, lists::authorization_list)
+    }
+
+    /// Decodes a list field the service gives as the bytes of its binary column; absent or
+    /// without bytes means empty. A failure names the field and shows the start of its value.
+    fn list<T: Default>(
         &self,
         field: &'static str,
-        value: Option<&serde_json::Value>,
+        value: Option<&Bytes>,
+        decode: fn(&[u8]) -> Result<T, String>,
     ) -> Result<T, Check> {
-        let Some(value) = value.filter(|value| !value.is_null()) else {
+        // No value, or a value of no bytes: no list.
+        let Some(value) = value.filter(|value| !value.is_empty()) else {
             return Ok(T::default());
         };
-        T::deserialize(value).map_err(|err| Check::Field {
-            index: self.index,
-            field,
-            reason: err.to_string(),
+        decode(value).map_err(|reason| {
+            let shown = value.get(..SHOWN_BYTES).unwrap_or(value);
+            Check::Field {
+                index: self.index,
+                field,
+                reason: format!(
+                    "{reason}; the value is {} bytes and starts {}",
+                    value.len(),
+                    hex::encode_prefixed(shown)
+                ),
+            }
         })
     }
 
@@ -215,8 +235,7 @@ impl Fields<'_> {
 
     fn eip7702(&self) -> Result<OpTxEnvelope, Check> {
         let row = self.row;
-        let authorization_list: Vec<SignedAuthorization> =
-            self.list("authorization_list", row.authorization_list.as_ref())?;
+        let authorization_list = self.authorization_list()?;
         let transaction = TxEip7702 {
             chain_id: self.chain_id()?,
             nonce: row.nonce.to(),

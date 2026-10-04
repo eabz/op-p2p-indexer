@@ -12,6 +12,7 @@ publish = false
 # Internal crates.
 op-indexer-chainspec = { path = "crates/chainspec" }
 op-indexer-el = { path = "crates/el" }
+op-indexer-l1 = { path = "crates/l1" }
 op-indexer-p2p = { path = "crates/p2p" }
 op-indexer-pipeline = { path = "crates/pipeline" }
 op-indexer-primitives = { path = "crates/primitives" }
@@ -31,6 +32,8 @@ alloy-rlp = { version = "0.3", default-features = false, features = ["std"] }
 # `Encodable2718` for the raw transaction bytes stored in ClickHouse, and `Withdrawals` to
 # rebuild a block body read back from Redis.
 alloy-eips = { version = "2", default-features = false, features = ["std"] }
+# Ethereum mainnet's hardfork schedule, for the fork id the `l1` crate shows L1 peers.
+alloy-hardforks = { version = "0.4", default-features = false }
 
 # TCP + Noise + yamux transport with a secp256k1 identity, gossipsub for block gossip,
 # `macros` to compose gossipsub with connection limits.

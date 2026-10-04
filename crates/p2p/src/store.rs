@@ -29,6 +29,8 @@ const NODE: &str = "node";
 const IDENTITY_KEY: &str = "secp256k1_secret";
 /// Secret of the node's identity on the execution network; never the same as [`IDENTITY_KEY`].
 const EXECUTION_KEY: &str = "execution_secp256k1_secret";
+/// Secret of the node's identity on L1's execution network; a third key.
+const L1_KEY: &str = "l1_secp256k1_secret";
 /// Known good peers: multiaddr bytes -> last time (Unix seconds, big-endian) they delivered a
 /// valid block.
 const PEERS: &str = "known_peers";
@@ -68,7 +70,7 @@ pub enum StoreError {
     /// The persisted identity key could not be decoded.
     #[error("stored identity key is invalid")]
     InvalidIdentity(#[source] DecodingError),
-    /// The persisted execution-network key has the wrong length.
+    /// A persisted execution-network key (the L2 one or the L1 one) has the wrong length.
     #[error("stored execution key is {len} bytes, not 32")]
     InvalidExecutionKey {
         /// Length of the stored value.
@@ -166,14 +168,31 @@ impl NodeStore {
     /// Returns [`StoreError::Database`] if reading or writing fails, and
     /// [`StoreError::InvalidExecutionKey`] if the stored key is not 32 bytes.
     pub fn execution_key(&self) -> Result<B256, StoreError> {
+        self.network_key(EXECUTION_KEY)
+    }
+
+    /// Returns the secp256k1 secret of the node's identity on L1's execution network,
+    /// generating and persisting one on first use. A third key, for the same reason
+    /// [`Self::execution_key`] is a second one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Database`] if reading or writing fails, and
+    /// [`StoreError::InvalidExecutionKey`] if the stored key is not 32 bytes.
+    pub fn l1_key(&self) -> Result<B256, StoreError> {
+        self.network_key(L1_KEY)
+    }
+
+    /// Returns the secret stored under `name`, generating and persisting one on first use.
+    fn network_key(&self, name: &str) -> Result<B256, StoreError> {
         let _write = self.write.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(secret) = self.node.get(EXECUTION_KEY)? {
+        if let Some(secret) = self.node.get(name)? {
             return B256::try_from(secret.as_ref())
                 .map_err(|_err| StoreError::InvalidExecutionKey { len: secret.len() });
         }
         let secret = B256::from(secp256k1::Keypair::generate().secret().to_bytes());
         let mut batch = self.durable_batch();
-        batch.insert(&self.node, EXECUTION_KEY, secret.as_slice());
+        batch.insert(&self.node, name, secret.as_slice());
         batch.commit()?;
         Ok(secret)
     }

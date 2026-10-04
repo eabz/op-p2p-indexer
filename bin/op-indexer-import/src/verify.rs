@@ -18,6 +18,7 @@
 //! address. They are counted.
 
 mod block;
+mod lists;
 mod receipt;
 mod transaction;
 
@@ -190,7 +191,11 @@ pub(crate) async fn run(
                 Some(Ok((chunk, bytes, Err(err)))) => {
                     in_flight_bytes = in_flight_bytes.saturating_sub(bytes);
                     let file = state.raw_path(chunk);
-                    error!(%err, file = %file.display(), "chunk failed verification");
+                    // The first failure is the one reported; the chunks already running
+                    // usually fail for the same reason.
+                    if failure.is_none() {
+                        error!(%err, file = %file.display(), "chunk failed verification");
+                    }
                     failure.get_or_insert_with(|| {
                         format!(
                             "{err} (chunk {}; delete it and download again if the data is wrong)",

@@ -158,6 +158,21 @@ stops with the error (`PipelineError::RangeBlock` for a block this build cannot 
 `PipelineError::Storage` for a store that refuses the batch), because the archive is one
 contiguous range and a sync that cannot continue must not look like it is running.
 
+**Commitment** (`commit.rs`, when the L1 side is connected: `Pipeline::with_l1_games`). The
+L1 side publishes the dispute games it has verified on L1 (`L1Games`: the newest one seen and
+the newest one in a finalized L1 block). A game is a claim about an L2 block's output root;
+verified on L1 does not mean it is about our chain. The task reads our own block at the game's
+height (the unsafe store's canonical block at that number, else the archive's header),
+computes its output root (`VerifiedGame::check`: state root, the message passer's storage root
+the header carries from Isthmus on, block hash; the timestamp too for super games) and
+compares. Equal: that block, number and hash, becomes the safe head, and the finalized head
+when the game's L1 block is finalized; a head only moves up. Different: an error log with the
+game and both values, counted (`op_indexer_pipeline_l1_games_total{outcome="mismatch"}`), and
+the head does not advance. A block before Isthmus cannot be checked from its header: warning,
+counted, no advance. A game about a block we do not hold yet is checked again every 12 s.
+The heads go to promotion through the binary, which holds them back while a range sync is
+still bringing the archive up to the chain.
+
 Ingest also publishes the unsafe head on a `watch` (`Pipeline::with_head`), which the binary
 gives to the execution network as the newest block the node knows.
 

@@ -165,6 +165,17 @@ pub trait UnsafeStore {
         hash: BlockHash,
     ) -> impl Future<Output = Result<Option<DecodedBlock>, StorageError>> + Send;
 
+    /// Returns the canonical block at height `number`, or `None` if no canonical block is
+    /// stored there: it is below what the store still holds, above the head, or in a gap.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the store cannot be reached or stored data cannot be decoded.
+    fn canonical(
+        &self,
+        number: BlockNumber,
+    ) -> impl Future<Output = Result<Option<DecodedBlock>, StorageError>> + Send;
+
     /// Records the L1 safe and finalized heads.
     ///
     /// # Errors

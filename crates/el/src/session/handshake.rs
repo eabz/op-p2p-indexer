@@ -184,10 +184,10 @@ async fn handshake(
     let latest = advertised.map(|range| range.latest);
     let status = UnifiedStatus {
         version: EthVersion::Eth69,
-        chain: ctx.chain().chain_id.into(),
-        genesis: ctx.chain().genesis_hash,
+        chain: ctx.spec().network_id.into(),
+        genesis: ctx.spec().genesis_hash,
         forkid: fork_filter.current(),
-        blockhash: latest.map_or(ctx.chain().genesis_hash, |latest| latest.hash),
+        blockhash: latest.map_or(ctx.spec().genesis_hash, |latest| latest.hash),
         total_difficulty: Some(U256::ZERO),
         earliest_block: Some(advertised.map_or(0, |range| range.earliest)),
         latest_block: Some(latest.map_or(0, |latest| latest.number)),

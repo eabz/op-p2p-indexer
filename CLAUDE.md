@@ -22,9 +22,11 @@ before proposing a design, and record new decisions there.
 | `crates/storage` | `op-indexer-storage` | Unsafe store (Redis, fork choice) / committed store (ClickHouse, migrations) / local block archive (fjall), their traits and metrics | primitives |
 | `crates/pipeline` | `op-indexer-pipeline` | Unsafe blocks → unsafe store; promote safe/finalized → committed store and archive; the retry policy | primitives, storage |
 | `crates/el` | `op-indexer-el` | Execution p2p (devp2p): discovery, sessions, receipts of new blocks, serving the archive to peers, range sync | primitives, chainspec |
+| `crates/l1` | `op-indexer-l1` | L1 commitment without an RPC: from L1 block hashes a beacon light client vouches for, finds and verifies the dispute games created for the chain, giving the L2 blocks claimed on L1 | el, chainspec, primitives |
 
 - Keep these edges: `p2p` and `storage` never depend on each other, and `pipeline` doesn't depend
-  on `p2p`. `el` depends on none of `p2p`, `storage` and `pipeline`. Nothing about an external API
+  on `p2p`. `el` depends on none of `p2p`, `storage` and `pipeline`, and `l1` on none of `storage`,
+  `pipeline` and the importer. Nothing about an external API
   (HyperSync or any other) may appear outside `bin/op-indexer-import`. `p2p` depends on `chainspec` (it is chain-specific); the binary parses overrides (e.g.
   bootnodes) at the edge. The binary wires them together with channels.
 - Safe/finalized status will come from an L1 p2p crate, not from reth or an RPC (see `docs/roadmap.md`).

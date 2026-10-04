@@ -333,7 +333,11 @@ where
         })
         .await?;
         self.archive_range(&blocks, cancel).await?;
-        metrics::blocks_promoted(blocks.len());
+        let without_receipts = blocks
+            .iter()
+            .filter(|block| block.receipts.is_none())
+            .count();
+        metrics::blocks_promoted(blocks.len(), without_receipts);
         info!(
             from = stop_at.saturating_add(1),
             to = safe.number,

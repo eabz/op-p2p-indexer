@@ -53,16 +53,20 @@ type Stream = P2PStream<ECIESStream<TcpStream>>;
 /// The blocks a peer says it serves. It covers headers and bodies; receipts may reach less far
 /// back, which a peer does not announce.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct BlockRange {
-    pub(crate) earliest: u64,
-    pub(crate) latest: u64,
+pub struct BlockRange {
+    /// The first block.
+    pub earliest: u64,
+    /// The last block.
+    pub latest: u64,
 }
 
 /// Why a request got no usable answer.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum RequestError {
+pub enum RequestError {
+    /// The peer did not answer in time.
     #[error("request timed out")]
     Timeout,
+    /// The session ended before the answer.
     #[error("session closed")]
     SessionClosed,
     /// The answer could not be decoded.
@@ -70,7 +74,12 @@ pub(crate) enum RequestError {
     Malformed(String),
     /// The answer holds more items than were asked for: a peer fault.
     #[error("{got} items answered, {asked} asked for")]
-    Excess { asked: usize, got: usize },
+    Excess {
+        /// Items asked for.
+        asked: usize,
+        /// Items in the answer.
+        got: usize,
+    },
 }
 
 /// How a session ended.
@@ -143,9 +152,9 @@ pub(super) fn new(
     (handle, driver)
 }
 
-/// A live session, cheap to clone. Requests go through it; the [`SessionDriver`] does the I/O.
+/// A live session, cheap to clone. Requests go through it; the `SessionDriver` does the I/O.
 #[derive(Debug, Clone)]
-pub(crate) struct SessionHandle {
+pub struct SessionHandle {
     status: Arc<PeerStatus>,
     commands: mpsc::Sender<Command>,
     range: watch::Receiver<BlockRange>,
@@ -157,22 +166,28 @@ impl SessionHandle {
         &self.status
     }
 
+    /// The peer's id: its public key.
+    #[must_use]
+    pub fn peer_id(&self) -> PeerId {
+        self.status.peer_id
+    }
+
     /// The blocks the peer currently says it serves: its status, then its range updates.
-    pub(crate) fn range(&self) -> BlockRange {
+    #[must_use]
+    pub fn range(&self) -> BlockRange {
         *self.range.borrow()
     }
 
     /// Requests the receipts of `blocks`, in request order. Each item is one block's receipts
-    /// as the peer sent them, not decoded (see [`wire::decode_receipts`], which is CPU work
-    /// for a blocking thread). A peer may answer for fewer blocks than asked: the answer is
+    /// as the peer sent them, not decoded (decoding them is CPU work for a blocking thread). A peer may answer for fewer blocks than asked: the answer is
     /// then a prefix; an empty answer means the peer does not hold them. Nothing is verified.
     ///
     /// # Errors
     ///
-    /// Returns [`RequestError::Timeout`] after [`REQUEST_TIMEOUT`], [`RequestError::SessionClosed`]
+    /// Returns [`RequestError::Timeout`] after the request timeout (20 s), [`RequestError::SessionClosed`]
     /// if the session ended, [`RequestError::Malformed`] if the answer cannot be cut into
     /// items, and [`RequestError::Excess`] if it has more items than were asked for.
-    pub(crate) async fn receipts(&self, blocks: Vec<B256>) -> Result<Vec<Bytes>, RequestError> {
+    pub async fn receipts(&self, blocks: Vec<B256>) -> Result<Vec<Bytes>, RequestError> {
         let asked = blocks.len();
         let body = self.request(Request::Receipts(blocks)).await?;
         items(&body, asked)
@@ -185,11 +200,7 @@ impl SessionHandle {
     /// # Errors
     ///
     /// As [`Self::receipts`].
-    pub(crate) async fn headers(
-        &self,
-        start: B256,
-        limit: u64,
-    ) -> Result<Vec<Bytes>, RequestError> {
+    pub async fn headers(&self, start: B256, limit: u64) -> Result<Vec<Bytes>, RequestError> {
         let body = self.request(Request::Headers { start, limit }).await?;
         items(&body, usize::try_from(limit).unwrap_or(usize::MAX))
     }
@@ -201,7 +212,7 @@ impl SessionHandle {
     /// # Errors
     ///
     /// As [`Self::receipts`].
-    pub(crate) async fn bodies(&self, blocks: Vec<B256>) -> Result<Vec<Bytes>, RequestError> {
+    pub async fn bodies(&self, blocks: Vec<B256>) -> Result<Vec<Bytes>, RequestError> {
         let asked = blocks.len();
         let body = self.request(Request::Bodies(blocks)).await?;
         items(&body, asked)

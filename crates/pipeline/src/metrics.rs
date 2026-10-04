@@ -17,12 +17,14 @@
 //! | `op_indexer_pipeline_ingest_lag_seconds` | histogram | | Time from a block's timestamp to its insert. |
 //! | `op_indexer_pipeline_channel_depth` | gauge | | Blocks waiting in the channel from the network. |
 //! | `op_indexer_pipeline_blocks_promoted_total` | counter | | Blocks written to the committed store by promotion. |
+//! | `op_indexer_pipeline_blocks_promoted_without_receipts_total` | counter | | Of those, the blocks promoted before their receipts arrived. Receipts that come later reach the archive, not the committed store. |
 //! | `op_indexer_pipeline_promotion_holes_total` | counter | `reason` | Promotions that could not read their whole range from the unsafe store: `missing_ancestor`, `too_long` (the blocks may exist) or `parent_mismatch` (nothing left out, but the range is another chain than the committed safe head). |
 //! | `op_indexer_pipeline_promotion_blocks_missing_total` | counter | `reason` | Blocks those promotions left out of the committed store, for backfill. |
 //! | `op_indexer_pipeline_archive_skipped_blocks_total` | counter | | Promoted blocks not archived because they did not extend the archive's tip. |
 //! | `op_indexer_pipeline_safe_block_number` | gauge | | Number of the committed safe head. |
 //! | `op_indexer_pipeline_range_blocks_stored_total` | counter | | Blocks of a range sync written to the committed store and the archive. |
 //! | `op_indexer_pipeline_range_block_number` | gauge | | Last block of the range sync that is stored. |
+//! | `op_indexer_pipeline_l1_games_total` | counter | `outcome` | Dispute games verified on L1 and compared with our block at their height: `matched` (the block became a head), `mismatch` (the head did not advance) or `unchecked` (a block before Isthmus). |
 
 use metrics::{
     Unit, counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram,
@@ -34,12 +36,15 @@ const BLOCKS_FILLED: &str = "op_indexer_pipeline_blocks_filled_total";
 const INGEST_LAG: &str = "op_indexer_pipeline_ingest_lag_seconds";
 const CHANNEL_DEPTH: &str = "op_indexer_pipeline_channel_depth";
 const BLOCKS_PROMOTED: &str = "op_indexer_pipeline_blocks_promoted_total";
+const BLOCKS_PROMOTED_WITHOUT_RECEIPTS: &str =
+    "op_indexer_pipeline_blocks_promoted_without_receipts_total";
 const PROMOTION_HOLES: &str = "op_indexer_pipeline_promotion_holes_total";
 const PROMOTION_BLOCKS_MISSING: &str = "op_indexer_pipeline_promotion_blocks_missing_total";
 const ARCHIVE_SKIPPED_BLOCKS: &str = "op_indexer_pipeline_archive_skipped_blocks_total";
 const SAFE_BLOCK_NUMBER: &str = "op_indexer_pipeline_safe_block_number";
 const RANGE_BLOCKS_STORED: &str = "op_indexer_pipeline_range_blocks_stored_total";
 const RANGE_BLOCK_NUMBER: &str = "op_indexer_pipeline_range_block_number";
+const L1_GAMES: &str = "op_indexer_pipeline_l1_games_total";
 const RECEIPT_REQUESTS: &str = "op_indexer_pipeline_receipt_requests_total";
 const RECEIPTS_ATTACHED: &str = "op_indexer_pipeline_receipts_attached_total";
 const RECEIPTS_UNMATCHED: &str = "op_indexer_pipeline_receipts_unmatched_total";
@@ -86,6 +91,27 @@ impl HoleReason {
     }
 }
 
+/// What came of comparing a dispute game with our block, the `outcome` label.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum GameOutcome {
+    /// The claim equals our block's output root.
+    Matched,
+    /// The claim differs from our block.
+    Mismatch,
+    /// Our header does not carry what the claim commits to (a block before Isthmus).
+    Unchecked,
+}
+
+impl GameOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Matched => "matched",
+            Self::Mismatch => "mismatch",
+            Self::Unchecked => "unchecked",
+        }
+    }
+}
+
 /// What happened to a request for a block's receipts.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum RequestOutcome {
@@ -127,6 +153,11 @@ impl UnmatchedReason {
 /// A no-op without a recorder, so the binary calls this after installing one.
 pub fn describe() {
     describe_counter!(
+        L1_GAMES,
+        Unit::Count,
+        "Dispute games verified on L1 and compared with our block, by outcome"
+    );
+    describe_counter!(
         RECEIPT_REQUESTS,
         Unit::Count,
         "Requests for a block's receipts, by outcome"
@@ -156,6 +187,11 @@ pub fn describe() {
         INGEST_LAG,
         Unit::Seconds,
         "Time from a block's timestamp to its insert"
+    );
+    describe_counter!(
+        BLOCKS_PROMOTED_WITHOUT_RECEIPTS,
+        Unit::Count,
+        "Blocks promoted before their receipts arrived"
     );
     describe_gauge!(
         CHANNEL_DEPTH,
@@ -219,9 +255,11 @@ pub(crate) fn channel_depth(blocks: usize) {
     gauge!(CHANNEL_DEPTH).set(small(count(blocks)));
 }
 
-/// Records blocks written to the committed store by one promotion.
-pub(crate) fn blocks_promoted(blocks: usize) {
+/// Records blocks written to the committed store by one promotion, and how many of them had
+/// no receipts yet.
+pub(crate) fn blocks_promoted(blocks: usize, without_receipts: usize) {
     counter!(BLOCKS_PROMOTED).increment(count(blocks));
+    counter!(BLOCKS_PROMOTED_WITHOUT_RECEIPTS).increment(count(without_receipts));
 }
 
 /// Records a promotion that could not read its whole range and left `blocks_missing` blocks
@@ -264,6 +302,11 @@ fn gauge_value(value: u64) -> f64 {
 pub(crate) fn range_stored(blocks: usize, last: u64) {
     counter!(RANGE_BLOCKS_STORED).increment(count(blocks));
     gauge!(RANGE_BLOCK_NUMBER).set(gauge_value(last));
+}
+
+/// Records a dispute game compared with our block.
+pub(crate) fn game(outcome: GameOutcome) {
+    counter!(L1_GAMES, "outcome" => outcome.as_str()).increment(1);
 }
 
 /// Records a request for a block's receipts.

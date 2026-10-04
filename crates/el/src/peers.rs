@@ -20,7 +20,7 @@
 //! | its data failed verification | not for [`BAN_DURATION`] |
 //!
 //! It is never a tight loop: no peer is dialed more often than once per [`FULL_PEER_RETRY`],
-//! at most [`MAX_DIALS_IN_FLIGHT`] dials run at once, and at most 30 start in any minute. The
+//! at most [`MAX_DIALS_IN_FLIGHT`] dials run at once, and at most 60 start in any minute. The
 //! waits, the bans and the choice of whom to dial next are in `schedule`.
 //!
 //! Nothing is dialed or accepted until the node knows a block to advertise as its tip (the
@@ -74,14 +74,14 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 /// The open sessions, as a requester (the tip fetcher, range sync) sees them, and its way to
 /// report a peer. A clone has its own view of what changed.
 #[derive(Debug, Clone)]
-pub(crate) struct Peers {
+pub struct Peers {
     sessions: watch::Receiver<Arc<[SessionHandle]>>,
     reports: mpsc::Sender<Report>,
 }
 
-/// What the fetcher tells the peer set about a peer.
+/// What a requester tells the peer set about a peer.
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum Report {
+pub enum Report {
     /// The peer's answer failed verification: drop it and ban it.
     BadData(PeerId),
     /// The peer's answer could not be decoded: drop it for a long while, without a ban. It may
@@ -135,8 +135,25 @@ enum Done {
 }
 
 impl Peers {
+    /// The handle, with the ends the peer set keeps: the reports it receives and where it
+    /// publishes the open sessions.
+    pub(crate) fn new() -> (
+        Self,
+        mpsc::Receiver<Report>,
+        watch::Sender<Arc<[SessionHandle]>>,
+    ) {
+        let (published, sessions) = watch::channel(Arc::from(Vec::new()));
+        let (reports_tx, reports) = mpsc::channel(REPORTS_CAPACITY);
+        let peers = Self {
+            sessions,
+            reports: reports_tx,
+        };
+        (peers, reports, published)
+    }
+
     /// The sessions open now.
-    pub(crate) fn sessions(&self) -> Arc<[SessionHandle]> {
+    #[must_use]
+    pub fn sessions(&self) -> Arc<[SessionHandle]> {
         Arc::clone(&self.sessions.borrow())
     }
 
@@ -145,13 +162,13 @@ impl Peers {
     /// # Cancel safety
     ///
     /// Cancel-safe: a change not yet seen is reported by the next call.
-    pub(crate) async fn changed(&mut self) -> bool {
+    pub async fn changed(&mut self) -> bool {
         self.sessions.changed().await.is_ok()
     }
 
     /// Reports a peer to the peer set. Never waits: if the peer set is busy or gone the report
     /// is dropped, and the peer is reported again when it fails again.
-    pub(crate) fn report(&self, report: Report) {
+    pub fn report(&self, report: Report) {
         if let Err(err) = self.reports.try_send(report) {
             debug!(%err, "peer report dropped");
         }
@@ -159,35 +176,31 @@ impl Peers {
 }
 
 impl PeerSet {
-    /// Creates the peer set and the handle the fetcher uses. Dials nothing until
-    /// [`Self::run`].
+    /// Creates the peer set, with the ends of the requesters' handle ([`Peers::new`]). Dials
+    /// nothing until [`Self::run`].
     pub(crate) fn new(
         ctx: Arc<SessionContext>,
         candidates: mpsc::Receiver<Candidate>,
         accepted: mpsc::Receiver<Accepted>,
         saved: &[ExecutionPeer],
         served: mpsc::Sender<ExecutionPeer>,
-    ) -> (Self, Peers) {
-        let (published, sessions) = watch::channel(Arc::from(Vec::new()));
-        let (reports_tx, reports) = mpsc::channel(REPORTS_CAPACITY);
-        let peer_set = Self {
+        reports: mpsc::Receiver<Report>,
+        published: watch::Sender<Arc<[SessionHandle]>>,
+    ) -> Self {
+        let schedule = Schedule::new(ctx.spec().label, saved);
+        Self {
             ctx,
             candidates,
             accepted,
             reports,
             served,
             published,
-            schedule: Schedule::new(saved),
+            schedule,
             sessions: HashMap::new(),
             dialing: HashSet::new(),
             tasks: JoinSet::new(),
             next_generation: 0,
-        };
-        let peers = Peers {
-            sessions,
-            reports: reports_tx,
-        };
-        (peer_set, peers)
+        }
     }
 
     /// Runs until `cancel` fires: learns candidates, dials when below the target, keeps or
@@ -295,7 +308,7 @@ impl PeerSet {
                 self.dialing.remove(&peer);
                 match *result {
                     Ok((handle, driver)) => {
-                        metrics::dial(DialOutcome::Connected);
+                        metrics::dial(self.ctx.spec().label, DialOutcome::Connected);
                         if self.sessions.contains_key(&peer) {
                             // The peer dialed us while we dialed it.
                             self.refuse(driver, DisconnectReason::AlreadyConnected);
@@ -321,7 +334,7 @@ impl PeerSet {
             || self.sessions.contains_key(&peer)
             || self.schedule.is_banned(&peer)
         {
-            metrics::inbound_refused();
+            metrics::inbound_refused(self.ctx.spec().label);
             self.refuse(driver, DisconnectReason::TooManyPeers);
             return;
         }
@@ -353,7 +366,7 @@ impl PeerSet {
                 generation,
             })
         });
-        metrics::session_opened(direction);
+        metrics::session_opened(self.ctx.spec().label, direction);
         self.publish();
     }
 
@@ -391,7 +404,7 @@ impl PeerSet {
             // It asked for data and did not read it.
             EndReason::Stalled => (EndLabel::Stalled, LONG_BACKOFF, None),
         };
-        metrics::session_ended(label, end.lasted);
+        metrics::session_ended(self.ctx.spec().label, label, end.lasted);
         info!(
             %peer,
             reason = ?end.reason,
@@ -430,7 +443,7 @@ impl PeerSet {
             return;
         };
         live.handle.disconnect(tell);
-        metrics::peer_dropped(reason);
+        metrics::peer_dropped(self.ctx.spec().label, reason);
         warn!(%peer, ?reason, client = %live.handle.status().client, "dropped execution peer");
         self.publish();
     }

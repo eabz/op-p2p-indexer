@@ -45,7 +45,7 @@ use std::time::Duration;
 use alloy_primitives::{B256, BlockNumber};
 use op_indexer_primitives::{BlockRef, EncodedBlock, SyncRange};
 use reth_network_peers::PeerId;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::task::{JoinError, JoinSet};
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until};
 use tokio_util::sync::CancellationToken;
@@ -83,9 +83,10 @@ pub struct SyncPlan {
 /// A range sync to run: where its plan comes from and where its output goes.
 #[derive(Debug)]
 pub struct RangeSync {
-    /// Receives what to fetch, once: the anchor may be a block the node has yet to learn.
-    /// Nothing is fetched before it arrives, or at all if the sender is dropped.
-    pub plan: oneshot::Receiver<SyncPlan>,
+    /// Receives what to fetch: the anchor may be a block the node has yet to learn. Plans are
+    /// run one after the other, each to its end; nothing is fetched before the first arrives,
+    /// and the sync is over when the sender is dropped.
+    pub plans: mpsc::Receiver<SyncPlan>,
     /// Receives the verified blocks in ascending order, in batches of consecutive blocks. The
     /// sync waits when it is full and stops when it closes.
     pub blocks: mpsc::Sender<Vec<EncodedBlock>>,
@@ -95,9 +96,9 @@ pub struct RangeSync {
     pub verified: mpsc::Sender<Vec<BlockRef>>,
 }
 
-/// Runs the range sync `sync` until `cancel` fires: waits for its plan, then fetches. When the
-/// range is complete, no plan comes, or nothing takes its output any more, it stops fetching
-/// and waits for `cancel`, so the rest of the network carries on.
+/// Runs the range sync `sync` until `cancel` fires: fetches each plan it is given, one after
+/// the other. When no more plans come, or nothing takes its output any more, it stops
+/// fetching and waits for `cancel`, so the rest of the network carries on.
 ///
 /// # Errors
 ///
@@ -111,23 +112,31 @@ pub(crate) async fn run(
     cancel: CancellationToken,
 ) -> Result<(), ElError> {
     let RangeSync {
-        plan,
+        mut plans,
         blocks,
         verified,
     } = sync;
-    let plan = tokio::select! {
-        biased;
-        () = cancel.cancelled() => return Ok(()),
-        plan = plan => plan,
-    };
-    let Ok(plan) = plan else {
-        // Nothing to sync.
-        cancel.cancelled().await;
-        return Ok(());
-    };
-    Syncer::new(canyon_time, peers, plan, blocks, verified)
-        .run(cancel)
-        .await
+    loop {
+        let plan = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Ok(()),
+            plan = plans.recv() => plan,
+        };
+        // No more plans: nothing left to sync.
+        let Some(plan) = plan else { break };
+        let syncer = Syncer::new(
+            canyon_time,
+            peers.clone(),
+            plan,
+            blocks.clone(),
+            verified.clone(),
+        );
+        if !syncer.run(&cancel).await? {
+            break;
+        }
+    }
+    cancel.cancelled().await;
+    Ok(())
 }
 
 /// The range syncer.
@@ -291,15 +300,16 @@ impl Syncer {
         syncer
     }
 
-    async fn run(mut self, cancel: CancellationToken) -> Result<(), ElError> {
+    /// Fetches the plan's range. Returns `true` once it is complete, and `false` if it
+    /// stopped before: the node is shutting down or nothing takes its output.
+    async fn run(mut self, cancel: &CancellationToken) -> Result<bool, ElError> {
         if self.is_complete() {
             info!(
                 first = self.first,
                 anchor = self.anchor.number,
                 "range sync has nothing to fetch"
             );
-            cancel.cancelled().await;
-            return Ok(());
+            return Ok(true);
         }
         info!(
             first = self.first,
@@ -310,23 +320,23 @@ impl Syncer {
         );
         let mut progress = interval(PROGRESS_INTERVAL);
         progress.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        loop {
+        let complete = loop {
             // A resting peer becomes free without anything else happening.
             let wake = self.schedule.next_wake(Instant::now());
             tokio::select! {
                 biased;
-                () = cancel.cancelled() => return Ok(()),
+                () = cancel.cancelled() => return Ok(false),
                 Some(joined) = self.jobs.join_next() => {
                     let done = joined.map_err(|source| {
                         ElError::Task { task: "range sync", source }
                     })?;
-                    if !self.finished(done, &cancel).await? {
-                        break;
+                    if !self.finished(done, cancel).await? {
+                        break false;
                     }
                 }
                 alive = self.peers.changed() => {
                     if !alive {
-                        return closed("sessions", &cancel);
+                        return closed("sessions", cancel).map(|()| false);
                     }
                     self.schedule.retain(&self.peers.sessions());
                 }
@@ -339,15 +349,18 @@ impl Syncer {
                 _ = progress.tick() => self.log_progress(),
             }
             if self.is_complete() {
-                info!(anchor = self.anchor.number, "range sync complete");
-                break;
+                info!(
+                    first = self.first,
+                    anchor = self.anchor.number,
+                    "range sync complete"
+                );
+                break true;
             }
             self.dispatch();
-        }
+        };
         // In-flight jobs have nowhere to deliver.
         self.jobs.shutdown().await;
-        cancel.cancelled().await;
-        Ok(())
+        Ok(complete)
     }
 
     const fn is_complete(&self) -> bool {

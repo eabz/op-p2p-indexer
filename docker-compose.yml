@@ -46,12 +46,19 @@ services:
       # true: fetch every block between the archive's last block and the chain's head from
       # execution peers, once. Needs OP_INDEXER_ARCHIVE_RETENTION_BLOCKS=all.
       OP_INDEXER_EL_SYNC: ${OP_INDEXER_EL_SYNC:-}
+      # true: follow Ethereum L1 for what it commits to, and promote on it. Needs the
+      # checkpoint: the root of a recent finalized beacon block, from a source you trust.
+      OP_INDEXER_L1_ENABLED: ${OP_INDEXER_L1_ENABLED:-}
+      OP_INDEXER_L1_CHECKPOINT: ${OP_INDEXER_L1_CHECKPOINT:-}
+      OP_INDEXER_L1_LISTEN_ADDR: ${OP_INDEXER_L1_LISTEN_ADDR:-}
     ports:
       - "9222:9222/tcp"
       - "9222:9222/udp"
       # Execution p2p; unused while it is disabled.
       - "30303:30303/tcp"
       - "30303:30303/udp"
+      - "30304:30304/tcp"
+      - "30304:30304/udp"
     volumes:
       # The data directory (the image sets OP_INDEXER_DATA_DIR=/data): `node/` holds the node
       # identity and known peers, `archive/` the local block archive.

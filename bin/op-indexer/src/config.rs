@@ -4,6 +4,7 @@ use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
+use alloy_primitives::B256;
 use eyre::{WrapErr, ensure, eyre};
 use op_indexer_chainspec::{ChainSpec, OP_MAINNET};
 use op_indexer_el::ElConfig;
@@ -27,6 +28,10 @@ const DEFAULT_ARCHIVE_RETENTION_BLOCKS: u64 = 30 * 24 * 60 * 60 / 2;
 const ARCHIVE_DIR: &str = "archive";
 const ARCHIVE_RETENTION_VAR: &str = "OP_INDEXER_ARCHIVE_RETENTION_BLOCKS";
 const SYNC_VAR: &str = "OP_INDEXER_EL_SYNC";
+const L1_CHECKPOINT_VAR: &str = "OP_INDEXER_L1_CHECKPOINT";
+/// The port next to the execution network's.
+const DEFAULT_L1_LISTEN_ADDR: SocketAddr =
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 30304);
 /// Value of [`ARCHIVE_RETENTION_VAR`] that keeps every block.
 const ARCHIVE_RETENTION_ALL: &str = "all";
 
@@ -53,6 +58,15 @@ impl ElSettings {
     }
 }
 
+/// What the environment says about the L1 side.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct L1Settings {
+    /// Listen address of the L1 execution p2p node, UDP and TCP.
+    pub(crate) listen_addr: SocketAddr,
+    /// The finalized beacon block root the light client starts from.
+    pub(crate) checkpoint: B256,
+}
+
 /// Process configuration.
 #[derive(Debug)]
 pub(crate) struct Config {
@@ -62,6 +76,8 @@ pub(crate) struct Config {
     /// Whether to fetch the blocks between the archive's last block and the chain's head
     /// from execution peers.
     pub(crate) sync: bool,
+    /// The L1 side, which learns what L1 commits to; `None` when it is disabled.
+    pub(crate) l1: Option<L1Settings>,
     /// Unsafe store (Redis), committed store (ClickHouse) and local block archive (fjall).
     pub(crate) storage: StorageConfig,
     /// Directory for local state: the node store (`node/`) and the block archive (`archive/`).
@@ -99,11 +115,23 @@ impl Config {
     /// - `OP_INDEXER_EL_SYNC`: `true` to fetch from execution peers every block between the
     ///   archive's last block and the chain's head, once, into the committed store and the
     ///   archive (default `false`). It starts after the archive's last block (at block 0 on
-    ///   an empty archive) and ends at the first block the node receives over gossip after
-    ///   it starts, whose sequencer-signed hash every fetched block is verified against. A
-    ///   restart continues after the archive's last block, to the same end. Needs the
+    ///   an empty archive) and goes to the unsafe head gossip delivers, whose
+    ///   sequencer-signed hash every fetched block is verified against; if the head has moved
+    ///   far ahead by then, it goes again, until the archive has caught up. Blocks are only
+    ///   promoted on L1's word after that, so promotion continues the archive where the sync
+    ///   left it. A restart continues after the archive's last block. Needs the
     ///   execution network and an archive that keeps every block
     ///   (`OP_INDEXER_ARCHIVE_RETENTION_BLOCKS=all`).
+    /// - `OP_INDEXER_L1_ENABLED`: `true` to follow Ethereum L1 for what it commits to
+    ///   (default `false`: no safe or finalized head, nothing is promoted). The node then
+    ///   joins L1's execution p2p network to read the dispute games of the chain, checks
+    ///   each claim against its own block, and promotes on a match. Needs
+    ///   `OP_INDEXER_L1_CHECKPOINT`.
+    /// - `OP_INDEXER_L1_CHECKPOINT`: root of a recent finalized beacon block, from a source
+    ///   you trust: the one value the L1 side takes on trust, everything after it is
+    ///   verified.
+    /// - `OP_INDEXER_L1_LISTEN_ADDR`: L1 execution p2p listen socket, TCP and UDP (default
+    ///   `0.0.0.0:30304`; it must differ from `OP_INDEXER_EL_LISTEN_ADDR`).
     pub(crate) fn from_env() -> eyre::Result<Self> {
         let chain_id = parse_var("OP_INDEXER_CHAIN_ID")?.unwrap_or(DEFAULT_CHAIN_ID);
         let chain = ChainSpec::by_chain_id(chain_id)
@@ -140,6 +168,7 @@ impl Config {
         );
 
         Ok(Self {
+            l1: l1_settings()?,
             el,
             sync,
             network: NetworkConfig {
@@ -189,6 +218,22 @@ fn el_settings(chain: &'static ChainSpec) -> eyre::Result<Option<ElSettings>> {
             })
             .unwrap_or_default(),
         advertised_addr: parse_var("OP_INDEXER_EL_ADVERTISED_ADDR")?,
+    }))
+}
+
+/// Reads the L1 side's settings; `None` unless it is enabled.
+fn l1_settings() -> eyre::Result<Option<L1Settings>> {
+    if !parse_var("OP_INDEXER_L1_ENABLED")?.unwrap_or(false) {
+        return Ok(None);
+    }
+    let checkpoint = parse_var(L1_CHECKPOINT_VAR)?.ok_or_else(|| {
+        eyre!(
+            "OP_INDEXER_L1_ENABLED needs {L1_CHECKPOINT_VAR}: a recent finalized beacon block root"
+        )
+    })?;
+    Ok(Some(L1Settings {
+        listen_addr: parse_var("OP_INDEXER_L1_LISTEN_ADDR")?.unwrap_or(DEFAULT_L1_LISTEN_ADDR),
+        checkpoint,
     }))
 }
 

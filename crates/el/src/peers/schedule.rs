@@ -21,10 +21,11 @@ use crate::session::SessionError;
 /// Base wait before dialing a peer again after a TCP failure, a timeout, a failed hello or
 /// status, or a session that ended for an ordinary reason. Full peers are retried sooner.
 pub(super) const REDIAL_INTERVAL: Duration = Duration::from_mins(5);
-/// Most dials started in any minute. With every known peer waiting at least
-/// [`FULL_PEER_RETRY`], about 25 peers stay under it; it bounds what a flood of node records
-/// can make us dial.
-const MAX_DIALS_PER_MINUTE: usize = 30;
+/// Most dials started in any minute: one a second. It bounds what a flood of node records can
+/// make us dial. On a network with few peers every one of them waits at least
+/// [`FULL_PEER_RETRY`], so it is never reached; on one with hundreds of candidates, most of
+/// them full, it is what decides how fast a free slot is found.
+const MAX_DIALS_PER_MINUTE: usize = 60;
 /// The window [`MAX_DIALS_PER_MINUTE`] is counted over.
 const DIAL_WINDOW: Duration = Duration::from_secs(60);
 /// Shortest wait before the same peer is dialed again, and the wait after "too many peers" or
@@ -47,6 +48,8 @@ const MAX_BACKOFF_DOUBLINGS: u32 = 3;
 /// Whom to dial and when.
 #[derive(Debug)]
 pub(super) struct Schedule {
+    /// The network, as the metrics label.
+    network: &'static str,
     /// Peers discovery told us about, by id. At most [`MAX_KNOWN_PEERS`].
     known: HashMap<PeerId, Known>,
     /// Peers not to dial or accept, with when the ban ends. At most [`MAX_BANNED_PEERS`].
@@ -63,6 +66,8 @@ struct Known {
     next_dial: Instant,
     /// Failed dials since the last session.
     failures: u32,
+    /// Dials since the last session, whatever their end.
+    attempts: u32,
     /// Whether a session with it has ever been open: a peer that exists and speaks our
     /// protocol, which fresh ids from discovery must not crowd out.
     proven: bool,
@@ -73,7 +78,7 @@ struct Known {
 impl Schedule {
     /// A schedule that knows the peers `saved` from an earlier run, due at once: they are
     /// dialed as soon as a tip is known, before discovery has found anyone.
-    pub(super) fn new(saved: &[ExecutionPeer]) -> Self {
+    pub(super) fn new(network: &'static str, saved: &[ExecutionPeer]) -> Self {
         let now = Instant::now();
         let known = saved
             .iter()
@@ -87,6 +92,7 @@ impl Schedule {
                     candidate,
                     next_dial: now,
                     failures: 0,
+                    attempts: 0,
                     // Saved because it served us in an earlier run.
                     proven: true,
                     last_seen: now,
@@ -95,6 +101,7 @@ impl Schedule {
             })
             .collect();
         Self {
+            network,
             known,
             banned: HashMap::new(),
             recent_dials: VecDeque::new(),
@@ -131,6 +138,7 @@ impl Schedule {
                 candidate,
                 next_dial: now,
                 failures: 0,
+                attempts: 0,
                 proven: false,
                 last_seen: now,
             },
@@ -157,15 +165,21 @@ impl Schedule {
         if wanted == 0 {
             return Vec::new();
         }
-        let mut due: Vec<(bool, u32, Instant, PeerId)> = self
+        let mut due: Vec<(bool, u32, u32, Instant, PeerId)> = self
             .known
             .iter()
             .filter(|(id, known)| known.next_dial <= now && !in_use(id) && !self.is_banned(id))
-            .map(|(id, known)| (!known.proven, known.failures, known.next_dial, *id))
+            .map(|(id, known)| {
+                let key = (!known.proven, known.failures, known.attempts);
+                (key.0, key.1, key.2, known.next_dial, *id)
+            })
             .collect();
         // Half of the dials go to proven peers first, so that discovery handing out fresh ids
         // without end (each with no failure yet) cannot take every dial. Within each half:
-        // peers that failed least first, then those waiting longest.
+        // peers that failed least first, then those dialed least often, then those waiting
+        // longest. Most peers are full, so a slot is found by asking many different peers
+        // rather than the same few again: a peer not yet dialed goes before one that said
+        // "too many peers" a minute ago.
         due.sort_unstable();
         let reserved = wanted.div_ceil(2);
         let proven = due.iter().take_while(|(unproven, ..)| !unproven).count();
@@ -183,6 +197,7 @@ impl Schedule {
             };
             // Set before the dial ends, so no path can dial a peer twice within the floor.
             known.next_dial = now + jittered(FULL_PEER_RETRY);
+            known.attempts = known.attempts.saturating_add(1);
             self.recent_dials.push_back(now);
             candidates.push(known.candidate.clone());
         }
@@ -210,7 +225,7 @@ impl Schedule {
             }
             SessionError::NoSharedEth => (DialOutcome::Incompatible, LONG_BACKOFF, false),
         };
-        metrics::dial(outcome);
+        metrics::dial(self.network, outcome);
         debug!(%peer, %err, "dial failed");
         let Some(known) = self.known.get_mut(&peer) else {
             return;
@@ -229,6 +244,7 @@ impl Schedule {
     pub(super) fn connected(&mut self, peer: &PeerId) {
         if let Some(known) = self.known.get_mut(peer) {
             known.failures = 0;
+            known.attempts = 0;
             known.proven = true;
         }
     }
