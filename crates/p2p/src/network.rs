@@ -123,7 +123,8 @@ impl Network {
         let chain = config.chain;
         metrics::describe();
 
-        let (gossipsub, topics) = gossip::behaviour(chain.chain_id)?;
+        let (gossipsub, topics) =
+            gossip::behaviour(chain.chain_id, Duration::from_secs(chain.block_time_secs))?;
         let limits = connection_limits::Behaviour::new(
             ConnectionLimits::default()
                 .with_max_established(Some(config.max_peers))

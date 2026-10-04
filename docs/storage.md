@@ -118,9 +118,10 @@ All keys are prefixed `opidx:{chain_id}:` (shown as `…:`). Hashes are lowercas
 Values are JSON in Ethereum JSON-RPC field naming (alloy's `serde` output), so readers can use
 any Ethereum library to parse them. Block-scoped keys get `UNSAFE_TTL` (24 hours) as a backstop
 for when nothing prunes them. The sorted sets do not expire, so `insert` also enforces
-**retention**: heights more than `UNSAFE_RETENTION_BLOCKS` (43200, 24 hours of 2-second blocks)
-below the head are removed from `heights` and `canonical` together with their block keys, a
-bounded number per call, without an event. Readers must not expect blocks older than that.
+**retention**: the lowest heights whose set has expired are removed from `heights` and
+`canonical`, a bounded number per call, without an event. Their block keys expired no later,
+since every insert at a height renews its set. The horizon is `UNSAFE_TTL`, a time, so it is
+the same on every chain whatever its block time. Readers must not expect blocks older than that.
 
 | Key | Type | Content |
 |---|---|---|
@@ -221,8 +222,10 @@ Limits and consequences:
   branch's block, so a reader learns the new canonical hash at each height it changed.
 - **The head can outlive its block.** Prune or retention may remove the block the `head` key
   points at; the key stays, because fork choice only compares hashes against it.
-- **Retention is measured from the head**, so a block with a far-future number would start
-  trimming real blocks. The guard is upstream: only sequencer-signed blocks reach the store.
+- **Retention follows key expiry**, not the head: a height leaves the index once its set has
+  expired, `UNSAFE_TTL` after the last block stored at it. A day of blocks is 43,200 heights
+  on OP Mainnet and 86,400 on Unichain, so a Unichain store holds about twice the keys and
+  memory of an OP Mainnet one.
 - **Single Redis instance.** The scripts build block and height keys from a prefix, so they are
   not valid on Redis Cluster.
 
@@ -275,6 +278,10 @@ addresses `FixedString(20)`, wei amounts `UInt256`, gas prices `UInt128`, timest
 starts with `chain_id UInt64`. Block-data tables are `ReplacingMergeTree(version)`, `version` =
 insert time in microseconds as `UInt64`: inserting the same block twice is harmless and the newest row
 wins. Read with `FINAL`. Partition by `toYYYYMM` of the block timestamp.
+
+**One database per chain** is the model, but nothing depends on it: every query that reads or
+deletes filters by `chain_id`, so two chains sharing a database never see each other's rows.
+The database therefore records no chain, unlike the archive (section 9.1).
 
 No per-row status column: a block is finalized if `number <= finalized head`, else safe.
 
@@ -463,8 +470,7 @@ inserted per table, rollbacks.
 | Constant | Value | Where |
 |---|---|---|
 | `UNSAFE_TTL` | 24 h | block and height keys |
-| `UNSAFE_RETENTION_BLOCKS` | 43200 | retention horizon below the head |
-| `RETENTION_HEIGHTS_PER_INSERT` | 16 | heights trimmed per insert |
+| `RETENTION_HEIGHTS_PER_INSERT` | 16 | expired heights trimmed per insert |
 | `MAX_REORG_DEPTH` | 256 | jump and fill walks |
 | `MAX_ANCESTRY_BLOCKS` | 1024 | one `ancestry` call |
 | `PRUNE_HEIGHTS_PER_CALL` | 1024 | one prune script call |
@@ -531,7 +537,7 @@ so key order is block order. Values are RLP, snappy-compressed (`snap`).
 | `bodies` | number | RLP of the body (transactions in network encoding, ommers, withdrawals) |
 | `receipts` | number | RLP list of the receipts in network encoding, with bloom (one `Receipts` entry up to eth/68; a caller serving eth/69 re-encodes without the bloom); absent until set |
 | `numbers` | block hash (32 bytes) | number |
-| `meta` | name | `schema_version` |
+| `meta` | name | `schema_version`; `chain`, the chain the archive holds: its id (8 bytes, big-endian), then its genesis hash (32 bytes) |
 
 `bodies` and `receipts` use fjall's key-value separation, which keeps large values out of the
 index tree; its own blob compression is off, because the values are already compressed.
@@ -648,6 +654,19 @@ pub trait ArchiveStore {
   version) is refused with `StorageError::ArchiveSchema`, naming the directory and both
   versions. Nothing is deleted: an archive can hold an import of the whole chain, so removing
   it is the operator's decision.
+- On open, the chain: `open` takes the node's `ChainIdentity` (chain id and genesis hash). An
+  archive recording another chain is refused with `StorageError::ArchiveChain`, naming the
+  directory and both chains, and left as it is; one whose record does not decode is refused
+  with `StorageError::ArchiveChainUnreadable`. One with no record is given one first. If it
+  holds blocks, a build before the record wrote it, and every such build ran OP Mainnet only,
+  so it is recorded as OP Mainnet's (`ChainIdentity::BEFORE_RECORD`) and then compared as
+  usual: an imported OP Mainnet archive opened by a Unichain node is refused, not relabelled.
+  If it is empty, it is recorded as the node's chain. The importer's `load` opens the archive the same way, so it refuses
+  another chain's archive before appending anything. The p2p node store (`node/`, next to
+  `archive/`) records and checks its chain the same way (`StoreError::WrongChain`,
+  `StoreError::UnreadableChain`); for it, holding data means an identity, saved peers or sync
+  progress. The binary opens the archive before the node store, so a refused archive leaves
+  the node store without a record.
 - **What removes blocks.** `trim` (the oldest, down to a window) and `truncate_above` (the
   newest, above a number), nothing else. Their callers bound them: see `docs/pipeline.md`
   section 4.
@@ -659,7 +678,7 @@ after appending; with unlimited retention it never trims.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OP_INDEXER_ARCHIVE_RETENTION_BLOCKS` | `1296000` (30 days of 2-second blocks) | Blocks kept for serving. `all` keeps every block. `0` disables the archive: nothing is opened or written. |
+| `OP_INDEXER_ARCHIVE_RETENTION_BLOCKS` | 30 days of the chain's blocks (`1296000` on OP Mainnet, `2592000` on Unichain) | Blocks kept for serving. `all` keeps every block. `0` disables the archive: nothing is opened or written. |
 
 The archive lives at `{OP_INDEXER_DATA_DIR}/archive/`. The binary opens it at startup when
 enabled; promotion and range sync write to it, the importer's `load` too (with the indexer

@@ -9,7 +9,7 @@ use eyre::{WrapErr, ensure, eyre};
 use op_indexer_chainspec::{ChainSpec, OP_MAINNET};
 use op_indexer_el::ElConfig;
 use op_indexer_p2p::{Bootnode, NetworkConfig};
-use op_indexer_primitives::ExecutionPeer;
+use op_indexer_primitives::{ChainIdentity, ExecutionPeer};
 use op_indexer_storage::{
     ArchiveConfig, ArchiveRetention, ClickHouseConfig, RedisConfig, StorageConfig,
 };
@@ -22,8 +22,8 @@ const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:6379";
 const DEFAULT_CLICKHOUSE_URL: &str = "http://127.0.0.1:8123";
 const DEFAULT_CLICKHOUSE_DATABASE: &str = "op_indexer";
 const DEFAULT_CLICKHOUSE_USER: &str = "indexer";
-/// 30 days of 2-second blocks (1296000).
-const DEFAULT_ARCHIVE_RETENTION_BLOCKS: u64 = 30 * 24 * 60 * 60 / 2;
+/// The archive's default window: 30 days, in the configured chain's blocks.
+const DEFAULT_ARCHIVE_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
 /// Directory of the local block archive, inside the data directory.
 const ARCHIVE_DIR: &str = "archive";
 const ARCHIVE_RETENTION_VAR: &str = "OP_INDEXER_ARCHIVE_RETENTION_BLOCKS";
@@ -94,7 +94,8 @@ pub(crate) struct Config {
 impl Config {
     /// Reads the configuration:
     ///
-    /// - `OP_INDEXER_CHAIN_ID`: L2 chain id (default 10, OP Mainnet).
+    /// - `OP_INDEXER_CHAIN_ID`: L2 chain id, one of [`ChainSpec::ALL`] (default 10, OP
+    ///   Mainnet).
     /// - `OP_INDEXER_LISTEN_ADDR`: p2p listen socket, TCP and UDP (default `0.0.0.0:9222`).
     /// - `OP_INDEXER_BOOTNODES`: comma-separated `enr:` records or `enode://` URLs (default: the
     ///   chain's bootnodes).
@@ -107,8 +108,8 @@ impl Config {
     /// - `OP_INDEXER_CLICKHOUSE_USER`: ClickHouse user (default `indexer`).
     /// - `OP_INDEXER_CLICKHOUSE_PASSWORD`: ClickHouse password (default: none). Never logged.
     /// - `OP_INDEXER_ARCHIVE_RETENTION_BLOCKS`: blocks kept in the local archive, the
-    ///   `archive` directory inside the data directory: a block count (default 1296000, 30
-    ///   days), `all` to keep every block, or `0` to disable the archive.
+    ///   `archive` directory inside the data directory: a block count (default 30 days of the
+    ///   chain's blocks), `all` to keep every block, or `0` to disable the archive.
     /// - `OP_INDEXER_EL_ENABLED`: `true` to join the execution p2p network (devp2p) and fetch
     ///   the receipts gossip does not carry (default `false`: blocks stay without receipts).
     ///   The variables below only apply when it is enabled.
@@ -154,17 +155,16 @@ impl Config {
         let chain_id = parse_var("OP_INDEXER_CHAIN_ID")?.unwrap_or(DEFAULT_CHAIN_ID);
         let chain = ChainSpec::by_chain_id(chain_id)
             .ok_or_else(|| eyre!("unsupported chain id {chain_id}"))?;
-        let bootnodes_override = var("OP_INDEXER_BOOTNODES");
-        let bootnodes = match &bootnodes_override {
-            Some(list) => list.split(',').map(str::trim).collect(),
-            None => chain.bootnodes.to_vec(),
-        }
-        .into_iter()
-        .map(parse_bootnode)
-        .collect::<eyre::Result<Vec<Bootnode>>>()?;
+        let bootnodes = match var("OP_INDEXER_BOOTNODES") {
+            Some(list) => list
+                .split(',')
+                .map(|node| parse_bootnode(node.trim()))
+                .collect::<eyre::Result<Vec<_>>>(),
+            None => chain.bootnodes().map(parse_bootnode).collect(),
+        }?;
 
         let data_dir = PathBuf::from(var_or("OP_INDEXER_DATA_DIR", DEFAULT_DATA_DIR));
-        let archive = archive_retention()?.map(|retention| ArchiveConfig {
+        let archive = archive_retention(chain)?.map(|retention| ArchiveConfig {
             path: data_dir.join(ARCHIVE_DIR),
             retention,
         });
@@ -209,7 +209,10 @@ impl Config {
                     password: var("OP_INDEXER_CLICKHOUSE_PASSWORD"),
                 },
                 archive,
-                chain_id,
+                chain: ChainIdentity {
+                    chain_id,
+                    genesis_hash: chain.genesis_hash,
+                },
             },
             data_dir,
         })
@@ -262,12 +265,12 @@ fn var(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.is_empty())
 }
 
-/// Reads the archive retention: a block count, `all`, or `0` for no archive (`None`).
-fn archive_retention() -> eyre::Result<Option<ArchiveRetention>> {
+/// Reads the archive retention: a block count, `all`, or `0` for no archive (`None`). The
+/// default is [`DEFAULT_ARCHIVE_RETENTION_SECS`] of `chain`'s blocks.
+fn archive_retention(chain: &ChainSpec) -> eyre::Result<Option<ArchiveRetention>> {
     let Some(value) = var(ARCHIVE_RETENTION_VAR) else {
-        return Ok(Some(ArchiveRetention::Blocks(
-            DEFAULT_ARCHIVE_RETENTION_BLOCKS,
-        )));
+        let blocks = chain.blocks_in(DEFAULT_ARCHIVE_RETENTION_SECS);
+        return Ok(Some(ArchiveRetention::Blocks(blocks)));
     };
     if value.eq_ignore_ascii_case(ARCHIVE_RETENTION_ALL) {
         return Ok(Some(ArchiveRetention::All));

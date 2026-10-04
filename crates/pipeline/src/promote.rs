@@ -15,9 +15,10 @@
 //!    committed chain below `C`, or one the archive cannot tell about, is nothing to do: a
 //!    rollback deletes committed blocks and is only done on evidence.
 //! 2. Record the heads in the unsafe store.
-//! 3. Read the blocks above `C` up to `S` from the unsafe store.
-//! 4. Insert them into the committed store; append them to the archive if they extend it, and
-//!    trim it to its window.
+//! 3. Read the blocks above `C` up to `S` from the unsafe store, walking down from `S` one
+//!    ancestry call (1,024 blocks) at a time.
+//! 4. Part by part, oldest first: insert them into the committed store; append them to the
+//!    archive if they extend it, and trim it to its window.
 //! 5. Record the heads in the committed store: the marker that the range is committed.
 //! 6. Prune the unsafe store up to `S` and publish `S`'s number.
 //!
@@ -61,7 +62,7 @@
 //!
 //! - **Holes.** When the whole range cannot be read, the readable part next to `S` is promoted
 //!   and the rest, next to `C`, is left out: below a block missing from the unsafe store, or
-//!   beyond what one ancestry call returns. Everything from `S` down to the break is on `S`'s
+//!   beyond [`MAX_PROMOTED_PARTS`]. Everything from `S` down to the break is on `S`'s
 //!   chain, so it is safe. The hole is logged and counted with the blocks left out, `S` is
 //!   recorded, and promotion continues from there; backfill finds the hole by block number.
 //!   If `S` itself is missing, nothing is promoted. The blocks promoted after a hole do not
@@ -92,10 +93,17 @@ use crate::PipelineError;
 use crate::metrics::{self, HoleReason};
 use crate::retry::{RetryError, retry};
 
-/// Most ancestry calls one promotion makes: one for the whole range and up to three narrower
-/// ones (as much as one call returns, then above each missing block found). Past that nothing
-/// of the range is promoted and all of it is the hole.
+/// Most ancestry calls one part of the range takes: one for all of what is left and up to three
+/// narrower ones (as much as one call returns, then above each missing block found). Past that
+/// nothing more of the range is read and the rest of it is the hole.
 const MAX_RANGE_READS: usize = 4;
+
+/// Most parts one promotion reads, which bounds its work. A part is what one ancestry call
+/// returns (1,024 blocks), so the cap is a count of blocks and its span depends on the block
+/// time: about 9 hours on OP Mainnet and 4.5 hours on Unichain, either several times the
+/// interval between the dispute games that move the safe head. Past it the oldest part of the
+/// range is a hole.
+const MAX_PROMOTED_PARTS: usize = 16;
 
 /// Shortest time between two warnings that promoted blocks are not archived, or that the
 /// archive is not trimmed. Either state lasts until something else changes the archive.
@@ -360,8 +368,8 @@ where
 
     /// Steps 3 and 4: reads the blocks above `committed`, or above the archive's last block
     /// when that is higher and below `safe`, up to `safe` and writes them to the committed
-    /// store and the archive. When only the part next to `safe` can be read, that part is
-    /// written and the rest is a hole.
+    /// store and the archive, oldest part first. When only the part next to `safe` can be
+    /// read, that part is written and the rest is a hole.
     async fn commit_range(
         &mut self,
         committed: Option<BlockRef>,
@@ -389,11 +397,14 @@ where
             (committed, _) => committed,
         };
         let floor = base.map_or_else(|| safe.number.saturating_sub(1), |base| base.number);
-        let RangeRead {
-            blocks,
-            above: stop_at,
-            hole,
-        } = self.read_range(floor, safe, cancel).await?;
+        let (
+            RangeRead {
+                blocks,
+                above: stop_at,
+                hole,
+            },
+            heads,
+        ) = self.walk_range(floor, safe, cancel).await?;
         let builds_on_base = base
             .zip(blocks.first())
             .is_none_or(|(base, first)| first.block.header.parent_hash == base.hash);
@@ -406,26 +417,95 @@ where
             ),
             (None, _) => {}
         }
+        let mut promoted = blocks.len();
+        self.write_blocks(&blocks, cancel).await?;
+        drop(blocks);
+        for pair in heads.windows(2) {
+            let [above, head] = *pair else { continue };
+            // Read moments ago, so a hole here means the unsafe store changed in between.
+            let read = self.read_range(above.number, head, cancel).await?;
+            let builds_on_previous = read
+                .blocks
+                .first()
+                .is_some_and(|first| first.block.header.parent_hash == above.hash);
+            match read.hole {
+                Some(reason) => report_hole(reason, above, read.above, safe),
+                // The walk linked the parts by parent hash, so only a store that changed under
+                // it gets here: nothing above a broken link is written.
+                None if !builds_on_previous => {
+                    report_hole(HoleReason::ParentMismatch, above, read.above, safe);
+                    break;
+                }
+                None => {}
+            }
+            promoted = promoted.saturating_add(read.blocks.len());
+            self.write_blocks(&read.blocks, cancel).await?;
+        }
+        if promoted > 0 {
+            info!(
+                from = stop_at.saturating_add(1),
+                to = safe.number,
+                blocks = promoted,
+                "promoted blocks to the committed store"
+            );
+        }
+        Ok(())
+    }
+
+    /// Walks the range above `floor` up to `safe` downwards, one [`Self::read_range`] at a
+    /// time, until it reaches `floor`, finds a block missing from the unsafe store, or has read
+    /// [`MAX_PROMOTED_PARTS`]. Returns the oldest part read, with the reason for the hole below
+    /// it if any, and the head of every part, oldest first, ending at `safe`: each part after
+    /// the oldest is the blocks above the previous head up to its own, read again when it is
+    /// promoted, so only one part's blocks are held at a time.
+    async fn walk_range(
+        &self,
+        floor: BlockNumber,
+        safe: BlockRef,
+        cancel: &CancellationToken,
+    ) -> Result<(RangeRead, Vec<BlockRef>), Stop> {
+        let mut heads = vec![safe];
+        loop {
+            let head = heads.last().copied().unwrap_or(safe);
+            let part = self.read_range(floor, head, cancel).await?;
+            // The parent of the part's oldest block heads the next part down.
+            let parent = part.blocks.first().map(|oldest| BlockRef {
+                number: oldest.block.header.number.saturating_sub(1),
+                hash: oldest.block.header.parent_hash,
+            });
+            match (part.hole, parent) {
+                // A part cut short at one call's worth: more of the range is below it.
+                (Some(HoleReason::TooLong), Some(parent)) if heads.len() < MAX_PROMOTED_PARTS => {
+                    heads.push(parent);
+                }
+                _ => {
+                    heads.reverse();
+                    return Ok((part, heads));
+                }
+            }
+        }
+    }
+
+    /// Step 4 for one part of the range: inserts `blocks` into the committed store and
+    /// archives them.
+    async fn write_blocks(
+        &mut self,
+        blocks: &[DecodedBlock],
+        cancel: &CancellationToken,
+    ) -> Result<(), Stop> {
         if blocks.is_empty() {
             return Ok(());
         }
-
         call(cancel, Store::Committed, "committed insert", || {
-            self.committed_store.insert(&blocks)
+            self.committed_store.insert(blocks)
         })
         .await?;
-        self.archive_range(&blocks, cancel).await?;
+        self.archive_range(blocks, cancel).await?;
         let without_receipts = blocks
             .iter()
             .filter(|block| block.receipts.is_none())
             .count();
         metrics::blocks_promoted(blocks.len(), without_receipts);
-        info!(
-            from = stop_at.saturating_add(1),
-            to = safe.number,
-            blocks = blocks.len(),
-            "promoted blocks to the committed store"
-        );
         Ok(())
     }
 
@@ -606,8 +686,8 @@ fn report_hole(reason: HoleReason, base: BlockRef, left_out_to: BlockNumber, saf
     let why = match reason {
         HoleReason::MissingAncestor => "a block of the range is not in the unsafe store",
         HoleReason::TooLong => {
-            "the range is longer than one read returns; the blocks left out may be in the \
-             unsafe store but are not promoted"
+            "the range is longer than one promotion reads; the blocks left out may be in \
+             the unsafe store but are not promoted"
         }
         HoleReason::ParentMismatch => {
             warn!(

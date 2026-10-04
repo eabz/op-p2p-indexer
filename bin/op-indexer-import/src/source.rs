@@ -126,6 +126,20 @@ const CURSOR_KEY: &[u8] = b"\"next_block\":";
 
 /// The content encodings asked for, cheapest to decode first.
 const ACCEPT_ENCODING: &str = "zstd, gzip;q=0.5";
+/// The service's endpoint of each chain this build knows, by chain id. Unichain's is the
+/// host the service's naming gives; it has not been reached from here.
+const ENDPOINTS: &[(u64, &str)] = &[
+    (10, "https://optimism.hypersync.xyz"),
+    (130, "https://unichain.hypersync.xyz"),
+];
+
+/// The service's endpoint of chain `chain_id`, if this build knows it.
+pub(crate) fn default_endpoint(chain_id: u64) -> Option<&'static str> {
+    ENDPOINTS
+        .iter()
+        .find(|(id, _)| *id == chain_id)
+        .map(|(_, endpoint)| *endpoint)
+}
 
 /// How an answer's bytes are encoded, as its `Content-Encoding` says. The number is the
 /// first byte of a chunk file, which holds answers of one encoding.

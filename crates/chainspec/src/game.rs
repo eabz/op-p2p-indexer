@@ -190,10 +190,10 @@ impl ChainSpec {
             }
             ClaimFormat::SuperRoot => {
                 let (at, output_root) = super_root_claim(extra, root_claim, self.chain_id)?;
-                let blocks = at
+                let elapsed = at
                     .checked_sub(self.bedrock_time)
-                    .and_then(|elapsed| elapsed.checked_div(self.block_time_secs))
                     .ok_or(ClaimError::BeforeBedrock)?;
+                let blocks = self.blocks_in(elapsed);
                 // The chain's block at a time is its last block not after it.
                 let timestamp = blocks
                     .saturating_mul(self.block_time_secs)

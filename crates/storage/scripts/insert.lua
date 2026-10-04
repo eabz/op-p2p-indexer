@@ -186,14 +186,17 @@ local function fork_choice(out, head)
   end
 end
 
--- Retention: block keys expire on their own but the sorted sets do not, and nothing prunes
--- until an L1 source exists. Drops a few of the heights further than UNSAFE_RETENTION_BLOCKS
--- below the head, with their blocks, on every insert. Emits no event.
+-- Retention: block and height keys expire on their own (UNSAFE_TTL_SECS) but the sorted sets
+-- do not, and nothing prunes until an L1 source exists. On every insert, drops a few of the
+-- lowest heights whose set has expired from the index and the canonical chain; their blocks
+-- expired no later than the set, which every insert at the height renews. The horizon is a
+-- time, so it needs no block time. Emits no event.
 local function retain()
-  local horizon = tonumber(redis.call('HGET', head_key, 'number')) - UNSAFE_RETENTION_BLOCKS
-  local expired = redis.call('ZRANGEBYSCORE', heights_key, '-inf', '(' .. num(horizon),
-    'LIMIT', 0, RETENTION_HEIGHTS_PER_INSERT)
-  for _, height in ipairs(expired) do
+  local lowest = redis.call('ZRANGE', heights_key, 0, RETENTION_HEIGHTS_PER_INSERT - 1)
+  for _, height in ipairs(lowest) do
+    if redis.call('EXISTS', height_key(tonumber(height))) == 1 then
+      break
+    end
     remove_height(tonumber(height))
   end
 end

@@ -7,12 +7,15 @@
 mod body;
 mod game;
 
+use std::fmt;
 use std::net::SocketAddr;
 
 use alloy_consensus::transaction::{RlpEcdsaDecodableTx, RlpEcdsaEncodableTx};
 use alloy_consensus::{Signed, TxLegacy};
 use alloy_eips::eip2718::{Decodable2718, Eip2718Result, Encodable2718};
-use alloy_primitives::{Address, B256, B512, BlockHash, BlockNumber, Signature, U256, keccak256};
+use alloy_primitives::{
+    Address, B256, B512, BlockHash, BlockNumber, ChainId, Signature, U256, b256, keccak256,
+};
 use alloy_rlp::Header;
 use op_alloy_consensus::{OpBlock, OpReceiptEnvelope, OpTxEnvelope};
 
@@ -99,6 +102,56 @@ pub struct BlockRef {
     pub number: BlockNumber,
     /// Block hash.
     pub hash: BlockHash,
+}
+
+/// The chain a local store holds, recorded in it when it is created so that a node of another
+/// chain refuses it: the chain id, and the hash of block 0 in case two chains share an id.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct ChainIdentity {
+    /// Chain id.
+    pub chain_id: ChainId,
+    /// Hash of the chain's block 0.
+    pub genesis_hash: B256,
+}
+
+impl ChainIdentity {
+    /// The chain of a local store made before stores recorded their chain: OP Mainnet, the
+    /// only chain the builds before the record ran. A store without a record that holds data is
+    /// taken to be this chain's; an empty one is taken to be the configured chain's. Its
+    /// values are OP Mainnet's in `op-indexer-chainspec`, which this crate cannot depend on.
+    pub const BEFORE_RECORD: Self = Self {
+        chain_id: 10,
+        genesis_hash: b256!("0x7ca38a1916c42007829c55e69d3e9a73265554b586a499015373241b8a3fa48b"),
+    };
+
+    /// Length of [`Self::to_bytes`].
+    pub const LEN: usize = 40;
+
+    /// The record a store keeps: the chain id (8 bytes, big-endian), then the genesis hash.
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; Self::LEN] {
+        let mut bytes = [0; Self::LEN];
+        let (chain_id, genesis_hash) = bytes.split_at_mut(8);
+        chain_id.copy_from_slice(&self.chain_id.to_be_bytes());
+        genesis_hash.copy_from_slice(self.genesis_hash.as_slice());
+        bytes
+    }
+
+    /// Reads a record written by [`Self::to_bytes`]; `None` if it is not one.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let (chain_id, genesis_hash) = bytes.split_first_chunk::<8>()?;
+        Some(Self {
+            chain_id: u64::from_be_bytes(*chain_id),
+            genesis_hash: B256::try_from(genesis_hash).ok()?,
+        })
+    }
+}
+
+impl fmt::Display for ChainIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "chain {} (genesis {})", self.chain_id, self.genesis_hash)
+    }
 }
 
 /// Canonical entries of the unsafe store that were replaced or removed.

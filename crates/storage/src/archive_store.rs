@@ -35,7 +35,7 @@ use alloy_primitives::{BlockHash, BlockNumber, Bytes, keccak256};
 use alloy_rlp::Decodable;
 use op_alloy_consensus::OpReceiptEnvelope;
 use op_indexer_primitives::{
-    BlockRead, BlockRef, EncodedBlock, ItemConvert, ReadLimits, encode_receipts,
+    BlockRead, BlockRef, ChainIdentity, EncodedBlock, ItemConvert, ReadLimits, encode_receipts,
 };
 
 use self::tables::{Entry, Failure, Prepared, Tables};
@@ -69,8 +69,12 @@ impl fmt::Debug for FjallArchive {
 }
 
 impl FjallArchive {
-    /// Opens the archive in the directory `path`, creating it and its keyspaces if needed.
-    /// fjall locks the directory, so one process opens it at a time.
+    /// Opens the archive of `chain` in the directory `path`, creating it and its keyspaces if
+    /// needed. fjall locks the directory, so one process opens it at a time.
+    ///
+    /// The archive records its chain when it is created. One with no record (made by a build
+    /// before the record) is taken to hold OP Mainnet's ([`ChainIdentity::BEFORE_RECORD`]) if
+    /// it holds blocks, and `chain`'s if it is empty; that chain is recorded then.
     ///
     /// Does blocking disk I/O, including replaying the journal after a crash: call it at startup
     /// or from a blocking thread.
@@ -78,10 +82,13 @@ impl FjallArchive {
     /// # Errors
     ///
     /// Returns [`StorageError::ArchiveSchema`] if the directory holds an archive of another
-    /// schema version (it is left as it is), and [`StorageError::Fjall`] if the directory
-    /// cannot be created, opened, locked or written.
-    pub fn open(path: &Path) -> Result<Self, StorageError> {
-        let tables = tables::open(path).map_err(|failure| failure.into_storage_error("open"))?;
+    /// schema version, [`StorageError::ArchiveChain`] if it holds another chain's,
+    /// [`StorageError::ArchiveChainUnreadable`] if its chain record does not decode (each is
+    /// left as it is), and [`StorageError::Fjall`] if the directory cannot be created, opened,
+    /// locked or written.
+    pub fn open(path: &Path, chain: ChainIdentity) -> Result<Self, StorageError> {
+        let tables =
+            tables::open(path, chain).map_err(|failure| failure.into_storage_error("open"))?;
         Ok(Self { tables })
     }
 

@@ -111,8 +111,7 @@ impl L1Network {
         served: mpsc::Sender<ExecutionPeer>,
     ) -> Result<Self, L1Error> {
         let bootnodes = if config.bootnodes.is_empty() {
-            let chain = config.chain.bootnodes.iter();
-            chain.map(|node| (*node).to_owned()).collect()
+            config.chain.bootnodes().map(str::to_owned).collect()
         } else {
             config.bootnodes
         };

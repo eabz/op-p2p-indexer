@@ -97,13 +97,18 @@ hole itself; backfill belongs to the `el` crate.
 - `MissingAncestor` (a block was never received or has expired): the blocks above the missing
   one are read again and promoted; the hole is from `C + 1` to the missing block. If `S`
   itself is missing, nothing is promoted.
-- `AncestryTooLong` (more than 1024 blocks): the newest blocks one call returns are promoted;
-  the hole is the rest, which may still be in the unsafe store.
+- `AncestryTooLong` (more than 1024 blocks, what one call returns): the range is walked down
+  from `S` one call at a time, each part's head being the parent of the oldest block read
+  before, until it reaches `C`, a missing block, or 16 parts (`MAX_PROMOTED_PARTS`, 16,384 blocks).
+  The parts are then promoted oldest first, each read again so that only one part's blocks
+  are held at a time. Past the cap, the rest is the hole, which may still be in the unsafe
+  store. Hourly dispute games move the safe head by about 1,800 blocks on OP Mainnet and 3,600
+  on Unichain, so one ancestry call alone would leave a hole every time.
 - The first block does not build on `C`: the range is promoted. Nothing is missing, but the
   committed block at `C`'s height belongs to another chain (the reorg limit below).
 
-One promotion makes at most four `ancestry` calls (`MAX_RANGE_READS`); if none succeeds, the
-whole range is the hole. Each hole is logged with its range and reason and counted, with only
+Each part takes at most four `ancestry` calls (`MAX_RANGE_READS`); if none succeeds, the rest
+of the range is the hole. Each hole is logged with its range and reason and counted, with only
 the blocks actually left out; a promotion repeated after a crash counts its hole again. `S` is
 recorded as the committed safe head and promotion continues from there. The blocks promoted
 after a hole do not extend the archive and are not archived until range sync fills it (below).
@@ -135,10 +140,9 @@ everything else, including the gap below a promoted range that did not connect.
 
 **Known limits:**
 
-- *A safe head that jumps more than 1024 blocks at once* (an L1 source catching up after
-  downtime): only the newest 1024 are promoted, even when the unsafe store has every block.
-  Promoting the rest in chunks, oldest first, needs a lookup of a block's ancestor at a height
-  in the unsafe store.
+- *A safe head that jumps more than 16,384 blocks at once* (an L1 source catching up after
+  downtime): only the newest 16,384 are promoted, even when the unsafe store has every block.
+  The cap is a count of blocks, so it spans about 9 hours on OP Mainnet and 4.5 on Unichain.
 - *An L1 reorg where the block at `S.number` itself changed*: `rollback_to(S)` deletes the rows
   above `S.number`, but the row at `S.number` is the old chain's block and stays. The pipeline
   cannot replace it (the unsafe store ignores blocks at or below the safe head, and the
