@@ -15,12 +15,12 @@
 use std::io;
 use std::path::Path;
 
-use alloy_consensus::proofs::{calculate_receipt_root, ordered_trie_root_with_encoder};
 use alloy_consensus::{EMPTY_OMMER_ROOT_HASH, Header};
 use alloy_eips::eip7685::EMPTY_REQUESTS_HASH;
-use alloy_primitives::{B256, Bloom, Bytes, keccak256};
-use alloy_rlp::Encodable;
-use op_indexer_primitives::{EncodedBlock, encode_receipts};
+use alloy_primitives::{B256, Bloom, keccak256};
+use op_indexer_primitives::{
+    EncodedBlock, encode_body, encode_receipts, receipts_root, transactions_root,
+};
 
 use super::{Check, ChunkError, Forks, Stats, receipt, transaction};
 use crate::chunk::{self, Link, VerifiedBlock};
@@ -125,10 +125,8 @@ fn verify_block(
     if row.sha3_uncles != EMPTY_OMMER_ROOT_HASH {
         return Err(Check::Ommers(row.sha3_uncles));
     }
-    let transactions_root = ordered_trie_root_with_encoder(&encodings, |encoding, out| {
-        out.extend_from_slice(encoding);
-    });
-    let receipts_root = calculate_receipt_root(&receipts);
+    let transactions_root = transactions_root(&encodings);
+    let receipts_root = receipts_root(&receipts, timestamp, forks.canyon);
     let header = encode_header(forks, row, transactions_root, receipts_root, logs_bloom);
     let computed = keccak256(&header);
     if computed != row.hash {
@@ -186,41 +184,6 @@ fn encode_header(
             .then_some(EMPTY_REQUESTS_HASH),
         ..Default::default()
     })
-}
-
-/// Encodes a block body as the eth protocol's `BlockBodies` holds it: the transactions, each
-/// in its verified encoding (a legacy transaction is an RLP list, a typed one a byte string),
-/// no ommers, and an empty withdrawals list from the fork that added the withdrawals root.
-fn encode_body(transactions: &[Vec<u8>], with_withdrawals: bool) -> Bytes {
-    let mut list = Vec::new();
-    for encoding in transactions {
-        if encoding
-            .first()
-            .is_some_and(|byte| *byte >= alloy_rlp::EMPTY_LIST_CODE)
-        {
-            list.extend_from_slice(encoding);
-        } else {
-            encoding.as_slice().encode(&mut list);
-        }
-    }
-    let empty_lists = if with_withdrawals { 2 } else { 1 };
-    let transactions = alloy_rlp::Header {
-        list: true,
-        payload_length: list.len(),
-    };
-    let mut out = Vec::new();
-    alloy_rlp::Header {
-        list: true,
-        payload_length: transactions
-            .length()
-            .saturating_add(list.len())
-            .saturating_add(empty_lists),
-    }
-    .encode(&mut out);
-    transactions.encode(&mut out);
-    out.extend_from_slice(&list);
-    out.extend(std::iter::repeat_n(alloy_rlp::EMPTY_LIST_CODE, empty_lists));
-    out.into()
 }
 
 /// Splits off the leading rows that satisfy `belongs`.

@@ -497,8 +497,8 @@ pub trait ArchiveStore {
     async fn append_batch(&self, blocks: Vec<EncodedBlock>) -> Result<(), StorageError>;
     /// Attaches receipts to an archived block. Ok(false) if it is not archived.
     async fn set_receipts(&self, block: BlockRef, receipts: &[OpReceiptEnvelope]) -> Result<bool, StorageError>;
-    /// One part (header, body or receipts) of the block at `number`, reading only that part.
-    async fn part(&self, number: BlockNumber, part: BlockPart) -> Result<Option<Bytes>, StorageError>;
+    /// A run of headers, bodies or receipts, read in one call on one snapshot, up to `limits`.
+    async fn read(&self, read: BlockRead, limits: ReadLimits, convert: Option<ItemConvert>) -> Result<Vec<Bytes>, StorageError>;
     /// The number of the archived block with this hash.
     async fn number_of(&self, hash: BlockHash) -> Result<Option<BlockNumber>, StorageError>;
     /// The first and last archived block, or None if empty.
@@ -534,7 +534,12 @@ pub trait ArchiveStore {
 - The whole list is checked before the first write, then written in batches of at most 16 MiB
   of RLP (no limit on the number of blocks: a batch is one synced commit), one turn at the writer lock each; a failure leaves the earlier
   batches in place and `range` says where to resume.
-- `part` reads and decompresses one keyspace: the header, the body or the receipts alone.
+- `read` answers one peer request in one blocking call on one snapshot: a run of headers
+  (from a number or a hash, every `step`-th block, rising or falling; consecutive headers are
+  one range scan), or the bodies or receipts of a list of hashes. The run ends at the first
+  block not held and at the limits (items, and bytes after the item that crosses them). With
+  `convert`, each item is passed through it inside the same call (serving strips the receipts'
+  blooms there); an item it refuses ends the run.
 - `set_receipts` requires one receipt per transaction and the stored number to match
   (`InvalidBlock`), as in the unsafe store. A block appended with receipts stores them at once.
 - Every write is one fjall batch across the keyspaces it touches: one journal record, applied

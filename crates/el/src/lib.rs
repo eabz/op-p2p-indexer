@@ -41,14 +41,13 @@ use tokio_util::sync::CancellationToken;
 pub use config::ElConfig;
 pub use error::ElError;
 pub use serve::BlockProvider;
-pub use sync::RangeSync;
+pub use sync::{RangeSync, SyncPlan};
 
 use crate::discovery::Discovery;
 use crate::fetch::Fetcher;
 use crate::peers::PeerSet;
 use crate::serve::Server;
 use crate::session::SessionContext;
-use crate::sync::Syncer;
 
 /// Discovered peers waiting for the peer set. Discovery repeats what does not fit.
 const CANDIDATES_CAPACITY: usize = 256;
@@ -193,9 +192,14 @@ impl<P: BlockProvider> ExecutionNetwork<P> {
             tasks.spawn(async move { ("server", block_server.run(stop).await) });
         }
         if let Some(sync) = sync {
-            let syncer = Syncer::new(config.chain.canyon_time, peers.clone(), sync);
-            let stop = stop.clone();
-            tasks.spawn(async move { ("range sync", syncer.run(stop).await) });
+            let (peers, stop) = (peers.clone(), stop.clone());
+            let canyon_time = config.chain.canyon_time;
+            tasks.spawn(async move {
+                (
+                    "range sync",
+                    sync::run(canyon_time, peers, sync, stop).await,
+                )
+            });
         }
         let fetcher = Fetcher::new(config.chain, peers, requests, verified);
         {

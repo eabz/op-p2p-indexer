@@ -140,7 +140,7 @@ the binary gets configuration and wiring (all Worker 2). Worker 3 owns the root 
 
 - `OP_INDEXER_EL_ENABLED` (default `false` while peer access is unproven),
   `OP_INDEXER_EL_LISTEN_ADDR` (default `0.0.0.0:30303`, TCP and UDP),
-  `OP_INDEXER_EL_BOOTNODES`, `OP_INDEXER_EL_MAX_SESSIONS` (default 8, for each direction).
+  `OP_INDEXER_EL_BOOTNODES`. The session limit is a constant (8 for each direction).
   `OP_INDEXER_EL_ADVERTISED_ADDR` (optional `ip:port`): the public address the node record
   carries for TCP and UDP, for a server or a forwarded port. Unset, discovery fills in the
   address it learns from other nodes, and withdraws it again if nothing reaches the node
@@ -216,30 +216,38 @@ The node answers peers from its own stores, so that another node can sync from i
 Owner: Worker 1 (`serve.rs`, the provider trait, the hooks in the session driver). The
 binary's provider over `ArchiveStore`: Worker 2.
 
-## 12. Range sync (being built)
+## 12. Range sync
 
 The node fetches a range of blocks from peers and verifies it, so that a node without
 history can get it from one that has it.
 
-- Input: a target range and a trusted anchor (a block hash at the top of the range: the
-  Bedrock block's parent for the legacy range, or a gossip-verified block).
-- Headers are fetched in pages and verified by the hash chain down from the anchor; then
-  bodies against each header's transactions root and receipts against its receipts root, with
+- Input: a target range and a trusted anchor (a block hash at the top of the range).
+- Headers are walked in pages down from the anchor and verified by the hash chain; the walk's
+  checkpoints are saved, so a restart continues it. Then, from the bottom up, bodies are
+  checked against each header's transactions root and receipts against its receipts root, with
   the rules of the block's era: plain legacy receipts before Bedrock, the deposit nonce left
   out of the hash before Canyon, the consensus encoding after.
-- Verified blocks go to the pipeline in ascending order, in batches, as `DecodedBlock`s; the
-  pipeline writes them to the committed store and appends them to the archive
-  (`ArchiveStore::append_batch`). Senders are recovered as for gossip blocks; a zero-signature
-  legacy transaction gets the zero address.
-- Progress is stored, so a sync resumes where it stopped. A peer that returns data failing
-  verification is dropped and banned, as for tip receipts.
-- It shares sessions with the tip fetcher and never starves it: tip requests go first.
-- Off by default: with `OP_INDEXER_EL_SYNC_FROM`, `OP_INDEXER_EL_SYNC_TO` and
-  `OP_INDEXER_EL_SYNC_ANCHOR` unset there is no sync task at all.
+- Items in an answer are matched by what verifies: leading items that belong to their blocks
+  are kept and the rest asked for again; an item of a later block means "not held from here";
+  an item of no block asked for is bad data and bans the peer.
+- Verified blocks go to the pipeline in ascending order, in batches, as the exact bytes
+  received (`EncodedBlock`). The pipeline decodes them on blocking threads for the committed
+  store, recovers senders in parallel, and appends the bytes to the archive
+  (`ArchiveStore::append_batch`). A zero-signature legacy transaction gets the zero address.
+- No progress is stored: the archive's last block is the resume point.
+- One sync request per session, next to the tip fetcher's own; neither waits for the other.
+- It needs an archive that keeps every block and whose range the sync continues; otherwise
+  the binary refuses to start it. A store that refuses a batch stops the process.
+- Off by default; `OP_INDEXER_EL_SYNC=true` starts one sync from the block after the archive's
+  last one (block 0 on an empty archive) up to the first block gossip delivers after start,
+  whose sequencer-signed hash is the anchor. A node filled by the importer therefore continues
+  from the import's last block, with no range to configure. An unfinished sync is resumed to
+  its saved anchor on restart. On an empty archive the range begins before Bedrock, which no
+  public peer serves: the header walk reaches as far down as peers hold and then waits,
+  warning once a minute.
 
-**State (2026-10-04): parked.** Written and wired, never run, not reviewed. Before it is
-turned on: split `sync.rs`, decide who appends to the archive when promotion and a range sync
-both run (the archive is one contiguous range), run it against a node that serves.
-
-Owner: Worker 2 (`sync.rs` in `el`, the pipeline's range input, configuration and wiring),
-on Worker 3's session calls for headers and bodies.
+**State (2026-10-04): written, never run.** It compiles; nothing has executed it, because it
+needs execution sessions with a peer that serves the range. Known inefficiencies: bodies and
+receipts of a segment are fetched one after the other, and headers are downloaded twice (once
+by the walk, once per segment). Before Bedrock no public peer serves blocks, so a sync from
+genesis only works against another instance of this node.

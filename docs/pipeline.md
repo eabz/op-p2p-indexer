@@ -134,6 +134,33 @@ everything else, including the gap below a promoted range that did not connect.
   committed store has no read call to compare hashes). Backfill repairs it, like a hole of one
   block.
 
+## 4b. The receipts task and the range task
+
+Two more tasks run next to ingest and promotion, each only when something feeds it.
+
+**Receipts** (`receipts.rs`, when the execution network is enabled). Ingest asks for the
+receipts of every block it stores, on a bounded channel it never waits on (a request that does
+not fit is dropped and counted). At startup the task asks again for the newest stored blocks
+that still lack receipts (up to 1,024, one read per block: the unsafe store has no bulk read
+of that field). Verified receipts come back on a second channel and are attached in the unsafe
+store, or in the archive when the block has been promoted in the meantime; receipts for a
+block neither holds are dropped and counted. A store that refuses them (wrong count or number)
+is logged and counted; any other store error stops the pipeline.
+
+**Range** (`range.rs`, when a range sync is configured). The execution network hands over
+verified blocks in ascending order, in batches of consecutive blocks, as the bytes it received
+(`EncodedBlock`). For each batch the task decodes the blocks and recovers their senders on
+blocking threads (32 blocks per thread; a legacy transaction signed with all zeros gets the
+zero address), inserts them into the committed store with source `Sync`, then appends the same
+bytes to the archive with `append_batch`. It keeps no progress of its own: the archive's last
+block is where the binary starts the sync again. A batch is stored whole or the pipeline
+stops with the error (`PipelineError::RangeBlock` for a block this build cannot read,
+`PipelineError::Storage` for a store that refuses the batch), because the archive is one
+contiguous range and a sync that cannot continue must not look like it is running.
+
+Ingest also publishes the unsafe head on a `watch` (`Pipeline::with_head`), which the binary
+gives to the execution network as the newest block the node knows.
+
 ## 5. Startup
 
 1. Read `C` from the committed store. If there is none, start both tasks.

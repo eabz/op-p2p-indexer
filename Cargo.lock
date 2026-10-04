@@ -4726,7 +4726,6 @@ version = "0.1.0"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
- "fastrand",
  "metrics",
  "op-alloy-consensus",
  "op-indexer-primitives",

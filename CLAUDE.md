@@ -14,15 +14,18 @@ before proposing a design, and record new decisions there.
 
 | Path | Package | Role | Internal deps |
 |---|---|---|---|
-| `bin/op-indexer` | `op-indexer` | Thin binary: config, tracing, wiring, shutdown | chainspec, p2p, storage, pipeline |
+| `bin/op-indexer` | `op-indexer` | Thin binary: config, tracing, wiring, shutdown | chainspec, p2p, el, storage, pipeline, primitives |
+| `bin/op-indexer-import` | `op-indexer-import` | Command-line importer, a separate process: downloads a block range from an external archive (Envio HyperSync), verifies it, loads it into the block archive (and optionally ClickHouse) | chainspec, primitives, storage |
 | `crates/primitives` | `op-indexer-primitives` | Shared domain types (alloy and op-alloy only) | none |
 | `crates/chainspec` | `op-indexer-chainspec` | Static chain parameters (chain id, sequencer signer, bootnodes) | none |
 | `crates/p2p` | `op-indexer-p2p` | discv5 discovery, gossipsub block gossip (scoring, connection limits), unsafe-block validation, fjall node state | primitives, chainspec |
 | `crates/storage` | `op-indexer-storage` | Unsafe store (Redis, fork choice) / committed store (ClickHouse, migrations) / local block archive (fjall), their traits and metrics | primitives |
 | `crates/pipeline` | `op-indexer-pipeline` | Unsafe blocks → unsafe store; promote safe/finalized → committed store and archive; the retry policy | primitives, storage |
+| `crates/el` | `op-indexer-el` | Execution p2p (devp2p): discovery, sessions, receipts of new blocks, serving the archive to peers, range sync | primitives, chainspec |
 
 - Keep these edges: `p2p` and `storage` never depend on each other, and `pipeline` doesn't depend
-  on `p2p`. `p2p` depends on `chainspec` (it is chain-specific); the binary parses overrides (e.g.
+  on `p2p`. `el` depends on none of `p2p`, `storage` and `pipeline`. Nothing about an external API
+  (HyperSync or any other) may appear outside `bin/op-indexer-import`. `p2p` depends on `chainspec` (it is chain-specific); the binary parses overrides (e.g.
   bootnodes) at the edge. The binary wires them together with channels.
 - Safe/finalized status will come from an L1 p2p crate, not from reth or an RPC (see `docs/roadmap.md`).
 - New crates go in `crates/<name>` as package `op-indexer-<name>`, inherit `[workspace.package]`,

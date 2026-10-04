@@ -45,7 +45,7 @@ use std::time::Duration;
 use alloy_primitives::{B256, BlockNumber};
 use op_indexer_primitives::{BlockRef, EncodedBlock, SyncRange};
 use reth_network_peers::PeerId;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinError, JoinSet};
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until};
 use tokio_util::sync::CancellationToken;
@@ -70,26 +70,69 @@ const PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 /// How often it is said that no connected peer serves the blocks needed.
 const STARVED_INTERVAL: Duration = Duration::from_mins(1);
 
-/// A range sync to run: what to fetch, what is already verified, and where its output goes.
+/// What a range sync fetches, known once its anchor is.
 #[derive(Debug)]
-pub struct RangeSync {
+pub struct SyncPlan {
     /// The first block to fetch and the trusted anchor at the top.
     pub range: SyncRange,
     /// Blocks whose hash an earlier run verified from the same anchor; empty for a new sync.
     /// Fetching resumes from them without walking the chain again.
     pub checkpoints: Vec<BlockRef>,
+}
+
+/// A range sync to run: where its plan comes from and where its output goes.
+#[derive(Debug)]
+pub struct RangeSync {
+    /// Receives what to fetch, once: the anchor may be a block the node has yet to learn.
+    /// Nothing is fetched before it arrives, or at all if the sender is dropped.
+    pub plan: oneshot::Receiver<SyncPlan>,
     /// Receives the verified blocks in ascending order, in batches of consecutive blocks. The
     /// sync waits when it is full and stops when it closes.
     pub blocks: mpsc::Sender<Vec<EncodedBlock>>,
     /// Receives blocks whose hash is verified, to be saved and given back in
-    /// [`Self::checkpoints`] on the next start. The sync waits when it is full and stops when
+    /// [`SyncPlan::checkpoints`] on the next start. The sync waits when it is full and stops when
     /// it closes.
     pub verified: mpsc::Sender<Vec<BlockRef>>,
 }
 
-/// The range syncer. [`Syncer::run`] is its task.
+/// Runs the range sync `sync` until `cancel` fires: waits for its plan, then fetches. When the
+/// range is complete, no plan comes, or nothing takes its output any more, it stops fetching
+/// and waits for `cancel`, so the rest of the network carries on.
+///
+/// # Errors
+///
+/// Returns [`ElError::Sync`] if blocks of the chain cannot be read by this build,
+/// [`ElError::ChannelClosed`] if the peer set stopped while the node was running, and
+/// [`ElError::Task`] if verification panicked.
+pub(crate) async fn run(
+    canyon_time: u64,
+    peers: Peers,
+    sync: RangeSync,
+    cancel: CancellationToken,
+) -> Result<(), ElError> {
+    let RangeSync {
+        plan,
+        blocks,
+        verified,
+    } = sync;
+    let plan = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return Ok(()),
+        plan = plan => plan,
+    };
+    let Ok(plan) = plan else {
+        // Nothing to sync.
+        cancel.cancelled().await;
+        return Ok(());
+    };
+    Syncer::new(canyon_time, peers, plan, blocks, verified)
+        .run(cancel)
+        .await
+}
+
+/// The range syncer.
 #[derive(Debug)]
-pub(crate) struct Syncer {
+struct Syncer {
     canyon_time: u64,
     peers: Peers,
     schedule: Schedule,
@@ -204,17 +247,21 @@ impl Failure {
 }
 
 impl Syncer {
-    /// Creates the syncer. Sends nothing until [`Self::run`].
-    pub(crate) fn new(canyon_time: u64, peers: Peers, sync: RangeSync) -> Self {
-        let RangeSync {
+    /// Creates the syncer for `plan`. Sends nothing until [`Self::run`].
+    fn new(
+        canyon_time: u64,
+        peers: Peers,
+        plan: SyncPlan,
+        blocks: mpsc::Sender<Vec<EncodedBlock>>,
+        saved: mpsc::Sender<Vec<BlockRef>>,
+    ) -> Self {
+        let SyncPlan {
             range: SyncRange {
                 from: first,
                 anchor,
             },
             checkpoints,
-            blocks,
-            verified: saved,
-        } = sync;
+        } = plan;
         let mut checkpoints: BTreeMap<BlockNumber, B256> = checkpoints
             .into_iter()
             .filter(|checkpoint| (first..anchor.number).contains(&checkpoint.number))
@@ -244,15 +291,7 @@ impl Syncer {
         syncer
     }
 
-    /// Runs until `cancel` fires. When the range is complete, or nothing takes its output any
-    /// more, it stops fetching and waits for `cancel`, so the rest of the network carries on.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ElError::Sync`] if blocks of the chain cannot be read by this build,
-    /// [`ElError::ChannelClosed`] if the peer set stopped while the node was running, and
-    /// [`ElError::Task`] if verification panicked.
-    pub(crate) async fn run(mut self, cancel: CancellationToken) -> Result<(), ElError> {
+    async fn run(mut self, cancel: CancellationToken) -> Result<(), ElError> {
         if self.is_complete() {
             info!(
                 first = self.first,

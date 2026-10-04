@@ -4,12 +4,11 @@ use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
-use alloy_primitives::{B256, BlockNumber};
 use eyre::{WrapErr, ensure, eyre};
 use op_indexer_chainspec::{ChainSpec, OP_MAINNET};
 use op_indexer_el::ElConfig;
 use op_indexer_p2p::{Bootnode, NetworkConfig};
-use op_indexer_primitives::{BlockRef, ExecutionPeer, SyncRange};
+use op_indexer_primitives::ExecutionPeer;
 use op_indexer_storage::{
     ArchiveConfig, ArchiveRetention, ClickHouseConfig, RedisConfig, StorageConfig,
 };
@@ -27,9 +26,7 @@ const DEFAULT_ARCHIVE_RETENTION_BLOCKS: u64 = 30 * 24 * 60 * 60 / 2;
 /// Directory of the local block archive, inside the data directory.
 const ARCHIVE_DIR: &str = "archive";
 const ARCHIVE_RETENTION_VAR: &str = "OP_INDEXER_ARCHIVE_RETENTION_BLOCKS";
-const SYNC_FROM_VAR: &str = "OP_INDEXER_EL_SYNC_FROM";
-const SYNC_TO_VAR: &str = "OP_INDEXER_EL_SYNC_TO";
-const SYNC_ANCHOR_VAR: &str = "OP_INDEXER_EL_SYNC_ANCHOR";
+const SYNC_VAR: &str = "OP_INDEXER_EL_SYNC";
 /// Value of [`ARCHIVE_RETENTION_VAR`] that keeps every block.
 const ARCHIVE_RETENTION_ALL: &str = "all";
 
@@ -62,8 +59,9 @@ pub(crate) struct Config {
     pub(crate) network: NetworkConfig,
     /// The execution network, which fetches receipts; `None` when it is disabled.
     pub(crate) el: Option<ElSettings>,
-    /// A range of blocks to fetch from execution peers; `None` when no sync is asked for.
-    pub(crate) sync: Option<SyncRange>,
+    /// Whether to fetch the blocks between the archive's last block and the chain's head
+    /// from execution peers.
+    pub(crate) sync: bool,
     /// Unsafe store (Redis), committed store (ClickHouse) and local block archive (fjall).
     pub(crate) storage: StorageConfig,
     /// Directory for local state: the node store (`node/`) and the block archive (`archive/`).
@@ -98,14 +96,14 @@ impl Config {
     /// - `OP_INDEXER_EL_ADVERTISED_ADDR`: public socket (IP and port, the same for TCP and
     ///   UDP) announced in the execution node record, for a node behind NAT or in a container
     ///   (default: unset, the address other peers observe).
-    /// - `OP_INDEXER_EL_SYNC_FROM`, `OP_INDEXER_EL_SYNC_TO`, `OP_INDEXER_EL_SYNC_ANCHOR`: a
-    ///   range of blocks to fetch from execution peers into the committed store and the
-    ///   archive (default: unset, no sync). `FROM` and `TO` are the first and last block
-    ///   number; `ANCHOR` is the hash of block `TO`, which must come from a source you trust:
-    ///   every fetched block is verified against it. Set all three or none. The archive must
-    ///   keep every block (`OP_INDEXER_ARCHIVE_RETENTION_BLOCKS=all`) and be empty or end at
-    ///   block `FROM` - 1 or later: the sync continues after the archive's last block, which
-    ///   is how a restart resumes.
+    /// - `OP_INDEXER_EL_SYNC`: `true` to fetch from execution peers every block between the
+    ///   archive's last block and the chain's head, once, into the committed store and the
+    ///   archive (default `false`). It starts after the archive's last block (at block 0 on
+    ///   an empty archive) and ends at the first block the node receives over gossip after
+    ///   it starts, whose sequencer-signed hash every fetched block is verified against. A
+    ///   restart continues after the archive's last block, to the same end. Needs the
+    ///   execution network and an archive that keeps every block
+    ///   (`OP_INDEXER_ARCHIVE_RETENTION_BLOCKS=all`).
     pub(crate) fn from_env() -> eyre::Result<Self> {
         let chain_id = parse_var("OP_INDEXER_CHAIN_ID")?.unwrap_or(DEFAULT_CHAIN_ID);
         let chain = ChainSpec::by_chain_id(chain_id)
@@ -126,18 +124,18 @@ impl Config {
         });
 
         let el = el_settings(chain)?;
-        let sync = sync_range()?;
+        let sync = parse_var(SYNC_VAR)?.unwrap_or(false);
         ensure!(
-            sync.is_none() || el.is_some(),
-            "{SYNC_FROM_VAR} needs the execution network: set OP_INDEXER_EL_ENABLED=true"
+            !sync || el.is_some(),
+            "{SYNC_VAR} needs the execution network: set OP_INDEXER_EL_ENABLED=true"
         );
         // The synced range is the archive's: it must be there, and must not be trimmed.
         ensure!(
-            sync.is_none()
+            !sync
                 || archive
                     .as_ref()
                     .is_some_and(|archive| archive.retention == ArchiveRetention::All),
-            "{SYNC_FROM_VAR} needs an archive that keeps every block: set \
+            "{SYNC_VAR} needs an archive that keeps every block: set \
              {ARCHIVE_RETENTION_VAR}={ARCHIVE_RETENTION_ALL}"
         );
 
@@ -191,30 +189,6 @@ fn el_settings(chain: &'static ChainSpec) -> eyre::Result<Option<ElSettings>> {
             })
             .unwrap_or_default(),
         advertised_addr: parse_var("OP_INDEXER_EL_ADVERTISED_ADDR")?,
-    }))
-}
-
-/// Reads the range to sync from execution peers; `None` unless one is configured.
-fn sync_range() -> eyre::Result<Option<SyncRange>> {
-    let from: Option<BlockNumber> = parse_var(SYNC_FROM_VAR)?;
-    let to: Option<BlockNumber> = parse_var(SYNC_TO_VAR)?;
-    let anchor: Option<B256> = parse_var(SYNC_ANCHOR_VAR)?;
-    let (from, to, hash) = match (from, to, anchor) {
-        (None, None, None) => return Ok(None),
-        (Some(from), Some(to), Some(hash)) => (from, to, hash),
-        _ => {
-            return Err(eyre!(
-                "{SYNC_FROM_VAR}, {SYNC_TO_VAR} and {SYNC_ANCHOR_VAR} must be set together"
-            ));
-        }
-    };
-    ensure!(
-        from <= to,
-        "{SYNC_FROM_VAR} ({from}) is above {SYNC_TO_VAR} ({to})"
-    );
-    Ok(Some(SyncRange {
-        from,
-        anchor: BlockRef { number: to, hash },
     }))
 }
 

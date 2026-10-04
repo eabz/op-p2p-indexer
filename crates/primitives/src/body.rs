@@ -171,16 +171,25 @@ pub fn receipts_root(
     timestamp_secs: u64,
     canyon_time: u64,
 ) -> B256 {
-    let hashed = if timestamp_secs >= canyon_time {
+    // Only a deposit receipt that carries the fields hashes differently, and only before
+    // Canyon: every other list is hashed as it is, without a copy.
+    let hashed = if timestamp_secs >= canyon_time || !receipts.iter().any(has_deposit_fields) {
         Cow::Borrowed(receipts)
     } else {
-        Cow::Owned(receipts.iter().map(without_deposit_nonce).collect())
+        Cow::Owned(receipts.iter().map(without_deposit_fields).collect())
     };
     calculate_receipt_root(&hashed)
 }
 
+/// Whether `receipt` is a deposit receipt with a nonce or a version.
+fn has_deposit_fields(receipt: &OpReceiptEnvelope) -> bool {
+    matches!(receipt, OpReceiptEnvelope::Deposit(deposit)
+        if deposit.receipt.deposit_nonce.is_some()
+            || deposit.receipt.deposit_receipt_version.is_some())
+}
+
 /// The receipt as it is hashed before Canyon: a deposit receipt without its nonce and version.
-fn without_deposit_nonce(receipt: &OpReceiptEnvelope) -> OpReceiptEnvelope {
+fn without_deposit_fields(receipt: &OpReceiptEnvelope) -> OpReceiptEnvelope {
     let mut hashed = receipt.clone();
     if let OpReceiptEnvelope::Deposit(deposit) = &mut hashed {
         deposit.receipt.deposit_nonce = None;

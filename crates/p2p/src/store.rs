@@ -285,7 +285,25 @@ impl NodeStore {
         Ok(())
     }
 
-    /// Returns the blocks whose hash a range sync up to `anchor` has verified, ascending.
+    /// Returns the anchor of the range sync whose checkpoints are saved, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Database`] if reading fails.
+    pub fn sync_anchor(&self) -> Result<Option<BlockRef>, StoreError> {
+        let Some(id) = self.sync.get(SYNC_ANCHOR_KEY)? else {
+            return Ok(None);
+        };
+        Ok(id.split_first_chunk::<8>().and_then(|(number, hash)| {
+            Some(BlockRef {
+                number: u64::from_be_bytes(*number),
+                hash: B256::try_from(hash).ok()?,
+            })
+        }))
+    }
+
+    /// Returns the blocks whose hash a range sync up to `anchor` has verified, ascending, and
+    /// records `anchor` as the one being synced to.
     /// Checkpoints saved for another anchor are removed first: they prove nothing about this
     /// one.
     ///

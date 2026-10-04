@@ -12,7 +12,6 @@ op-indexer-storage.workspace = true
 
 alloy-consensus.workspace = true
 alloy-primitives.workspace = true
-fastrand.workspace = true
 metrics.workspace = true
 # `k256` implements sender recovery for `OpTxEnvelope`.
 op-alloy-consensus = { workspace = true, features = ["k256"] }
