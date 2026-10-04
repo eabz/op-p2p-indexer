@@ -4,7 +4,9 @@
 //! Blocks, transactions and receipts are the alloy / op-alloy consensus types; nothing here
 //! redefines them.
 
-use alloy_primitives::{Address, BlockHash, BlockNumber};
+use std::net::SocketAddr;
+
+use alloy_primitives::{Address, B256, B512, BlockHash, BlockNumber};
 use op_alloy_consensus::{OpBlock, OpReceiptEnvelope};
 
 /// Execution payload version a block was gossiped as, which is also the fork it belongs to.
@@ -125,6 +127,55 @@ pub struct L1Heads {
     pub safe: Option<BlockRef>,
     /// Highest block whose batch is in a finalized L1 block.
     pub finalized: Option<BlockRef>,
+}
+
+/// A stored block whose receipts are wanted, sent to whoever fetches them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceiptsRequest {
+    /// The block: number and hash.
+    pub block: BlockRef,
+    /// `receiptsRoot` of its header, which the fetched receipts must hash to.
+    pub receipts_root: B256,
+    /// Header timestamp, in seconds since the Unix epoch: selects the fork's receipt encoding.
+    pub timestamp_secs: u64,
+    /// Number of transactions in the block, so the number of receipts expected.
+    pub transaction_count: usize,
+}
+
+impl From<&DecodedBlock> for ReceiptsRequest {
+    fn from(block: &DecodedBlock) -> Self {
+        let header = &block.block.header;
+        Self {
+            block: BlockRef {
+                number: header.number,
+                hash: block.hash,
+            },
+            receipts_root: header.receipts_root,
+            timestamp_secs: header.timestamp,
+            transaction_count: block.block.body.transactions.len(),
+        }
+    }
+}
+
+/// Receipts of a block, verified against its header's receipts root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedReceipts {
+    /// The block they belong to, as in the request.
+    pub block: BlockRef,
+    /// One receipt per transaction, in block order.
+    pub receipts: Vec<OpReceiptEnvelope>,
+}
+
+/// An execution peer that served us, kept so a restart can dial it without waiting for
+/// discovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecutionPeer {
+    /// Node id: the peer's uncompressed secp256k1 public key without its `0x04` prefix.
+    pub id: B512,
+    /// TCP address its sessions are dialed at.
+    pub addr: SocketAddr,
+    /// When it last served a request, in seconds since the Unix epoch.
+    pub last_served_secs: u64,
 }
 
 /// Result of an unsafe-store insert.

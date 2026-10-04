@@ -1,31 +1,42 @@
 //! Persistent node state, stored in an embedded [fjall](https://docs.rs/fjall) database.
 //!
-//! Holds the node's secp256k1 identity, so it keeps a stable peer id across restarts, and the
-//! peers that recently delivered valid blocks, so a restart can reconnect without waiting for
-//! discovery.
+//! Holds the node's secp256k1 identity, so it keeps a stable peer id across restarts, a second
+//! key for its identity on the execution network, and the peers worth returning to, so a
+//! restart can reconnect without waiting for discovery: consensus peers that recently
+//! delivered valid blocks, and execution peers that served requests.
 //!
 //! This is a second fjall database next to the block archive's, on purpose: the archive lives
-//! in the storage crate, and p2p and storage must not depend on each other. It holds one key
+//! in the storage crate, and p2p and storage must not depend on each other. It holds two keys
 //! and a few dozen small entries, far below every size limit fjall has, so the only setting
 //! that matters is the number of background threads.
 
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 
+use alloy_primitives::{B256, B512};
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 use libp2p::Multiaddr;
 use libp2p::identity::{DecodingError, secp256k1};
+use op_indexer_primitives::ExecutionPeer;
 
 const NODE: &str = "node";
 const IDENTITY_KEY: &str = "secp256k1_secret";
+/// Secret of the node's identity on the execution network; never the same as [`IDENTITY_KEY`].
+const EXECUTION_KEY: &str = "execution_secp256k1_secret";
 /// Known good peers: multiaddr bytes -> last time (Unix seconds, big-endian) they delivered a
 /// valid block.
 const PEERS: &str = "known_peers";
 /// Peers kept; the least recently seen is evicted beyond this.
 const MAX_KNOWN_PEERS: usize = 64;
+/// Execution peers that served us: node id (64 bytes) -> last time they served a request
+/// (Unix seconds, big-endian) followed by their TCP address as text.
+const EXECUTION_PEERS: &str = "execution_peers";
+/// Execution peers kept; the least recently served is evicted beyond this.
+const MAX_EXECUTION_PEERS: usize = 32;
 
 /// Background threads for flushes and compactions (fjall starts up to four by default); there
 /// is almost nothing for them to do.
@@ -47,6 +58,12 @@ pub enum StoreError {
     /// The persisted identity key could not be decoded.
     #[error("stored identity key is invalid")]
     InvalidIdentity(#[source] DecodingError),
+    /// The persisted execution-network key has the wrong length.
+    #[error("stored execution key is {len} bytes, not 32")]
+    InvalidExecutionKey {
+        /// Length of the stored value.
+        len: usize,
+    },
 }
 
 /// Node state backed by a fjall database, which is a directory.
@@ -60,7 +77,8 @@ pub struct NodeStore {
     db: Database,
     node: Keyspace,
     peers: Keyspace,
-    /// Serializes the read-then-write of [`Self::identity`] and [`Self::save_peer`].
+    execution_peers: Keyspace,
+    /// Serializes the read-then-write of the keys and of both peer tables.
     write: Mutex<()>,
 }
 
@@ -96,6 +114,7 @@ impl NodeStore {
         Ok(Self {
             node: db.keyspace(NODE, KeyspaceCreateOptions::default)?,
             peers: db.keyspace(PEERS, KeyspaceCreateOptions::default)?,
+            execution_peers: db.keyspace(EXECUTION_PEERS, KeyspaceCreateOptions::default)?,
             db,
             write: Mutex::new(()),
         })
@@ -121,6 +140,30 @@ impl NodeStore {
         batch.insert(&self.node, IDENTITY_KEY, keypair.secret().to_bytes());
         batch.commit()?;
         Ok(keypair)
+    }
+
+    /// Returns the secret key of the node's identity on the execution network (devp2p),
+    /// generating and persisting one on first use.
+    ///
+    /// It is a second secp256k1 key, not the one of [`Self::identity`]: both networks run a
+    /// discv5 node, and one node id announcing two different records would look like a node
+    /// flapping between two addresses.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Database`] if reading or writing fails, and
+    /// [`StoreError::InvalidExecutionKey`] if the stored key is not 32 bytes.
+    pub fn execution_key(&self) -> Result<B256, StoreError> {
+        let _write = self.write.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(secret) = self.node.get(EXECUTION_KEY)? {
+            return B256::try_from(secret.as_ref())
+                .map_err(|_err| StoreError::InvalidExecutionKey { len: secret.len() });
+        }
+        let secret = B256::from(secp256k1::Keypair::generate().secret().to_bytes());
+        let mut batch = self.durable_batch();
+        batch.insert(&self.node, EXECUTION_KEY, secret.as_slice());
+        batch.commit()?;
+        Ok(secret)
     }
 
     /// Returns the known good peers' dial addresses, most recently seen first.
@@ -169,6 +212,62 @@ impl NodeStore {
         Ok(())
     }
 
+    /// Returns the saved execution peers, most recently served first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Database`] if reading fails.
+    pub fn execution_peers(&self) -> Result<Vec<ExecutionPeer>, StoreError> {
+        let mut peers: Vec<ExecutionPeer> = self.read_execution_peers()?.into_values().collect();
+        peers.sort_unstable_by_key(|peer| Reverse(peer.last_served_secs));
+        Ok(peers)
+    }
+
+    /// Records an execution peer that served a request, replacing what was saved for its node
+    /// id and evicting the least recently served peer if the table is full.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Database`] if writing fails.
+    pub fn save_execution_peer(&self, peer: &ExecutionPeer) -> Result<(), StoreError> {
+        let _write = self.write.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut peers = self.read_execution_peers()?;
+        peers.insert(peer.id, *peer);
+        let evicted = if peers.len() > MAX_EXECUTION_PEERS {
+            let oldest = peers.values().min_by_key(|peer| peer.last_served_secs);
+            oldest.map(|peer| peer.id)
+        } else {
+            None
+        };
+        // The new peer is itself the least recently served: nothing changes.
+        if evicted == Some(peer.id) {
+            return Ok(());
+        }
+
+        let mut value = peer.last_served_secs.to_be_bytes().to_vec();
+        value.extend_from_slice(peer.addr.to_string().as_bytes());
+        let mut batch = self.durable_batch();
+        batch.insert(&self.execution_peers, peer.id.as_slice(), value);
+        if let Some(evicted) = evicted {
+            batch.remove(&self.execution_peers, evicted.as_slice());
+        }
+        batch.commit()?;
+        Ok(())
+    }
+
+    /// Returns the stored execution peers by node id.
+    fn read_execution_peers(&self) -> Result<BTreeMap<B512, ExecutionPeer>, fjall::Error> {
+        let mut peers = BTreeMap::new();
+        for entry in self.execution_peers.iter() {
+            let (id, value) = entry.into_inner()?;
+            // An entry of another shape was not written by this code; skip it.
+            if let Some(peer) = decode_execution_peer(&id, &value) {
+                peers.insert(peer.id, peer);
+            }
+        }
+        Ok(peers)
+    }
+
     /// Returns the stored peers: multiaddr bytes and when each was last seen.
     fn read_peers(&self) -> Result<BTreeMap<Vec<u8>, u64>, fjall::Error> {
         let mut peers = BTreeMap::new();
@@ -186,4 +285,14 @@ impl NodeStore {
     fn durable_batch(&self) -> fjall::OwnedWriteBatch {
         self.db.batch().durability(Some(PersistMode::SyncAll))
     }
+}
+
+/// Decodes one entry of the execution peers table; `None` if it has another shape.
+fn decode_execution_peer(id: &[u8], value: &[u8]) -> Option<ExecutionPeer> {
+    let (served, addr) = value.split_first_chunk::<8>()?;
+    Some(ExecutionPeer {
+        id: B512::try_from(id).ok()?,
+        addr: std::str::from_utf8(addr).ok()?.parse::<SocketAddr>().ok()?,
+        last_served_secs: u64::from_be_bytes(*served),
+    })
 }

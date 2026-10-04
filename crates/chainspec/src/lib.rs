@@ -3,8 +3,15 @@
 //! Values come from the Superchain Registry
 //! (<https://github.com/ethereum-optimism/superchain-registry>) and op-node's default bootnodes.
 //! Add a chain by adding a constant and listing it in [`ChainSpec::ALL`].
+//!
+//! The fork activations are configuration this project keeps current: the fork id execution
+//! peers check ([EIP-2124]) is derived from them, and a node with a stale list only peers with
+//! nodes that missed the same upgrade. Add every new hardfork here when it is scheduled.
+//!
+//! [EIP-2124]: https://eips.ethereum.org/EIPS/eip-2124
 
-use alloy_primitives::{Address, ChainId, address};
+use alloy_eip2124::{ForkFilter, ForkFilterKey, ForkId, Head};
+use alloy_primitives::{Address, B256, BlockNumber, ChainId, address, b256};
 
 /// Static parameters of one OP Stack chain.
 #[derive(Debug)]
@@ -13,8 +20,18 @@ pub struct ChainSpec {
     pub chain_id: ChainId,
     /// Address of the sequencer key that signs gossiped unsafe blocks.
     pub unsafe_block_signer: Address,
-    /// Discovery bootnodes, as `enr:` records or `enode://` URLs, preferred first.
+    /// Discovery bootnodes, as `enr:` records or `enode://` URLs, preferred first. Consensus
+    /// and execution nodes share one discv5 network, so the execution network uses them too.
     pub bootnodes: &'static [&'static str],
+    /// Hash of the chain's block 0, which execution peers exchange in the eth status.
+    pub genesis_hash: B256,
+    /// Blocks at which a hardfork activated, ascending.
+    pub fork_blocks: &'static [BlockNumber],
+    /// Timestamps (seconds) at which a hardfork activated, ascending.
+    pub fork_times: &'static [u64],
+    /// Activation time of Canyon. Deposit receipts hash differently before it: the deposit
+    /// nonce is not part of the hashed receipt.
+    pub canyon_time: u64,
 }
 
 /// OP Mainnet (chain id 10).
@@ -41,11 +58,66 @@ pub const OP_MAINNET: ChainSpec = ChainSpec {
         "enr:-J24QHmGyBwUZXIcsGYMaUqGGSl4CFdx9Tozu-vQCn5bHIQbR7On7dZbU61vYvfrJr30t0iahSqhc64J46MnUO2JvQaGAYiOoCKKgmlkgnY0gmlwhAPnCzSHb3BzdGFja4OFQgCJc2VjcDI1NmsxoQINc4fSijfbNIiGhcgvwjsjxVFJHUstK9L1T8OTKUjgloN0Y3CCJAaDdWRwgiQG",
         "enr:-J24QG3ypT4xSu0gjb5PABCmVxZqBjVw9ca7pvsI8jl4KATYAnxBmfkaIuEqy9sKvDHKuNCsy57WwK9wTt2aQgcaDDyGAYiOoGAXgmlkgnY0gmlwhDbGmZaHb3BzdGFja4OFQgCJc2VjcDI1NmsxoQIeAK_--tcLEiu7HvoUlbV52MspE0uCocsx1f_rYvRenIN0Y3CCJAaDdWRwgiQG",
     ],
+    // Sent by every OP Mainnet execution peer in its eth status (observed 2026-10-04).
+    genesis_hash: b256!("0x7ca38a1916c42007829c55e69d3e9a73265554b586a499015373241b8a3fa48b"),
+    // Berlin and the Bedrock transition (which also carries London and the merge forks), as in
+    // `alloy-op-hardforks` and op-geth's OP Mainnet chain config.
+    fork_blocks: &[3_950_000, 105_235_063],
+    // Canyon, Ecotone, Fjord, Granite, Holocene, Isthmus and Jovian from `alloy-op-hardforks`
+    // 0.5.0. The last one, 2026-07-08 16:00:01 UTC, is not in that crate: it was learned from
+    // execution peers (node records of nodes that had not upgraded announce it as their next
+    // fork) and confirmed by the result, fork hash `c29239af`, being the one up-to-date peers
+    // report. Its name is not recorded here because no source for it was read.
+    fork_times: &[
+        1_704_992_401,
+        1_710_374_401,
+        1_720_627_201,
+        1_726_070_401,
+        1_736_445_601,
+        1_746_806_401,
+        1_764_691_201,
+        1_783_526_401,
+    ],
+    canyon_time: 1_704_992_401,
 };
 
 impl ChainSpec {
     /// Every supported chain.
     pub const ALL: &'static [&'static Self] = &[&OP_MAINNET];
+
+    /// The EIP-2124 fork filter for a node whose head is at `head_number` and
+    /// `head_timestamp` (seconds): it yields our fork id and validates a peer's.
+    #[must_use]
+    pub fn fork_filter(&self, head_number: BlockNumber, head_timestamp: u64) -> ForkFilter {
+        let head = Head {
+            number: head_number,
+            timestamp: head_timestamp,
+            ..Head::default()
+        };
+        let forks = self
+            .fork_blocks
+            .iter()
+            .map(|block| ForkFilterKey::Block(*block))
+            .chain(
+                self.fork_times
+                    .iter()
+                    .map(|time| ForkFilterKey::Time(*time)),
+            );
+        // OP Mainnet's genesis timestamp is 0; time forks are all later.
+        ForkFilter::new(head, self.genesis_hash, 0, forks)
+    }
+
+    /// The fork id a node at this head advertises.
+    #[must_use]
+    pub fn fork_id(&self, head_number: BlockNumber, head_timestamp: u64) -> ForkId {
+        self.fork_filter(head_number, head_timestamp).current()
+    }
+
+    /// Whether `time` is a hardfork activation this build knows.
+    #[must_use]
+    pub fn knows_fork_time(&self, time: u64) -> bool {
+        self.fork_times.contains(&time)
+    }
 
     /// Returns the spec for `chain_id`, if supported.
     pub fn by_chain_id(chain_id: ChainId) -> Option<&'static Self> {

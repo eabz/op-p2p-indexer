@@ -46,8 +46,9 @@ deny = [
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# Git dependencies, if one is ever needed, must be pinned to a tag or rev, never a branch.
+# Git dependencies must be pinned to a tag or rev, never a branch.
 required-git-spec = "tag"
-
-[sources.allow-org]
-github = ["paradigmxyz", "alloy-rs", "ethereum-optimism", "op-rs", "libp2p"]
+# The one git source: reth's wire crates (RLPx transport and eth handshake) for `crates/el`.
+# They are on crates.io only as 0.0.0 placeholders and no maintained published alternative
+# exists. Pinned to a release tag in the root manifest; bump it deliberately.
+allow-git = ["https://github.com/paradigmxyz/reth"]

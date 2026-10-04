@@ -7,7 +7,7 @@
 use std::ops::ControlFlow;
 use std::time::UNIX_EPOCH;
 
-use op_indexer_primitives::{UnsafeBlock, UnsafeEvent};
+use op_indexer_primitives::{ReceiptsRequest, UnsafeBlock, UnsafeEvent};
 use op_indexer_storage::{StorageError, Store, UnsafeStore};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -15,13 +15,15 @@ use tracing::{debug, info, warn};
 
 use crate::PipelineError;
 use crate::metrics::{self, DropReason};
+use crate::receipts;
 use crate::recover::{RecoverError, recover};
 use crate::retry::{RetryError, retry};
 
 /// Name of the one store call ingest makes, for errors and retry logs.
 const INSERT: &str = "unsafe insert";
 
-/// Stores every block received on `blocks` until the channel closes or `cancel` fires.
+/// Stores every block received on `blocks` until the channel closes or `cancel` fires, and
+/// asks for the receipts of each block it stores on `receipts`, when there is a fetcher.
 ///
 /// On cancellation the blocks already in the channel are still stored, without waiting for
 /// more; a store that is failing then is not waited for.
@@ -34,8 +36,10 @@ const INSERT: &str = "unsafe insert";
 pub(crate) async fn run<U: UnsafeStore>(
     store: U,
     mut blocks: mpsc::Receiver<UnsafeBlock>,
+    receipts: Option<mpsc::Sender<ReceiptsRequest>>,
     cancel: CancellationToken,
 ) -> Result<(), PipelineError> {
+    let receipts = receipts.as_ref();
     loop {
         tokio::select! {
             biased;
@@ -44,14 +48,14 @@ pub(crate) async fn run<U: UnsafeStore>(
                 // A closed channel is the network shutting down.
                 let Some(block) = block else { return Ok(()) };
                 metrics::channel_depth(blocks.len());
-                if ingest(&store, block, &cancel).await?.is_break() {
+                if ingest(&store, block, receipts, &cancel).await?.is_break() {
                     return Ok(());
                 }
             }
         }
     }
     while let Ok(block) = blocks.try_recv() {
-        if ingest(&store, block, &cancel).await?.is_break() {
+        if ingest(&store, block, receipts, &cancel).await?.is_break() {
             break;
         }
     }
@@ -62,6 +66,7 @@ pub(crate) async fn run<U: UnsafeStore>(
 async fn ingest<U: UnsafeStore>(
     store: &U,
     block: UnsafeBlock,
+    receipts: Option<&mpsc::Sender<ReceiptsRequest>>,
     cancel: &CancellationToken,
 ) -> Result<ControlFlow<()>, PipelineError> {
     let (number, hash, timestamp_secs) = (block.number(), block.hash, block.timestamp_secs());
@@ -102,6 +107,10 @@ async fn ingest<U: UnsafeStore>(
     if outcome.stored {
         metrics::block_ingested();
         metrics::ingest_lag(unix_now_secs().saturating_sub(timestamp_secs));
+        if let Some(requests) = receipts {
+            // Never waited on; a dropped request is counted and asked again at the next start.
+            let _sent = receipts::request(requests, &block);
+        }
     }
     debug!(number, %hash, stored = outcome.stored, "ingested block");
     for event in &outcome.events {

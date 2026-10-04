@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use eyre::{WrapErr, eyre};
 use op_indexer_chainspec::{ChainSpec, OP_MAINNET};
+use op_indexer_el::ElConfig;
 use op_indexer_p2p::{Bootnode, NetworkConfig};
 use op_indexer_storage::{
     ArchiveConfig, ArchiveRetention, ClickHouseConfig, RedisConfig, StorageConfig,
@@ -14,6 +15,8 @@ use op_indexer_storage::{
 const DEFAULT_CHAIN_ID: u64 = OP_MAINNET.chain_id;
 const DEFAULT_LISTEN_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9222);
 const DEFAULT_MAX_PEERS: u32 = 30;
+/// Sessions the execution network keeps in each direction.
+const DEFAULT_EL_MAX_SESSIONS: usize = 8;
 const DEFAULT_DATA_DIR: &str = "data";
 const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:6379";
 const DEFAULT_CLICKHOUSE_URL: &str = "http://127.0.0.1:8123";
@@ -31,6 +34,8 @@ const ARCHIVE_RETENTION_ALL: &str = "all";
 #[derive(Debug)]
 pub(crate) struct Config {
     pub(crate) network: NetworkConfig,
+    /// The execution network, which fetches receipts; `None` when it is disabled.
+    pub(crate) el: Option<ElConfig>,
     /// Unsafe store (Redis), committed store (ClickHouse) and local block archive (fjall).
     pub(crate) storage: StorageConfig,
     /// Directory for local state: the node store (`node/`) and the block archive (`archive/`).
@@ -55,6 +60,18 @@ impl Config {
     /// - `OP_INDEXER_ARCHIVE_RETENTION_BLOCKS`: blocks kept in the local archive, the
     ///   `archive` directory inside the data directory: a block count (default 1296000, 30
     ///   days), `all` to keep every block, or `0` to disable the archive.
+    /// - `OP_INDEXER_EL_ENABLED`: `true` to join the execution p2p network (devp2p) and fetch
+    ///   the receipts gossip does not carry (default `false`: blocks stay without receipts).
+    ///   The variables below only apply when it is enabled.
+    /// - `OP_INDEXER_EL_LISTEN_ADDR`: execution p2p listen socket, TCP and UDP (default
+    ///   `0.0.0.0:30303`).
+    /// - `OP_INDEXER_EL_BOOTNODES`: comma-separated `enr:` records or `enode://` URLs
+    ///   (default: the chain's execution bootnodes).
+    /// - `OP_INDEXER_EL_MAX_SESSIONS`: execution peers kept, as dialed sessions and again as
+    ///   accepted ones (default 8).
+    /// - `OP_INDEXER_EL_ADVERTISED_ADDR`: public socket (IP and port, the same for TCP and
+    ///   UDP) announced in the execution node record, for a node behind NAT or in a container
+    ///   (default: unset, the address other peers observe).
     pub(crate) fn from_env() -> eyre::Result<Self> {
         let chain_id = parse_var("OP_INDEXER_CHAIN_ID")?.unwrap_or(DEFAULT_CHAIN_ID);
         let chain = ChainSpec::by_chain_id(chain_id)
@@ -75,6 +92,7 @@ impl Config {
         });
 
         Ok(Self {
+            el: el_config(chain)?,
             network: NetworkConfig {
                 chain,
                 listen_addr: parse_var("OP_INDEXER_LISTEN_ADDR")?.unwrap_or(DEFAULT_LISTEN_ADDR),
@@ -100,6 +118,34 @@ impl Config {
             data_dir,
         })
     }
+}
+
+/// Reads the execution network's configuration; `None` unless it is enabled.
+fn el_config(chain: &'static ChainSpec) -> eyre::Result<Option<ElConfig>> {
+    if !parse_var("OP_INDEXER_EL_ENABLED")?.unwrap_or(false) {
+        return Ok(None);
+    }
+    let max_sessions = parse_var("OP_INDEXER_EL_MAX_SESSIONS")?.unwrap_or(DEFAULT_EL_MAX_SESSIONS);
+    Ok(Some(ElConfig {
+        chain,
+        listen_addr: parse_var("OP_INDEXER_EL_LISTEN_ADDR")?
+            .unwrap_or(ElConfig::DEFAULT_LISTEN_ADDR),
+        // Parsed by the execution network; an empty list means the chain's bootnodes.
+        bootnodes: var("OP_INDEXER_EL_BOOTNODES")
+            .map(|list| {
+                list.split(',')
+                    .map(str::trim)
+                    .filter(|node| !node.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        max_outbound_sessions: max_sessions,
+        max_inbound_sessions: max_sessions,
+        // Filled by the binary from the node store.
+        saved_peers: Vec::new(),
+        advertised_addr: parse_var("OP_INDEXER_EL_ADVERTISED_ADDR")?,
+    }))
 }
 
 fn var(name: &str) -> Option<String> {

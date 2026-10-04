@@ -42,7 +42,8 @@ USER indexer
 ENV OP_INDEXER_DATA_DIR=/data
 VOLUME /data
 
-# OP Stack p2p (libp2p TCP + discv5 UDP).
-EXPOSE 9222/tcp 9222/udp
+# OP Stack p2p (libp2p TCP + discv5 UDP), and execution p2p (RLPx TCP + discv5 UDP), which
+# is only used when OP_INDEXER_EL_ENABLED=true.
+EXPOSE 9222/tcp 9222/udp 30303/tcp 30303/udp
 
 ENTRYPOINT ["/usr/local/bin/op-indexer"]

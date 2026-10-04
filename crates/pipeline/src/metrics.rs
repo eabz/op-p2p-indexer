@@ -44,6 +44,9 @@ const PROMOTION_BLOCKS_MISSING: &str = "op_indexer_pipeline_promotion_blocks_mis
 const L1_REORGS: &str = "op_indexer_pipeline_l1_reorgs_total";
 const ARCHIVE_RESTARTS: &str = "op_indexer_pipeline_archive_restarts_total";
 const SAFE_BLOCK_NUMBER: &str = "op_indexer_pipeline_safe_block_number";
+const RECEIPT_REQUESTS: &str = "op_indexer_pipeline_receipt_requests_total";
+const RECEIPTS_ATTACHED: &str = "op_indexer_pipeline_receipts_attached_total";
+const RECEIPTS_UNMATCHED: &str = "op_indexer_pipeline_receipts_unmatched_total";
 
 /// Why ingest did not store a block, the `reason` label.
 #[derive(Debug, Clone, Copy)]
@@ -87,10 +90,62 @@ impl HoleReason {
     }
 }
 
+/// What happened to a request for a block's receipts.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RequestOutcome {
+    /// Handed to the fetcher.
+    Sent,
+    /// Dropped: the fetcher's channel was full or closed.
+    Dropped,
+}
+
+impl RequestOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sent => "sent",
+            Self::Dropped => "dropped",
+        }
+    }
+}
+
+/// Why verified receipts were not attached to a block.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum UnmatchedReason {
+    /// No store holds the block any more.
+    UnknownBlock,
+    /// The store holding the block refused them: wrong count or wrong number.
+    Refused,
+}
+
+impl UnmatchedReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnknownBlock => "unknown_block",
+            Self::Refused => "refused",
+        }
+    }
+}
+
 /// Registers the description and unit of every metric with the installed recorder.
 ///
 /// A no-op without a recorder, so the binary calls this after installing one.
 pub fn describe() {
+    describe_counter!(
+        RECEIPT_REQUESTS,
+        Unit::Count,
+        "Requests for a block's receipts, by outcome"
+    );
+    describe_counter!(
+        RECEIPTS_ATTACHED,
+        Unit::Count,
+        "Blocks that got their receipts, by the store that held the block; in the archive the \
+         committed store is not updated"
+    );
+    describe_counter!(
+        RECEIPTS_UNMATCHED,
+        Unit::Count,
+        "Verified receipts that were not attached, by reason"
+    );
     describe_counter!(
         BLOCKS_INGESTED,
         Unit::Count,
@@ -239,4 +294,19 @@ fn gauge_value(value: u64) -> f64 {
     let high = u32::try_from(value >> u32::BITS).unwrap_or(u32::MAX);
     let low = u32::try_from(value & u64::from(u32::MAX)).unwrap_or(u32::MAX);
     f64::from(high).mul_add(HIGH_UNIT, f64::from(low))
+}
+
+/// Records a request for a block's receipts.
+pub(crate) fn receipts_requested(outcome: RequestOutcome) {
+    counter!(RECEIPT_REQUESTS, "outcome" => outcome.as_str()).increment(1);
+}
+
+/// Records receipts attached to a block held by `store`.
+pub(crate) fn receipts_attached(store: Store) {
+    counter!(RECEIPTS_ATTACHED, "store" => store.as_str()).increment(1);
+}
+
+/// Records verified receipts that could not be attached.
+pub(crate) fn receipts_unmatched(reason: UnmatchedReason) {
+    counter!(RECEIPTS_UNMATCHED, "reason" => reason.as_str()).increment(1);
 }

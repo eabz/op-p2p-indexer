@@ -35,9 +35,21 @@ services:
       # Blocks kept in the local archive (the archive directory in the data volume): a block
       # count, `all` to keep every block, or 0 to disable it. Empty means 30 days.
       OP_INDEXER_ARCHIVE_RETENTION_BLOCKS: ${OP_INDEXER_ARCHIVE_RETENTION_BLOCKS:-}
+      # Execution p2p (devp2p), which fetches the receipts gossip does not carry. Off unless
+      # OP_INDEXER_EL_ENABLED is true; the others only apply then.
+      OP_INDEXER_EL_ENABLED: ${OP_INDEXER_EL_ENABLED:-}
+      OP_INDEXER_EL_LISTEN_ADDR: ${OP_INDEXER_EL_LISTEN_ADDR:-}
+      OP_INDEXER_EL_BOOTNODES: ${OP_INDEXER_EL_BOOTNODES:-}
+      OP_INDEXER_EL_MAX_SESSIONS: ${OP_INDEXER_EL_MAX_SESSIONS:-}
+      # The host's public IP and port, so peers can dial back; the container only sees its
+      # own bridge address.
+      OP_INDEXER_EL_ADVERTISED_ADDR: ${OP_INDEXER_EL_ADVERTISED_ADDR:-}
     ports:
       - "9222:9222/tcp"
       - "9222:9222/udp"
+      # Execution p2p; unused while it is disabled.
+      - "30303:30303/tcp"
+      - "30303:30303/udp"
     volumes:
       # The data directory (the image sets OP_INDEXER_DATA_DIR=/data): `node/` holds the node
       # identity and known peers, `archive/` the local block archive.

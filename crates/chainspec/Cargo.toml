@@ -7,6 +7,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+alloy-eip2124.workspace = true
 alloy-primitives.workspace = true
 
 [lints]

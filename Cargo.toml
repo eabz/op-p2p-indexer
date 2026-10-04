@@ -11,6 +11,7 @@ publish = false
 [workspace.dependencies]
 # Internal crates.
 op-indexer-chainspec = { path = "crates/chainspec" }
+op-indexer-el = { path = "crates/el" }
 op-indexer-p2p = { path = "crates/p2p" }
 op-indexer-pipeline = { path = "crates/pipeline" }
 op-indexer-primitives = { path = "crates/primitives" }
@@ -41,6 +42,24 @@ discv5 = { version = "0.12", features = ["libp2p"] }
 enr = { version = "0.14", default-features = false, features = ["k256"] }
 # Already in the tree via multiaddr; used for the `opstack` ENR entry.
 unsigned-varint = "0.8"
+
+# Execution p2p (`crates/el`): RLPx (ECIES transport, p2p hello) and the eth wire handshake and
+# message types. reth's crates exist on crates.io only as 0.0.0 placeholders, so they come from
+# git, pinned to a release tag; only the four crates `el` calls. No published alternative is
+# maintained, and hand-writing the encrypted transport is not an option we want.
+reth-ecies = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-eth-wire = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-eth-wire-types = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-network-peers = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+# The fork id (EIP-2124) peers check in the node record and the eth status.
+alloy-eip2124 = { version = "0.2", default-features = false, features = ["std"] }
+# The node key type reth's transport takes (same version as reth).
+secp256k1 = { version = "0.30", default-features = false, features = ["std", "global-context", "recovery"] }
+# Peer id of an `enode://` bootnode, to ask it for its node record (already in the tree through
+# libp2p and discv5).
+libp2p-identity = { version = "0.2", default-features = false, features = ["secp256k1", "peerid"] }
+# `StreamExt` / `SinkExt` to drive reth's p2p stream.
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 
 # Embedded store for the node state (p2p) and the local block archive (storage): pure Rust,
 # log-structured, one directory per store. Its only default feature, `lz4`, is off: archived
