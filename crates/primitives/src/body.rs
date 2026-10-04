@@ -3,7 +3,7 @@
 //!
 //! Everything here works on the encodings themselves, so what is hashed, stored and served is
 //! what was received or built once; nothing is decoded into a typed value and encoded again.
-//! Does not decode transactions (see [`decode_transaction`](crate::decode_transaction)) and
+//! Does not decode transactions (see [`decode_transaction`]) and
 //! does not compare anything with a header: callers do.
 
 use std::borrow::Cow;

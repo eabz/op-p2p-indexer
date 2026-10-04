@@ -10,7 +10,7 @@
 //!
 //! [EIP-2124]: https://eips.ethereum.org/EIPS/eip-2124
 
-use alloy_eip2124::{ForkFilter, ForkFilterKey, ForkId, Head};
+use alloy_eip2124::{ForkFilter, ForkFilterKey, Head};
 use alloy_primitives::{Address, B256, BlockNumber, ChainId, address, b256};
 
 /// Static parameters of one OP Stack chain.
@@ -27,11 +27,21 @@ pub struct ChainSpec {
     pub genesis_hash: B256,
     /// Blocks at which a hardfork activated, ascending.
     pub fork_blocks: &'static [BlockNumber],
-    /// Timestamps (seconds) at which a hardfork activated, ascending.
-    pub fork_times: &'static [u64],
     /// Activation time of Canyon. Deposit receipts hash differently before it: the deposit
     /// nonce is not part of the hashed receipt.
     pub canyon_time: u64,
+    /// Activation time of Ecotone.
+    pub ecotone_time: u64,
+    /// Activation time of Fjord.
+    pub fjord_time: u64,
+    /// Activation time of Granite.
+    pub granite_time: u64,
+    /// Activation time of Holocene.
+    pub holocene_time: u64,
+    /// Activation time of Jovian.
+    pub jovian_time: u64,
+    /// Activation time of Karst.
+    pub karst_time: u64,
     /// Activation time of Regolith. From it on the L1-attributes deposit is not a system
     /// transaction and deposit receipts record the sender's nonce.
     pub regolith_time: u64,
@@ -80,22 +90,16 @@ pub const OP_MAINNET: ChainSpec = ChainSpec {
     // Berlin and the Bedrock transition (which also carries London and the merge forks), as in
     // `alloy-op-hardforks` and op-geth's OP Mainnet chain config.
     fork_blocks: &[3_950_000, 105_235_063],
-    // Canyon, Ecotone, Fjord, Granite, Holocene, Isthmus and Jovian from `alloy-op-hardforks`
-    // 0.5.0. The last one, 2026-07-08 16:00:01 UTC, is not in that crate: it was learned from
-    // execution peers (node records of nodes that had not upgraded announce it as their next
-    // fork) and confirmed by the result, fork hash `c29239af`, being the one up-to-date peers
-    // report. Its name is not recorded here because no source for it was read.
-    fork_times: &[
-        1_704_992_401,
-        1_710_374_401,
-        1_720_627_201,
-        1_726_070_401,
-        1_736_445_601,
-        1_746_806_401,
-        1_764_691_201,
-        1_783_526_401,
-    ],
+    // The time forks, as in `superchain/configs/mainnet/op.toml` of the superchain registry
+    // (read 2026-10-03). Karst's time was first learned from execution peers, whose fork hash
+    // `c29239af` it reproduces.
     canyon_time: 1_704_992_401,
+    ecotone_time: 1_710_374_401,
+    fjord_time: 1_720_627_201,
+    granite_time: 1_726_070_401,
+    holocene_time: 1_736_445_601,
+    jovian_time: 1_764_691_201,
+    karst_time: 1_783_526_401,
     // Regolith is active from the Bedrock block on OP Mainnet (superchain registry).
     regolith_time: 0,
     isthmus_time: 1_746_806_401,
@@ -126,25 +130,31 @@ impl ChainSpec {
             .fork_blocks
             .iter()
             .map(|block| ForkFilterKey::Block(*block))
-            .chain(
-                self.fork_times
-                    .iter()
-                    .map(|time| ForkFilterKey::Time(*time)),
-            );
+            .chain(self.fork_times().into_iter().map(ForkFilterKey::Time));
         // OP Mainnet's genesis timestamp is 0; time forks are all later.
         ForkFilter::new(head, self.genesis_hash, 0, forks)
     }
 
-    /// The fork id a node at this head advertises.
+    /// The hardforks that activate at a timestamp and change the fork id, ascending. Regolith
+    /// is not one of them: it has no activation of its own in the fork id.
     #[must_use]
-    pub fn fork_id(&self, head_number: BlockNumber, head_timestamp: u64) -> ForkId {
-        self.fork_filter(head_number, head_timestamp).current()
+    pub const fn fork_times(&self) -> [u64; 8] {
+        [
+            self.canyon_time,
+            self.ecotone_time,
+            self.fjord_time,
+            self.granite_time,
+            self.holocene_time,
+            self.isthmus_time,
+            self.jovian_time,
+            self.karst_time,
+        ]
     }
 
     /// Whether `time` is a hardfork activation this build knows.
     #[must_use]
     pub fn knows_fork_time(&self, time: u64) -> bool {
-        self.fork_times.contains(&time)
+        self.fork_times().contains(&time)
     }
 
     /// Returns the spec for `chain_id`, if supported.

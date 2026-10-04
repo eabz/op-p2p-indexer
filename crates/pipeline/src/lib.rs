@@ -11,8 +11,9 @@
 //!   block: ingest (`ingest`, `recover`), promotion (`promote`) and, when something fetches
 //!   receipts, the task that attaches them (`receipts`); and, when a range of blocks is
 //!   fetched from peers, the task that stores it (`range`).
-//! - `retry` is the retry policy storage deliberately does not have: transient store errors are
-//!   retried with backoff, everything else is decided by the task that made the call.
+//! - `retry` is how store calls are made: transient store errors are retried with backoff
+//!   (storage's helper, without a time limit), everything else is decided by the task that
+//!   made the call.
 //! - [`metrics`] names and records what both tasks do.
 //!
 //! Generic over the three store traits, so it does not know about Redis, ClickHouse or fjall,

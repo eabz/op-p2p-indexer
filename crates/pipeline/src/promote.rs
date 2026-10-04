@@ -272,7 +272,6 @@ where
         .await?;
         // The rollback recorded `safe` as the committed safe head.
         self.committed.safe = Some(safe);
-        metrics::l1_reorg();
 
         let Some((archive, _)) = &self.archive else {
             return Ok(());

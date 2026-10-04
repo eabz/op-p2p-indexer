@@ -111,7 +111,6 @@ async fn ingest<U: UnsafeStore>(
     // Not stored: a retry of an insert that had been applied, or a block the store already
     // had or no longer wants. Its events, if any, went to the stream the first time.
     if outcome.stored {
-        metrics::block_ingested();
         metrics::ingest_lag(unix_now_secs().saturating_sub(timestamp_secs));
         if let Some(requests) = receipts {
             // Never waited on; a dropped request is counted and asked again at the next start.
@@ -150,7 +149,6 @@ fn record(event: &UnsafeEvent) {
                 depth = reorg.replaced.len(),
                 "unsafe chain reorganized"
             );
-            metrics::reorg(reorg.replaced.len());
         }
         UnsafeEvent::Filled(block) => {
             info!(number = block.number, hash = %block.hash, "gap in the unsafe chain filled");

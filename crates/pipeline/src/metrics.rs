@@ -3,25 +3,22 @@
 //! This module only records. It installs no recorder and serves no endpoint: until the binary
 //! installs one every call here is a no-op, and [`describe`] must run after that. Call sites use
 //! the typed helpers below, so metric names and labels live in this file only. The stores'
-//! own metrics (operations, durations, rows) are in `op_indexer_storage::metrics`.
+//! own metrics are in `op_indexer_storage::metrics` and are not repeated here: blocks written
+//! per store, unsafe-chain reorgs and their depth, and rollbacks of the committed store (one
+//! per L1 reorg of the safe head).
 //!
 //! Labels are low-cardinality by construction: a drop reason, a hole reason or a store. Block numbers and
 //! hashes are never labels.
 //!
 //! | Metric | Type | Labels | Meaning |
 //! |---|---|---|---|
-//! | `op_indexer_pipeline_blocks_ingested_total` | counter | | Gossip blocks newly stored in the unsafe store. |
 //! | `op_indexer_pipeline_blocks_dropped_total` | counter | `reason` | Gossip blocks not stored: `sender_recovery`, `invalid` or `unsupported`. |
-//! | `op_indexer_pipeline_reorgs_total` | counter | | Unsafe-chain reorgs reported by an insert. |
-//! | `op_indexer_pipeline_reorg_depth` | histogram | | Blocks replaced by one unsafe-chain reorg. |
 //! | `op_indexer_pipeline_blocks_filled_total` | counter | | Blocks below the head that became canonical: gaps repaired. |
-//! | `op_indexer_pipeline_retries_total` | counter | `store` | Store calls repeated after a transient error. |
 //! | `op_indexer_pipeline_ingest_lag_seconds` | histogram | | Time from a block's timestamp to its insert. |
 //! | `op_indexer_pipeline_channel_depth` | gauge | | Blocks waiting in the channel from the network. |
 //! | `op_indexer_pipeline_blocks_promoted_total` | counter | | Blocks written to the committed store by promotion. |
 //! | `op_indexer_pipeline_promotion_holes_total` | counter | `reason` | Promotions that could not read their whole range from the unsafe store: `missing_ancestor`, `too_long` (the blocks may exist) or `parent_mismatch` (nothing left out, but the range is another chain than the committed safe head). |
 //! | `op_indexer_pipeline_promotion_blocks_missing_total` | counter | `reason` | Blocks those promotions left out of the committed store, for backfill. |
-//! | `op_indexer_pipeline_l1_reorgs_total` | counter | | Times the safe head moved back or changed hash, rolling the committed store back. |
 //! | `op_indexer_pipeline_archive_skipped_blocks_total` | counter | | Promoted blocks not archived because they did not extend the archive's tip. |
 //! | `op_indexer_pipeline_safe_block_number` | gauge | | Number of the committed safe head. |
 //! | `op_indexer_pipeline_range_blocks_stored_total` | counter | | Blocks of a range sync written to the committed store and the archive. |
@@ -32,18 +29,13 @@ use metrics::{
 };
 use op_indexer_storage::Store;
 
-const BLOCKS_INGESTED: &str = "op_indexer_pipeline_blocks_ingested_total";
 const BLOCKS_DROPPED: &str = "op_indexer_pipeline_blocks_dropped_total";
-const REORGS: &str = "op_indexer_pipeline_reorgs_total";
-const REORG_DEPTH: &str = "op_indexer_pipeline_reorg_depth";
 const BLOCKS_FILLED: &str = "op_indexer_pipeline_blocks_filled_total";
-const RETRIES: &str = "op_indexer_pipeline_retries_total";
 const INGEST_LAG: &str = "op_indexer_pipeline_ingest_lag_seconds";
 const CHANNEL_DEPTH: &str = "op_indexer_pipeline_channel_depth";
 const BLOCKS_PROMOTED: &str = "op_indexer_pipeline_blocks_promoted_total";
 const PROMOTION_HOLES: &str = "op_indexer_pipeline_promotion_holes_total";
 const PROMOTION_BLOCKS_MISSING: &str = "op_indexer_pipeline_promotion_blocks_missing_total";
-const L1_REORGS: &str = "op_indexer_pipeline_l1_reorgs_total";
 const ARCHIVE_SKIPPED_BLOCKS: &str = "op_indexer_pipeline_archive_skipped_blocks_total";
 const SAFE_BLOCK_NUMBER: &str = "op_indexer_pipeline_safe_block_number";
 const RANGE_BLOCKS_STORED: &str = "op_indexer_pipeline_range_blocks_stored_total";
@@ -151,30 +143,14 @@ pub fn describe() {
         "Verified receipts that were not attached, by reason"
     );
     describe_counter!(
-        BLOCKS_INGESTED,
-        Unit::Count,
-        "Gossip blocks stored in the unsafe store"
-    );
-    describe_counter!(
         BLOCKS_DROPPED,
         Unit::Count,
         "Gossip blocks not stored, by reason"
-    );
-    describe_counter!(REORGS, Unit::Count, "Unsafe-chain reorgs");
-    describe_histogram!(
-        REORG_DEPTH,
-        Unit::Count,
-        "Blocks replaced by one unsafe-chain reorg"
     );
     describe_counter!(
         BLOCKS_FILLED,
         Unit::Count,
         "Blocks that repaired a gap below the head"
-    );
-    describe_counter!(
-        RETRIES,
-        Unit::Count,
-        "Store calls repeated after a transient error"
     );
     describe_histogram!(
         INGEST_LAG,
@@ -202,11 +178,6 @@ pub fn describe() {
         "Blocks left out of the committed store by promotion holes"
     );
     describe_counter!(
-        L1_REORGS,
-        Unit::Count,
-        "Rollbacks of the committed store after the safe head moved back"
-    );
-    describe_counter!(
         ARCHIVE_SKIPPED_BLOCKS,
         Unit::Count,
         "Promoted blocks not archived because they did not extend the archive"
@@ -228,30 +199,14 @@ pub fn describe() {
     );
 }
 
-/// Records a gossip block newly stored in the unsafe store.
-pub(crate) fn block_ingested() {
-    counter!(BLOCKS_INGESTED).increment(1);
-}
-
 /// Records a gossip block that was not stored.
 pub(crate) fn block_dropped(reason: DropReason) {
     counter!(BLOCKS_DROPPED, "reason" => reason.as_str()).increment(1);
 }
 
-/// Records an unsafe-chain reorg that replaced `depth` blocks.
-pub(crate) fn reorg(depth: usize) {
-    counter!(REORGS).increment(1);
-    histogram!(REORG_DEPTH).record(small(count(depth)));
-}
-
 /// Records blocks below the head that became canonical.
 pub(crate) fn fill(blocks: usize) {
     counter!(BLOCKS_FILLED).increment(count(blocks));
-}
-
-/// Records a call to `store` repeated after a transient error.
-pub(crate) fn retry(store: Store) {
-    counter!(RETRIES, "store" => store.as_str()).increment(1);
 }
 
 /// Records how long after its timestamp a block was inserted.
@@ -274,11 +229,6 @@ pub(crate) fn blocks_promoted(blocks: usize) {
 pub(crate) fn promotion_hole(reason: HoleReason, blocks_missing: u64) {
     counter!(PROMOTION_HOLES, "reason" => reason.as_str()).increment(1);
     counter!(PROMOTION_BLOCKS_MISSING, "reason" => reason.as_str()).increment(blocks_missing);
-}
-
-/// Records a rollback of the committed store after the safe head moved back or changed hash.
-pub(crate) fn l1_reorg() {
-    counter!(L1_REORGS).increment(1);
 }
 
 /// Records promoted blocks that were not archived because they do not extend the archive.

@@ -24,6 +24,7 @@ pub mod committed_store;
 mod config;
 mod error;
 pub mod metrics;
+mod retry;
 pub mod unsafe_store;
 mod validate;
 
@@ -38,6 +39,7 @@ use op_indexer_primitives::{
 
 pub use config::{ArchiveConfig, ArchiveRetention, ClickHouseConfig, RedisConfig, StorageConfig};
 pub use error::{InvalidBlockReason, ParseError, Severity, StorageError};
+pub use retry::{RetryError, retry};
 
 /// One of the three stores, for errors and metric labels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

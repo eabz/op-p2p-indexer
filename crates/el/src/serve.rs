@@ -27,18 +27,19 @@
 //! says "not from me". Does not verify what it serves: the provider's blocks were verified
 //! when they were stored.
 
-use std::fmt;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+mod provider;
+mod session;
 
-use alloy_primitives::{BlockNumber, Bytes};
+use std::sync::Arc;
+use std::time::Duration;
+
+use alloy_primitives::Bytes;
 use alloy_rlp::{Decodable, Encodable, Header};
 use op_alloy_consensus::{OpReceipt, OpReceiptEnvelope};
-use op_indexer_primitives::{BlockRead, BlockRef, BlockStart, ItemConvert, ReadLimits};
+use op_indexer_primitives::{BlockRead, BlockStart, ItemConvert, ReadLimits};
 use reth_eth_wire_types::message::RequestPair;
 use reth_eth_wire_types::{
-    BlockHashOrNumber, BlockRangeUpdate, GetBlockBodies, GetBlockHeaders, GetReceipts,
-    HeadersDirection,
+    BlockHashOrNumber, GetBlockBodies, GetBlockHeaders, GetReceipts, HeadersDirection,
 };
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
@@ -46,6 +47,9 @@ use tokio::time::{MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+pub use self::provider::BlockProvider;
+use self::provider::HeldRange;
+pub(crate) use self::session::{Handled, Serving, SessionServing};
 use crate::ElError;
 use crate::metrics::{self, ServeKind, ServeOutcome};
 use crate::wire;
@@ -56,18 +60,6 @@ const MAX_ITEMS: usize = 1024;
 /// A response stops growing once it passes this size: the soft limit of the eth protocol, well
 /// under the 10 MiB hard limit on a message, so the block that crosses it still fits.
 const SOFT_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
-
-/// Requests answered from the provider per peer per [`RATE_WINDOW`]; further ones get an empty
-/// answer. Two a second, each up to [`SOFT_RESPONSE_BYTES`], is more than a syncing node asks
-/// of one peer, and bounds what one peer can make this node read.
-const MAX_REQUESTS_PER_WINDOW: u32 = 120;
-
-/// The window of the per-peer request limit.
-const RATE_WINDOW: Duration = Duration::from_mins(1);
-
-/// Requests of one peer being answered at once; further ones get an empty answer. A syncing
-/// node keeps a few requests open per peer.
-const MAX_IN_FLIGHT_PER_PEER: usize = 4;
 
 /// Requests of all peers waiting for the server; further ones get an empty answer. A few
 /// seconds of work at most, so no peer waits into its own request timeout.
@@ -80,70 +72,6 @@ const MAX_CONCURRENT: usize = 4;
 /// How often the held range is read from the provider.
 const RANGE_REFRESH: Duration = Duration::from_secs(10);
 
-/// Largest request body read: a request for [`MAX_ITEMS`] hashes (33 bytes each as RLP), its
-/// list headers and its request id. A larger request asks for more than is ever answered, and
-/// is refused before it is copied or decoded: a 10 MiB request holds 300,000 hashes.
-const MAX_REQUEST_BYTES: usize = MAX_ITEMS * 33 + 32;
-
-/// Shortest time between two `BlockRangeUpdate`s to one peer. The range moves with every
-/// block; peers only need it roughly (reth announces once per epoch, about six minutes).
-const RANGE_UPDATE_INTERVAL: Duration = Duration::from_mins(1);
-
-/// The first and the last block held.
-pub(crate) type HeldRange = (BlockRef, BlockRef);
-
-/// The range a session tells its peer, in the status and in `BlockRangeUpdate`: only blocks
-/// this node serves, or its tip alone.
-///
-/// - Blocks are held: the held range as it is, from its first block to its last, with the last
-///   block as the head, however far that is behind the chain's tip. Every block advertised is
-///   served, and peers (and our own range sync) know to ask for them: making an imported
-///   history available is the point of holding it. The node then looks like one that is
-///   behind. Earlier runs suggest peers accept that (a stale but real head kept sessions; only
-///   genesis as the head ended them), but a status hours or days behind is **not confirmed
-///   live**: whether peers keep such a session, and still answer its requests for the tip's
-///   receipts, is the first thing to check in the next run.
-/// - Nothing is held: the tip the node knows, earliest and latest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct AdvertisedRange {
-    pub(crate) earliest: BlockNumber,
-    pub(crate) latest: BlockRef,
-}
-
-/// The blocks this node can serve: one contiguous range, each block in its consensus encoding.
-///
-/// The binary implements it over its local archive. The bytes it returns are sent to peers as
-/// they are (receipts without their blooms), so they must be the block's original encoding.
-pub trait BlockProvider: fmt::Debug + Send + Sync + 'static {
-    /// Why a read failed.
-    type Error: std::error::Error + Send + Sync + 'static;
-
-    /// Reads a run of headers, bodies or receipts (each block's receipts as an RLP list, every
-    /// receipt in network encoding with its bloom), each item as the RLP held, ending at the
-    /// first block not held and at `limits`. One call answers one request, so it should be one
-    /// read of the store, off the async runtime.
-    ///
-    /// With `convert`, each item is passed through it, on the thread of the read, before it
-    /// counts against the limits and is returned; an item it returns `None` for ends the run.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Self::Error`] if the store cannot be read.
-    fn read(
-        &self,
-        read: BlockRead,
-        limits: ReadLimits,
-        convert: Option<ItemConvert>,
-    ) -> impl Future<Output = Result<Vec<Bytes>, Self::Error>> + Send;
-
-    /// Returns the first and the last block held, or `None` if nothing is held.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Self::Error`] if the store cannot be read.
-    fn range(&self) -> impl Future<Output = Result<Option<HeldRange>, Self::Error>> + Send;
-}
-
 /// A peer's request on its way to the server.
 #[derive(Debug)]
 struct Request {
@@ -153,170 +81,6 @@ struct Request {
     body: Bytes,
     /// Where the answer goes: a reserved place in the session's answer channel.
     answer: mpsc::OwnedPermit<Bytes>,
-}
-
-/// What every session needs to serve: the way to the server and the range it holds.
-#[derive(Debug, Clone)]
-pub(crate) struct Serving {
-    requests: mpsc::Sender<Request>,
-    range: watch::Receiver<Option<HeldRange>>,
-}
-
-impl Serving {
-    /// The serving side of one new session, and the channel its answers arrive on. `tip`
-    /// follows the newest block the node knows. The session is taken to advertise the current
-    /// range in its status.
-    pub(crate) fn session(
-        &self,
-        tip: watch::Receiver<Option<BlockRef>>,
-    ) -> (SessionServing, mpsc::Receiver<Bytes>) {
-        let (answers_tx, answers_rx) = mpsc::channel(MAX_IN_FLIGHT_PER_PEER);
-        let now = Instant::now();
-        let mut session = SessionServing {
-            requests: self.requests.clone(),
-            answers: answers_tx,
-            held: self.range.clone(),
-            tip,
-            advertised: None,
-            advertised_at: now,
-            window_start: now,
-            window_requests: 0,
-        };
-        session.advertised = session.range();
-        (session, answers_rx)
-    }
-}
-
-/// What a session does with a message that may be a request.
-#[derive(Debug)]
-pub(crate) enum Handled {
-    /// Send this answer now.
-    Now(Bytes),
-    /// The answer will arrive on the session's answer channel.
-    Later,
-    /// Not a request this node answers.
-    NotARequest,
-}
-
-/// One session's serving state: its limits and what it last told the peer about our range.
-#[derive(Debug)]
-pub(crate) struct SessionServing {
-    requests: mpsc::Sender<Request>,
-    answers: mpsc::Sender<Bytes>,
-    held: watch::Receiver<Option<HeldRange>>,
-    tip: watch::Receiver<Option<BlockRef>>,
-    /// The range the peer was last told.
-    advertised: Option<AdvertisedRange>,
-    advertised_at: Instant,
-    window_start: Instant,
-    /// Requests handed to the server since `window_start`.
-    window_requests: u32,
-}
-
-impl SessionServing {
-    /// The range the peer was last told: the one to put in the status of a new session.
-    pub(crate) const fn advertised(&self) -> Option<AdvertisedRange> {
-        self.advertised
-    }
-
-    /// The range to advertise now; `None` until the node knows a tip.
-    fn range(&self) -> Option<AdvertisedRange> {
-        let tip = (*self.tip.borrow())?;
-        let held = *self.held.borrow();
-        Some(held.map_or(
-            AdvertisedRange {
-                earliest: tip.number,
-                latest: tip,
-            },
-            |(first, last)| AdvertisedRange {
-                earliest: first.number,
-                latest: last,
-            },
-        ))
-    }
-
-    /// Handles a message from the peer if it is a request. Never waits: within the limits the
-    /// request goes to the server, otherwise the peer gets an empty answer.
-    pub(crate) fn request(&mut self, message_id: u8, body: &[u8]) -> Handled {
-        let kind = match message_id {
-            wire::GET_BLOCK_HEADERS => Some(ServeKind::Headers),
-            wire::GET_BLOCK_BODIES => Some(ServeKind::Bodies),
-            wire::GET_RECEIPTS => Some(ServeKind::Receipts),
-            // This node has no transaction pool.
-            wire::GET_POOLED_TRANSACTIONS => None,
-            _ => return Handled::NotARequest,
-        };
-        let response_id = kind.map_or(wire::POOLED_TRANSACTIONS, response_id);
-        let Some(request_id) = wire::request_id(body) else {
-            return Handled::NotARequest;
-        };
-        let empty = || Handled::Now(response(response_id, request_id, &[]));
-        let Some(kind) = kind else {
-            return empty();
-        };
-        if body.len() > MAX_REQUEST_BYTES {
-            metrics::served(kind, ServeOutcome::Malformed);
-            return empty();
-        }
-        if !self.within_rate() {
-            metrics::served(kind, ServeOutcome::RateLimited);
-            return empty();
-        }
-        // No free place means the peer already has its share of requests being answered.
-        let Ok(answer) = self.answers.clone().try_reserve_owned() else {
-            metrics::served(kind, ServeOutcome::Busy);
-            return empty();
-        };
-        let request = Request {
-            kind,
-            id: request_id,
-            body: Bytes::copy_from_slice(body),
-            answer,
-        };
-        // Full: the server is behind. Closed: it has stopped.
-        if self.requests.try_send(request).is_err() {
-            metrics::served(kind, ServeOutcome::Busy);
-            return empty();
-        }
-        Handled::Later
-    }
-
-    /// The `BlockRangeUpdate` to send now, if the range to advertise changed since the peer was
-    /// last told and [`RANGE_UPDATE_INTERVAL`] has passed. The tip moves with every block, so in
-    /// practice one goes out every interval.
-    pub(crate) fn range_update(&mut self) -> Option<Bytes> {
-        if self.advertised_at.elapsed() < RANGE_UPDATE_INTERVAL {
-            return None;
-        }
-        let range = self.range()?;
-        if self.advertised == Some(range) {
-            return None;
-        }
-        self.advertised = Some(range);
-        self.advertised_at = Instant::now();
-        let update = BlockRangeUpdate {
-            earliest: range.earliest,
-            latest: range.latest.number,
-            latest_hash: range.latest.hash,
-        };
-        let mut out = Vec::with_capacity(update.length().saturating_add(1));
-        out.push(wire::BLOCK_RANGE_UPDATE);
-        update.encode(&mut out);
-        Some(out.into())
-    }
-
-    /// Counts one request against the per-peer limit; `false` once the window is used up.
-    fn within_rate(&mut self) -> bool {
-        if self.window_start.elapsed() >= RATE_WINDOW {
-            self.window_start = Instant::now();
-            self.window_requests = 0;
-        }
-        if self.window_requests >= MAX_REQUESTS_PER_WINDOW {
-            return false;
-        }
-        self.window_requests = self.window_requests.saturating_add(1);
-        true
-    }
 }
 
 /// The task that answers requests from the provider and keeps the held range current.

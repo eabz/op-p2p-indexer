@@ -4757,6 +4757,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "clickhouse",
+ "fastrand",
  "fjall",
  "metrics",
  "op-alloy-consensus",
@@ -4770,6 +4771,7 @@ dependencies = [
  "snap",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 

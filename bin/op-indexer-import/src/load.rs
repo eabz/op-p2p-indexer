@@ -39,11 +39,12 @@ use eyre::{WrapErr, ensure, eyre};
 use op_indexer_primitives::{BlockSource, DecodedBlock, EncodedBlock, decode_block};
 use op_indexer_storage::archive_store::FjallArchive;
 use op_indexer_storage::committed_store::ClickHouseStore;
-use op_indexer_storage::{ArchiveStore, ClickHouseConfig, CommittedStore, Severity, StorageError};
+use op_indexer_storage::{
+    ArchiveStore, ClickHouseConfig, CommittedStore, RetryError, Severity, StorageError, Store,
+};
 use tokio::task::{JoinHandle, spawn_blocking};
-use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::chunk::{self, VerifiedBlock};
 use crate::cli::Secret;
@@ -58,10 +59,6 @@ const READ_AHEAD: usize = 4;
 const APPEND_BYTES: usize = 16 * 1024 * 1024;
 /// Blocks per insert into ClickHouse.
 const INSERT_BLOCKS: usize = 1000;
-/// Wait before the first retry of a store call that failed with a transient error.
-const INITIAL_BACKOFF: Duration = Duration::from_millis(200);
-/// Longest wait between retries.
-const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// How long a store call is retried before `load` gives up. A store that is down for longer
 /// needs an operator; `load` continues where it stopped when it is run again.
 const RETRY_BUDGET: Duration = Duration::from_mins(5);
@@ -215,7 +212,7 @@ async fn fill_archive(
         if !pending.is_empty() {
             let (blocks, bytes) = (pending.len(), pending_bytes);
             // The clone is of reference-counted buffers; the bytes are not copied.
-            let append = retry(cancel, "archive append_batch", || {
+            let append = retry(cancel, Store::Archive, "archive append_batch", || {
                 archive.append_batch(pending.clone())
             });
             if append.await?.is_none() {
@@ -270,7 +267,9 @@ async fn fill_clickhouse(
         .await
         .wrap_err("reading a chunk panicked")??;
         for batch in blocks.chunks(INSERT_BLOCKS) {
-            let insert = retry(cancel, "ClickHouse insert", || committed.insert(batch));
+            let insert = retry(cancel, Store::Committed, "ClickHouse insert", || {
+                committed.insert(batch)
+            });
             if insert.await?.is_none() {
                 return Ok(Some(chunk.from));
             }
@@ -490,9 +489,8 @@ fn exists(path: &Path) -> eyre::Result<bool> {
         .wrap_err_with(|| format!("failed to look for {}", path.display()))
 }
 
-/// Runs a store call and repeats it while it fails with a transient error, waiting between
-/// attempts with exponential backoff, shortened at random by up to half. `None` if `cancel`
-/// fired while waiting.
+/// Runs a call to `store` through storage's retry helper, for at most [`RETRY_BUDGET`].
+/// `None` if `cancel` fired while it was waiting to retry.
 ///
 /// # Errors
 ///
@@ -500,38 +498,26 @@ fn exists(path: &Path) -> eyre::Result<bool> {
 /// has been failing for [`RETRY_BUDGET`].
 async fn retry<T, F, Fut>(
     cancel: &CancellationToken,
+    store: Store,
     operation: &'static str,
-    mut call: F,
+    call: F,
 ) -> eyre::Result<Option<T>>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, StorageError>>,
 {
-    let started = Instant::now();
-    let mut backoff = INITIAL_BACKOFF;
-    loop {
-        let err = match call().await {
-            Ok(value) => return Ok(Some(value)),
-            Err(err) if err.severity() == Severity::Transient => err,
-            Err(err) => return Err(err).wrap_err(operation),
-        };
-        if started.elapsed() >= RETRY_BUDGET {
-            return Err(err).wrap_err_with(|| {
+    let result = op_indexer_storage::retry(cancel, store, operation, Some(RETRY_BUDGET), call);
+    match result.await {
+        Ok(value) => Ok(Some(value)),
+        Err(RetryError::Cancelled) => Ok(None),
+        Err(RetryError::Storage(err)) if err.severity() == Severity::Transient => Err(err)
+            .wrap_err_with(|| {
                 format!(
                     "{operation} kept failing for {} minutes; run `load` again once the store \
                      is reachable",
                     RETRY_BUDGET.as_secs() / 60
                 )
-            });
-        }
-        let half = backoff / 2;
-        let delay = half + half.mul_f64(fastrand::f64());
-        warn!(operation, ?delay, ?err, "store call failed, retrying");
-        tokio::select! {
-            biased;
-            () = cancel.cancelled() => return Ok(None),
-            () = sleep(delay) => {}
-        }
-        backoff = backoff.saturating_mul(2).min(MAX_BACKOFF);
+            }),
+        Err(RetryError::Storage(err)) => Err(err).wrap_err(operation),
     }
 }

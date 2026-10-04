@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use crate::recover::{RecoverError, recover_encoded};
-use crate::retry::{RetryError, retry};
+use crate::retry::{retry, settle};
 use crate::{PipelineError, metrics};
 
 const INSERT: &str = "committed insert (range)";
@@ -61,30 +61,16 @@ pub(crate) async fn run<C: CommittedStore, A: ArchiveStore>(
         let insert = retry(&cancel, Store::Committed, INSERT, || {
             committed.insert(&blocks)
         });
-        match insert.await {
-            Ok(()) => {}
-            Err(RetryError::Cancelled) => return Ok(()),
-            Err(RetryError::Storage(source)) => {
-                return Err(PipelineError::Storage {
-                    operation: INSERT,
-                    source,
-                });
-            }
+        if settle(insert.await, INSERT)?.is_none() {
+            return Ok(());
         }
         if let Some(archive) = &archive {
             // The clone is of reference-counted buffers; the bytes are not copied.
             let append = retry(&cancel, Store::Archive, APPEND, || {
                 archive.append_batch(batch.clone())
             });
-            match append.await {
-                Ok(()) => {}
-                Err(RetryError::Cancelled) => return Ok(()),
-                Err(RetryError::Storage(source)) => {
-                    return Err(PipelineError::Storage {
-                        operation: APPEND,
-                        source,
-                    });
-                }
+            if settle(append.await, APPEND)?.is_none() {
+                return Ok(());
             }
         }
         debug!(

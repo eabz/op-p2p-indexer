@@ -4,9 +4,9 @@
 //! Execution peers of our chain are few (about 25 on our fork) and mostly full: a dial usually
 //! ends with "too many peers" or a dropped handshake, and a slot opens only when a full peer's
 //! own sessions churn. So getting a session is a matter of asking every known peer and asking
-//! again soon. While it has fewer outbound sessions than its target the peer set dials every
-//! peer that is due, several at once; at the target it stops dialing. A session won by a dial
-//! is always kept, so a burst of dials can end slightly above the target.
+//! again soon. While it has fewer outbound sessions than its target ([`MAX_SESSIONS`]) the peer
+//! set dials peers that are due, at most as many at once as sessions are missing, so dialing
+//! never opens more than the target.
 //!
 //! How soon a peer is dialed again depends on why the last dial failed:
 //!
@@ -20,21 +20,21 @@
 //! | its data failed verification | not for [`BAN_DURATION`] |
 //!
 //! It is never a tight loop: no peer is dialed more often than once per [`FULL_PEER_RETRY`],
-//! at most [`MAX_DIALS_IN_FLIGHT`] dials run at once, and at most [`MAX_DIALS_PER_MINUTE`]
-//! start in any minute.
+//! at most [`MAX_DIALS_IN_FLIGHT`] dials run at once, and at most 30 start in any minute. The
+//! waits, the bans and the choice of whom to dial next are in `schedule`.
 //!
 //! Nothing is dialed or accepted until the node knows a block to advertise as its tip (the
-//! fetcher sets it in the session context when the first request arrives): peers end a session
-//! at once with a node whose status says it is at genesis.
+//! binary provides it): peers end a session at once with a node whose status says it is at
+//! genesis.
 //!
 //! Does not discover peers (candidates arrive on a channel), run the handshake or the listener
 //! (`session`), or decide which peer serves a request (`fetch`). `fetch` sees the open sessions
 //! through [`Peers`] and reports peers that sent bad data or stopped answering.
 //!
-//! Everything a peer can make us remember is bounded: known peers and bans are capped maps
-//! that evict their least useful entry.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+mod schedule;
+
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,10 +43,11 @@ use reth_eth_wire_types::DisconnectReason;
 use reth_network_peers::PeerId;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
-use tokio::time::{Instant, MissedTickBehavior, interval, timeout};
+use tokio::time::{MissedTickBehavior, interval, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use self::schedule::{BAN_DURATION, FULL_PEER_RETRY, LONG_BACKOFF, REDIAL_INTERVAL, Schedule};
 use crate::ElError;
 use crate::discovery::Candidate;
 use crate::metrics::{self, DialOutcome, DropReason, EndLabel};
@@ -58,37 +59,12 @@ use crate::session::{
 /// Sessions the node keeps in each direction: this many it dials, and as many again it
 /// accepts. A handful is enough for a node that asks slowly.
 const MAX_SESSIONS: usize = 8;
-/// Base wait before dialing a peer again after a TCP failure, a timeout, a failed hello or
-/// status, or a session that ended for an ordinary reason. Full peers are retried sooner.
-const REDIAL_INTERVAL: Duration = Duration::from_mins(5);
 /// How often the peer set looks for peers that have become due for a dial. New candidates and
 /// finished dials are acted on at once; this only catches waits that ran out.
 const DIAL_TICK: Duration = Duration::from_secs(1);
 /// Most dials in progress at once, while below the session target. Enough to ask every peer
 /// of our fork within a few seconds of knowing it.
 const MAX_DIALS_IN_FLIGHT: usize = 8;
-/// Most dials started in any minute. With every known peer waiting at least
-/// [`FULL_PEER_RETRY`], about 25 peers stay under it; it bounds what a flood of node records
-/// can make us dial.
-const MAX_DIALS_PER_MINUTE: usize = 30;
-/// The window [`MAX_DIALS_PER_MINUTE`] is counted over.
-const DIAL_WINDOW: Duration = Duration::from_secs(60);
-/// Shortest wait before the same peer is dialed again, and the wait after "too many peers" or
-/// a dropped handshake: a full peer's slots churn, so asking again soon is what gets one. The
-/// jitter adds up to half, so 60 to 90 s.
-const FULL_PEER_RETRY: Duration = Duration::from_secs(60);
-/// Most peers remembered for dialing. Discovery finds a few dozen peers of our fork; the cap
-/// only bounds what a flood of node records can make us hold.
-const MAX_KNOWN_PEERS: usize = 1024;
-/// Most bans remembered. Beyond it the ban that expires first is forgotten.
-const MAX_BANNED_PEERS: usize = 1024;
-/// How long a peer whose data failed verification is neither dialed nor accepted.
-const BAN_DURATION: Duration = Duration::from_hours(6);
-/// Wait before dialing again a peer that cannot serve us for a reason that does not change
-/// soon: another fork or chain, no shared protocol version, or it called us useless.
-const LONG_BACKOFF: Duration = Duration::from_hours(1);
-/// Failures in a row double the wait this many times at most (so up to 8 times the base).
-const MAX_BACKOFF_DOUBLINGS: u32 = 3;
 /// Reports from the fetcher waiting to be handled. Reports are rare; a full queue drops one,
 /// and the peer is reported again on its next failure.
 const REPORTS_CAPACITY: usize = 64;
@@ -128,33 +104,14 @@ pub(crate) struct PeerSet {
     served: mpsc::Sender<ExecutionPeer>,
     /// The open sessions, published to the fetcher on every change.
     published: watch::Sender<Arc<[SessionHandle]>>,
-    /// Peers discovery told us about, by id. At most [`MAX_KNOWN_PEERS`].
-    known: HashMap<PeerId, Known>,
-    /// Peers not to dial or accept, with when the ban ends. At most [`MAX_BANNED_PEERS`].
-    banned: HashMap<PeerId, Instant>,
+    /// Whom to dial and when, and whom to stay away from.
+    schedule: Schedule,
     sessions: HashMap<PeerId, Live>,
     dialing: HashSet<PeerId>,
-    /// When the dials of the last [`DIAL_WINDOW`] started, oldest first.
-    recent_dials: VecDeque<Instant>,
     /// Dials in progress, running sessions and refusals being sent.
     tasks: JoinSet<Option<Done>>,
     /// Numbers sessions, so the end of an old session cannot remove a newer one of that peer.
     next_generation: u64,
-}
-
-/// A peer that can be dialed.
-#[derive(Debug)]
-struct Known {
-    candidate: Candidate,
-    /// Not dialed before this.
-    next_dial: Instant,
-    /// Failed dials since the last session.
-    failures: u32,
-    /// Whether a session with it has ever been open: a peer that exists and speaks our
-    /// protocol, which fresh ids from discovery must not crowd out.
-    proven: bool,
-    /// When discovery last reported it; the longest unseen is evicted first.
-    last_seen: Instant,
 }
 
 /// An open session.
@@ -211,28 +168,6 @@ impl PeerSet {
         saved: &[ExecutionPeer],
         served: mpsc::Sender<ExecutionPeer>,
     ) -> (Self, Peers) {
-        // Saved peers are known from the start, so they are dialed as soon as a tip is known,
-        // before discovery has found anyone.
-        let now = Instant::now();
-        let known = saved
-            .iter()
-            .take(MAX_KNOWN_PEERS)
-            .map(|peer| {
-                let candidate = Candidate {
-                    peer_id: peer.id,
-                    addr: peer.addr,
-                };
-                let known = Known {
-                    candidate,
-                    next_dial: now,
-                    failures: 0,
-                    // Saved because it served us in an earlier run.
-                    proven: true,
-                    last_seen: now,
-                };
-                (peer.id, known)
-            })
-            .collect();
         let (published, sessions) = watch::channel(Arc::from(Vec::new()));
         let (reports_tx, reports) = mpsc::channel(REPORTS_CAPACITY);
         let peer_set = Self {
@@ -242,11 +177,9 @@ impl PeerSet {
             reports,
             served,
             published,
-            known,
-            banned: HashMap::new(),
+            schedule: Schedule::new(saved),
             sessions: HashMap::new(),
             dialing: HashSet::new(),
-            recent_dials: VecDeque::new(),
             tasks: JoinSet::new(),
             next_generation: 0,
         };
@@ -314,37 +247,10 @@ impl PeerSet {
 
     /// Remembers a peer discovery found, or refreshes what is known about it.
     fn learn(&mut self, candidate: Candidate) {
-        let now = Instant::now();
-        if let Some(known) = self.known.get_mut(&candidate.peer_id) {
-            known.candidate = candidate;
-            known.last_seen = now;
-            return;
-        }
-        if self.known.len() >= MAX_KNOWN_PEERS {
-            // Evict the peer discovery has not mentioned for the longest time.
-            let stale = self
-                .known
-                .iter()
-                .filter(|(id, _)| !self.sessions.contains_key(*id) && !self.dialing.contains(*id))
-                // A proven peer goes only when no unproven one is left.
-                .min_by_key(|(_, known)| (known.proven, known.last_seen))
-                .map(|(id, _)| *id);
-            let Some(stale) = stale else {
-                return;
-            };
-            self.known.remove(&stale);
-        }
-        debug!(peer = %candidate.peer_id, addr = %candidate.addr, "learned execution peer");
-        self.known.insert(
-            candidate.peer_id,
-            Known {
-                candidate,
-                next_dial: now,
-                failures: 0,
-                proven: false,
-                last_seen: now,
-            },
-        );
+        let (sessions, dialing) = (&self.sessions, &self.dialing);
+        self.schedule.learn(candidate, |peer| {
+            sessions.contains_key(peer) || dialing.contains(peer)
+        });
     }
 
     /// Dials peers that are due: at most as many as outbound sessions are missing from
@@ -360,54 +266,13 @@ impl PeerSet {
         if missing == 0 {
             return;
         }
-        let now = Instant::now();
-        while self
-            .recent_dials
-            .front()
-            .is_some_and(|started| now.duration_since(*started) >= DIAL_WINDOW)
-        {
-            self.recent_dials.pop_front();
-        }
-        let wanted = missing
-            .min(MAX_DIALS_IN_FLIGHT.saturating_sub(self.dialing.len()))
-            .min(MAX_DIALS_PER_MINUTE.saturating_sub(self.recent_dials.len()));
-        if wanted == 0 {
-            return;
-        }
-        let mut due: Vec<(bool, u32, Instant, PeerId)> = self
-            .known
-            .iter()
-            .filter(|(id, known)| {
-                known.next_dial <= now
-                    && !self.sessions.contains_key(*id)
-                    && !self.dialing.contains(*id)
-                    && !self.is_banned(id, now)
-            })
-            .map(|(id, known)| (!known.proven, known.failures, known.next_dial, *id))
-            .collect();
-        // Half of the dials go to proven peers first, so that discovery handing out fresh ids
-        // without end (each with no failure yet) cannot take every dial. Within each half:
-        // peers that failed least first, then those waiting longest.
-        due.sort_unstable();
-        let reserved = wanted.div_ceil(2);
-        let proven = due.iter().take_while(|(unproven, ..)| !unproven).count();
-        let from_proven = proven.min(reserved);
-        let picked: Vec<PeerId> = due
-            .iter()
-            .take(from_proven)
-            .chain(due.iter().skip(proven))
-            .chain(due.iter().take(proven).skip(from_proven))
-            .take(wanted)
-            .map(|(.., peer)| *peer)
-            .collect();
-        for peer in picked {
-            let Some(known) = self.known.get_mut(&peer) else {
-                continue;
-            };
-            // Set before the dial ends, so no path can dial a peer twice within the floor.
-            known.next_dial = now + jittered(FULL_PEER_RETRY);
-            self.recent_dials.push_back(now);
-            let candidate = known.candidate.clone();
+        let wanted = missing.min(MAX_DIALS_IN_FLIGHT.saturating_sub(self.dialing.len()));
+        let (sessions, dialing) = (&self.sessions, &self.dialing);
+        let due = self.schedule.take_due(wanted, |peer| {
+            sessions.contains_key(peer) || dialing.contains(peer)
+        });
+        for candidate in due {
+            let peer = candidate.peer_id;
             self.dialing.insert(peer);
             let (ctx, cancel) = (Arc::clone(&self.ctx), cancel.clone());
             self.tasks.spawn(async move {
@@ -438,47 +303,11 @@ impl PeerSet {
                             self.keep(handle, driver, cancel);
                         }
                     }
-                    Err(err) => self.dial_failed(peer, &err),
+                    Err(err) => self.schedule.dial_failed(peer, &err),
                 }
             }
             Done::Ended { end, generation } => self.ended(&end, generation),
         }
-    }
-
-    /// Records a failed dial and when the peer may be dialed again.
-    fn dial_failed(&mut self, peer: PeerId, err: &SessionError) {
-        // The outcome, the wait after a first failure, and whether failures in a row double it.
-        let (outcome, base, grows) = match err {
-            // A full peer: its slots churn, so ask again soon, every time.
-            SessionError::Hello(Some(DisconnectReason::TooManyPeers))
-            | SessionError::Status {
-                reason: Some(DisconnectReason::TooManyPeers),
-            } => (DialOutcome::TooManyPeers, FULL_PEER_RETRY, false),
-            // How a full reth node refuses: the same, but back off if it keeps happening.
-            SessionError::Ecies => (DialOutcome::HandshakeDropped, FULL_PEER_RETRY, true),
-            SessionError::Tcp(_) => (DialOutcome::Unreachable, REDIAL_INTERVAL, true),
-            SessionError::Timeout { .. } => (DialOutcome::Timeout, REDIAL_INTERVAL, true),
-            SessionError::Hello(_) | SessionError::Status { .. } => {
-                (DialOutcome::Failed, REDIAL_INTERVAL, true)
-            }
-            SessionError::ForkMismatch { .. } | SessionError::WrongChain => {
-                (DialOutcome::WrongFork, LONG_BACKOFF, false)
-            }
-            SessionError::NoSharedEth => (DialOutcome::Incompatible, LONG_BACKOFF, false),
-        };
-        metrics::dial(outcome);
-        debug!(%peer, %err, "dial failed");
-        let Some(known) = self.known.get_mut(&peer) else {
-            return;
-        };
-        let wait = if grows {
-            let doublings = known.failures.min(MAX_BACKOFF_DOUBLINGS);
-            known.failures = known.failures.saturating_add(1);
-            base.saturating_mul(1_u32.checked_shl(doublings).unwrap_or(u32::MAX))
-        } else {
-            base
-        };
-        known.next_dial = Instant::now() + jittered(wait);
     }
 
     /// Keeps an inbound session if there is room for it and the peer is welcome.
@@ -490,7 +319,7 @@ impl PeerSet {
         if !self.ctx.has_tip()
             || full
             || self.sessions.contains_key(&peer)
-            || self.is_banned(&peer, Instant::now())
+            || self.schedule.is_banned(&peer)
         {
             metrics::inbound_refused();
             self.refuse(driver, DisconnectReason::TooManyPeers);
@@ -512,10 +341,7 @@ impl PeerSet {
             "execution session opened"
         );
         debug!(%peer, fork_id = ?status.fork_id, head = %status.head_hash, "peer status");
-        if let Some(known) = self.known.get_mut(&peer) {
-            known.failures = 0;
-            known.proven = true;
-        }
+        self.schedule.connected(&peer);
         let generation = self.next_generation;
         self.next_generation = self.next_generation.wrapping_add(1);
         self.sessions.insert(peer, Live { handle, generation });
@@ -574,9 +400,7 @@ impl PeerSet {
             "execution session ended"
         );
         // Never earlier than a wait already set, by a report that dropped the peer.
-        if let Some(known) = self.known.get_mut(&peer) {
-            known.next_dial = known.next_dial.max(Instant::now() + jittered(wait));
-        }
+        self.schedule.wait(&peer, wait);
     }
 
     /// Acts on a report from a requester: saves a peer that served, drops one that failed.
@@ -584,7 +408,7 @@ impl PeerSet {
         let (peer, reason, tell, wait) = match report {
             Report::Served(peer) => return self.save(peer),
             Report::BadData(peer) => {
-                self.ban(peer);
+                self.schedule.ban(peer);
                 let tell = DisconnectReason::ProtocolBreach;
                 (peer, DropReason::BadData, tell, BAN_DURATION)
             }
@@ -599,9 +423,7 @@ impl PeerSet {
         };
         // Set here, not when the driver ends: the peer would otherwise be due at once and be
         // dialed again in this same turn of the loop.
-        if let Some(known) = self.known.get_mut(&peer) {
-            known.next_dial = Instant::now() + jittered(wait);
-        }
+        self.schedule.wait(&peer, wait);
         // The session is removed now, so requesters stop using it at once; its driver ends on
         // the disconnect and reports that later.
         let Some(live) = self.sessions.remove(&peer) else {
@@ -635,26 +457,6 @@ impl PeerSet {
         }
     }
 
-    /// Remembers not to dial or accept `peer` for [`BAN_DURATION`].
-    fn ban(&mut self, peer: PeerId) {
-        let now = Instant::now();
-        if self.banned.len() >= MAX_BANNED_PEERS && !self.banned.contains_key(&peer) {
-            let first_to_expire = self
-                .banned
-                .iter()
-                .min_by_key(|(_, until)| **until)
-                .map(|(id, _)| *id);
-            if let Some(first_to_expire) = first_to_expire {
-                self.banned.remove(&first_to_expire);
-            }
-        }
-        self.banned.insert(peer, now + BAN_DURATION);
-    }
-
-    fn is_banned(&self, peer: &PeerId, now: Instant) -> bool {
-        self.banned.get(peer).is_some_and(|until| *until > now)
-    }
-
     /// Sessions open in one direction.
     fn count(&self, direction: Direction) -> usize {
         self.sessions
@@ -681,10 +483,4 @@ pub(crate) fn closed(channel: &'static str, cancel: &CancellationToken) -> Resul
     } else {
         Err(ElError::ChannelClosed { channel })
     }
-}
-
-/// `wait` lengthened by up to half, so peers that failed together are not dialed together and
-/// no wait is shorter than asked.
-fn jittered(wait: Duration) -> Duration {
-    wait.saturating_add((wait / 2).mul_f64(fastrand::f64()))
 }

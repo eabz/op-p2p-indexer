@@ -1,20 +1,20 @@
 # Import spec (`bin/op-indexer-import`)
 
-Status: **agreed 2026-10-04, being built** on `feat/el` (user: all of this work stays on one branch).
+Status: **built on `feat/el`; the legacy range has been downloaded once on the real service
+(2026-10-03); everything from the Bedrock block on is untested against real data.**
 
 **Goal (user, 2026-10-04): sync the whole chain from HyperSync as a separate process, usable
 for any chain, into a local store that the node serves over p2p; then test a normal p2p sync
-against that node.** The legacy range (section 1) verifies today and is built first. The
-range from the Bedrock block onward is section 9 and depends on a test that is running.
+against that node.**
 
 OP Mainnet's blocks before the Bedrock upgrade (0 to 105,235,062) cannot be re-executed by a
-modern EVM, and no execution peer we reached serves them (`docs/el-viability.md`, on the `el`
-branch). This binary fetches them once from Envio HyperSync, verifies every block, and loads
-them into the committed store. It keeps what it downloaded, so later steps can be repeated
-without HyperSync.
+modern EVM, and no execution peer we reached serves them (`docs/el-viability.md`). This binary
+downloads a chain's blocks from Envio HyperSync, verifies every block against a trusted anchor,
+and loads the verified bytes into the local block archive. It keeps what it downloaded, so
+`verify` and `load` can be repeated without HyperSync.
 
 It is a separate binary: the indexer never links it and never talks to an external service.
-The HyperSync dependency belongs to this package only.
+The HTTP client and the compression crates belong to this package only.
 
 ## 1. What was measured (2026-10-04, 1,009 blocks)
 
@@ -32,51 +32,77 @@ The HyperSync dependency belongs to this package only.
 ## 2. The constraint that shapes the design
 
 The API token allows unlimited requests for **30 minutes from first use**; the user can reset
-the window. 105.2 million blocks in 30 minutes is about 58,000 blocks per second. On a 1 Gbit
-line at most about 225 GB arrives in that time, so:
-
-- the transfer must be compact (binary or compressed responses, only the fields needed);
-- requests must run in parallel (the server work alone is about 130 minutes);
-- nothing but downloading happens during the window;
-- the download must resume, because one window may not be enough.
+the window. So nothing but downloading happens during the window, as few bytes as possible
+travel, as little work as possible is done per byte, and the download resumes: one window is
+not enough for the whole chain.
 
 ## 3. Phases
 
-Each phase is a subcommand, reads and writes a state directory, and can be stopped and run
-again; a completed step is never redone.
+Each phase is a subcommand, works in a state directory (section 7), and can be stopped and run
+again; a completed chunk is never redone.
 
 ### 3.1 `download`
 
-- Splits the range into fixed chunks of blocks (1,000 by default) and fetches them with a
-  configurable number of requests in flight.
-- A HyperSync response may cover less than the range asked for; the chunk is complete only
-  when every block of it has arrived.
-- Each complete chunk is written compressed to the state directory, atomically (temporary
-  file, then rename), so a file that exists is complete. A rerun fetches only missing chunks.
-- Fields requested: everything needed to rebuild the header, the transaction and the receipt
-  with its logs, plus the old client's L1 fee fields. The bloom filters are not requested:
-  they are recomputed from the logs, and the header hash check proves them.
-- Errors: a failed request is retried with capped, jittered backoff; when the service starts
-  refusing for rate limits the phase stops with a summary of what is missing, to be run again
-  after the window is reset. It never spins.
-- Prints progress (chunks done, blocks per second, bytes per second, time left at this rate)
-  at a fixed interval.
+- On its first run it decides the range and records it in `plan.json` (section 7).
+- The range is cut into chunks: 1,000 blocks before the chain's Bedrock block, 100 from it on,
+  where one block holds as much as many legacy ones (`--chunk-blocks`, and a tenth of it).
+  Chunks are fetched with `--requests` requests in flight (default 64), each on its own
+  HTTP/1.1 connection.
+- A response may cover less than the range asked for; the chunk is complete only when every
+  block of it has arrived.
+- **Stored as it travels.** The response body is written to the chunk's file exactly as
+  received, in the content encoding the service chose (zstd is asked for first, then gzip),
+  after one byte naming that encoding. Nothing is decompressed to be compressed again. The
+  only work per byte is one streaming decode, into nothing, to read the cursor
+  (`next_block`) at the end of the body. Memory is about a megabyte per request in flight,
+  whatever a chunk holds.
+- **Fields requested**: what the header, the transactions and the receipts with their logs
+  are rebuilt from. Not requested, because `verify` computes them and the header hash proves
+  them: the bloom filters, the transactions root, the receipts root and the transaction
+  hashes. The old client's L1 fee fields are not requested: no root covers them and nothing
+  reads them.
+- **Errors**: a chunk that fails for a reason that may pass (HTTP 429, 408, 5xx, a broken
+  connection, an answer cut short) is fetched again from its start, up to six times, with
+  capped, jittered backoff. A 400, 401 or 403 fails at once. When a chunk fails for good, or
+  free disk space falls below 16 GiB, no new chunk is started, the requests in flight finish
+  and are written, and the phase ends with a summary of what is missing. It never spins.
+- **Progress**, every 10 seconds: chunks done, blocks, blocks per second and time left from
+  the last minute, requests in flight, bytes per second on the wire, the processor time spent
+  decoding (`decode_cpu_percent`, 100 = one core), bytes on disk, free disk space.
 
 ### 3.2 `verify`
 
-Offline; reads the downloaded chunks only.
+Offline; reads the downloaded chunks only, several at once (`--verify-threads`, default one
+per core).
 
-- Rebuilds each header and checks that it hashes to its block hash and that each block's
-  parent hash is the previous block's hash, from the last legacy block down to block 0.
-- The anchor is the Bedrock block: 105,235,062's hash must equal the parent hash of block
-  105,235,063 (hash `0xdbf6a80f…afd3`), a constant with its source documented.
-- Rebuilds each transaction, checks its hash, and checks the transactions root.
-- Rebuilds each receipt (bloom from its logs) and checks the receipts root.
-- Recovers the sender of every signed transaction. A zero-signature transaction (an
-  L1-to-L2 message) gets the zero address as sender; they are counted.
-- CPU work runs in parallel, off the async runtime. A chunk that fails stops the phase with
-  the block number and the check that failed; the chunk can be deleted and downloaded again.
-- Records which chunks are verified.
+For every block it rebuilds the transactions and the receipts from the downloaded rows,
+computes the transactions root over the transaction encodings and the receipts root over the
+receipts, rebuilds the header with those roots and the bloom of the logs, and requires the
+header to hash to the block's hash and to name the previous block as its parent. Once every
+chunk is verified, the chunks are linked to each other and the last block is checked against
+the anchor (section 11). The bytes that passed are written as verified chunks.
+
+- **What is proven** for every block: its header hashes to its block hash and links to its
+  parent up to the anchor; its transactions root is the root over the stored transaction
+  encodings; its receipts root is the root over the stored receipts. That is what a peer
+  checks when the bytes are served to it.
+- **What is not proven: senders.** No signature is checked: one recovery per transaction was
+  most of the work of `verify`, and the bytes served to peers contain no senders. The sender
+  written to the optional ClickHouse rows is the `from` HyperSync reports, trusted as given. A
+  transaction signed with all zeros (an L1-to-L2 message of OP Mainnet's client before
+  Bedrock) has no signer and gets the zero address; they are counted.
+- **The accepted range.** Only when every chunk is verified, every link holds and the anchor
+  matches does `verify` write `verified.json` (range, anchor, hash of the last block, time).
+  Every run of `verify` removes it first. `load` refuses to load without a record that matches
+  the plan, so nothing `verify` did not accept as a whole is ever loaded.
+- A chunk that fails stops the phase with the block number, the check and the file; delete
+  the file and run `download` again. With the roots not downloaded, a wrong transaction,
+  receipt or log shows as the header hash not matching, for its block.
+- Memory: the chunks verified at once are limited to 256 MiB of downloaded bytes (one chunk is
+  always allowed); a chunk takes about twenty times its downloaded size while it is verified.
+- Progress every 10 seconds (chunks, blocks, transactions, their speed over the last minute,
+  time left, busy threads, bytes written), a line at start saying how many chunks are already
+  verified and how many are not downloaded, and lines during the linking pass.
 
 ### 3.3 `load`
 
@@ -86,9 +112,7 @@ Offline; reads the downloaded chunks only.
   given: verified chunks become `DecodedBlock`s with `BlockSource::Import` and go through
   `CommittedStore::insert`, in batches. It can be done later from the same chunks, without
   HyperSync and without touching the archive again.
-- Progress is recorded per target, so each resumes on its own.
-- The old client's L1 fee fields are not loaded anywhere: no root covers them. They stay in
-  the downloaded chunks.
+- It loads only the range `verify` accepted (`verified.json`).
 
 ## 4. The local history store, for serving
 
@@ -121,11 +145,14 @@ machine: `cargo build --release -p op-indexer-import` produces one file to copy.
   default `data/archive`) and contacts nothing else.
 - **ClickHouse is optional.** It is written only when `--clickhouse-url` is given
   (`OP_INDEXER_IMPORT_CLICKHOUSE_URL`); its migrations are then applied if missing, and
-  `--clickhouse-database`, `--clickhouse-user`, `--clickhouse-password` and `--chain-id`
-  apply. Redis is never needed.
-- The two targets keep separate records per chunk (`<state>/loaded/<chunk>.archive` and
-  `<chunk>.clickhouse`), so ClickHouse can be loaded on a later run from the same verified
-  chunks without redoing the archive.
+  `--clickhouse-database`, `--clickhouse-user` and `--clickhouse-password` apply. Redis is
+  never needed.
+- `load` needs the range accepted by `verify` (`verified.json`) and refuses anything else.
+  What the archive holds is asked of the archive: `load` continues after its last block, and
+  refuses an archive that does not start at the range's first block or holds another chain.
+  ClickHouse keeps one marker per chunk (`<state>/loaded/<chunk>.clickhouse`), so it can be
+  loaded on a later run from the same verified chunks without touching the archive.
+- `load` exits with an error if it stops before the end of the range, and says what to run.
 
 ### How to run it
 
@@ -151,27 +178,16 @@ op-indexer-import load --archive-dir data/archive
 ```
 
 `op-indexer-import --help` and `<command> --help` list every flag, its environment variable
-and its default. Range flags (`--state-dir`, `--first-block`, `--last-block`, `--anchor-hash`,
-`--legacy-only`, `--chunk-blocks`) must be the same for every step.
+and its default. Only `--state-dir` is shared by the steps: the range is decided by the first
+`download` and read from `plan.json` afterwards.
 
-- **The range's end**: with no range flags, `download` looks up the newest dispute game of
-  the chain on L1 (through HyperSync's L1 endpoint, same token), ends the range at that game's
-  L2 block, and records the game in `anchor.json` in the state directory. Every later run of
-  any step uses the recorded game; `verify` checks the last block's output root against the
-  game's claim. Delete `anchor.json` and run `download` again to extend the range to a newer
-  game: chunks already there are kept. `--legacy-only` ends at block 105,235,062 with its
-  known hash and needs no lookup; `--last-block <n> --anchor-hash <hash>` gives any end you
-  trust; `--last-block <n> --allow-unanchored-top` goes without an anchor (also the fallback
-  if the lookup fails).
-- **A state directory filled by an earlier legacy run** is continued by a default run: chunks
-  are files named by their block range, so every chunk already there is skipped. Only the
-  short last chunk of the legacy range (`…105235000-…105235063`) has no counterpart in the
-  longer range; its blocks are downloaded again as part of chunk `…105235000-…105236000`, and
-  the short file is never read again (it can be deleted).
-- **State directory**: `raw/` holds one compressed file per downloaded chunk (the service's
-  answers as received), `verified/` one file per verified chunk (the consensus encodings that
-  passed), `loaded/` one marker per loaded chunk. A file exists only when its chunk is
-  complete; `*.tmp` files are leftovers of an interrupted write and are overwritten.
+- **The range**: with no range flags, block 0 to the L2 block of the newest dispute game of
+  the chain on L1 (section 11). `--legacy-only` ends at the last block before Bedrock with its
+  known hash and needs no lookup; `--last-block <n> --anchor-hash <hash>` gives any end whose
+  hash you trust; `--first-block` any start. These are read on the first `download` only; on a
+  later run a range flag that disagrees with the recorded plan is refused. To import another
+  range, or to extend to a newer game, use an empty state directory.
+- **State directory**: section 7.
 - **Stopping and restarting**: Ctrl-C or SIGTERM stops a step within a fraction of a second
   and exits with status 1 and a summary; `run` does not start the next step. Run the same
   command again: it continues with exactly the chunks that are missing. A killed process
@@ -186,73 +202,83 @@ and its default. Range flags (`--state-dir`, `--first-block`, `--last-block`, `-
   fetched. Ctrl-C stops any step cleanly; run it again to continue.
 - **A chunk that fails `verify`**: the error names the block, the check and the file. Delete
   that file from `raw/` and run `download` again.
-- **Disk**: measured on 1,000 blocks around block 50,000,000, a downloaded chunk is about
-  0.8 KB per block compressed and a verified one about 0.5 KB per block: roughly 85 GB and
-  52 GB for the whole legacy range if that sample is typical, plus ClickHouse and the archive.
-  `raw/` can be deleted once `verify` reports the range verified up to the anchor.
+- **Disk**: a downloaded legacy chunk is 0.7 to 1.0 KB per block (zstd or gzip, as the
+  service sends it) and a verified one about 0.5 KB per block: roughly 75 to 105 GB and 52 GB
+  for the legacy range if the sample of section 6 is typical. Blocks from Bedrock on are many
+  times larger and have not been measured. `raw/` can be deleted once `load` has finished.
 
-## 6. Sizing (estimates until the rehearsal measures them)
+## 6. Measured
 
-- Downloaded chunks: 100 to 160 GB compressed.
-- ClickHouse: tens of GB.
-- Verification: one signature recovery per signed transaction, about 105 million in total.
+Offline, on 1,000 saved blocks (50,000,000 to 50,000,999, one transaction each), Apple M-series:
 
-## 7. Rehearsal before the real window
+- Size: 4.7 MB of JSON with the fields requested; 0.75 MB as zstd, 1.0 MB as gzip.
+- `verify`, one thread: 0.17 s of processor time per 1,000 blocks with sender recovery, about
+  0.06 s without (the build described here): reading and decoding 6 to 8 ms, parsing 10 to
+  13 ms, receipts and their blooms 8 ms, the two tries 9 ms, header, body and receipts
+  encoding 5 ms, transactions 1 ms, writing the verified chunk with its sync 17 to 22 ms (on
+  macOS; a sync is cheaper on Linux).
+- Projection, not a measurement: 105 million legacy blocks at 0.05 s per 1,000 are about 90
+  core-minutes, 11 minutes on 8 cores if the disk keeps up.
 
-A short run on a small range that measures: bytes per block in the chosen transfer format,
-how many requests in flight the service accepts, blocks per second achieved, and the time
-`verify` and `load` take per million blocks. Its numbers replace section 6 and decide the
-concurrency for the real run. It uses up a window, which the user then resets.
+On the real service (the user's run, 2026-10-03, 8 cores, 1 Gbit, the build before this one):
+the legacy range downloaded at about 185,000 blocks per second with 64 requests in flight.
+Nothing from the Bedrock block on has been measured.
 
-## 8. Not in this PR
+## 7. The state directory
 
-The senders and L1 metadata of L1-to-L2 messages, serving and backfill over p2p (`el`), any
-other source than HyperSync (the source sits behind one small trait so an RPC or the published
-legacy archive can be added).
+```text
+<state>/plan.json                 the chain, the range, its anchor and the chunk size
+<state>/verified.json             the range `verify` accepted; `load` requires it
+<state>/raw/<from>-<to>.raw       downloaded chunk: the service's answers as they travelled
+<state>/verified/<from>-<to>.blk  verified chunk: the consensus encodings that passed
+<state>/loaded/<from>-<to>.clickhouse   marker: ClickHouse holds the chunk
+<state>/lock                      held by the one process working on the directory
+```
+
+- `plan.json` is written by the first `download` and never changed: chain id, first and last
+  block, the anchor (a trusted hash, or the dispute game found on L1) and the chunk size. Every
+  later run of any step reads it; `verify` and `load` take no range flags. Files already
+  written were cut by it, which is why it cannot change.
+- A directory written by a build with another layout is refused: it either has chunks and no
+  `plan.json`, or a `plan.json` with another version. Delete it and download again.
+- A file exists only when it is complete: it is written under a `.tmp` name and renamed, and
+  leftover `.tmp` files are removed at the next start.
+
+## 8. Not built
+
+The senders and L1 metadata of L1-to-L2 messages; any source other than HyperSync; the binary
+(Arrow) format of HyperSync, which measured offline would save about 20% on the wire over the
+compressed JSON and was put aside; reading the deposit contract's logs on L1.
 
 ## 9. From the Bedrock block onward
 
-HyperSync does not return three fields of deposit transactions (source hash, mint,
-system-transaction flag) or the deposit nonce of their receipts, and every block from Bedrock
-on starts with a deposit. A block can only be imported if its deposits can be rebuilt so that
-each transaction hashes to its reported hash and both roots match the header:
+Every block from Bedrock on starts with a deposit, and bridged deposits follow. `verify`
+rebuilds legacy, EIP-2930, EIP-1559, EIP-7702 and deposit transactions, their receipts, and
+headers of every fork (base fee, withdrawals root, blob fields, beacon root, and from Isthmus
+the hash of an empty requests list, which has no column in HyperSync).
 
-- *The L1-attributes deposit* (first transaction of every block): its missing fields follow
-  from protocol rules and from its own calldata.
-- *User deposits* (bridged from L1): the source hash needs the L1 block hash and log index of
-  the deposit event, and the mint value is in that event; both would come from the bridge
-  contract's logs on L1, which HyperSync also serves.
-- *Deposit receipts*: the deposit nonce must be recoverable from the fields returned.
-
-Status (2026-10-04): built, verified offline on blocks 105,235,063 and 105,235,064 only.
-
-- `verify` rebuilds legacy, EIP-2930, EIP-1559, EIP-7702 and deposit transactions, their
-  receipts, and headers of every fork (base fee, withdrawals root, blob fields, beacon root,
-  and from Isthmus the hash of an empty requests list, which has no column in HyperSync).
-- HyperSync's schema lists `source_hash`, `mint`, `deposit_nonce` and
-  `deposit_receipt_version` columns; `download` requests them. Where a deposit's source hash
-  is reported, the deposit is rebuilt from its row; the system-transaction flag is the one of
-  the two values that gives the reported hash. Whether the OP Mainnet endpoint fills these
-  columns is not known until the first request.
-- Where it is not reported, the block's deposits are rebuilt by the protocol's rules
-  (`deposit.rs`): the L1-attributes deposit from its own calldata, network upgrade deposits
-  from their intents. User deposits then need the deposit contract's logs on L1, which are
-  **not downloaded yet**: such a block fails `verify` with a named check.
-- Before Canyon the deposit nonce is not part of the hashed receipt: the root is checked
-  without it, and the stored receipt keeps the reported nonce, unproven.
-- Fork times are flags (`--regolith-time`, `--canyon-time`, `--isthmus-time`), OP Mainnet by
-  default. For a post-Bedrock range set `--first-block`, `--last-block` and `--anchor-hash`.
-- Not verified on any sample: typed transactions (the JSON form of `access_list` and
+- **Deposits are rebuilt from HyperSync's `source_hash` and `mint` columns.** A deposit
+  without a reported source hash fails `verify` with a named check: the source hash comes from
+  the deposit's event on L1, which this tool does not read. Whether the OP Mainnet endpoint
+  fills these columns for every deposit is **not known**: no block from Bedrock on has been
+  verified against real data.
+- The system-transaction flag, which has no column, follows the protocol's rule: only the
+  L1-attributes deposit before Regolith has it.
+- A deposit receipt carries the sender's nonce and the receipt version from Canyon on, when
+  they became part of the hashed receipt; before Canyon nothing the root does not cover is
+  stored.
+- Fork times and the Bedrock block come from `op-indexer-chainspec`.
+- Verified offline on blocks 105,235,062 to 105,235,064 with an earlier build only. Not
+  verified on any sample: typed transactions (the JSON form of `access_list` and
   `authorization_list` is assumed to be the Ethereum RPC's), user deposits, blocks from Canyon
-  on. A block that cannot be rebuilt and verified is not imported; the importer never stores
-  data it could not verify.
+  on. A block that cannot be rebuilt and verified is not imported.
 
 ## 10. Any chain
 
-Everything chain-specific is configuration, not code: the HyperSync endpoint, the block
-range, the anchor (a trusted block hash the range must link to), the fork activations that
-change encodings, and for OP Stack chains the L1 endpoint and bridge contract. A chain without
-a legacy era or deposits needs only the endpoint, the range and the anchor.
+The chain is chosen with `--chain <id>` on the first `download`; its parameters (fork times,
+the Bedrock block and its time, the hash of the last legacy block, the block time, the
+dispute-game factory) come from `op-indexer-chainspec`, which today knows OP Mainnet. The
+HyperSync endpoints of the chain and of its L1 are flags (`--endpoint`, `--l1-endpoint`).
 
 ## 11. Where the import stops, and the top anchor
 
@@ -285,6 +311,10 @@ trusted hash at its top (section 3.2); a range that reaches the present needs on
   an hour behind the safe head (OP Mainnet creates a game about hourly).
 - **What it does not prove:** that the claim is right. A new game is a bonded claim nobody
   has challenged yet.
+- **It is a consistency check, not an independent proof.** The game is read through the same
+  provider as the blocks (HyperSync's L1 endpoint). A provider that served a wrong chain could
+  serve a matching wrong game. Against that, give `--last-block` with an `--anchor-hash` taken
+  from a source you trust.
 - **Before Isthmus** the header does not carry the message passer's storage root, so the
   output root cannot be computed from what is downloaded and a game cannot anchor such a
   block. A range that ends there needs the trusted hash of its last block instead.
@@ -299,4 +329,5 @@ trusted hash at its top (section 3.2); a range that reaches the present needs on
   recent games on OP Mainnet are all type 9 (seen 2026-10-03). The extra-data encodings are
   from `FaultDisputeGame.sol`, `SuperFaultDisputeGame.sol` and `Encoding.sol` in the Optimism
   monorepo.
-- The legacy-only default range (0 to 105,235,062) keeps its trusted hash and needs no lookup.
+- `--legacy-only` (0 to 105,235,062 on OP Mainnet) uses the trusted hash of the last legacy
+  block from the chain specification and needs no lookup.

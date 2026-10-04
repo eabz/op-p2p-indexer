@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 
 use crate::PipelineError;
 use crate::metrics::{self, RequestOutcome, UnmatchedReason};
-use crate::retry::{RetryError, retry};
+use crate::retry::{RetryError, retry, settle};
 
 /// Most stored blocks checked for missing receipts at startup, newest first. The walk also
 /// ends when the request channel is full; older blocks wait for the next start.
@@ -210,9 +210,8 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, StorageError>>,
 {
-    match retry(cancel, Store::Unsafe, operation, read).await {
-        Ok(value) => Ok(Some(value)),
-        Err(RetryError::Cancelled) => Ok(None),
-        Err(RetryError::Storage(source)) => Err(PipelineError::Storage { operation, source }),
-    }
+    settle(
+        retry(cancel, Store::Unsafe, operation, read).await,
+        operation,
+    )
 }
