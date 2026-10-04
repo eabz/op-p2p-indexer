@@ -34,13 +34,14 @@ use alloy_consensus::Header;
 use alloy_primitives::{BlockHash, BlockNumber, Bytes, keccak256};
 use alloy_rlp::Decodable;
 use op_alloy_consensus::OpReceiptEnvelope;
-use op_indexer_primitives::{ArchivedBlock, BlockRef, DecodedBlock, EncodedBlock, encode_receipts};
-use tracing::warn;
+use op_indexer_primitives::{
+    BlockRead, BlockRef, EncodedBlock, ItemConvert, ReadLimits, encode_receipts,
+};
 
 use self::tables::{Entry, Failure, Tables};
 use crate::metrics::{self, Operation};
-use crate::validate::{validate_block, validate_receipts};
-use crate::{ArchiveStore, BlockPart, InvalidBlockReason, StorageError, Store};
+use crate::validate::validate_receipts;
+use crate::{ArchiveStore, InvalidBlockReason, StorageError, Store};
 
 /// The block archive in one fjall database directory. Cheap to clone: clones share the open
 /// database.
@@ -68,27 +69,19 @@ impl fmt::Debug for FjallArchive {
 }
 
 impl FjallArchive {
-    /// Opens the archive in the directory `path`, creating it and its keyspaces if needed. An
-    /// archive written with another schema version is emptied, with a warning: it can be rebuilt
-    /// from the committed store. fjall locks the directory, so one process opens it at a time.
+    /// Opens the archive in the directory `path`, creating it and its keyspaces if needed.
+    /// fjall locks the directory, so one process opens it at a time.
     ///
     /// Does blocking disk I/O, including replaying the journal after a crash: call it at startup
     /// or from a blocking thread.
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError::Fjall`] if the directory cannot be created, opened, locked or
-    /// written.
+    /// Returns [`StorageError::ArchiveSchema`] if the directory holds an archive of another
+    /// schema version (it is left as it is), and [`StorageError::Fjall`] if the directory
+    /// cannot be created, opened, locked or written.
     pub fn open(path: &Path) -> Result<Self, StorageError> {
-        let (tables, emptied) =
-            tables::open(path).map_err(|failure| failure.into_storage_error("open"))?;
-        if let Some(version) = emptied {
-            warn!(
-                path = %path.display(),
-                %version,
-                "block archive had another schema version; emptied it"
-            );
-        }
+        let tables = tables::open(path).map_err(|failure| failure.into_storage_error("open"))?;
         Ok(Self { tables })
     }
 
@@ -118,19 +111,8 @@ impl FjallArchive {
 }
 
 impl ArchiveStore for FjallArchive {
-    /// Validates and encodes the block on the calling task, then compresses and writes it in
-    /// one durable batch on a blocking thread.
-    async fn append(&self, block: &DecodedBlock) -> Result<(), StorageError> {
-        // The error goes into the timed call on purpose, so an invalid block is counted.
-        let encoded = encode(block);
-        self.blocking(Operation::Append, "append", move |tables| {
-            tables::append_batch(tables, &[encoded?])
-        })
-        .await
-    }
-
-    /// Hashes, compresses and writes on a blocking thread. One batch holds at most 1024 blocks
-    /// or 16 MiB of RLP, and the writer lock is taken once per batch.
+    /// Hashes, compresses and writes on a blocking thread. One batch holds at most 16 MiB of
+    /// RLP, and the writer lock is taken once per batch.
     async fn append_batch(&self, blocks: Vec<EncodedBlock>) -> Result<(), StorageError> {
         self.blocking(Operation::AppendBatch, "append_batch", move |tables| {
             let entries: Vec<Entry> = blocks.into_iter().map(entry).collect::<Result<_, _>>()?;
@@ -144,7 +126,7 @@ impl ArchiveStore for FjallArchive {
         block: BlockRef,
         receipts: &[OpReceiptEnvelope],
     ) -> Result<bool, StorageError> {
-        // As in `append`: the error goes into the timed call, so invalid receipts are counted.
+        // The error goes into the timed call on purpose, so invalid receipts are counted.
         let checked = validate_receipts(block.number, receipts);
         let count = receipts.len();
         let receipts = encode_receipts(receipts);
@@ -155,20 +137,14 @@ impl ArchiveStore for FjallArchive {
         .await
     }
 
-    async fn block(&self, number: BlockNumber) -> Result<Option<ArchivedBlock>, StorageError> {
-        self.blocking(Operation::Block, "block", move |tables| {
-            tables::block(tables, number)
-        })
-        .await
-    }
-
-    async fn part(
+    async fn read(
         &self,
-        number: BlockNumber,
-        part: BlockPart,
-    ) -> Result<Option<Bytes>, StorageError> {
-        self.blocking(Operation::Part, "part", move |tables| {
-            tables::part(tables, number, part)
+        read: BlockRead,
+        limits: ReadLimits,
+        convert: Option<ItemConvert>,
+    ) -> Result<Vec<Bytes>, StorageError> {
+        self.blocking(Operation::Read, "read", move |tables| {
+            tables::read(tables, &read, limits, convert)
         })
         .await
     }
@@ -198,29 +174,6 @@ impl ArchiveStore for FjallArchive {
         })
         .await
     }
-}
-
-/// Validates `block` and encodes it as RLP, checking that the header hashes to its hash.
-fn encode(block: &DecodedBlock) -> Result<Entry, StorageError> {
-    validate_block(block)?;
-    let header = &block.block.header;
-    let header_rlp = alloy_rlp::encode(header);
-    if keccak256(&header_rlp) != block.hash {
-        return Err(StorageError::InvalidBlock {
-            number: header.number,
-            reason: InvalidBlockReason::HeaderHash,
-        });
-    }
-    Ok(Entry {
-        block: BlockRef {
-            number: header.number,
-            hash: block.hash,
-        },
-        parent_hash: header.parent_hash,
-        header: header_rlp.into(),
-        body: alloy_rlp::encode(&block.block.body).into(),
-        receipts: block.receipts.as_deref().map(encode_receipts),
-    })
 }
 
 /// The archive entry of a block handed over in its original encoding: its bytes unchanged, with

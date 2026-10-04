@@ -54,8 +54,6 @@ pub(crate) enum Operation {
     Migrate,
     /// `insert` of the unsafe or the committed store.
     Insert,
-    /// [`ArchiveStore::append`](crate::ArchiveStore::append).
-    Append,
     /// [`ArchiveStore::append_batch`](crate::ArchiveStore::append_batch).
     AppendBatch,
     /// [`ArchiveStore::number_of`](crate::ArchiveStore::number_of).
@@ -76,8 +74,8 @@ pub(crate) enum Operation {
     Head,
     /// `block` of the unsafe store or the archive.
     Block,
-    /// [`ArchiveStore::part`](crate::ArchiveStore::part).
-    Part,
+    /// [`ArchiveStore::read`](crate::ArchiveStore::read).
+    Read,
     /// [`CommittedStore::rollback_to`](crate::CommittedStore::rollback_to).
     RollbackTo,
     /// [`CommittedStore::l1_heads`](crate::CommittedStore::l1_heads).
@@ -105,8 +103,7 @@ impl Operation {
             Self::Connect => "connect",
             Self::Migrate => "migrate",
             Self::Insert => "insert",
-            Self::Append => "append",
-            Self::Part => "part",
+            Self::Read => "read",
             Self::AppendBatch => "append_batch",
             Self::NumberOf => "number_of",
             Self::Range => "range",

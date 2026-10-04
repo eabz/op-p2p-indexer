@@ -260,16 +260,21 @@ The archive service's newest blocks are unsafe: not yet committed to L1. And par
 only prove that a range is one chain, not that it is the canonical one. The legacy range has a
 trusted hash at its top (section 3.2); a range that reaches the present needs one too.
 
-- **End of a range that reaches the present:** with `--latest-game`, the L2 block of the
-  newest game of the configured `DisputeGameFactory` and game type on L1. `download` looks it
-  up (`game.rs`: the factory's `DisputeGameCreated` logs of the last day, and the L2 block
-  from the calldata of the `create` call) and writes the game's address, L2 block, root claim
-  and L1 block to `<state>/anchor.json`, so `verify` and `load` stay offline and a resumed
-  download keeps the same end; delete the file to move to a newer game. With
-  `--resolved-only` the newest game resolved in the proposer's favour is used instead
-  (searched over 30 days). `--latest-game` excludes `--last-block` and `--anchor-hash`; with
-  no flags the range is the legacy default. The lookup uses the service's L1 endpoint, so it
+- **End of a range that reaches the present:** the L2 block of the newest dispute game the
+  chain's `DisputeGameFactory` created on L1 (the factory's `DisputeGameCreated` logs of the
+  last day, every game type; the claim is read from the calldata of the `create` call). The
+  game is recorded with the plan in the state directory, so `verify` and `load` stay offline
+  and a resumed download keeps the same end. The lookup uses the service's L1 endpoint, so it
   counts against the token's window like any download.
+- **Two kinds of game, chosen by game type** from a table in `op-indexer-chainspec`
+  (`claim_format`): a fault dispute game (types 0, 1, 2, 3, 8) names an L2 block number and
+  its root claim is that block's output root; a super fault dispute game (types 4, 5, 7, 9;
+  OP Mainnet creates type 9 as of 2026-10) carries the preimage of a super root, a timestamp
+  and one output root per chain, and its root claim is the hash of that preimage. The claim
+  for this chain is the output root next to its chain id, about its block at that timestamp
+  (found from the Bedrock block, its time and the block time in the chain specification), and
+  `verify` also requires the block to have that timestamp. A newest game of a type that is
+  not in the table is refused by name, with the types the factory created.
 - **The check is mandatory.** `verify` computes the output root of that block from its
   downloaded header, `keccak256(bytes32(0) ‖ state root ‖ withdrawals root ‖ block hash)`, and
   requires it to equal the game's root claim. A mismatch fails `verify` with both values, and
@@ -279,18 +284,19 @@ trusted hash at its top (section 3.2); a range that reaches the present needs on
   blocks that are already safe, so the range is committed to L1. The import ends up to about
   an hour behind the safe head (OP Mainnet creates a game about hourly).
 - **What it does not prove:** that the claim is right. A new game is a bonded claim nobody
-  has challenged yet. The resolved-only flag removes that, at the price of ending days back.
+  has challenged yet.
 - **Before Isthmus** the header does not carry the message passer's storage root, so the
-  output root cannot be computed from what is downloaded. A range whose last block is before
-  Isthmus (another chain, or an explicit `--last-block`) and has no `--anchor-hash` is
-  anchored only from below; it needs `--allow-unanchored-top` to proceed, and the tool says so.
+  output root cannot be computed from what is downloaded and a game cannot anchor such a
+  block. A range that ends there needs the trusted hash of its last block instead.
 - A game not created by a plain call of the factory's `create` with a one-word extra data
   (created through another contract, or another kind of game) is refused with a message
   rather than misread.
-- Chain configuration, with OP Mainnet's defaults: the factory
-  `0xe5965Ab5962eDc7477C8520243A95517CD252fA9` (superchain registry,
-  `superchain/configs/mainnet/op.toml`, `DisputeGameFactoryProxy`), the game type (0, the
-  permissionless fault dispute game; the type the chain currently respects is set on L1 and
-  was not checked), and the L1 endpoint. The extra-data encoding is from
-  `FaultDisputeGame.sol` in the Optimism monorepo.
+- From the chain specification: the factory (OP Mainnet:
+  `0xe5965Ab5962eDc7477C8520243A95517CD252fA9`, superchain registry,
+  `superchain/configs/mainnet/op.toml`, `DisputeGameFactoryProxy`), the Bedrock block and its
+  time, and the block time. Which game type the chain's portal respects is stored on L1 and
+  cannot be read through logs, so the newest game of any known type is used; the factory's
+  recent games on OP Mainnet are all type 9 (seen 2026-10-03). The extra-data encodings are
+  from `FaultDisputeGame.sol`, `SuperFaultDisputeGame.sol` and `Encoding.sol` in the Optimism
+  monorepo.
 - The legacy-only default range (0 to 105,235,062) keeps its trusted hash and needs no lookup.

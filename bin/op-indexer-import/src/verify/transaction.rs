@@ -1,80 +1,74 @@
-//! Rebuilds one transaction from its downloaded row, for every type an OP Stack chain has.
+//! Encodes one transaction from its downloaded row, for every type an OP Stack chain has.
 //!
-//! The result is a typed transaction whose consensus encoding `verify` hashes and compares
-//! with the reported hash, so nothing here is trusted: a wrong field shows as a hash mismatch.
+//! The result is the transaction's consensus encoding, the bytes a block body and the
+//! transactions trie hold. Nothing here is trusted: `verify` puts the trie's root into the
+//! rebuilt header, whose hash must be the block's, so a wrong field in any row shows there.
 //!
-//! - Legacy, EIP-2930, EIP-1559 and EIP-7702 transactions are rebuilt from their fields and
-//!   signature; the sender is recovered from the signature.
+//! - Legacy, EIP-2930, EIP-1559 and EIP-7702 transactions are built from their fields and
+//!   signature.
 //! - A legacy transaction signed with all zeros (an L1-to-L2 message of OP Mainnet's client
-//!   before Bedrock) has no signer.
-//! - A deposit (type `0x7E`) is rebuilt from the source hash and mint the service reports,
-//!   when it does; its system-transaction flag, which no service reports, is the one of the
-//!   two values that gives the reported hash. Without a reported source hash the block's
-//!   deposits are rebuilt by the protocol's rules instead: see `deposit`.
+//!   before Bedrock) is encoded with those zeros; it has no signer.
+//! - A deposit (type `0x7E`) is built from the source hash and mint the service reports. Its
+//!   system-transaction flag, which no service reports, follows the protocol's rule: only the
+//!   L1-attributes deposit before Regolith has it ([L1 attributes deposited transaction],
+//!   [Regolith]).
 //!
-//! Does not check hashes or roots: see `verify`.
+//! No signature is checked and no sender recovered: one recovery per transaction would be most
+//! of the work of `verify`, and the bytes served to peers do not contain senders. The sender
+//! recorded for the optional database rows is the one the service reports.
+//!
+//! [L1 attributes deposited transaction]: https://specs.optimism.io/protocol/deposits.html#l1-attributes-deposited-transaction
+//! [Regolith]: https://specs.optimism.io/protocol/regolith/overview.html
 
-use alloy_consensus::transaction::{SignerRecoverable, from_eip155_value};
-use alloy_consensus::{Sealed, Signed, TxEip1559, TxEip2930, TxEip7702, TxLegacy};
+use alloy_consensus::transaction::from_eip155_value;
+use alloy_consensus::{Signed, TxEip1559, TxEip2930, TxEip7702, TxLegacy};
+use alloy_eips::eip2718::Encodable2718;
 use alloy_eips::eip2930::AccessList;
 use alloy_eips::eip7702::SignedAuthorization;
-use alloy_primitives::{Address, B256, Signature, TxKind, U256, normalize_v};
+use alloy_primitives::{Address, Signature, TxKind, U256, normalize_v};
 use op_alloy_consensus::{DEPOSIT_TX_TYPE_ID, OpTxEnvelope, TxDeposit};
-use op_indexer_primitives::is_zero_signature;
+use op_indexer_primitives::encode_transaction;
 use serde::de::DeserializeOwned;
 
+use super::Check;
 use crate::rows::TransactionRow;
-use crate::verify::Check;
 
-/// A rebuilt transaction.
-#[derive(Debug)]
-pub(crate) struct Rebuilt {
-    pub(crate) transaction: OpTxEnvelope,
-    /// The sender; `None` for a legacy transaction signed with all zeros, which has none.
-    pub(crate) sender: Option<Address>,
-}
-
-/// Rebuilds the transaction of `row`, the `index`-th of its block.
+/// Appends the consensus encoding of the transaction of `row`, the `index`-th of its block,
+/// to `out`, and returns its sender as the service reports it: the zero address, with `true`,
+/// for a legacy transaction signed with all zeros. `before_regolith` is whether the block is
+/// before the chain's Regolith fork.
 ///
 /// # Errors
 ///
 /// Returns the [`Check`] that names what is missing or invalid in the row.
-pub(crate) fn rebuild(index: u64, row: &TransactionRow) -> Result<Rebuilt, Check> {
+pub(super) fn encode(
+    index: u64,
+    row: &TransactionRow,
+    before_regolith: bool,
+    out: &mut Vec<u8>,
+) -> Result<(Address, bool), Check> {
     let fields = Fields { index, row };
     let transaction = match row.kind.unwrap_or_default() {
         0 => {
-            let legacy = fields.legacy()?;
-            if is_zero_signature(&legacy) {
-                return Ok(Rebuilt {
-                    transaction: legacy,
-                    sender: None,
-                });
+            let (legacy, zero_signature) = fields.legacy()?;
+            if zero_signature {
+                encode_transaction(&legacy, out);
+                return Ok((Address::ZERO, true));
             }
             legacy
         }
         1 => fields.eip2930()?,
         2 => fields.eip1559()?,
         4 => fields.eip7702()?,
-        DEPOSIT_TX_TYPE_ID => return fields.deposit(),
+        DEPOSIT_TX_TYPE_ID => {
+            let deposit = fields.deposit(before_regolith && index == 0)?;
+            deposit.encode_2718(out);
+            return Ok((deposit.from, false));
+        }
         kind => return Err(Check::UnsupportedType { index, kind }),
     };
-
-    let recovered = transaction
-        .recover_signer()
-        .map_err(|_invalid| Check::SenderRecovery { index })?;
-    if let Some(reported) = row.from
-        && reported != recovered
-    {
-        return Err(Check::Sender {
-            index,
-            recovered,
-            reported,
-        });
-    }
-    Ok(Rebuilt {
-        transaction,
-        sender: Some(recovered),
-    })
+    encode_transaction(&transaction, out);
+    Ok((row.from.ok_or_else(|| fields.missing("from"))?, false))
 }
 
 /// A transaction row being rebuilt: its fields, each failing with the [`Check`] that names it.
@@ -156,7 +150,8 @@ impl Fields<'_> {
             .ok_or(Check::SignatureV { index: self.index })
     }
 
-    fn legacy(&self) -> Result<OpTxEnvelope, Check> {
+    /// The legacy transaction, and whether it is signed with all zeros.
+    fn legacy(&self) -> Result<(OpTxEnvelope, bool), Check> {
         let row = self.row;
         let v = row.v.ok_or_else(|| self.missing("v"))?;
         let (r, s) = self.r_s()?;
@@ -169,7 +164,8 @@ impl Fields<'_> {
             value: row.value,
             input: row.input.clone(),
         };
-        let signature = if v.is_zero() && r.is_zero() && s.is_zero() {
+        let zero_signature = v.is_zero() && r.is_zero() && s.is_zero();
+        let signature = if zero_signature {
             Signature::new(U256::ZERO, U256::ZERO, false)
         } else {
             // EIP-155: v carries the chain id, which is then part of the signed message.
@@ -180,11 +176,8 @@ impl Fields<'_> {
             transaction.chain_id = chain_id;
             Signature::new(r, s, parity)
         };
-        Ok(OpTxEnvelope::Legacy(Signed::new_unchecked(
-            transaction,
-            signature,
-            row.hash,
-        )))
+        let signed = Signed::new_unhashed(transaction, signature);
+        Ok((OpTxEnvelope::Legacy(signed), zero_signature))
     }
 
     fn eip2930(&self) -> Result<OpTxEnvelope, Check> {
@@ -199,12 +192,8 @@ impl Fields<'_> {
             access_list: self.access_list()?,
             input: row.input.clone(),
         };
-        let signature = self.typed_signature()?;
-        Ok(OpTxEnvelope::Eip2930(Signed::new_unchecked(
-            transaction,
-            signature,
-            row.hash,
-        )))
+        let signed = Signed::new_unhashed(transaction, self.typed_signature()?);
+        Ok(OpTxEnvelope::Eip2930(signed))
     }
 
     fn eip1559(&self) -> Result<OpTxEnvelope, Check> {
@@ -220,12 +209,8 @@ impl Fields<'_> {
             access_list: self.access_list()?,
             input: row.input.clone(),
         };
-        let signature = self.typed_signature()?;
-        Ok(OpTxEnvelope::Eip1559(Signed::new_unchecked(
-            transaction,
-            signature,
-            row.hash,
-        )))
+        let signed = Signed::new_unhashed(transaction, self.typed_signature()?);
+        Ok(OpTxEnvelope::Eip1559(signed))
     }
 
     fn eip7702(&self) -> Result<OpTxEnvelope, Check> {
@@ -244,43 +229,23 @@ impl Fields<'_> {
             authorization_list,
             input: row.input.clone(),
         };
-        let signature = self.typed_signature()?;
-        Ok(OpTxEnvelope::Eip7702(Signed::new_unchecked(
-            transaction,
-            signature,
-            row.hash,
-        )))
+        let signed = Signed::new_unhashed(transaction, self.typed_signature()?);
+        Ok(OpTxEnvelope::Eip7702(signed))
     }
 
-    fn deposit(&self) -> Result<Rebuilt, Check> {
+    fn deposit(&self, is_system_transaction: bool) -> Result<TxDeposit, Check> {
         let row = self.row;
-        let from = row.from.ok_or_else(|| self.missing("from"))?;
-        let deposit = TxDeposit {
+        Ok(TxDeposit {
+            // Without it the deposit cannot be rebuilt: it comes from the deposit's event on
+            // L1, which this tool does not read.
             source_hash: row.source_hash.ok_or_else(|| self.missing("source_hash"))?,
-            from,
+            from: row.from.ok_or_else(|| self.missing("from"))?,
             to: self.to(),
             mint: row.mint.map(|mint| mint.to()).unwrap_or_default(),
             value: row.value,
             gas_limit: row.gas.to(),
-            is_system_transaction: false,
+            is_system_transaction,
             input: row.input.clone(),
-        };
-        Ok(Rebuilt {
-            transaction: deposit_with_flag(deposit, row.hash),
-            sender: Some(from),
         })
     }
-}
-
-/// Sets the system-transaction flag of `deposit`, which is not reported, to the value that
-/// makes it hash to `reported`; left unset if neither does, which the caller's hash check
-/// then reports.
-fn deposit_with_flag(mut deposit: TxDeposit, reported: B256) -> OpTxEnvelope {
-    if deposit.tx_hash() != reported {
-        deposit.is_system_transaction = true;
-        if deposit.tx_hash() != reported {
-            deposit.is_system_transaction = false;
-        }
-    }
-    OpTxEnvelope::Deposit(Sealed::new_unchecked(deposit, reported))
 }

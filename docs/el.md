@@ -189,15 +189,26 @@ The node answers peers from its own stores, so that another node can sync from i
   | Requests of all peers waiting | 64 | empty answer |
   | Requests read from the provider at once | 4 | the others wait in the queue |
 
-- The server reads the held range every 10 s. The status advertises `earliest` = the first
-  block held (block 0 once the legacy range is imported) and `latest` = the tip the node
-  knows, with its hash, exactly as before serving existed; a node holding nothing advertises
-  its tip alone. **The range is honest at both ends, and complete once the import has reached
-  the tip.** Until then blocks in the middle are not held, and requests for them get empty
-  answers, like every other node on this network; the same holds for the few newest blocks,
-  which are not yet committed. `latest` is the tip and not the last block held because peers
-  keep a session whose status carries the real tip and end one that does not look like a live
-  node (seen live). `BlockRangeUpdate` follows the same rule, once a minute per session.
+- **What is advertised** (status and `BlockRangeUpdate`, at most once a minute per session):
+  only blocks this node serves, or its tip alone. The server reads the held range every 10 s.
+  - Blocks are held: the held range as it is, `earliest` = its first block (block 0 once the
+    legacy range is imported), `latest` = its last block with its hash, however far that is
+    behind the chain's tip. Every block advertised is served, and peers (and our own range
+    sync) know to ask for them: making an imported history available is why it is held. The
+    node then looks like one that is behind. Earlier runs suggest peers accept that (a stale
+    but real head kept sessions; only genesis as the head ended them), but **a status hours or
+    days behind is not confirmed live. First thing to check in the next run:** do peers keep
+    sessions with such a node, and do they still answer its requests for the tip's receipts.
+  - Nothing is held: the tip alone, `earliest` = `latest` = the tip.
+  What is advertised is logged at info at startup and when its kind or its first block
+  changes.
+  The tip is an input: the binary provides the newest block the node knows (gossip, or the
+  newest block held when there is no gossip), so a node that only serves still peers.
+- A request body larger than a request for 1,024 hashes (about 34 KiB) is answered empty
+  before it is copied or decoded.
+- A session writes with a 10 s limit: a peer that asks and does not read is dropped and not
+  dialed for an hour. What the peer sends is read last in the session's loop, so a peer
+  flooding messages cannot keep its own answers or the flush from running.
 - Metrics: `op_indexer_el_served_requests_total{kind,outcome}`,
   `op_indexer_el_served_items_total{kind}`, `op_indexer_el_served_bytes_total{kind}`.
 - Not shown live: serving itself (built without a live run).

@@ -15,10 +15,10 @@ use std::sync::Arc;
 
 use alloy_primitives::BlockNumber;
 use eyre::WrapErr;
-use op_indexer_el::{ElConfig, ExecutionNetwork, RangeSync};
+use op_indexer_el::{ExecutionNetwork, RangeSync};
 use op_indexer_p2p::{Network, NodeStore};
-use op_indexer_pipeline::{Pipeline, RangeChannels, ReceiptsChannels};
-use op_indexer_primitives::{BlockRef, ExecutionPeer, L1Heads, SyncRange};
+use op_indexer_pipeline::{Pipeline, ReceiptsChannels};
+use op_indexer_primitives::{BlockRef, EncodedBlock, ExecutionPeer, L1Heads, SyncRange};
 use op_indexer_storage::archive_store::FjallArchive;
 use op_indexer_storage::committed_store::ClickHouseStore;
 use op_indexer_storage::unsafe_store::RedisStore;
@@ -30,7 +30,7 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::time::ChronoUtc;
 
-use crate::config::Config;
+use crate::config::{Config, ElSettings};
 use crate::provider::ArchiveProvider;
 
 /// Unsafe blocks waiting for the pipeline. Blocks arrive every ~2s; this absorbs a store that
@@ -84,25 +84,25 @@ async fn main() -> eyre::Result<()> {
     // The pipeline publishes the safe block number once its blocks are committed; the network
     // ignores gaps at or below it.
     let (safe_number_tx, safe_number_rx) = watch::channel(0);
+    // The newest block the node knows, which the execution network advertises: the archive's
+    // last block until gossip delivers a head. A node that only serves an archive has one too.
+    let (head_tx, head_rx) = watch::channel(stores.archive_range.map(|(_, tip)| tip));
 
-    let execution = match config.el {
-        Some(el) => Some(execution_network(
-            el,
-            config.sync,
-            &store,
-            stores.archive.as_ref().map(|(archive, _)| archive.clone()),
-        )?),
-        None => None,
-    };
-    let (execution, receipts, range, saves) = match execution {
-        Some(parts) => (
-            Some(parts.network),
-            Some(parts.receipts),
-            parts.range,
-            parts.saves,
-        ),
-        None => (None, None, None, Vec::new()),
-    };
+    let execution = config
+        .el
+        .map(|el| execution_network(el, config.sync, &store, &stores, head_rx))
+        .transpose()?;
+    let (execution, receipts, range, saves) = execution.map_or_else(
+        || (None, None, None, Vec::new()),
+        |parts| {
+            (
+                Some(parts.network),
+                Some(parts.receipts),
+                parts.range,
+                parts.saves,
+            )
+        },
+    );
 
     let pipeline = Pipeline::new(
         stores.unsafe_store,
@@ -112,15 +112,25 @@ async fn main() -> eyre::Result<()> {
         l1_heads_rx,
         safe_number_tx,
         receipts,
-    );
+    )
+    .with_head(head_tx);
     let pipeline = match range {
         Some(range) => pipeline.with_range(range),
         None => pipeline,
     };
     let network = Network::new(config.network, keypair, store, blocks_tx, safe_number_rx);
+    run(network, execution, pipeline, saves).await
+}
 
-    // The networks stop first, on their own token, so the pipeline can still store what they
-    // delivered; cancelling `cancel` stops everything.
+/// Runs the components until one stops or a signal arrives, then stops the others in order:
+/// the networks first, on their own token, so the pipeline can still store what they
+/// delivered.
+async fn run(
+    network: Network,
+    execution: Option<ExecutionNetwork<ArchiveProvider>>,
+    pipeline: Pipeline<RedisStore, ClickHouseStore, FjallArchive>,
+    saves: Vec<JoinHandle<()>>,
+) -> eyre::Result<()> {
     let cancel = CancellationToken::new();
     let networks_cancel = cancel.child_token();
     let mut network = Some(tokio::spawn(network.run(networks_cancel.clone())));
@@ -130,10 +140,7 @@ async fn main() -> eyre::Result<()> {
 
     // Any component stopping ends the process; the others are stopped and waited for.
     let stopped = tokio::select! {
-        signal = shutdown_signal() => {
-            info!(signal = signal?, "shutting down");
-            Ok(())
-        }
+        signal = shutdown_signal() => signal.map(|signal| info!(signal, "shutting down")),
         result = finished(&mut network) => {
             warn!("network stopped unexpectedly");
             result.wrap_err("network failed")
@@ -153,7 +160,7 @@ async fn main() -> eyre::Result<()> {
     let execution = join(execution).await.wrap_err("execution network failed");
     cancel.cancel();
     let pipeline = join(pipeline).await.wrap_err("pipeline failed");
-    // Their senders are gone with the execution network and the pipeline, so they end.
+    // Their senders are gone with the execution network, so they end.
     for save in saves {
         if let Err(err) = save.await {
             warn!(%err, "a task saving node state failed");
@@ -190,41 +197,47 @@ where
 
 /// The execution network with everything that goes with it.
 struct Execution {
-    network: ExecutionNetwork<Option<ArchiveProvider>>,
+    network: ExecutionNetwork<ArchiveProvider>,
     /// The pipeline's ends of the receipts channels.
     receipts: ReceiptsChannels,
-    /// The pipeline's ends of the range sync's channels, when a range is configured.
-    range: Option<RangeChannels>,
+    /// The batches of the range sync, for the pipeline, when a range is configured.
+    range: Option<mpsc::Receiver<Vec<EncodedBlock>>>,
     /// Tasks that save what the network reports to the node store.
     saves: Vec<JoinHandle<()>>,
 }
 
-/// Builds the execution network from its configuration and what the node store has saved
-/// for it, with the range sync `sync` when one is configured. Peers are served from
-/// `archive`; without one the node serves nothing.
+/// Builds the execution network from its settings and what the node store has saved for it,
+/// with the range sync `sync` when one is configured. Peers are served from the archive;
+/// without one the node serves nothing. `head` is the newest block the node knows.
 fn execution_network(
-    mut el: ElConfig,
+    el: ElSettings,
     sync: Option<SyncRange>,
     store: &Arc<NodeStore>,
-    archive: Option<FjallArchive>,
+    stores: &Stores,
+    head: watch::Receiver<Option<BlockRef>>,
 ) -> eyre::Result<Execution> {
     // A key of its own: the two networks must not share a node id.
     let key = store
         .execution_key()
         .wrap_err("failed to load the execution network key")?;
-    el.saved_peers = store
+    let saved_peers = store
         .execution_peers()
         .wrap_err("failed to load the saved execution peers")?;
     let (requests_tx, requests_rx) = mpsc::channel(RECEIPT_REQUEST_CAPACITY);
     let (verified_tx, verified_rx) = mpsc::channel(VERIFIED_RECEIPTS_CAPACITY);
     let (served_tx, served_rx) = mpsc::channel(SERVED_PEERS_CAPACITY);
+    let provider = stores
+        .archive
+        .as_ref()
+        .map(|(archive, _)| ArchiveProvider(archive.clone()));
     let network = ExecutionNetwork::new(
-        el,
+        el.into_config(saved_peers),
         key,
+        head,
         requests_rx,
         verified_tx,
         served_tx,
-        archive.map(ArchiveProvider),
+        provider,
     )
     .wrap_err("failed to create the execution network")?;
     let mut saves = vec![tokio::spawn(save_execution_peers(
@@ -234,29 +247,26 @@ fn execution_network(
 
     let (network, range) = match sync {
         Some(sync) => {
-            let state = store
-                .sync_state(&sync)
-                .wrap_err("failed to load the range sync's progress")?;
+            let from = sync_start(&sync, stores.archive_range)?;
+            let checkpoints = store
+                .sync_checkpoints(sync.anchor)
+                .wrap_err("failed to load the range sync's checkpoints")?;
             let (blocks_tx, batches) = mpsc::channel(SYNC_BATCH_CAPACITY);
             let (checkpoints_tx, checkpoints_rx) = mpsc::channel(SYNC_CHECKPOINT_CAPACITY);
-            let (stored_tx, stored_rx) = watch::channel(None);
-            saves.push(tokio::spawn(save_sync_progress(
+            saves.push(tokio::spawn(save_sync_checkpoints(
                 Arc::clone(store),
-                sync,
                 checkpoints_rx,
-                stored_rx,
             )));
             let network = network.with_sync(RangeSync {
-                range: sync,
-                state,
+                range: SyncRange {
+                    from,
+                    anchor: sync.anchor,
+                },
+                checkpoints,
                 blocks: blocks_tx,
-                checkpoints: checkpoints_tx,
+                verified: checkpoints_tx,
             });
-            let range = RangeChannels {
-                batches,
-                stored: stored_tx,
-            };
-            (network, Some(range))
+            (network, Some(batches))
         }
         None => (network, None),
     };
@@ -269,6 +279,39 @@ fn execution_network(
         range,
         saves,
     })
+}
+
+/// Returns the first block the range sync has to fetch: the block after the archive's last
+/// one, which is how a restart resumes, or the start of the range for an empty archive.
+///
+/// # Errors
+///
+/// Returns an error if the archive is not the one this range goes into: it has to be empty,
+/// or start at or below the range and end at the block before it or inside it.
+fn sync_start(
+    sync: &SyncRange,
+    archive: Option<(BlockRef, BlockRef)>,
+) -> eyre::Result<BlockNumber> {
+    let Some((first, tip)) = archive else {
+        return Ok(sync.from);
+    };
+    eyre::ensure!(
+        first.number <= sync.from && tip.number.saturating_add(1) >= sync.from,
+        "the block archive holds blocks {} to {}; a range sync from block {} needs it empty, \
+         or ending at block {} or later",
+        first.number,
+        tip.number,
+        sync.from,
+        sync.from.saturating_sub(1)
+    );
+    eyre::ensure!(
+        tip.number != sync.anchor.number || tip.hash == sync.anchor.hash,
+        "the block archive's block {} is {}, not the anchor {}: it holds another chain",
+        tip.number,
+        tip.hash,
+        sync.anchor.hash
+    );
+    Ok(tip.number.saturating_add(1))
 }
 
 /// Saves the execution peers that served us, so the next run dials them first. Ends when the
@@ -284,45 +327,16 @@ async fn save_execution_peers(store: Arc<NodeStore>, mut served: mpsc::Receiver<
     }
 }
 
-/// Saves the progress of the range sync `range`, so a restart resumes it: the checkpoints the
-/// execution network verifies, and how far the pipeline has stored the blocks. Ends when both
-/// have dropped their senders.
-async fn save_sync_progress(
-    store: Arc<NodeStore>,
-    range: SyncRange,
-    mut checkpoints: mpsc::Receiver<Vec<BlockRef>>,
-    mut stored: watch::Receiver<Option<BlockNumber>>,
-) {
-    let (mut fetching, mut storing) = (true, true);
-    while fetching || storing {
-        let save = tokio::select! {
-            verified = checkpoints.recv(), if fetching => {
-                let Some(verified) = verified else {
-                    fetching = false;
-                    continue;
-                };
-                let store = Arc::clone(&store);
-                tokio::task::spawn_blocking(move || store.save_sync_checkpoints(&verified))
-            }
-            changed = stored.changed(), if storing => {
-                if changed.is_err() {
-                    storing = false;
-                    continue;
-                }
-                let Some(stored_to) = *stored.borrow_and_update() else {
-                    continue;
-                };
-                if stored_to >= range.anchor.number {
-                    info!(from = range.from, to = stored_to, "range sync stored its whole range");
-                }
-                let store = Arc::clone(&store);
-                tokio::task::spawn_blocking(move || store.save_sync_stored(stored_to))
-            }
-        };
+/// Saves the checkpoints the range sync verifies, so a restart does not walk the header
+/// chain again. Ends when the execution network drops its sender.
+async fn save_sync_checkpoints(store: Arc<NodeStore>, mut verified: mpsc::Receiver<Vec<BlockRef>>) {
+    while let Some(checkpoints) = verified.recv().await {
+        let store = Arc::clone(&store);
+        let save = tokio::task::spawn_blocking(move || store.save_sync_checkpoints(&checkpoints));
         match save.await {
             Ok(Ok(())) => {}
-            Ok(Err(err)) => warn!(%err, "failed to save range sync progress"),
-            Err(err) => warn!(%err, "range sync progress save task failed"),
+            Ok(Err(err)) => warn!(%err, "failed to save range sync checkpoints"),
+            Err(err) => warn!(%err, "range sync checkpoint save task failed"),
         }
     }
 }
@@ -333,6 +347,8 @@ struct Stores {
     committed: ClickHouseStore,
     /// The local block archive with how much it keeps; `None` when it is disabled.
     archive: Option<(FjallArchive, ArchiveRetention)>,
+    /// The archive's first and last block at startup; `None` when it is empty or disabled.
+    archive_range: Option<(BlockRef, BlockRef)>,
 }
 
 /// Connects to both stores, runs the Redis schema check and the ClickHouse migrations, opens
@@ -364,14 +380,16 @@ async fn prepare_storage(config: &StorageConfig) -> eyre::Result<Stores> {
                 .await
                 .wrap_err("failed to read the block archive")?;
             info!(?range, retention = ?archive.retention, "block archive ready");
-            Some((store, archive.retention))
+            Some((store, archive.retention, range))
         }
         None => None,
     };
+    let archive_range = archive.as_ref().and_then(|(_, _, range)| *range);
     Ok(Stores {
         unsafe_store,
         committed,
-        archive,
+        archive: archive.map(|(store, retention, _)| (store, retention)),
+        archive_range,
     })
 }
 

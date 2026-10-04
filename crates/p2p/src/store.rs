@@ -8,8 +8,8 @@
 //!
 //! This is a second fjall database next to the block archive's, on purpose: the archive lives
 //! in the storage crate, and p2p and storage must not depend on each other. It holds two keys,
-//! a few dozen small entries and, during a range sync, one 32-byte hash per 256 blocks still to
-//! fetch, far below every size limit fjall has, so the only setting that matters is the number
+//! a few dozen small entries and, for a range sync, one 32-byte hash per 256 blocks of the
+//! range, far below every size limit fjall has, so the only setting that matters is the number
 //! of background threads.
 
 use std::cmp::Reverse;
@@ -23,7 +23,7 @@ use alloy_primitives::{B256, B512, BlockNumber};
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 use libp2p::Multiaddr;
 use libp2p::identity::{DecodingError, secp256k1};
-use op_indexer_primitives::{BlockRef, ExecutionPeer, SyncRange, SyncState};
+use op_indexer_primitives::{BlockRef, ExecutionPeer};
 
 const NODE: &str = "node";
 const IDENTITY_KEY: &str = "secp256k1_secret";
@@ -39,14 +39,11 @@ const MAX_KNOWN_PEERS: usize = 64;
 const EXECUTION_PEERS: &str = "execution_peers";
 /// Execution peers kept; the least recently served is evicted beyond this.
 const MAX_EXECUTION_PEERS: usize = 32;
-/// Progress of a range sync: the range it belongs to, how far it is stored, and its
-/// checkpoints.
+/// The verified checkpoints of a range sync, and the anchor they were verified from.
 const SYNC: &str = "sync";
-/// The range the progress belongs to: `from`, the anchor's number (both big-endian) and the
-/// anchor's hash. Progress of another range is discarded.
-const SYNC_RANGE_KEY: &[u8] = b"range";
-/// Highest stored block of the range, big-endian.
-const SYNC_STORED_KEY: &[u8] = b"stored";
+/// The anchor the checkpoints belong to: its number (big-endian) and hash. Checkpoints of
+/// another anchor are discarded.
+const SYNC_ANCHOR_KEY: &[u8] = b"anchor";
 /// Prefix of a checkpoint: followed by the block number, big-endian, so they iterate in
 /// block order; the value is the block hash.
 const SYNC_CHECKPOINT_PREFIX: u8 = b'c';
@@ -204,27 +201,12 @@ impl NodeStore {
     ///
     /// Returns [`StoreError::Database`] if writing fails.
     pub fn save_peer(&self, addr: &Multiaddr, seen_secs: u64) -> Result<(), StoreError> {
-        let _write = self.write.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut peers = self.read_peers()?;
-        peers.insert(addr.to_vec(), seen_secs);
-        let evicted = if peers.len() > MAX_KNOWN_PEERS {
-            let oldest = peers.iter().min_by_key(|(_, seen_secs)| **seen_secs);
-            oldest.map(|(addr, _)| addr.as_slice())
-        } else {
-            None
-        };
-        // The new peer is itself the least recently seen: nothing changes.
-        if evicted == Some(addr.as_ref()) {
-            return Ok(());
-        }
-
-        let mut batch = self.durable_batch();
-        batch.insert(&self.peers, addr.as_ref(), seen_secs.to_be_bytes());
-        if let Some(evicted) = evicted {
-            batch.remove(&self.peers, evicted);
-        }
-        batch.commit()?;
-        Ok(())
+        self.save_evicting(
+            &self.peers,
+            MAX_KNOWN_PEERS,
+            addr.as_ref(),
+            &seen_secs.to_be_bytes(),
+        )
     }
 
     /// Returns the saved execution peers, most recently served first.
@@ -233,7 +215,12 @@ impl NodeStore {
     ///
     /// Returns [`StoreError::Database`] if reading fails.
     pub fn execution_peers(&self) -> Result<Vec<ExecutionPeer>, StoreError> {
-        let mut peers: Vec<ExecutionPeer> = self.read_execution_peers()?.into_values().collect();
+        let mut peers = Vec::new();
+        for entry in self.execution_peers.iter() {
+            let (id, value) = entry.into_inner()?;
+            // An entry of another shape was not written by this code; skip it.
+            peers.extend(decode_execution_peer(&id, &value));
+        }
         peers.sort_unstable_by_key(|peer| Reverse(peer.last_served_secs));
         Ok(peers)
     }
@@ -245,58 +232,80 @@ impl NodeStore {
     ///
     /// Returns [`StoreError::Database`] if writing fails.
     pub fn save_execution_peer(&self, peer: &ExecutionPeer) -> Result<(), StoreError> {
-        let _write = self.write.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut peers = self.read_execution_peers()?;
-        peers.insert(peer.id, *peer);
-        let evicted = if peers.len() > MAX_EXECUTION_PEERS {
-            let oldest = peers.values().min_by_key(|peer| peer.last_served_secs);
-            oldest.map(|peer| peer.id)
-        } else {
-            None
+        let mut value = peer.last_served_secs.to_be_bytes().to_vec();
+        value.extend_from_slice(peer.addr.to_string().as_bytes());
+        self.save_evicting(
+            &self.execution_peers,
+            MAX_EXECUTION_PEERS,
+            peer.id.as_slice(),
+            &value,
+        )
+    }
+
+    /// Writes `key -> value` to a peer table, whose values start with a time (Unix seconds,
+    /// big-endian), and evicts the entry with the oldest time if the table then holds more
+    /// than `max`. When the new entry is itself the oldest, nothing changes.
+    fn save_evicting(
+        &self,
+        table: &Keyspace,
+        max: usize,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), StoreError> {
+        let time = |value: &[u8]| {
+            value
+                .first_chunk::<8>()
+                .map(|secs| u64::from_be_bytes(*secs))
         };
-        // The new peer is itself the least recently served: nothing changes.
-        if evicted == Some(peer.id) {
+        let _write = self.write.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut oldest = time(value).map(|secs| (secs, key.to_vec()));
+        let mut entries = 1_usize;
+        for entry in table.iter() {
+            let (other, other_value) = entry.into_inner()?;
+            // An entry of another shape was not written by this code; it is not counted.
+            let Some(secs) = time(&other_value).filter(|_| *other != *key) else {
+                continue;
+            };
+            entries = entries.saturating_add(1);
+            if oldest.as_ref().is_none_or(|(oldest, _)| secs < *oldest) {
+                oldest = Some((secs, other.to_vec()));
+            }
+        }
+        let evicted = oldest.filter(|_| entries > max).map(|(_, key)| key);
+        if evicted.as_deref() == Some(key) {
             return Ok(());
         }
 
-        let mut value = peer.last_served_secs.to_be_bytes().to_vec();
-        value.extend_from_slice(peer.addr.to_string().as_bytes());
         let mut batch = self.durable_batch();
-        batch.insert(&self.execution_peers, peer.id.as_slice(), value);
+        batch.insert(table, key, value);
         if let Some(evicted) = evicted {
-            batch.remove(&self.execution_peers, evicted.as_slice());
+            batch.remove(table, evicted);
         }
         batch.commit()?;
         Ok(())
     }
 
-    /// Returns the saved progress of the range sync `range`. Progress saved for another range
-    /// is removed first, so a changed configuration starts again.
+    /// Returns the blocks whose hash a range sync up to `anchor` has verified, ascending.
+    /// Checkpoints saved for another anchor are removed first: they prove nothing about this
+    /// one.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError::Database`] if reading or writing fails.
-    pub fn sync_state(&self, range: &SyncRange) -> Result<SyncState, StoreError> {
+    pub fn sync_checkpoints(&self, anchor: BlockRef) -> Result<Vec<BlockRef>, StoreError> {
         let _write = self.write.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut id = Vec::with_capacity(48);
-        id.extend_from_slice(&range.from.to_be_bytes());
-        id.extend_from_slice(&range.anchor.number.to_be_bytes());
-        id.extend_from_slice(range.anchor.hash.as_slice());
-        if self.sync.get(SYNC_RANGE_KEY)?.as_deref() != Some(id.as_slice()) {
+        let mut id = anchor.number.to_be_bytes().to_vec();
+        id.extend_from_slice(anchor.hash.as_slice());
+        if self.sync.get(SYNC_ANCHOR_KEY)?.as_deref() != Some(id.as_slice()) {
             let mut batch = self.durable_batch();
             for key in self.sync.iter() {
                 batch.remove(&self.sync, key.key()?);
             }
-            batch.insert(&self.sync, SYNC_RANGE_KEY, id);
+            batch.insert(&self.sync, SYNC_ANCHOR_KEY, id);
             batch.commit()?;
-            return Ok(SyncState::default());
+            return Ok(Vec::new());
         }
 
-        let stored_to = self
-            .sync
-            .get(SYNC_STORED_KEY)?
-            .and_then(|stored| <[u8; 8]>::try_from(stored.as_ref()).ok())
-            .map(u64::from_be_bytes);
         let mut checkpoints = Vec::new();
         for entry in self.sync.prefix([SYNC_CHECKPOINT_PREFIX]) {
             let (key, hash) = entry.into_inner()?;
@@ -305,10 +314,7 @@ impl NodeStore {
                 checkpoints.push(checkpoint);
             }
         }
-        Ok(SyncState {
-            stored_to,
-            checkpoints,
-        })
+        Ok(checkpoints)
     }
 
     /// Saves blocks of the range sync whose hash is verified.
@@ -328,39 +334,6 @@ impl NodeStore {
         }
         batch.commit()?;
         Ok(())
-    }
-
-    /// Records that the range sync's blocks are stored up to `stored_to`, and removes the
-    /// checkpoints at or below it, which are no longer needed.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StoreError::Database`] if reading or writing fails.
-    pub fn save_sync_stored(&self, stored_to: BlockNumber) -> Result<(), StoreError> {
-        let _write = self.write.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut batch = self.durable_batch();
-        batch.insert(&self.sync, SYNC_STORED_KEY, stored_to.to_be_bytes());
-        for key in self
-            .sync
-            .range(checkpoint_key(0)..=checkpoint_key(stored_to))
-        {
-            batch.remove(&self.sync, key.key()?);
-        }
-        batch.commit()?;
-        Ok(())
-    }
-
-    /// Returns the stored execution peers by node id.
-    fn read_execution_peers(&self) -> Result<BTreeMap<B512, ExecutionPeer>, fjall::Error> {
-        let mut peers = BTreeMap::new();
-        for entry in self.execution_peers.iter() {
-            let (id, value) = entry.into_inner()?;
-            // An entry of another shape was not written by this code; skip it.
-            if let Some(peer) = decode_execution_peer(&id, &value) {
-                peers.insert(peer.id, peer);
-            }
-        }
-        Ok(peers)
     }
 
     /// Returns the stored peers: multiaddr bytes and when each was last seen.

@@ -32,6 +32,23 @@ pub struct ChainSpec {
     /// Activation time of Canyon. Deposit receipts hash differently before it: the deposit
     /// nonce is not part of the hashed receipt.
     pub canyon_time: u64,
+    /// Activation time of Regolith. From it on the L1-attributes deposit is not a system
+    /// transaction and deposit receipts record the sender's nonce.
+    pub regolith_time: u64,
+    /// Activation time of Isthmus. From it on the header carries the storage root of the
+    /// message passer as its withdrawals root, and the hash of an empty requests list.
+    pub isthmus_time: u64,
+    /// The Bedrock block: the first block of the current chain format. Blocks before it are
+    /// the legacy chain. From it on blocks are [`Self::block_time_secs`] apart.
+    pub bedrock_block: BlockNumber,
+    /// Timestamp (seconds) of the Bedrock block.
+    pub bedrock_time: u64,
+    /// Hash of the last legacy block: the parent hash in the Bedrock block's header.
+    pub last_legacy_hash: B256,
+    /// Seconds between two blocks from Bedrock on.
+    pub block_time_secs: u64,
+    /// The chain's `DisputeGameFactory` on L1, whose games claim the chain's output roots.
+    pub dispute_game_factory: Address,
 }
 
 /// OP Mainnet (chain id 10).
@@ -79,6 +96,17 @@ pub const OP_MAINNET: ChainSpec = ChainSpec {
         1_783_526_401,
     ],
     canyon_time: 1_704_992_401,
+    // Regolith is active from the Bedrock block on OP Mainnet (superchain registry).
+    regolith_time: 0,
+    isthmus_time: 1_746_806_401,
+    bedrock_block: 105_235_063,
+    bedrock_time: 1_686_068_903,
+    // The parent hash in the header of the Bedrock block (hash `0xdbf6a80f…afd3`), which every
+    // execution peer served identically (`docs/el-viability.md`).
+    last_legacy_hash: b256!("0x21a168dfa5e727926063a28ba16fd5ee84c814e847c81a699c7a0ea551e4ca50"),
+    block_time_secs: 2,
+    // `DisputeGameFactoryProxy` in `superchain/configs/mainnet/op.toml` of the registry.
+    dispute_game_factory: address!("0xe5965Ab5962eDc7477C8520243A95517CD252fA9"),
 };
 
 impl ChainSpec {
@@ -125,5 +153,35 @@ impl ChainSpec {
             .iter()
             .copied()
             .find(|spec| spec.chain_id == chain_id)
+    }
+}
+
+/// How a dispute game on L1 states the L2 block it is about and the output root it claims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimFormat {
+    /// A fault dispute game: its extra data is one word, the L2 block number, and its root
+    /// claim is that block's output root.
+    OutputRoot,
+    /// A super fault dispute game: its extra data is the preimage of a super root (a timestamp
+    /// and one output root per chain) and its root claim is the hash of that preimage.
+    SuperRoot,
+}
+
+/// The claim format of the dispute games of `game_type`, or `None` for a type this build does
+/// not know how to read.
+///
+/// Game types are the same on every OP Stack chain: `GameTypes` in
+/// `packages/contracts-bedrock/src/dispute/lib/Types.sol` of the Optimism monorepo (read on
+/// its `develop` branch). The fault dispute games are `CANNON` (0), `PERMISSIONED_CANNON` (1),
+/// `ASTERISC` (2), `ASTERISC_KONA` (3) and `CANNON_KONA` (8); the super ones are `SUPER_CANNON`
+/// (4), `SUPER_PERMISSIONED` (5), `SUPER_ASTERISC_KONA` (7) and `SUPER_CANNON_KONA` (9), which
+/// OP Mainnet creates as of 2026-10. The validity-proof games (6, 10) and the test games are
+/// not listed: their claims were not read.
+#[must_use]
+pub const fn claim_format(game_type: u32) -> Option<ClaimFormat> {
+    match game_type {
+        0..=3 | 8 => Some(ClaimFormat::OutputRoot),
+        4 | 5 | 7 | 9 => Some(ClaimFormat::SuperRoot),
+        _ => None,
     }
 }

@@ -9,7 +9,7 @@ use eyre::{WrapErr, ensure, eyre};
 use op_indexer_chainspec::{ChainSpec, OP_MAINNET};
 use op_indexer_el::ElConfig;
 use op_indexer_p2p::{Bootnode, NetworkConfig};
-use op_indexer_primitives::{BlockRef, SyncRange};
+use op_indexer_primitives::{BlockRef, ExecutionPeer, SyncRange};
 use op_indexer_storage::{
     ArchiveConfig, ArchiveRetention, ClickHouseConfig, RedisConfig, StorageConfig,
 };
@@ -17,8 +17,6 @@ use op_indexer_storage::{
 const DEFAULT_CHAIN_ID: u64 = OP_MAINNET.chain_id;
 const DEFAULT_LISTEN_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9222);
 const DEFAULT_MAX_PEERS: u32 = 30;
-/// Sessions the execution network keeps in each direction.
-const DEFAULT_EL_MAX_SESSIONS: usize = 8;
 const DEFAULT_DATA_DIR: &str = "data";
 const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:6379";
 const DEFAULT_CLICKHOUSE_URL: &str = "http://127.0.0.1:8123";
@@ -35,12 +33,35 @@ const SYNC_ANCHOR_VAR: &str = "OP_INDEXER_EL_SYNC_ANCHOR";
 /// Value of [`ARCHIVE_RETENTION_VAR`] that keeps every block.
 const ARCHIVE_RETENTION_ALL: &str = "all";
 
+/// What the environment says about the execution network. The rest of its configuration,
+/// the peers saved by earlier runs, comes from the node store.
+#[derive(Debug)]
+pub(crate) struct ElSettings {
+    chain: &'static ChainSpec,
+    listen_addr: SocketAddr,
+    bootnodes: Vec<String>,
+    advertised_addr: Option<SocketAddr>,
+}
+
+impl ElSettings {
+    /// The execution network's configuration, with the peers that served earlier runs.
+    pub(crate) fn into_config(self, saved_peers: Vec<ExecutionPeer>) -> ElConfig {
+        ElConfig {
+            chain: self.chain,
+            listen_addr: self.listen_addr,
+            bootnodes: self.bootnodes,
+            saved_peers,
+            advertised_addr: self.advertised_addr,
+        }
+    }
+}
+
 /// Process configuration.
 #[derive(Debug)]
 pub(crate) struct Config {
     pub(crate) network: NetworkConfig,
     /// The execution network, which fetches receipts; `None` when it is disabled.
-    pub(crate) el: Option<ElConfig>,
+    pub(crate) el: Option<ElSettings>,
     /// A range of blocks to fetch from execution peers; `None` when no sync is asked for.
     pub(crate) sync: Option<SyncRange>,
     /// Unsafe store (Redis), committed store (ClickHouse) and local block archive (fjall).
@@ -74,8 +95,6 @@ impl Config {
     ///   `0.0.0.0:30303`).
     /// - `OP_INDEXER_EL_BOOTNODES`: comma-separated `enr:` records or `enode://` URLs
     ///   (default: the chain's execution bootnodes).
-    /// - `OP_INDEXER_EL_MAX_SESSIONS`: execution peers kept, as dialed sessions and again as
-    ///   accepted ones (default 8).
     /// - `OP_INDEXER_EL_ADVERTISED_ADDR`: public socket (IP and port, the same for TCP and
     ///   UDP) announced in the execution node record, for a node behind NAT or in a container
     ///   (default: unset, the address other peers observe).
@@ -84,9 +103,9 @@ impl Config {
     ///   archive (default: unset, no sync). `FROM` and `TO` are the first and last block
     ///   number; `ANCHOR` is the hash of block `TO`, which must come from a source you trust:
     ///   every fetched block is verified against it. Set all three or none. The archive must
-    ///   be empty or end at block `FROM` - 1, and should keep every block
-    ///   (`OP_INDEXER_ARCHIVE_RETENTION_BLOCKS=all`). Progress is kept in the node store; a
-    ///   restart with the same three values resumes, other values start again.
+    ///   keep every block (`OP_INDEXER_ARCHIVE_RETENTION_BLOCKS=all`) and be empty or end at
+    ///   block `FROM` - 1 or later: the sync continues after the archive's last block, which
+    ///   is how a restart resumes.
     pub(crate) fn from_env() -> eyre::Result<Self> {
         let chain_id = parse_var("OP_INDEXER_CHAIN_ID")?.unwrap_or(DEFAULT_CHAIN_ID);
         let chain = ChainSpec::by_chain_id(chain_id)
@@ -106,11 +125,20 @@ impl Config {
             retention,
         });
 
-        let el = el_config(chain)?;
+        let el = el_settings(chain)?;
         let sync = sync_range()?;
         ensure!(
             sync.is_none() || el.is_some(),
             "{SYNC_FROM_VAR} needs the execution network: set OP_INDEXER_EL_ENABLED=true"
+        );
+        // The synced range is the archive's: it must be there, and must not be trimmed.
+        ensure!(
+            sync.is_none()
+                || archive
+                    .as_ref()
+                    .is_some_and(|archive| archive.retention == ArchiveRetention::All),
+            "{SYNC_FROM_VAR} needs an archive that keeps every block: set \
+             {ARCHIVE_RETENTION_VAR}={ARCHIVE_RETENTION_ALL}"
         );
 
         Ok(Self {
@@ -143,13 +171,12 @@ impl Config {
     }
 }
 
-/// Reads the execution network's configuration; `None` unless it is enabled.
-fn el_config(chain: &'static ChainSpec) -> eyre::Result<Option<ElConfig>> {
+/// Reads the execution network's settings; `None` unless it is enabled.
+fn el_settings(chain: &'static ChainSpec) -> eyre::Result<Option<ElSettings>> {
     if !parse_var("OP_INDEXER_EL_ENABLED")?.unwrap_or(false) {
         return Ok(None);
     }
-    let max_sessions = parse_var("OP_INDEXER_EL_MAX_SESSIONS")?.unwrap_or(DEFAULT_EL_MAX_SESSIONS);
-    Ok(Some(ElConfig {
+    Ok(Some(ElSettings {
         chain,
         listen_addr: parse_var("OP_INDEXER_EL_LISTEN_ADDR")?
             .unwrap_or(ElConfig::DEFAULT_LISTEN_ADDR),
@@ -163,10 +190,6 @@ fn el_config(chain: &'static ChainSpec) -> eyre::Result<Option<ElConfig>> {
                     .collect()
             })
             .unwrap_or_default(),
-        max_outbound_sessions: max_sessions,
-        max_inbound_sessions: max_sessions,
-        // Filled by the binary from the node store.
-        saved_peers: Vec::new(),
         advertised_addr: parse_var("OP_INDEXER_EL_ADVERTISED_ADDR")?,
     }))
 }

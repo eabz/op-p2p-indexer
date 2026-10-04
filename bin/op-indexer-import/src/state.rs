@@ -1,17 +1,21 @@
-//! The state directory: which chunks the range is cut into and where each one's files are.
+//! The state directory: the plan of the import, and where each chunk's files are.
 //!
 //! ```text
-//! <state>/anchor.json                 the dispute game that anchors the range, if one does
-//! <state>/raw/<from>-<to>.json.zst    downloaded chunk: the service's answers, compressed
+//! <state>/plan.json                   the range, its anchor and the chunk size
+//! <state>/verified.json               written by `verify` once the whole range is accepted
+//! <state>/raw/<from>-<to>.raw         downloaded chunk: the service's answers as they travelled
 //! <state>/verified/<from>-<to>.blk    verified chunk: consensus encodings, see `chunk`
-//! <state>/loaded/<from>-<to>.archive     empty marker: the block archive holds the chunk
 //! <state>/loaded/<from>-<to>.clickhouse  empty marker: ClickHouse holds the chunk
 //! <state>/lock                        held by the one process working on the directory
 //! ```
 //!
-//! A file that exists is complete: files are written under a temporary name (`*.tmp`) and
-//! renamed; temporary files left by a killed run are removed when the directory is opened.
-//! Holds no credentials. Does not know what the files contain.
+//! `download` writes the plan on its first run; every later run of any step reads it, so the
+//! range and the chunk size cannot change under files already written. A file that exists is
+//! complete: files are written under a temporary name (`*.tmp`) and renamed; temporary files
+//! left by a killed run are removed when the directory is opened. Holds no credentials. Does
+//! not know what the chunk files contain.
+//!
+//! What the block archive holds is not recorded here: `load` asks the archive.
 
 use std::fmt;
 use std::fs::{self, File, TryLockError};
@@ -20,8 +24,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use alloy_primitives::B256;
+use op_indexer_chainspec::ChainSpec;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 
 use crate::game::GameAnchor;
+
+/// Version of the state directory's layout and file formats. A directory written with another
+/// version is refused.
+const LAYOUT_VERSION: u32 = 1;
 
 /// Blocks `from..to` (`to` excluded): one file per step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,28 +51,28 @@ impl Chunk {
 /// The range to import and how it is cut into chunks.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Plan {
+    /// The chain the blocks belong to.
+    pub(crate) chain: &'static ChainSpec,
     /// First block.
     pub(crate) first: u64,
     /// Last block.
     pub(crate) last: u64,
     /// What the last block is checked against.
     pub(crate) anchor: Anchor,
-    /// Blocks per chunk; never zero.
+    /// Blocks per chunk before the chain's Bedrock block; never zero. From Bedrock on blocks
+    /// hold many transactions and a chunk is a tenth of this: see [`Plan::chunks`].
     pub(crate) chunk_blocks: u64,
-    /// Fork activations that change how blocks are encoded.
-    pub(crate) forks: Forks,
 }
 
 /// What proves that the last block of the range is the canonical one; every block below is
 /// then proven by the chain of parent hashes.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum Anchor {
     /// A block hash the operator trusts.
     Hash(B256),
     /// The claim of a dispute game on L1 about the last block.
     Game(GameAnchor),
-    /// Nothing: the range is only checked to be one chain. Asked for explicitly.
-    None,
 }
 
 impl fmt::Display for Anchor {
@@ -69,36 +80,30 @@ impl fmt::Display for Anchor {
         match self {
             Self::Hash(hash) => write!(f, "hash {hash}"),
             Self::Game(game) => write!(f, "dispute game {} on L1", game.game),
-            Self::None => f.write_str("none"),
         }
     }
 }
 
-/// The fork activations of an OP Stack chain that change an encoding `verify` rebuilds, in
-/// Unix seconds. Unused for blocks without deposits and before the fork times.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Forks {
-    /// Regolith: the L1-attributes deposit stops being a system transaction, and deposit
-    /// receipts record the sender's nonce.
-    pub(crate) regolith: u64,
-    /// Canyon: the deposit nonce and receipt version become part of the hashed receipt.
-    pub(crate) canyon: u64,
-    /// Isthmus: the header carries the hash of an empty requests list.
-    pub(crate) isthmus: u64,
-}
-
 impl Plan {
-    /// The chunks of the range, in block order. The last one may be shorter.
+    /// The chunks of the range, in block order: [`Self::chunk_blocks`] blocks each before the
+    /// Bedrock block, a tenth of that from it on, where one block holds as much as many legacy
+    /// ones. The chunk before the Bedrock block and the last one may be shorter.
     pub(crate) fn chunks(&self) -> impl Iterator<Item = Chunk> + use<> {
-        let (first, end, step) = (self.first, self.last.saturating_add(1), self.chunk_blocks);
-        let mut from = first;
+        let (end, bedrock) = (self.last.saturating_add(1), self.chain.bedrock_block);
+        let (legacy_step, step) = (self.chunk_blocks, (self.chunk_blocks / 10).max(1));
+        let mut from = self.first;
         std::iter::from_fn(move || {
             if from >= end {
                 return None;
             }
+            let to = if from < bedrock {
+                from.saturating_add(legacy_step).min(bedrock)
+            } else {
+                from.saturating_add(step)
+            };
             let chunk = Chunk {
                 from,
-                to: from.saturating_add(step).min(end),
+                to: to.min(end),
             };
             from = chunk.to;
             Some(chunk)
@@ -106,19 +111,42 @@ impl Plan {
     }
 }
 
-/// Something `load` writes chunks to. Each keeps its own record of the chunks it holds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Target {
-    /// The local block archive the node serves from.
-    Archive,
-    /// ClickHouse, when asked for.
-    ClickHouse,
+/// `plan.json`.
+#[derive(Debug, Serialize, Deserialize)]
+struct PlanFile {
+    version: u32,
+    chain_id: u64,
+    first: u64,
+    last: u64,
+    anchor: Anchor,
+    chunk_blocks: u64,
+}
+
+/// `verified.json`: the range `verify` accepted. It exists only while every chunk of the plan
+/// is verified, each chunk continues the one before, and the last block matched the anchor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct VerifiedRange {
+    pub(crate) first: u64,
+    pub(crate) last: u64,
+    /// Hash of the last block.
+    pub(crate) last_hash: B256,
+    /// What the last block was checked against.
+    pub(crate) anchor: Anchor,
+    /// When `verify` accepted the range, in seconds since the Unix epoch.
+    pub(crate) verified_at_secs: u64,
+}
+
+impl VerifiedRange {
+    /// Whether this is the range of `plan`, checked against the plan's anchor.
+    pub(crate) fn covers(&self, plan: &Plan) -> bool {
+        (self.first, self.last, self.anchor) == (plan.first, plan.last, plan.anchor)
+    }
 }
 
 /// Paths inside the state directory.
 #[derive(Debug, Clone)]
 pub(crate) struct State {
-    anchor: PathBuf,
+    root: PathBuf,
     raw: PathBuf,
     verified: PathBuf,
     loaded: PathBuf,
@@ -148,7 +176,7 @@ impl State {
             TryLockError::Error(err) => err,
         })?;
         let state = Self {
-            anchor: root.join("anchor.json"),
+            root: root.to_owned(),
             raw: root.join("raw"),
             verified: root.join("verified"),
             loaded: root.join("loaded"),
@@ -169,15 +197,121 @@ impl State {
         Ok(state)
     }
 
-    /// File recording the dispute game that anchors the range, when one does.
-    pub(crate) fn anchor_path(&self) -> &Path {
-        &self.anchor
+    /// The directory, for messages.
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Reads the recorded plan; `None` if `download` has not written one yet. Blocking.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidData` if the file is damaged, was written by another version of this
+    /// tool, or names a chain this build does not know; and the I/O error of reading it.
+    pub(crate) fn read_plan(&self) -> io::Result<Option<Plan>> {
+        let Some(file) = read_json::<PlanFile>(&self.root.join("plan.json"))? else {
+            return Ok(None);
+        };
+        let invalid = |reason: String| io::Error::new(io::ErrorKind::InvalidData, reason);
+        if file.version != LAYOUT_VERSION {
+            return Err(invalid(format!(
+                "the state directory has layout version {}, this build writes {LAYOUT_VERSION}: \
+                 delete the directory and download again",
+                file.version
+            )));
+        }
+        let chain = ChainSpec::by_chain_id(file.chain_id)
+            .ok_or_else(|| invalid(format!("plan.json names unknown chain {}", file.chain_id)))?;
+        if file.chunk_blocks == 0 {
+            return Err(invalid("plan.json has a chunk size of zero".to_owned()));
+        }
+        Ok(Some(Plan {
+            chain,
+            first: file.first,
+            last: file.last,
+            anchor: file.anchor,
+            chunk_blocks: file.chunk_blocks,
+        }))
+    }
+
+    /// Records `plan`. Blocking.
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error of writing the file.
+    pub(crate) fn write_plan(&self, plan: &Plan) -> io::Result<()> {
+        let file = PlanFile {
+            version: LAYOUT_VERSION,
+            chain_id: plan.chain.chain_id,
+            first: plan.first,
+            last: plan.last,
+            anchor: plan.anchor,
+            chunk_blocks: plan.chunk_blocks,
+        };
+        write_json(&self.root.join("plan.json"), &file)
+    }
+
+    /// Whether the directory holds any downloaded chunk. Blocking.
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error of listing the directory.
+    pub(crate) fn has_chunks(&self) -> io::Result<bool> {
+        Ok(fs::read_dir(&self.raw)?.next().is_some())
+    }
+
+    /// Reads the range `verify` accepted; `None` if it has not accepted one. Blocking.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidData` if the file is damaged, and the I/O error of reading it.
+    pub(crate) fn read_verified(&self) -> io::Result<Option<VerifiedRange>> {
+        read_json(&self.root.join("verified.json"))
+    }
+
+    /// Records that `verify` accepted `range`. Blocking.
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error of writing the file.
+    pub(crate) fn write_verified(&self, range: &VerifiedRange) -> io::Result<()> {
+        write_json(&self.root.join("verified.json"), range)
+    }
+
+    /// Removes the record of the accepted range, if there is one. Blocking.
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error of removing the file.
+    pub(crate) fn clear_verified(&self) -> io::Result<()> {
+        match fs::remove_file(self.root.join("verified.json")) {
+            Err(err) if err.kind() != io::ErrorKind::NotFound => Err(err),
+            _ => Ok(()),
+        }
+    }
+
+    /// Free space on the directory's filesystem, in bytes; `None` where the system has no call
+    /// for it. Blocking.
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error of the system call.
+    pub(crate) fn free_bytes(&self) -> io::Result<Option<u64>> {
+        #[cfg(unix)]
+        {
+            let stat = rustix::fs::statvfs(&self.root)?;
+            Ok(Some(stat.f_bavail.saturating_mul(stat.f_frsize)))
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(None)
+        }
     }
 
     /// File of the downloaded chunk.
     pub(crate) fn raw_path(&self, chunk: Chunk) -> PathBuf {
         self.raw
-            .join(format!("{:012}-{:012}.json.zst", chunk.from, chunk.to))
+            .join(format!("{:012}-{:012}.raw", chunk.from, chunk.to))
     }
 
     /// File of the verified chunk.
@@ -186,15 +320,10 @@ impl State {
             .join(format!("{:012}-{:012}.blk", chunk.from, chunk.to))
     }
 
-    /// Marker of the chunk for one target of `load`: an empty file, written once that target
-    /// holds the chunk.
-    pub(crate) fn loaded_path(&self, chunk: Chunk, target: Target) -> PathBuf {
-        let extension = match target {
-            Target::Archive => "archive",
-            Target::ClickHouse => "clickhouse",
-        };
+    /// Marker that ClickHouse holds the chunk: an empty file, written by `load` once it does.
+    pub(crate) fn clickhouse_loaded_path(&self, chunk: Chunk) -> PathBuf {
         self.loaded
-            .join(format!("{:012}-{:012}.{extension}", chunk.from, chunk.to))
+            .join(format!("{:012}-{:012}.clickhouse", chunk.from, chunk.to))
     }
 }
 
@@ -209,9 +338,37 @@ pub(crate) fn write_atomic(
     write: impl FnOnce(&mut File) -> io::Result<()>,
 ) -> io::Result<()> {
     let temporary = path.with_extension("tmp");
-    let mut file = File::create(&temporary)?;
-    write(&mut file)?;
-    file.flush()?;
-    file.sync_all()?;
+    let written = File::create(&temporary).and_then(|mut file| {
+        write(&mut file)?;
+        file.flush()?;
+        file.sync_all()
+    });
+    if let Err(err) = written {
+        // Best effort: a leftover is removed when the directory is next opened.
+        let _removed = fs::remove_file(&temporary);
+        return Err(err);
+    }
     fs::rename(&temporary, path)
+}
+
+fn read_json<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
+    let content = match fs::read(path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    serde_json::from_slice(&content).map(Some).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} is damaged or from another version: {err}",
+                path.display()
+            ),
+        )
+    })
+}
+
+fn write_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
+    let content = serde_json::to_vec_pretty(value)?;
+    write_atomic(path, |file| file.write_all(&content))
 }

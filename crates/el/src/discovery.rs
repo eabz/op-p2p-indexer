@@ -16,18 +16,17 @@
 //! [EIP-2124]: https://eips.ethereum.org/EIPS/eip-2124
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use alloy_eip2124::ForkId;
-use alloy_primitives::hex;
 use alloy_rlp::Decodable;
 use discv5::{ConfigBuilder, Discv5, Enr, ListenConfig, QueryError};
 use enr::{CombinedKey, CombinedPublicKey, EnrPublicKey, NodeId};
 use futures_util::future::join_all;
 use futures_util::stream::{FuturesUnordered, StreamExt};
-use reth_network_peers::PeerId;
+use reth_network_peers::{NodeRecord, PeerId};
 use tokio::sync::mpsc;
 use tokio::time::error::Elapsed;
 use tokio::time::{Instant, MissedTickBehavior, interval, timeout};
@@ -69,6 +68,9 @@ const BOOTNODE_TIMEOUT: Duration = Duration::from_secs(10);
 const REPORT_INTERVAL: Duration = Duration::from_secs(60);
 /// Peers of our chain remembered for re-reporting. When full, the set starts over.
 const MAX_KNOWN_PEERS: usize = 4096;
+/// How often discovery says that it has found no peer of our fork while records of other forks
+/// keep arriving: the sign of a build that does not know a fork the chain has activated.
+const NO_PEERS_WARN_INTERVAL: Duration = Duration::from_mins(10);
 
 /// An execution peer of our chain and fork that can be dialed.
 #[derive(Debug, Clone)]
@@ -88,6 +90,11 @@ pub(crate) struct Discovery {
     known: HashMap<NodeId, Candidate>,
     /// What the node record advertised when it was last logged.
     advertised: Option<Advertised>,
+    /// The fork id in the node record.
+    fork_id: ForkId,
+    /// Node records with an `opel` entry of another fork seen since the last warning: OP Stack
+    /// nodes of another chain, or of ours past a fork this build does not know.
+    other_forks: u64,
 }
 
 /// The address a node record advertises: what other nodes dial.
@@ -116,7 +123,8 @@ impl Discovery {
         let key =
             CombinedKey::secp256k1_from_bytes(&mut secret).map_err(|_err| ElError::InvalidKey)?;
 
-        let fork_entry = vec![ctx.fork_filter().current()];
+        let fork_id = ctx.fork_filter().current();
+        let fork_entry = vec![fork_id];
         let mut builder = Enr::builder();
         match advertised {
             // A configured address goes into the record as it is.
@@ -152,6 +160,8 @@ impl Discovery {
             bootnodes,
             known: HashMap::new(),
             advertised: None,
+            fork_id,
+            other_forks: 0,
         })
     }
 
@@ -183,6 +193,9 @@ impl Discovery {
         reports.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut table_scans = interval(TABLE_SCAN_INTERVAL);
         table_scans.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut no_peers = interval(NO_PEERS_WARN_INTERVAL);
+        no_peers.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        no_peers.reset();
         // Lookups in flight. Dropping them on shutdown is fine: discv5 owns the queries.
         let mut lookups = FuturesUnordered::new();
         let started = Instant::now();
@@ -209,7 +222,9 @@ impl Discovery {
                 }
                 Some(result) = lookups.next() => self.found(result, &candidates),
                 // The routing table keeps peers that random lookups themselves rarely return.
+                _ = no_peers.tick() => self.warn_no_peers(),
                 _ = table_scans.tick() => {
+                    self.refresh_fork_id();
                     self.log_advertised();
                     self.consider(&self.discv5.table_entries_enr(), &candidates);
                 }
@@ -292,6 +307,47 @@ impl Discovery {
         }
     }
 
+    /// Puts our current fork id into the node record if it changed: a time fork activated
+    /// while the node runs. A record left at the old fork id would have peers past the fork
+    /// take us for a node that missed it.
+    fn refresh_fork_id(&mut self) {
+        let current = self.ctx.fork_filter().current();
+        if current == self.fork_id {
+            return;
+        }
+        let entry = vec![current];
+        for key in [OPEL_ENR_KEY, ETH_ENR_KEY] {
+            if let Err(err) = self.discv5.enr_insert(key, &entry) {
+                warn!(
+                    key,
+                    ?err,
+                    "failed to update the fork id in the execution node record"
+                );
+                return;
+            }
+        }
+        info!(fork_id = ?current, "a hardfork activated; execution node record updated");
+        self.fork_id = current;
+        // Peers of the fork before are not ours any more.
+        self.known.clear();
+    }
+
+    /// Says that no peer of our fork is known while OP Stack records of other forks arrive.
+    /// Peers past a fork this build does not know are skipped like any other chain's, so
+    /// without this a node on a stale build finds nobody and logs nothing.
+    fn warn_no_peers(&mut self) {
+        let other_forks = std::mem::take(&mut self.other_forks);
+        if self.known.is_empty() && other_forks > 0 {
+            warn!(
+                our_fork_hash = ?self.fork_id.hash,
+                other_forks,
+                "execution discovery knows no peer on this build's fork, only OP Stack nodes \
+                 on other forks; if the chain activated a hardfork this build does not know, \
+                 update the fork activations"
+            );
+        }
+    }
+
     /// Starts one lookup toward a random region of the network, bounded by [`LOOKUP_TIMEOUT`].
     fn start_lookup(
         &self,
@@ -314,13 +370,16 @@ impl Discovery {
 
     /// Reports the peers of our chain and fork among `found` that were not known yet.
     fn consider(&mut self, found: &[Enr], candidates: &mpsc::Sender<Candidate>) {
-        let ours = self.ctx.fork_filter().current();
+        let ours = self.fork_id;
         let mut new_peers = 0;
         for enr in found {
             let Some(fork_id) = fork_id(enr) else {
                 continue;
             };
             if fork_id.hash != ours.hash {
+                if enr.get_raw_rlp(OPEL_ENR_KEY).is_some() {
+                    self.other_forks = self.other_forks.saturating_add(1);
+                }
                 continue;
             }
             // A node on our fork announcing a next fork we do not know: this build is behind.
@@ -367,36 +426,50 @@ fn fork_id(enr: &Enr) -> Option<ForkId> {
     })
 }
 
-/// Builds the dialable candidate of a node record with a secp256k1 key, an IPv4 address and a
-/// TCP port.
+/// Builds the dialable candidate of a node record with a secp256k1 key, a public IPv4
+/// address and a TCP port. A record is written by its node, so its address is untrusted: one
+/// that points into this host or a private network would make us dial it.
 fn candidate(enr: &Enr) -> Option<Candidate> {
     let CombinedPublicKey::Secp256k1(public) = enr.public_key() else {
         return None;
     };
+    let addr = enr.tcp4_socket()?;
+    if addr.port() == 0 || !is_public(*addr.ip()) {
+        return None;
+    }
     Some(Candidate {
         peer_id: PeerId::from_slice(public.encode_uncompressed().as_ref()),
-        addr: SocketAddr::V4(enr.tcp4_socket()?),
+        addr: SocketAddr::V4(addr),
     })
 }
 
-/// Parses `enode://<key>@<ip>:<port>[?discport=<udp port>]` into the discv5 contact address
-/// `/ip4/<ip>/udp/<port>/p2p/<peer id>`.
+/// Whether `ip` is an address on the public internet: not loopback, private, link-local,
+/// unspecified, broadcast, multicast or reserved for documentation.
+const fn is_public(ip: Ipv4Addr) -> bool {
+    !(ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        || ip.is_documentation())
+}
+
+/// Turns an `enode://<key>@<ip>:<port>[?discport=<udp port>]` URL into the discv5 contact
+/// address `/ip4/<ip>/udp/<port>/p2p/<peer id>`.
 fn enode_discovery_addr(enode: &str) -> Option<String> {
-    let (key_hex, endpoint) = enode.strip_prefix("enode://")?.split_once('@')?;
-    let (endpoint, query) = endpoint.split_once('?').unwrap_or((endpoint, ""));
-    let socket: SocketAddr = endpoint.parse().ok()?;
-    let udp_port = match query.strip_prefix("discport=") {
-        Some(port) => port.parse().ok()?,
-        None => socket.port(),
-    };
-    let key = hex::decode(key_hex).ok()?;
-    let public =
-        libp2p_identity::secp256k1::PublicKey::try_from_bytes(&[[0x04].as_slice(), &key].concat())
-            .ok()?;
+    let record: NodeRecord = enode.parse().ok()?;
+    // discv5 names a node by the libp2p peer id of its uncompressed public key.
+    let key = [[0x04].as_slice(), record.id.as_slice()].concat();
+    let public = libp2p_identity::secp256k1::PublicKey::try_from_bytes(&key).ok()?;
     let peer = libp2p_identity::PeerId::from_public_key(&libp2p_identity::PublicKey::from(public));
-    let family = if socket.is_ipv6() { "ip6" } else { "ip4" };
+    let family = if record.address.is_ipv6() {
+        "ip6"
+    } else {
+        "ip4"
+    };
     Some(format!(
-        "/{family}/{}/udp/{udp_port}/p2p/{peer}",
-        socket.ip()
+        "/{family}/{}/udp/{}/p2p/{peer}",
+        record.address, record.udp_port
     ))
 }

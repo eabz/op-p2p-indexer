@@ -4,8 +4,8 @@
 //! archive service ─▶ download ─▶ <state>/raw ─▶ verify ─▶ <state>/verified ─▶ load ─▶ stores
 //! ```
 //!
-//! - `download` ([`mod@download`]) fetches the range in chunks through a [`source::Source`] and
-//!   keeps each answer as received. It does nothing else, so a limited request window is spent
+//! - `download` ([`mod@download`]) decides the range, records it, fetches it in chunks from
+//!   the archive service ([`source`]) and keeps each answer as received. It does nothing else, so a limited request window is spent
 //!   on the transfer only.
 //! - `verify` ([`mod@verify`]) rebuilds every block's consensus encoding from the downloaded rows
 //!   and checks it: header hash, parent links up to a trusted hash, transaction hashes and
@@ -20,35 +20,32 @@
 
 mod chunk;
 mod cli;
-mod deposit;
 mod download;
 mod game;
 mod load;
+mod progress;
 mod rows;
 mod source;
 mod state;
-mod transaction;
 mod verify;
-
-use std::io::Write;
 
 use clap::Parser;
 use eyre::WrapErr;
+use op_indexer_chainspec::{ChainSpec, OP_MAINNET};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::time::ChronoUtc;
 
-use crate::cli::{
-    Cli, Command, DownloadArgs, OP_MAINNET_LAST_LEGACY_BLOCK, OP_MAINNET_LAST_LEGACY_HASH,
-    VerifyArgs,
-};
-use crate::game::{GameAnchor, GameConfig, L2Chain};
+use crate::cli::{Cli, Command, DownloadArgs, VerifyArgs};
 use crate::source::HyperSync;
-use crate::state::{Anchor, Forks, Plan, State};
+use crate::state::{Anchor, Plan, State};
 
 /// Log timestamp: UTC time of day with milliseconds, as the indexer's.
 const LOG_TIME_FORMAT: &str = "%H:%M:%S%.3f";
+
+/// Blocks per chunk unless the first `download` says otherwise.
+const DEFAULT_CHUNK_BLOCKS: u64 = 1000;
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
@@ -61,33 +58,17 @@ async fn main() -> eyre::Result<()> {
         .init();
 
     // Startup-only blocking I/O, before any task runs.
-    let state = State::open(&cli.range.state_dir).wrap_err("failed to open the state directory")?;
-    let (last, anchor) = top(&cli, &state).await?;
-    eyre::ensure!(
-        cli.range.first_block <= last,
-        "--first-block is above the last block of the range, {last}"
-    );
-    let plan = Plan {
-        first: cli.range.first_block,
-        last,
-        anchor,
-        chunk_blocks: cli.range.chunk_blocks,
-        forks: Forks {
-            regolith: cli.range.regolith_time,
-            canyon: cli.range.canyon_time,
-            isthmus: cli.range.isthmus_time,
-        },
-    };
+    let state = State::open(&cli.state_dir).wrap_err("failed to open the state directory")?;
 
     let cancel = CancellationToken::new();
     let signal = tokio::spawn(cancel_on_signal(cancel.clone()));
     let result = match cli.command {
-        Command::Download(args) => download(&args, &state, &plan, &cancel).await,
-        Command::Verify(args) => verify(&args, &state, &plan, &cancel).await,
-        Command::Load(args) => load::run(&args, &state, &plan, &cancel).await,
+        Command::Download(args) => download(&args, &state, &cancel).await.map(|_plan| ()),
+        Command::Verify(args) => verify(&args, &state, &recorded_plan(&state)?, &cancel).await,
+        Command::Load(args) => load::run(&args, &state, &recorded_plan(&state)?, &cancel).await,
         Command::Run(args) => {
             let steps = async {
-                download(&args.download, &state, &plan, &cancel).await?;
+                let plan = download(&args.download, &state, &cancel).await?;
                 verify(&args.verify, &state, &plan, &cancel).await?;
                 load::run(&args.load, &state, &plan, &cancel).await
             };
@@ -98,89 +79,135 @@ async fn main() -> eyre::Result<()> {
     result
 }
 
-/// The last block of the range and what it is checked against. By default the block of the
-/// newest dispute game on L1, which is looked up once (by `download` or `run`, which hold
-/// the API token) and recorded in the state directory; with range flags a trusted hash, or
-/// nothing when that was asked for.
-async fn top(cli: &Cli, state: &State) -> eyre::Result<(u64, Anchor)> {
-    let range = &cli.range;
-    if range.legacy_only {
-        let hash = Anchor::Hash(OP_MAINNET_LAST_LEGACY_HASH);
-        return Ok((OP_MAINNET_LAST_LEGACY_BLOCK, hash));
-    }
-    if let Some(last) = range.last_block {
-        let anchor = match range.anchor_hash {
-            Some(hash) => Anchor::Hash(hash),
-            None if last == OP_MAINNET_LAST_LEGACY_BLOCK => {
-                Anchor::Hash(OP_MAINNET_LAST_LEGACY_HASH)
-            }
-            None if range.allow_unanchored_top => Anchor::None,
-            None => eyre::bail!(
-                "--last-block {last} needs --anchor-hash, the trusted hash of that block \
-                 (or --allow-unanchored-top to go without)"
-            ),
-        };
-        return Ok((last, anchor));
-    }
+/// The plan `download` recorded, which `verify` and `load` work from.
+fn recorded_plan(state: &State) -> eyre::Result<Plan> {
+    state.read_plan()?.ok_or_else(|| {
+        eyre::eyre!(
+            "{} has no plan.json: run `download` first, which decides the range",
+            state.root().display()
+        )
+    })
+}
 
-    let path = state.anchor_path();
-    let game: GameAnchor = if path.exists() {
-        let recorded = std::fs::read(path).wrap_err("failed to read anchor.json")?;
-        serde_json::from_slice(&recorded).wrap_err("anchor.json is damaged")?
+/// The plan `download` works from: the recorded one, which the range flags must not
+/// contradict, or on the first run the one the flags describe, which is then recorded.
+async fn plan(args: &DownloadArgs, state: &State) -> eyre::Result<Plan> {
+    if let Some(plan) = state.read_plan()? {
+        check_flags(args, &plan)?;
+        return Ok(plan);
+    }
+    eyre::ensure!(
+        !state.has_chunks()?,
+        "{} holds chunks but no plan.json: it was written by an older build. Delete it and \
+         download again",
+        state.root().display()
+    );
+    let chain_id = args.chain.unwrap_or(OP_MAINNET.chain_id);
+    let chain = ChainSpec::by_chain_id(chain_id)
+        .ok_or_else(|| eyre::eyre!("chain {chain_id} is not known to this build"))?;
+    let (last, anchor) = if args.legacy_only {
+        let last = chain.bedrock_block.saturating_sub(1);
+        (last, Anchor::Hash(chain.last_legacy_hash))
+    } else if let (Some(last), Some(hash)) = (args.last_block, args.anchor_hash) {
+        (last, Anchor::Hash(hash))
     } else {
-        let args = match &cli.command {
-            Command::Download(args) => args,
-            Command::Run(args) => &args.download,
-            Command::Verify(_) | Command::Load(_) => eyre::bail!(
-                "the range has no end: no dispute game is recorded in {}. Run `download` \
-                 first, or give the range (--legacy-only, or --last-block <n> with \
-                 --anchor-hash <hash>)",
-                path.display()
-            ),
-        };
         let l1 = HyperSync::new(&args.l1_endpoint, &args.api_token)?;
-        let config = GameConfig {
-            factory: args.dispute_game_factory,
-            game_type: args.game_type,
-            resolved_only: args.resolved_only,
-            l2: L2Chain {
-                chain_id: args.l2_chain_id,
-                genesis_number: args.l2_genesis_block,
-                genesis_time: args.l2_genesis_time,
-                block_time_secs: args.l2_block_time,
-            },
-        };
-        let game = game::newest_game(&l1, &config).await.wrap_err_with(|| {
+        let game = game::newest_game(&l1, chain).await.wrap_err_with(|| {
             format!(
                 "the lookup of the newest dispute game on L1 ({}) failed. To go without it, \
-                 give the end of the range yourself: --last-block <n> --allow-unanchored-top \
-                 (or --last-block <n> --anchor-hash <hash>, or --legacy-only)",
+                 give the end of the range yourself: --last-block <n> --anchor-hash <hash>, or \
+                 --legacy-only",
                 args.l1_endpoint
             )
         })?;
-        let recorded = serde_json::to_vec_pretty(&game)?;
-        state::write_atomic(path, |file| file.write_all(&recorded))
-            .wrap_err("failed to write anchor.json")?;
-        game
+        (game.l2_block, Anchor::Game(game))
     };
-    info!(
-        game = %game.game,
-        l2_block = game.l2_block,
-        l1_block = game.l1_block,
-        "the range ends at the block of a dispute game"
+    let plan = Plan {
+        chain,
+        first: args.first_block.unwrap_or_default(),
+        last,
+        anchor,
+        chunk_blocks: args.chunk_blocks.unwrap_or(DEFAULT_CHUNK_BLOCKS),
+    };
+    eyre::ensure!(
+        plan.first <= plan.last,
+        "--first-block is above the last block of the range, {last}"
     );
-    Ok((game.l2_block, Anchor::Game(game)))
+    state
+        .write_plan(&plan)
+        .wrap_err("failed to write plan.json")?;
+    info!(
+        chain = chain.chain_id,
+        first = plan.first,
+        last,
+        anchor = %plan.anchor,
+        chunk_blocks = plan.chunk_blocks,
+        "plan recorded"
+    );
+    Ok(plan)
+}
+
+/// Refuses a range flag that disagrees with the recorded plan: files already written were
+/// cut by that plan.
+fn check_flags(args: &DownloadArgs, plan: &Plan) -> eyre::Result<()> {
+    let legacy = (
+        plan.chain.bedrock_block.saturating_sub(1),
+        Anchor::Hash(plan.chain.last_legacy_hash),
+    );
+    let disagreements = [
+        (
+            "--chain",
+            args.chain.is_some_and(|chain| chain != plan.chain.chain_id),
+        ),
+        (
+            "--first-block",
+            args.first_block.is_some_and(|first| first != plan.first),
+        ),
+        (
+            "--last-block",
+            args.last_block.is_some_and(|last| last != plan.last),
+        ),
+        (
+            "--anchor-hash",
+            args.anchor_hash
+                .is_some_and(|hash| Anchor::Hash(hash) != plan.anchor),
+        ),
+        (
+            "--legacy-only",
+            args.legacy_only && (plan.last, plan.anchor) != legacy,
+        ),
+        (
+            "--chunk-blocks",
+            args.chunk_blocks
+                .is_some_and(|blocks| blocks != plan.chunk_blocks),
+        ),
+    ];
+    for (flag, disagrees) in disagreements {
+        eyre::ensure!(
+            !disagrees,
+            "{flag} disagrees with the plan recorded in this state directory (chain {}, blocks \
+             {} to {}, anchor {}, {} blocks per chunk). Leave the flag out to continue, or use \
+             an empty state directory for another range",
+            plan.chain.chain_id,
+            plan.first,
+            plan.last,
+            plan.anchor,
+            plan.chunk_blocks
+        );
+    }
+    Ok(())
 }
 
 async fn download(
     args: &DownloadArgs,
     state: &State,
-    plan: &Plan,
     cancel: &CancellationToken,
-) -> eyre::Result<()> {
+) -> eyre::Result<Plan> {
+    let plan = plan(args, state).await?;
     let source = HyperSync::new(&args.endpoint, &args.api_token)?;
     let requests = usize::try_from(args.requests).wrap_err("--requests is too large")?;
-    download::run(source, state, plan, requests, cancel).await
+    download::run(&source, state, &plan, requests, cancel).await?;
+    Ok(plan)
 }
 
 async fn verify(

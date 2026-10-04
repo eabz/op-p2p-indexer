@@ -1,15 +1,17 @@
 //! Sender recovery: turns a gossiped block, or blocks fetched from peers, into the
 //! [`DecodedBlock`] storage takes.
 //!
-//! One secp256k1 recovery per signed transaction, so it runs on a blocking thread. It does not
-//! decide what to do with a block whose senders cannot be recovered; ingest does.
+//! One secp256k1 recovery per signed transaction, so it runs on blocking threads. It does not
+//! decide what to do with a block whose senders cannot be recovered; its caller does.
 
 use alloy_consensus::crypto::RecoveryError;
 use alloy_consensus::transaction::SignerRecoverable;
-use alloy_primitives::{Address, BlockNumber};
+use std::sync::Arc;
+
+use alloy_primitives::{Address, BlockHash, BlockNumber};
 use op_alloy_consensus::OpTxEnvelope;
 use op_indexer_primitives::{
-    BlockSource, DecodedBlock, EncodedBlock, SyncedBlock, UnsafeBlock, is_zero_signature,
+    BlockSource, DecodedBlock, EncodedBlock, UnsafeBlock, decode_block, is_zero_signature,
 };
 use tokio::task::JoinError;
 
@@ -24,6 +26,13 @@ pub(crate) enum RecoverError {
         index: usize,
         #[source]
         source: RecoveryError,
+    },
+    /// A fetched block's bytes do not decode.
+    #[error("block {hash} does not decode: {reason}")]
+    Decode {
+        hash: BlockHash,
+        /// The decoder's error.
+        reason: String,
     },
     /// The blocking task panicked or was aborted.
     #[error("sender recovery task failed")]
@@ -55,38 +64,60 @@ fn recover_blocking(block: UnsafeBlock) -> Result<DecodedBlock, RecoverError> {
     })
 }
 
-/// Recovers the senders of a batch of fetched blocks on a blocking thread, and returns each
-/// block as storage takes it next to its original encoding, in the same order.
+/// Blocks decoded on one blocking thread. A batch is cut into this many blocks per thread, so
+/// a batch of a few hundred blocks uses the cores there are: one signature recovery per
+/// transaction is what bounds how fast a range is stored.
+const BLOCKS_PER_THREAD: usize = 32;
+
+/// Decodes a batch of fetched blocks and recovers their senders, on blocking threads, and
+/// returns them as storage takes them, in the same order.
 ///
 /// A legacy transaction whose signature is all zero has no signer: before Bedrock these are
 /// the messages sent from L1, and their sender is the zero address.
 ///
 /// # Errors
 ///
-/// Returns [`RecoverError::Sender`] for the first other transaction without a recoverable
-/// sender, and [`RecoverError::Task`] if the blocking task did not finish.
-pub(crate) async fn recover_synced(
-    blocks: Vec<SyncedBlock>,
-) -> Result<(Vec<DecodedBlock>, Vec<EncodedBlock>), RecoverError> {
-    tokio::task::spawn_blocking(move || {
-        blocks
-            .into_iter()
-            .map(|synced| {
-                let number = synced.block.header.number;
-                let senders = senders(number, &synced.block.body.transactions, true)?;
-                let decoded = DecodedBlock {
-                    block: synced.block,
-                    hash: synced.encoded.hash,
-                    senders,
-                    receipts: Some(synced.receipts),
-                    source: BlockSource::Sync,
-                };
-                Ok((decoded, synced.encoded))
+/// Returns [`RecoverError::Decode`] for the first block that does not decode,
+/// [`RecoverError::Sender`] for the first other transaction without a recoverable sender,
+/// and [`RecoverError::Task`] if a blocking task did not finish.
+pub(crate) async fn recover_encoded(
+    batch: Vec<EncodedBlock>,
+) -> Result<Vec<DecodedBlock>, RecoverError> {
+    let batch: Arc<[EncodedBlock]> = batch.into();
+    let threads: Vec<_> = (0..batch.len())
+        .step_by(BLOCKS_PER_THREAD)
+        .map(|from| {
+            let batch = Arc::clone(&batch);
+            tokio::task::spawn_blocking(move || {
+                batch
+                    .iter()
+                    .skip(from)
+                    .take(BLOCKS_PER_THREAD)
+                    .map(decode)
+                    .collect::<Result<Vec<_>, _>>()
             })
-            .collect()
+        })
+        .collect();
+    let mut blocks = Vec::with_capacity(batch.len());
+    for thread in threads {
+        blocks.extend(thread.await.map_err(RecoverError::Task)??);
+    }
+    Ok(blocks)
+}
+
+fn decode(encoded: &EncodedBlock) -> Result<DecodedBlock, RecoverError> {
+    let (block, receipts) = decode_block(encoded).map_err(|err| RecoverError::Decode {
+        hash: encoded.hash,
+        reason: err.to_string(),
+    })?;
+    let senders = senders(block.header.number, &block.body.transactions, true)?;
+    Ok(DecodedBlock {
+        block,
+        hash: encoded.hash,
+        senders,
+        receipts,
+        source: BlockSource::Sync,
     })
-    .await
-    .map_err(RecoverError::Task)?
 }
 
 /// The sender of every transaction of block `number`, in order. With `zero_signatures`, a

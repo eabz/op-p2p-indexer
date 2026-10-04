@@ -31,10 +31,10 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use alloy_primitives::{BlockHash, BlockNumber, Bytes};
+use alloy_primitives::{BlockNumber, Bytes};
 use alloy_rlp::{Decodable, Encodable, Header};
 use op_alloy_consensus::{OpReceipt, OpReceiptEnvelope};
-use op_indexer_primitives::BlockRef;
+use op_indexer_primitives::{BlockRead, BlockRef, BlockStart, ItemConvert, ReadLimits};
 use reth_eth_wire_types::message::RequestPair;
 use reth_eth_wire_types::{
     BlockHashOrNumber, BlockRangeUpdate, GetBlockBodies, GetBlockHeaders, GetReceipts,
@@ -44,7 +44,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::{MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::ElError;
 use crate::metrics::{self, ServeKind, ServeOutcome};
@@ -80,6 +80,11 @@ const MAX_CONCURRENT: usize = 4;
 /// How often the held range is read from the provider.
 const RANGE_REFRESH: Duration = Duration::from_secs(10);
 
+/// Largest request body read: a request for [`MAX_ITEMS`] hashes (33 bytes each as RLP), its
+/// list headers and its request id. A larger request asks for more than is ever answered, and
+/// is refused before it is copied or decoded: a 10 MiB request holds 300,000 hashes.
+const MAX_REQUEST_BYTES: usize = MAX_ITEMS * 33 + 32;
+
 /// Shortest time between two `BlockRangeUpdate`s to one peer. The range moves with every
 /// block; peers only need it roughly (reth announces once per epoch, about six minutes).
 const RANGE_UPDATE_INTERVAL: Duration = Duration::from_mins(1);
@@ -87,14 +92,18 @@ const RANGE_UPDATE_INTERVAL: Duration = Duration::from_mins(1);
 /// The first and the last block held.
 pub(crate) type HeldRange = (BlockRef, BlockRef);
 
-/// The range a session tells its peer, in the status and in `BlockRangeUpdate`: from the first
-/// block held to the tip the node knows (the tip alone when nothing is held).
+/// The range a session tells its peer, in the status and in `BlockRangeUpdate`: only blocks
+/// this node serves, or its tip alone.
 ///
-/// It is honest at both ends, and complete once the blocks held reach the tip. Until then
-/// (during an import, and for the few newest blocks, which are not yet committed) blocks
-/// inside it are not held, and requests for them get empty answers. The end is the tip rather
-/// than the last block held because peers end a session whose status does not look like a
-/// live node's.
+/// - Blocks are held: the held range as it is, from its first block to its last, with the last
+///   block as the head, however far that is behind the chain's tip. Every block advertised is
+///   served, and peers (and our own range sync) know to ask for them: making an imported
+///   history available is the point of holding it. The node then looks like one that is
+///   behind. Earlier runs suggest peers accept that (a stale but real head kept sessions; only
+///   genesis as the head ended them), but a status hours or days behind is **not confirmed
+///   live**: whether peers keep such a session, and still answer its requests for the tip's
+///   receipts, is the first thing to check in the next run.
+/// - Nothing is held: the tip the node knows, earliest and latest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AdvertisedRange {
     pub(crate) earliest: BlockNumber,
@@ -105,52 +114,27 @@ pub(crate) struct AdvertisedRange {
 ///
 /// The binary implements it over its local archive. The bytes it returns are sent to peers as
 /// they are (receipts without their blooms), so they must be the block's original encoding.
-/// Implemented for `Option<P>`, where `None` holds nothing.
 pub trait BlockProvider: fmt::Debug + Send + Sync + 'static {
     /// Why a read failed.
     type Error: std::error::Error + Send + Sync + 'static;
 
-    /// Returns the RLP of the header of block `number`, or `None` if it is not held.
+    /// Reads a run of headers, bodies or receipts (each block's receipts as an RLP list, every
+    /// receipt in network encoding with its bloom), each item as the RLP held, ending at the
+    /// first block not held and at `limits`. One call answers one request, so it should be one
+    /// read of the store, off the async runtime.
+    ///
+    /// With `convert`, each item is passed through it, on the thread of the read, before it
+    /// counts against the limits and is returned; an item it returns `None` for ends the run.
     ///
     /// # Errors
     ///
     /// Returns [`Self::Error`] if the store cannot be read.
-    fn header(
+    fn read(
         &self,
-        number: BlockNumber,
-    ) -> impl Future<Output = Result<Option<Bytes>, Self::Error>> + Send;
-
-    /// Returns the RLP of the body of block `number` (transactions, ommers, optional
-    /// withdrawals: one `BlockBodies` entry), or `None` if it is not held.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Self::Error`] if the store cannot be read.
-    fn body(
-        &self,
-        number: BlockNumber,
-    ) -> impl Future<Output = Result<Option<Bytes>, Self::Error>> + Send;
-
-    /// Returns the receipts of block `number` as an RLP list, each receipt in network encoding
-    /// with its bloom, or `None` if the block or its receipts are not held.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Self::Error`] if the store cannot be read.
-    fn receipts(
-        &self,
-        number: BlockNumber,
-    ) -> impl Future<Output = Result<Option<Bytes>, Self::Error>> + Send;
-
-    /// Returns the number of the held block with this hash.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Self::Error`] if the store cannot be read.
-    fn number_of(
-        &self,
-        hash: BlockHash,
-    ) -> impl Future<Output = Result<Option<BlockNumber>, Self::Error>> + Send;
+        read: BlockRead,
+        limits: ReadLimits,
+        convert: Option<ItemConvert>,
+    ) -> impl Future<Output = Result<Vec<Bytes>, Self::Error>> + Send;
 
     /// Returns the first and the last block held, or `None` if nothing is held.
     ///
@@ -158,45 +142,6 @@ pub trait BlockProvider: fmt::Debug + Send + Sync + 'static {
     ///
     /// Returns [`Self::Error`] if the store cannot be read.
     fn range(&self) -> impl Future<Output = Result<Option<HeldRange>, Self::Error>> + Send;
-}
-
-impl<P: BlockProvider> BlockProvider for Option<P> {
-    type Error = P::Error;
-
-    async fn header(&self, number: BlockNumber) -> Result<Option<Bytes>, Self::Error> {
-        match self {
-            Some(provider) => provider.header(number).await,
-            None => Ok(None),
-        }
-    }
-
-    async fn body(&self, number: BlockNumber) -> Result<Option<Bytes>, Self::Error> {
-        match self {
-            Some(provider) => provider.body(number).await,
-            None => Ok(None),
-        }
-    }
-
-    async fn receipts(&self, number: BlockNumber) -> Result<Option<Bytes>, Self::Error> {
-        match self {
-            Some(provider) => provider.receipts(number).await,
-            None => Ok(None),
-        }
-    }
-
-    async fn number_of(&self, hash: BlockHash) -> Result<Option<BlockNumber>, Self::Error> {
-        match self {
-            Some(provider) => provider.number_of(hash).await,
-            None => Ok(None),
-        }
-    }
-
-    async fn range(&self) -> Result<Option<HeldRange>, Self::Error> {
-        match self {
-            Some(provider) => provider.range().await,
-            None => Ok(None),
-        }
-    }
 }
 
 /// A peer's request on its way to the server.
@@ -276,12 +221,18 @@ impl SessionServing {
 
     /// The range to advertise now; `None` until the node knows a tip.
     fn range(&self) -> Option<AdvertisedRange> {
-        let latest = (*self.tip.borrow())?;
+        let tip = (*self.tip.borrow())?;
         let held = *self.held.borrow();
-        Some(AdvertisedRange {
-            earliest: held.map_or(latest.number, |(first, _)| first.number.min(latest.number)),
-            latest,
-        })
+        Some(held.map_or(
+            AdvertisedRange {
+                earliest: tip.number,
+                latest: tip,
+            },
+            |(first, last)| AdvertisedRange {
+                earliest: first.number,
+                latest: last,
+            },
+        ))
     }
 
     /// Handles a message from the peer if it is a request. Never waits: within the limits the
@@ -303,6 +254,10 @@ impl SessionServing {
         let Some(kind) = kind else {
             return empty();
         };
+        if body.len() > MAX_REQUEST_BYTES {
+            metrics::served(kind, ServeOutcome::Malformed);
+            return empty();
+        }
         if !self.within_rate() {
             metrics::served(kind, ServeOutcome::RateLimited);
             return empty();
@@ -367,20 +322,24 @@ impl SessionServing {
 /// The task that answers requests from the provider and keeps the held range current.
 #[derive(Debug)]
 pub(crate) struct Server<P> {
-    provider: Arc<P>,
+    /// `None` when the node holds no blocks to serve: every request is answered empty.
+    provider: Option<Arc<P>>,
     requests: mpsc::Receiver<Request>,
     range: watch::Sender<Option<HeldRange>>,
+    /// Whether what is advertised has been logged once.
+    logged: bool,
 }
 
-/// Builds the server over `provider` and what sessions use to reach it. The held range is
-/// unknown (nothing held) until the server runs.
-pub(crate) fn new<P: BlockProvider>(provider: P) -> (Server<P>, Serving) {
+/// Builds the server over `provider` (`None`: nothing to serve) and what sessions use to
+/// reach it. The held range is unknown (nothing held) until the server runs.
+pub(crate) fn new<P: BlockProvider>(provider: Option<P>) -> (Server<P>, Serving) {
     let (requests_tx, requests_rx) = mpsc::channel(MAX_QUEUED);
     let (range_tx, range_rx) = watch::channel(None);
     let server = Server {
-        provider: Arc::new(provider),
+        provider: provider.map(Arc::new),
         requests: requests_rx,
         range: range_tx,
+        logged: false,
     };
     let serving = Serving {
         requests: requests_tx,
@@ -413,52 +372,53 @@ impl<P: BlockProvider> Server<P> {
                 request = self.requests.recv(), if answering.len() < MAX_CONCURRENT => {
                     // Closed: every session and the context are gone.
                     let Some(request) = request else { return Ok(()) };
-                    answering.spawn(answer(Arc::clone(&self.provider), request));
+                    answering.spawn(answer(self.provider.clone(), request));
                 }
             }
         }
     }
 
     /// Reads the held range from the provider. A failed read keeps the last one.
-    async fn refresh_range(&self) {
-        match self.provider.range().await {
+    async fn refresh_range(&mut self) {
+        let held = match &self.provider {
+            Some(provider) => provider.range().await,
+            None => Ok(None),
+        };
+        match held {
             Ok(held) => {
-                self.range.send_if_modified(|current| {
-                    let changed = *current != held;
-                    *current = held;
-                    changed
-                });
+                let before = self.range.send_replace(held);
+                // The last block moves with every promotion; what is worth a line is the
+                // kind of range advertised and where it starts.
+                let start = |range: Option<HeldRange>| range.map(|(first, _)| first.number);
+                if !self.logged || start(before) != start(held) {
+                    self.logged = true;
+                    if let Some((first, last)) = held {
+                        info!(
+                            earliest = first.number,
+                            latest = last.number,
+                            hash = %last.hash,
+                            "execution peers are told the range of blocks held, with its last \
+                             block as the head"
+                        );
+                    } else {
+                        info!(
+                            "no blocks are held to serve; execution peers are told the tip alone"
+                        );
+                    }
+                }
             }
             Err(err) => warn!(%err, "could not read the range of blocks to serve"),
         }
     }
 }
 
-/// Why gathering an answer stopped early. What was gathered before is still sent.
+/// Why a request got no items.
 #[derive(Debug)]
 enum Fault<E> {
     /// The request could not be decoded.
     Malformed(alloy_rlp::Error),
     /// The provider failed.
     Provider(E),
-    /// Held receipts could not be decoded.
-    Stored(alloy_rlp::Error),
-}
-
-/// The items of one response, with the limits on their number and size.
-#[derive(Debug, Default)]
-struct Items {
-    list: Vec<Bytes>,
-    bytes: usize,
-}
-
-impl Items {
-    /// Adds an item. Returns whether the response may take another one.
-    fn push(&mut self, item: Bytes) -> bool {
-        self.bytes = self.bytes.saturating_add(item.len());
-        self.list.push(item);
-        self.list.len() < MAX_ITEMS && self.bytes < SOFT_RESPONSE_BYTES
-    }
 }
 
 /// The message id of the response to a request of `kind`.
@@ -471,129 +431,106 @@ const fn response_id(kind: ServeKind) -> u8 {
 }
 
 /// Answers one request from `provider` and hands the answer to its session.
-async fn answer<P: BlockProvider>(provider: Arc<P>, request: Request) {
+async fn answer<P: BlockProvider>(provider: Option<Arc<P>>, request: Request) {
     let Request {
         kind,
         id,
         body,
         answer,
     } = request;
-    let mut items = Items::default();
-    let outcome = match gather(&*provider, kind, &body, &mut items).await {
-        Ok(()) if items.list.is_empty() => ServeOutcome::Empty,
-        Ok(()) => ServeOutcome::Answered,
+    let items = match provider {
+        Some(provider) => gather(&*provider, kind, &body).await,
+        None => Ok(Vec::new()),
+    };
+    let (items, outcome) = match items {
+        Ok(items) if items.is_empty() => (items, ServeOutcome::Empty),
+        Ok(items) => (items, ServeOutcome::Answered),
         Err(Fault::Malformed(err)) => {
             debug!(?kind, %err, "malformed request from an execution peer");
-            ServeOutcome::Malformed
+            (Vec::new(), ServeOutcome::Malformed)
         }
         Err(Fault::Provider(err)) => {
             warn!(?kind, %err, "could not read blocks to serve");
-            ServeOutcome::Failed
-        }
-        Err(Fault::Stored(err)) => {
-            warn!(?kind, %err, "held receipts could not be decoded");
-            ServeOutcome::Failed
+            (Vec::new(), ServeOutcome::Failed)
         }
     };
+    let bytes = items
+        .iter()
+        .fold(0_usize, |sum, item| sum.saturating_add(item.len()));
     metrics::served(kind, outcome);
-    metrics::served_items(kind, items.list.len(), items.bytes);
+    metrics::served_items(kind, items.len(), bytes);
     // If the session has ended, the answer is dropped with its channel.
-    drop(answer.send(response(response_id(kind), id, &items.list)));
+    drop(answer.send(response(response_id(kind), id, &items)));
 }
 
-/// Gathers the items answering the request in `body` into `items`, up to its limits. Stops at
-/// the first block that is not held: a response is a run of blocks, not a selection.
+/// Reads the items answering the request in `body`: one call of the provider, which applies
+/// the limits and ends the run at the first block that is not held (a response is a run of
+/// blocks, not a selection).
 async fn gather<P: BlockProvider>(
     provider: &P,
     kind: ServeKind,
     mut body: &[u8],
-    items: &mut Items,
-) -> Result<(), Fault<P::Error>> {
-    let hashes = match kind {
+) -> Result<Vec<Bytes>, Fault<P::Error>> {
+    let mut limits = ReadLimits {
+        items: MAX_ITEMS,
+        bytes: SOFT_RESPONSE_BYTES,
+    };
+    let (read, convert): (BlockRead, Option<ItemConvert>) = match kind {
         ServeKind::Headers => {
             let request = RequestPair::<GetBlockHeaders>::decode(&mut body)
                 .map_err(Fault::Malformed)?
                 .message;
-            return headers(provider, &request, items)
-                .await
-                .map_err(Fault::Provider);
+            // The peer's limit, within ours.
+            limits.items =
+                usize::try_from(request.limit).map_or(MAX_ITEMS, |limit| limit.min(MAX_ITEMS));
+            let read = BlockRead::Headers {
+                start: match request.start_block {
+                    BlockHashOrNumber::Hash(hash) => BlockStart::Hash(hash),
+                    BlockHashOrNumber::Number(number) => BlockStart::Number(number),
+                },
+                // The held blocks are one chain, so walking it is walking the numbers.
+                step: u64::from(request.skip).saturating_add(1),
+                rising: matches!(request.direction, HeadersDirection::Rising),
+            };
+            (read, None)
         }
         ServeKind::Bodies => {
-            RequestPair::<GetBlockBodies>::decode(&mut body).map(|pair| pair.message.0)
+            let request = RequestPair::<GetBlockBodies>::decode(&mut body);
+            let hashes = request.map_err(Fault::Malformed)?.message.0;
+            (BlockRead::Bodies(hashes), None)
         }
         ServeKind::Receipts => {
-            RequestPair::<GetReceipts>::decode(&mut body).map(|pair| pair.message.0)
+            let request = RequestPair::<GetReceipts>::decode(&mut body);
+            let hashes = request.map_err(Fault::Malformed)?.message.0;
+            (BlockRead::Receipts(hashes), Some(without_blooms))
         }
-    }
-    .map_err(Fault::Malformed)?;
-    for hash in hashes {
-        let number = provider.number_of(hash).await.map_err(Fault::Provider)?;
-        let Some(number) = number else { break };
-        let item = if matches!(kind, ServeKind::Receipts) {
-            let stored = provider.receipts(number).await.map_err(Fault::Provider)?;
-            stored
-                .map(|stored| without_blooms(&stored))
-                .transpose()
-                .map_err(Fault::Stored)?
-        } else {
-            provider.body(number).await.map_err(Fault::Provider)?
-        };
-        let Some(item) = item else { break };
-        if !items.push(item) {
-            break;
-        }
-    }
-    Ok(())
-}
-
-/// Gathers the headers `request` asks for: from its start, by number or hash, every
-/// `skip + 1`-th block in its direction.
-async fn headers<P: BlockProvider>(
-    provider: &P,
-    request: &GetBlockHeaders,
-    items: &mut Items,
-) -> Result<(), P::Error> {
-    let mut next = match request.start_block {
-        BlockHashOrNumber::Hash(hash) => provider.number_of(hash).await?,
-        BlockHashOrNumber::Number(number) => Some(number),
     };
-    // The held blocks are one chain, so walking it is walking the numbers.
-    let step = u64::from(request.skip).saturating_add(1);
-    // `limit` is the peer's; `Items::push` ends the walk at ours.
-    for _ in 0..request.limit {
-        let Some(number) = next else { break };
-        let Some(header) = provider.header(number).await? else {
-            break;
-        };
-        if !items.push(header) {
-            break;
-        }
-        next = match request.direction {
-            HeadersDirection::Rising => number.checked_add(step),
-            HeadersDirection::Falling => number.checked_sub(step),
-        };
-    }
-    Ok(())
+    provider
+        .read(read, limits, convert)
+        .await
+        .map_err(Fault::Provider)
 }
 
-/// Converts a block's receipts from the held form to the eth/69 one ([EIP-7642]).
+/// Converts a block's receipts from the held form to the eth/69 one ([EIP-7642]); `None` if
+/// the held list cannot be decoded. Called by the provider, inside its read.
 ///
 /// Held: an RLP list of receipts in network encoding, `status, cumulative-gas, bloom, logs`,
 /// and for a deposit receipt its nonce and version when it has them. Sent: per receipt
 /// `[tx-type, status, cumulative-gas, logs]`, followed by the same deposit nonce and version.
 /// The only field dropped is the bloom, which the receiver rebuilds from the logs; the type
 /// (legacy included, as type 0), the status or post-state root, the gas, every log and the
-/// deposit fields are carried over as they are. A few milliseconds of CPU for the largest
-/// response.
+/// deposit fields are carried over as they are.
 ///
 /// [EIP-7642]: https://eips.ethereum.org/EIPS/eip-7642
-fn without_blooms(stored: &[u8]) -> alloy_rlp::Result<Bytes> {
-    let receipts = Vec::<OpReceiptEnvelope>::decode(&mut &*stored)?;
+fn without_blooms(stored: &[u8]) -> Option<Bytes> {
+    let receipts = Vec::<OpReceiptEnvelope>::decode(&mut &*stored)
+        .inspect_err(|err| warn!(%err, "held receipts could not be decoded; not served"))
+        .ok()?;
     let receipts: Vec<OpReceipt> = receipts.into_iter().map(OpReceipt::from).collect();
     // Without the blooms the list is smaller than it was.
     let mut out = Vec::with_capacity(stored.len());
     alloy_rlp::encode_list(&receipts, &mut out);
-    Ok(out.into())
+    Some(out.into())
 }
 
 /// Encodes a response: the message id, then `[request-id, [item, ...]]` with each item copied

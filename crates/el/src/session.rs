@@ -19,5 +19,5 @@ mod listener;
 
 pub(crate) use context::{SessionContext, unix_now};
 pub(crate) use driver::{EndReason, RequestError, SessionDriver, SessionEnd, SessionHandle};
-pub(crate) use handshake::{Direction, Session, SessionError};
+pub(crate) use handshake::{Direction, SessionError, connect};
 pub(crate) use listener::{Accepted, listen};

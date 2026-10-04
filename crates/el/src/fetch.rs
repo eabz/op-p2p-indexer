@@ -6,8 +6,15 @@
 //! is asked of another peer. A block nobody can serve stays queued and is tried again, with a
 //! growing wait.
 //!
-//! Does not open sessions or choose peers to dial (`peers`), and does not decode or verify
-//! receipts itself (`wire`, `verify`).
+//! Does not open sessions or choose peers to dial (`peers`), does not decode or verify
+//! receipts itself (`wire`, `verify`), and does not decide which tip the node advertises (the
+//! binary does).
+//!
+//! What a peer's answer costs it: a wrong count or a wrong receipts root is a lie, and the
+//! peer is banned. An answer that cannot be decoded is not: it may be a receipt of a kind this
+//! build does not know yet, sent by every honest peer, so the answer is dropped and the peer
+//! only dropped for a while. Not answering, or saying "not held" only after a long wait,
+//! counts towards dropping the peer as unresponsive.
 //!
 //! Peers do not announce how far back their receipts reach. When a peer answers "not held" for
 //! a block well below its head, the fetcher remembers that height as the peer's floor and does
@@ -17,11 +24,10 @@
 //! exists only for open sessions.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
 use std::time::Duration;
 
 use alloy_consensus::EMPTY_ROOT_HASH;
-use alloy_primitives::{BlockHash, BlockNumber};
+use alloy_primitives::{BlockHash, BlockNumber, Bytes};
 use op_alloy_consensus::OpReceiptEnvelope;
 use op_indexer_chainspec::ChainSpec;
 use op_indexer_primitives::{ReceiptsRequest, VerifiedReceipts};
@@ -30,13 +36,15 @@ use tokio::sync::mpsc;
 use tokio::task::{JoinError, JoinSet, spawn_blocking};
 use tokio::time::{Instant, MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::ElError;
-use crate::metrics::{self, RequestOutcome};
+use crate::metrics;
+use crate::pacing::{Pacing, REQUEST_SPACING};
 use crate::peers::{Peers, Report, closed};
-use crate::session::{RequestError, SessionContext, SessionHandle};
+use crate::session::{RequestError, SessionHandle};
 use crate::verify::{VerifyError, verify_receipts};
+use crate::wire::{self, ReceiptsError};
 
 /// Most blocks waiting for receipts. About two hours of blocks; beyond it the oldest is dropped
 /// and the pipeline asks again for stored blocks without receipts when it restarts.
@@ -49,10 +57,11 @@ const DISPATCH_TICK: Duration = REQUEST_SPACING;
 const FIRST_RETRY: Duration = Duration::from_secs(2);
 /// Longest wait between two rounds for one block.
 const MAX_RETRY: Duration = Duration::from_secs(60);
-/// Pause between two requests to the same peer: this node only asks, so it asks slowly.
-const REQUEST_SPACING: Duration = Duration::from_millis(200);
-/// Timeouts in a row after which a peer is reported as unresponsive.
-const MAX_TIMEOUTS: u32 = 3;
+/// A "not held" answer that took longer than this counts as a timeout: a peer could otherwise
+/// claim the newest block and hold every request for it for the whole request timeout, at no
+/// cost. Honest answers arrived within a second when measured. Enough timeouts in a row and the
+/// peer is reported as unresponsive (see `pacing`).
+const SLOW_EMPTY: Duration = Duration::from_secs(5);
 /// A "not held" answer sets the peer's floor only for a block at least this far below the
 /// peer's head. Nearer the head it can also mean the peer has another block at that height.
 const FLOOR_MARGIN: u64 = 64;
@@ -63,7 +72,6 @@ const MAX_TRIED: usize = 16;
 #[derive(Debug)]
 pub(crate) struct Fetcher {
     chain: &'static ChainSpec,
-    ctx: Arc<SessionContext>,
     peers: Peers,
     requests: mpsc::Receiver<ReceiptsRequest>,
     verified: mpsc::Sender<VerifiedReceipts>,
@@ -95,13 +103,9 @@ struct Pending {
 /// What the fetcher knows about the peer of an open session.
 #[derive(Debug)]
 struct PeerState {
-    busy: bool,
-    /// Not asked before this.
-    next_request: Instant,
+    pacing: Pacing,
     /// The peer holds no receipts below this block number.
     floor: BlockNumber,
-    /// Timeouts in a row.
-    timeouts: u32,
     /// Whether the peer set has been told that this peer served a verified answer.
     reported_served: bool,
 }
@@ -117,27 +121,44 @@ struct Answer {
 #[derive(Debug)]
 enum Outcome {
     Verified(Vec<OpReceiptEnvelope>),
-    /// The peer does not hold the receipts.
-    Empty,
+    /// The peer does not hold the receipts; `slow` if it took longer than [`SLOW_EMPTY`] to
+    /// say so.
+    Empty {
+        slow: bool,
+    },
+    /// The answer is not the block's receipts: a lie.
     Invalid(VerifyError),
+    /// The answer could not be decoded: possibly this build is behind.
     Malformed(String),
     Timeout,
     /// The session ended before the answer.
     Closed,
 }
 
+impl Outcome {
+    /// The outcome as the `outcome` label of the request counter.
+    const fn label(&self) -> &'static str {
+        match self {
+            Self::Verified(_) => "verified",
+            Self::Empty { .. } => "empty",
+            Self::Invalid(_) => "invalid",
+            Self::Malformed(_) => "malformed",
+            Self::Timeout => "timeout",
+            Self::Closed => "closed",
+        }
+    }
+}
+
 impl Fetcher {
     /// Creates the fetcher. Sends nothing until [`Self::run`].
     pub(crate) fn new(
         chain: &'static ChainSpec,
-        ctx: Arc<SessionContext>,
         peers: Peers,
         requests: mpsc::Receiver<ReceiptsRequest>,
         verified: mpsc::Sender<VerifiedReceipts>,
     ) -> Self {
         Self {
             chain,
-            ctx,
             peers,
             requests,
             verified,
@@ -192,16 +213,6 @@ impl Fetcher {
 
     /// Queues a block. Returns `false` if the pipeline no longer takes receipts.
     async fn enqueue(&mut self, request: ReceiptsRequest, cancel: &CancellationToken) -> bool {
-        // The newest block asked for is the tip this node advertises to peers; the peer set
-        // opens no session before one is known.
-        if !self.ctx.has_tip() {
-            info!(
-                number = request.block.number,
-                hash = %request.block.hash,
-                "first block to fetch receipts for; it is the tip advertised to execution peers"
-            );
-        }
-        self.ctx.set_tip(request.block);
         if request.transaction_count == 0 {
             // Nothing to fetch. Not expected on an OP chain: every block has a deposit.
             if request.receipts_root != EMPTY_ROOT_HASH {
@@ -262,13 +273,11 @@ impl Fetcher {
         for session in sessions {
             let peer = session.status().peer_id;
             let state = self.peer_states.entry(peer).or_insert(PeerState {
-                busy: false,
-                next_request: now,
+                pacing: Pacing::new(now),
                 floor: 0,
-                timeouts: 0,
                 reported_served: false,
             });
-            if state.busy || state.next_request > now {
+            if !state.pacing.is_ready(now) {
                 continue;
             }
             // Below what the peer says it serves, or below where it answered "not held".
@@ -283,7 +292,7 @@ impl Fetcher {
                 continue;
             };
             pending.in_flight = true;
-            state.busy = true;
+            state.pacing.started();
             let (key, request) = (*key, pending.request);
             self.in_flight
                 .spawn(ask(session, key, request, canyon_time));
@@ -294,23 +303,17 @@ impl Fetcher {
     /// receipts.
     async fn answered(&mut self, answer: Answer, cancel: &CancellationToken) -> bool {
         let Answer { key, peer, outcome } = answer;
-        let mut timeouts = 0;
-        if let Some(state) = self.peer_states.get_mut(&peer) {
-            state.busy = false;
-            state.next_request = Instant::now() + REQUEST_SPACING;
-            state.timeouts = match outcome {
-                Outcome::Timeout => state.timeouts.saturating_add(1),
-                Outcome::Verified(_)
-                | Outcome::Empty
-                | Outcome::Invalid(_)
-                | Outcome::Malformed(_)
-                | Outcome::Closed => 0,
-            };
-            timeouts = state.timeouts;
+        metrics::request(outcome.label());
+        let timely = !matches!(outcome, Outcome::Timeout | Outcome::Empty { slow: true });
+        let unresponsive = self
+            .peer_states
+            .get_mut(&peer)
+            .is_some_and(|state| state.pacing.finished(timely));
+        if unresponsive {
+            self.peers.report(Report::Unresponsive(peer));
         }
         match outcome {
             Outcome::Verified(receipts) => {
-                metrics::request(RequestOutcome::Verified);
                 if let Some(state) = self.peer_states.get_mut(&peer)
                     && !state.reported_served
                 {
@@ -332,35 +335,34 @@ impl Fetcher {
                 );
                 return self.deliver(pending.request, receipts, cancel).await;
             }
-            Outcome::Empty => {
-                metrics::request(RequestOutcome::Empty);
-                debug!(%peer, number = key.0, "peer does not hold the receipts");
+            Outcome::Empty { slow } => {
+                debug!(%peer, number = key.0, slow, "peer does not hold the receipts");
                 self.note_not_held(peer, key.0);
                 self.try_another(key, Some(peer));
             }
             Outcome::Invalid(err) => {
-                metrics::request(RequestOutcome::Invalid);
                 metrics::verification_failed(err.kind());
                 warn!(%peer, number = key.0, hash = %key.1, %err, "receipts failed verification");
                 self.peers.report(Report::BadData(peer));
                 self.try_another(key, Some(peer));
             }
             Outcome::Malformed(reason) => {
-                metrics::request(RequestOutcome::Malformed);
-                warn!(%peer, number = key.0, hash = %key.1, reason, "receipts answer could not be decoded");
-                self.peers.report(Report::BadData(peer));
+                warn!(
+                    %peer,
+                    number = key.0,
+                    hash = %key.1,
+                    reason,
+                    "receipts answer could not be decoded; if every peer's is, this build is \
+                     behind the chain"
+                );
+                self.peers.report(Report::Undecodable(peer));
                 self.try_another(key, Some(peer));
             }
             Outcome::Timeout => {
-                metrics::request(RequestOutcome::Timeout);
-                debug!(%peer, number = key.0, timeouts, "receipts request timed out");
-                if timeouts >= MAX_TIMEOUTS {
-                    self.peers.report(Report::Unresponsive(peer));
-                }
+                debug!(%peer, number = key.0, "receipts request timed out");
                 self.try_another(key, Some(peer));
             }
             Outcome::Closed => {
-                metrics::request(RequestOutcome::Closed);
                 self.try_another(key, None);
             }
         }
@@ -458,7 +460,8 @@ impl Fetcher {
     }
 }
 
-/// Asks one peer for one block's receipts and verifies the answer on a blocking thread.
+/// Asks one peer for one block's receipts, then decodes and verifies the answer on a blocking
+/// thread.
 async fn ask(
     session: SessionHandle,
     key: Key,
@@ -466,21 +469,46 @@ async fn ask(
     canyon_time: u64,
 ) -> Result<Answer, JoinError> {
     let peer = session.status().peer_id;
-    let outcome = match session.receipts(request.block.hash).await {
-        Ok(receipts) if receipts.is_empty() => Outcome::Empty,
-        Ok(receipts) => {
-            let verified = spawn_blocking(move || {
-                verify_receipts(&request, &receipts, canyon_time).map(|()| receipts)
-            })
-            .await?;
-            match verified {
-                Ok(receipts) => Outcome::Verified(receipts),
-                Err(err) => Outcome::Invalid(err),
+    let asked_at = Instant::now();
+    let outcome = match session.receipts(vec![request.block.hash]).await {
+        Ok(blocks) => match blocks.into_iter().next() {
+            Some(item) => {
+                let checked = spawn_blocking(move || check(&request, &item, canyon_time)).await?;
+                checked.unwrap_or_else(|outcome| outcome)
             }
-        }
+            None => Outcome::Empty { slow: false },
+        },
         Err(RequestError::Timeout) => Outcome::Timeout,
         Err(RequestError::SessionClosed) => Outcome::Closed,
         Err(RequestError::Malformed(reason)) => Outcome::Malformed(reason),
+        // More blocks than the one asked for.
+        Err(RequestError::Excess { asked, got }) => Outcome::Invalid(VerifyError::Count {
+            expected: asked,
+            got,
+        }),
+    };
+    let outcome = if matches!(outcome, Outcome::Empty { .. }) {
+        Outcome::Empty {
+            slow: asked_at.elapsed() > SLOW_EMPTY,
+        }
+    } else {
+        outcome
     };
     Ok(Answer { key, peer, outcome })
+}
+
+/// Decodes one block's receipts from an answer and verifies them against `request`.
+fn check(request: &ReceiptsRequest, item: &Bytes, canyon_time: u64) -> Result<Outcome, Outcome> {
+    let receipts =
+        wire::decode_receipts(item, request.transaction_count).map_err(|err| match err {
+            ReceiptsError::Count { expected, got } => {
+                Outcome::Invalid(VerifyError::Count { expected, got })
+            }
+            ReceiptsError::Rlp(err) => Outcome::Malformed(err.to_string()),
+        })?;
+    if receipts.is_empty() {
+        return Ok(Outcome::Empty { slow: false });
+    }
+    verify_receipts(request, &receipts, canyon_time).map_err(Outcome::Invalid)?;
+    Ok(Outcome::Verified(receipts))
 }

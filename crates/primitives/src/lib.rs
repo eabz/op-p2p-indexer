@@ -4,6 +4,8 @@
 //! Blocks, transactions and receipts are the alloy / op-alloy consensus types; nothing here
 //! redefines them.
 
+mod body;
+
 use std::net::SocketAddr;
 
 use alloy_consensus::transaction::{RlpEcdsaDecodableTx, RlpEcdsaEncodableTx};
@@ -12,6 +14,10 @@ use alloy_eips::eip2718::{Decodable2718, Eip2718Result, Encodable2718};
 use alloy_primitives::{Address, B256, B512, BlockHash, BlockNumber, Signature, U256, keccak256};
 use alloy_rlp::Header;
 use op_alloy_consensus::{OpBlock, OpReceiptEnvelope, OpTxEnvelope};
+
+pub use body::{
+    BodyParts, decode_block, encode_body, receipts_root, split_body, transactions_root,
+};
 
 /// Execution payload version a block was gossiped as, which is also the fork it belongs to.
 ///
@@ -198,29 +204,6 @@ pub struct SyncRange {
     pub anchor: BlockRef,
 }
 
-/// How far a range sync got, kept so a restart resumes it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SyncState {
-    /// Highest block of the range that is stored, with every block of the range below it;
-    /// `None` until the first batch is stored.
-    pub stored_to: Option<BlockNumber>,
-    /// Blocks above [`Self::stored_to`] whose hash was verified by the header chain down from
-    /// the anchor, ascending. Fetching resumes from them without walking the chain again.
-    pub checkpoints: Vec<BlockRef>,
-}
-
-/// A block fetched from execution peers and verified: its header by the hash chain from a
-/// trusted block, its transactions and receipts against the roots in that header.
-#[derive(Debug, Clone)]
-pub struct SyncedBlock {
-    /// Header and transactions, decoded from the bytes in [`Self::encoded`].
-    pub block: OpBlock,
-    /// The header and body exactly as received, and the receipts encoded with their blooms.
-    pub encoded: EncodedBlock,
-    /// Receipt of each transaction, in block order.
-    pub receipts: Vec<OpReceiptEnvelope>,
-}
-
 /// Result of an unsafe-store insert.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InsertOutcome {
@@ -248,6 +231,64 @@ pub struct EncodedBlock {
     pub receipts: Option<alloy_primitives::Bytes>,
 }
 
+/// A run of blocks to read from the blocks a node holds, for answering a peer: what the eth
+/// protocol's `GetBlockHeaders`, `GetBlockBodies` and `GetReceipts` ask for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockRead {
+    /// Headers from `start`, then every `step`-th block (`step` is at least 1), towards higher
+    /// numbers if `rising`, else towards lower ones.
+    Headers {
+        /// The first header.
+        start: BlockStart,
+        /// The distance between two headers, in blocks.
+        step: u64,
+        /// The direction.
+        rising: bool,
+    },
+    /// The bodies of the blocks with these hashes, in this order.
+    Bodies(Vec<BlockHash>),
+    /// The receipts of the blocks with these hashes, in this order.
+    Receipts(Vec<BlockHash>),
+}
+
+/// Where a run of headers starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockStart {
+    /// At the block with this number.
+    Number(BlockNumber),
+    /// At the block with this hash.
+    Hash(BlockHash),
+}
+
+/// Turns an item read for a [`BlockRead`] into the form it is sent in; `None` if the item
+/// cannot be converted.
+pub type ItemConvert = fn(&[u8]) -> Option<alloy_primitives::Bytes>;
+
+/// Where the answer to a [`BlockRead`] ends even if more is held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadLimits {
+    /// Most items.
+    pub items: usize,
+    /// The answer ends after the item that takes it to this size or beyond.
+    pub bytes: usize,
+}
+
+impl From<&DecodedBlock> for EncodedBlock {
+    /// Encodes a decoded block: the header, the body and its receipts, if it has them, as
+    /// their types encode. For a block received over gossip these are its original bytes (its
+    /// transactions are signed, so they survive the decoding); a block that may hold a
+    /// transaction with an all-zero signature must be handed over in its original bytes
+    /// instead.
+    fn from(block: &DecodedBlock) -> Self {
+        Self {
+            hash: block.hash,
+            header: alloy_rlp::encode(&block.block.header).into(),
+            body: alloy_rlp::encode(&block.block.body).into(),
+            receipts: block.receipts.as_deref().map(encode_receipts),
+        }
+    }
+}
+
 /// Encodes `receipts` as the archive holds them and [`EncodedBlock::receipts`] carries them:
 /// an RLP list of the receipts, each in network encoding with its bloom (one `Receipts` entry
 /// of the eth protocol up to eth/68). A deposit receipt keeps its nonce and version as given.
@@ -256,18 +297,6 @@ pub fn encode_receipts(receipts: &[OpReceiptEnvelope]) -> alloy_primitives::Byte
     let mut out = Vec::new();
     alloy_rlp::encode_list(receipts, &mut out);
     out.into()
-}
-
-/// A block as the archive holds it: RLP, decompressed, ready to be put on the wire by a caller
-/// that knows the protocol version.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ArchivedBlock {
-    /// RLP of the header.
-    pub header: alloy_primitives::Bytes,
-    /// RLP of the body: transactions in network encoding, ommers, withdrawals.
-    pub body: alloy_primitives::Bytes,
-    /// RLP list of the consensus receipts; `None` until they are set.
-    pub receipts: Option<alloy_primitives::Bytes>,
 }
 
 /// RLP of the integer zero, which is how each of `v`, `r` and `s` of a zero signature is encoded.
@@ -325,8 +354,13 @@ pub fn is_zero_signature(transaction: &OpTxEnvelope) -> bool {
     matches!(transaction, OpTxEnvelope::Legacy(signed) if is_zero(signed.signature()))
 }
 
+/// Whether `signature` is the one [`decode_zero_signature`] builds for `v = r = s = 0`.
+///
+/// A typed signature keeps only the parity of `v`, so `v = 27` with `r = s = 0` looks the
+/// same. That is not a signature (`r` and `s` are never zero), so no valid block has one and
+/// the regular decoder is the one that would report it.
 fn is_zero(signature: &Signature) -> bool {
-    signature.r().is_zero() && signature.s().is_zero()
+    !signature.v() && signature.r().is_zero() && signature.s().is_zero()
 }
 
 /// Decodes `leaf` if it is a legacy transaction with `v = r = s = 0`; `None` for anything

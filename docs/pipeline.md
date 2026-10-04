@@ -26,7 +26,7 @@ Ingestion and promotion are separate tasks, so a slow ClickHouse never delays a 
 
 ```text
 p2p ─▶ [ingest]  decode ─▶ recover senders ─▶ UnsafeStore::insert
-l1  ─▶ [promote] UnsafeStore::ancestry ─▶ CommittedStore::insert ─▶ ArchiveStore::append/trim
+l1  ─▶ [promote] UnsafeStore::ancestry ─▶ CommittedStore::insert ─▶ ArchiveStore::append_batch/trim
                  ─▶ CommittedStore::set_l1_heads ─▶ UnsafeStore::prune ─▶ safe number to p2p
 ```
 
@@ -58,13 +58,15 @@ Runs whenever the L1 heads change. `C` is the safe head recorded in the committe
 (`CommittedStore::l1_heads`), `S` the new safe head.
 
 1. **L1 reorg** (`S` is below `C`, or at `C`'s height with another hash):
-   `CommittedStore::rollback_to(S)`, `ArchiveStore::truncate_above(S.number)`, then continue.
+   `CommittedStore::rollback_to(S)`; `ArchiveStore::truncate_above(S.number)` if the archive
+   ends at or below `C` (so at most `C - S` blocks go); then continue.
 2. `UnsafeStore::set_l1_heads(heads)`, so the unsafe store stops accepting blocks at or below
    `S` and fork choice respects it.
 3. `UnsafeStore::ancestry(S, C.number)`: the blocks above `C` up to `S`, oldest first. The
    first block's parent must be `C`.
-4. `CommittedStore::insert(blocks)`, then `ArchiveStore::append` for each block and
-   `ArchiveStore::trim(retention)` (skipped when the archive is disabled or keeps everything).
+4. `CommittedStore::insert(blocks)`, then `ArchiveStore::append_batch` of the blocks if they
+   extend the archive's tip, and `ArchiveStore::trim(retention)` (skipped when the archive is
+   disabled, keeps everything, or already holds more than the window).
 5. `CommittedStore::set_l1_heads(heads)`: the marker that the range is committed. Written
    after the data, so a crash before it repeats the range.
 6. `UnsafeStore::prune(S)`, then publish `S.number` to `p2p`.
@@ -92,8 +94,8 @@ hole itself; backfill belongs to the `el` crate.
 One promotion makes at most four `ancestry` calls (`MAX_RANGE_READS`); if none succeeds, the
 whole range is the hole. Each hole is logged with its range and reason and counted, with only
 the blocks actually left out; a promotion repeated after a crash counts its hole again. `S` is
-recorded as the committed safe head and promotion continues from there. The archive is not
-emptied for a hole: the first promoted block that does not extend it restarts it (below).
+recorded as the committed safe head and promotion continues from there. The blocks promoted
+after a hole do not extend the archive and are not archived until range sync fills it (below).
 Stalling until backfill exists was rejected: it would stop pruning and committing entirely.
 
 **First safe head** (the committed store has recorded none): the committed store begins at
@@ -101,9 +103,24 @@ Stalling until backfill exists was rejected: it would stop pruning and committin
 hole is counted. Older history belongs to backfill. Heads with no safe head (only finalized
 known) are recorded and nothing else happens.
 
-**The archive not matching** is handled where it shows: an `append` that returns
-`NotContiguous` empties the archive (`trim(0)`, repeated while it times out) and appends the
-block again. Startup leftovers, holes and reorgs share that path.
+**The archive is never emptied by promotion.** It holds one contiguous range, and the
+importer and range sync write to it too, below and above `C`. The rule for who writes where:
+promotion appends at the tip, and only blocks that extend it; range sync and the importer own
+everything else, including the gap below a promoted range that did not connect.
+
+- A promoted range that does not extend the archive's tip (`NotContiguous`: the archive is
+  behind, or holds another chain at that height) is not archived. It is logged at most once
+  in ten minutes with the archive's tip and the block, and counted
+  (`op_indexer_pipeline_archive_skipped_blocks_total`). Nothing is removed to make room.
+  Blocks the archive already holds are skipped by `append_batch`, so a range that range sync
+  or an import stored first is fine.
+- `trim` runs only while the archive holds no more than the retention window plus the blocks
+  just appended, so it removes at most as many blocks as were appended. An archive that is
+  already larger (an import: set the retention to `all`) is not trimmed, with a warning.
+- Blocks are removed only in step 1, an L1 reorg of the safe head, and only if the archive
+  ends at or below `C`: at most `C - S` blocks, the depth of the reorg. If it reaches above
+  `C`, other writers put blocks there and it is left alone, with a warning.
+- Startup removes nothing (section 5).
 
 **Known limits, to be closed with the `l1` crate:**
 
@@ -120,15 +137,21 @@ block again. Startup leftovers, holes and reorgs share that path.
 ## 5. Startup
 
 1. Read `C` from the committed store. If there is none, start both tasks.
-2. `CommittedStore::rollback_to(C)`: removes rows above `C` left by a promotion that stopped
-   before its marker. The repeat would overwrite them only if the same blocks come again; if
-   the safe chain differs, rows of the old attempt would remain.
-3. Write the heads to the unsafe store (Redis may have been wiped by a layout change), prune it
+2. Write the heads to the unsafe store (Redis may have been wiped by a layout change), prune it
    up to `C` (the last run may have stopped between the marker and the prune), and publish
    `C`'s number to `p2p`.
-4. If the archive's tip is above `C`, truncate it to `C`. An archive that is behind or does not
-   match is handled at the next append (section 4).
-5. Start both tasks.
+3. Start both tasks.
+
+Nothing is deleted from the committed store or the archive at startup. Rows or archived blocks
+above `C` may come from a promotion that stopped before its marker, or from an import or a
+range sync that reached further; the two cannot be told apart, and deleting the second kind
+would discard work that takes days. What a stopped promotion leaves is harmless: the repeat
+inserts the same rows again (the insert is idempotent) and finds its blocks in the archive,
+which skips them. Only if the safe chain is another one after the restart (a crash between
+steps 4 and 5, then an L1 reorg) do rows of the stopped attempt stay and its blocks stay at
+the archive's tip, where later ranges then do not connect: backfill repairs the rows, the
+operator the archive.
+
 
 The network is not held back: it starts next to this reconciliation, and the block channel
 buffers what arrives until ingest starts.

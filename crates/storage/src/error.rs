@@ -4,6 +4,7 @@
 
 use std::fmt;
 use std::num::ParseIntError;
+use std::path::PathBuf;
 
 use alloy_primitives::hex::FromHexError;
 use alloy_primitives::{BlockHash, BlockNumber};
@@ -206,8 +207,24 @@ pub enum StorageError {
     NotContiguous {
         /// The tip of the archive, which the block must extend.
         expected: BlockRef,
-        /// The parent the block claims: its number minus one and its parent hash.
+        /// The parent the block claims (its number minus one and its parent hash), or the
+        /// block of the list that the archive holds another block in place of.
         got: BlockRef,
+    },
+    /// The archive directory was written with another schema version. Nothing is deleted: the
+    /// operator removes the directory, or runs the build that wrote it.
+    #[error(
+        "the block archive in {} has schema version {found}, this build reads version \
+         {expected}; delete the directory to start a new archive",
+        path.display()
+    )]
+    ArchiveSchema {
+        /// The archive directory.
+        path: PathBuf,
+        /// The version found: a number, or the bytes stored where it should be.
+        found: String,
+        /// The version this build writes.
+        expected: u64,
     },
     /// A block to store does not fit the schema.
     #[error("block {number} cannot be stored: {reason}")]
@@ -270,6 +287,19 @@ impl fmt::Display for InvalidBlockReason {
 }
 
 impl StorageError {
+    /// Whether the error is the block archive's directory being open in another process:
+    /// fjall locks it, so one process uses it at a time.
+    #[must_use]
+    pub const fn is_archive_locked(&self) -> bool {
+        matches!(
+            self,
+            Self::Fjall {
+                source: fjall::Error::Locked,
+                ..
+            }
+        )
+    }
+
     /// Classifies the error: retry it, handle it, or stop for an operator.
     #[must_use]
     pub fn severity(&self) -> Severity {
@@ -292,6 +322,7 @@ impl StorageError {
             | Self::Decode { .. }
             | Self::MissingField { .. }
             | Self::InvalidData { .. }
+            | Self::ArchiveSchema { .. }
             | Self::InvalidBlock { .. }
             | Self::Oversized { .. }
             | Self::UnsupportedTransaction { .. }

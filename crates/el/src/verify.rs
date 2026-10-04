@@ -26,12 +26,9 @@
 //! [EIP-2718]: https://eips.ethereum.org/EIPS/eip-2718
 //! [deposit receipt]: https://specs.optimism.io/protocol/deposits.html#deposit-receipt
 
-use std::borrow::Cow;
-
-use alloy_consensus::proofs::calculate_receipt_root;
 use alloy_primitives::B256;
 use op_alloy_consensus::OpReceiptEnvelope;
-use op_indexer_primitives::ReceiptsRequest;
+use op_indexer_primitives::{ReceiptsRequest, receipts_root};
 
 use crate::metrics::VerificationFailure;
 
@@ -87,12 +84,7 @@ pub(crate) fn verify_receipts(
             got: receipts.len(),
         });
     }
-    let hashed = if request.timestamp_secs >= canyon_time {
-        Cow::Borrowed(receipts)
-    } else {
-        Cow::Owned(receipts.iter().map(without_deposit_nonce).collect())
-    };
-    let computed = calculate_receipt_root(&hashed);
+    let computed = receipts_root(receipts, request.timestamp_secs, canyon_time);
     if computed != request.receipts_root {
         return Err(VerifyError::Root {
             expected: request.receipts_root,
@@ -100,14 +92,4 @@ pub(crate) fn verify_receipts(
         });
     }
     Ok(())
-}
-
-/// The receipt as it is hashed before Canyon: a deposit receipt without its nonce and version.
-fn without_deposit_nonce(receipt: &OpReceiptEnvelope) -> OpReceiptEnvelope {
-    let mut hashed = receipt.clone();
-    if let OpReceiptEnvelope::Deposit(deposit) = &mut hashed {
-        deposit.receipt.deposit_nonce = None;
-        deposit.receipt.deposit_receipt_version = None;
-    }
-    hashed
 }

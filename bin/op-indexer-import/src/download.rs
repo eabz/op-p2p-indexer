@@ -1,39 +1,50 @@
 //! The `download` step: fetches every chunk of the range that is not on disk yet.
 //!
-//! Chunks are fetched with a fixed number of requests in flight. A chunk may take several
-//! requests (an answer may cover less than was asked); it is written, compressed, only once
-//! every block of it has arrived. Nothing is parsed beyond the cursor and nothing is verified:
-//! the request window is spent on the transfer.
+//! Chunks are fetched with a fixed number of requests in flight. Each answer is written to
+//! the chunk's temporary file as it arrives and as it travelled, in the service's content
+//! encoding, so memory stays small whatever a chunk holds and nothing is compressed here.
+//! The file gets its final name only once every block of the chunk has arrived (a chunk may
+//! take several requests: an answer may cover less than was asked). Nothing is parsed and
+//! nothing is verified: the request window is spent on the transfer.
 //!
-//! A failed request is retried a few times with capped, jittered backoff. When the service
-//! refuses for rate limits or the token, or retries run out, the step stops with a summary of
-//! what is missing; it never spins.
+//! A chunk that fails for a reason that may pass (the service busy or limiting, a broken
+//! connection) is fetched again from its start a few times, with capped, jittered backoff.
+//! When a chunk fails for good, or the disk is nearly full, no new chunk is started, the
+//! requests in flight finish and are written, and the step ends with a summary of what is
+//! missing. It never spins.
 
-use std::io::{self, Write};
-use std::path::PathBuf;
+use std::io::{self, BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use eyre::WrapErr;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinError, JoinSet};
 use tokio::time::{MissedTickBehavior, interval, sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::source::{Source, SourceError};
+use crate::progress::{self, Rate};
+use crate::source::{Encoding, HyperSync, Meters, SourceError};
 use crate::state::{Chunk, Plan, State, write_atomic};
 
-/// Attempts per request before the step gives up.
+/// Attempts per chunk before the step stops.
 const MAX_ATTEMPTS: u32 = 6;
 /// Wait before the second attempt; doubled for each further one.
 const BACKOFF_BASE: Duration = Duration::from_millis(500);
 /// Longest wait between two attempts.
 const BACKOFF_CAP: Duration = Duration::from_secs(20);
-/// How often progress is logged.
-const PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
-/// Compression level of the chunks on disk. Low, so writing keeps up with the transfer; the
-/// answers are hex text and compress well at any level.
-const COMPRESSION_LEVEL: i32 = 1;
+/// Pieces of an answer waiting to be written, per chunk. A piece is what the HTTP client
+/// hands over at once, tens of kilobytes; with the decoder that finds the cursor a request
+/// in flight holds about a megabyte.
+const WRITE_QUEUE_PIECES: usize = 16;
+/// Free space below which a warning is logged with the progress.
+const LOW_SPACE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+/// Free space below which no new chunk is started: the chunks in flight still have to fit.
+const MIN_SPACE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
 /// Why a chunk was not downloaded.
 #[derive(Debug, thiserror::Error)]
@@ -49,14 +60,14 @@ enum DownloadError {
 }
 
 /// Downloads the missing chunks of `plan` from `source`, `requests` at a time, until all are
-/// on disk, `cancel` fires, or the service stops answering.
+/// on disk, `cancel` fires, a chunk fails for good, or the disk is nearly full.
 ///
 /// # Errors
 ///
-/// Returns an error if the range is not complete when the step ends: it was cancelled, or
-/// the service refused or kept failing. Run it again to continue.
-pub(crate) async fn run<S: Source>(
-    source: S,
+/// Returns an error if the range is not complete when the step ends. Run it again to
+/// continue.
+pub(crate) async fn run(
+    source: &HyperSync,
     state: &State,
     plan: &Plan,
     requests: usize,
@@ -71,32 +82,30 @@ pub(crate) async fn run<S: Source>(
         })
         .await?
     };
-    let total = missing.len();
-    let total_blocks: u64 = missing.iter().map(|chunk| chunk.blocks()).sum();
+    let meters = Arc::new(Meters::default());
+    let mut done = Progress::new(&missing, Arc::clone(&meters));
     info!(
-        chunks = total,
-        blocks = total_blocks,
+        chunks = done.total_chunks,
+        blocks = done.total_blocks,
         requests,
         "download starting"
     );
 
-    let source = Arc::new(source);
     let mut queue = missing.into_iter();
     let mut tasks = JoinSet::new();
-    let mut progress = interval(PROGRESS_INTERVAL);
-    progress.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let started = Instant::now();
-    let (mut chunks_done, mut blocks_done) = (0_usize, 0_u64);
-    // Bytes of the answers once decompressed, and of the chunk files written.
-    let (mut answer_bytes, mut disk_bytes) = (0_u64, 0_u64);
-    let mut stopped = None;
+    let mut tick = interval(progress::INTERVAL);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // Why no new chunk is started any more; the chunks in flight still finish.
+    let mut stopped: Option<String> = None;
 
     loop {
-        while tasks.len() < requests
+        while stopped.is_none()
+            && tasks.len() < requests
             && let Some(chunk) = queue.next()
         {
-            let (source, path) = (Arc::clone(&source), state.raw_path(chunk));
-            tasks.spawn(async move { (chunk, fetch_chunk(&*source, chunk, path).await) });
+            let (source, path) = (source.clone(), state.raw_path(chunk));
+            let meters = Arc::clone(&meters);
+            tasks.spawn(async move { (chunk, fetch_chunk(&source, &meters, chunk, path).await) });
         }
         tokio::select! {
             biased;
@@ -105,125 +114,246 @@ pub(crate) async fn run<S: Source>(
                 break;
             }
             finished = tasks.join_next() => match finished {
-                Some(Ok((chunk, Ok((answers, written))))) => {
-                    chunks_done = chunks_done.saturating_add(1);
-                    blocks_done = blocks_done.saturating_add(chunk.blocks());
-                    answer_bytes = answer_bytes.saturating_add(answers);
-                    disk_bytes = disk_bytes.saturating_add(written);
-                }
+                Some(Ok((chunk, Ok(written)))) => done.chunk_done(chunk, written),
                 Some(Ok((chunk, Err(err)))) => {
-                    stopped = Some(format!("blocks {}..{}: {err}", chunk.from, chunk.to));
-                    break;
+                    warn!(from = chunk.from, to = chunk.to, %err, "chunk failed");
+                    stopped.get_or_insert_with(|| {
+                        format!("blocks {}..{}: {err}", chunk.from, chunk.to)
+                    });
                 }
                 Some(Err(err)) => {
-                    stopped = Some(format!("download task failed: {err}"));
-                    break;
+                    stopped.get_or_insert_with(|| format!("download task failed: {err}"));
                 }
                 None => break,
             },
-            _ = progress.tick() => {
-                let secs = started.elapsed().as_secs().max(1);
-                let blocks_per_sec = blocks_done / secs;
-                let left_blocks = total_blocks.saturating_sub(blocks_done);
-                info!(
-                    chunks = chunks_done,
-                    of = total,
-                    blocks_per_sec,
-                    decompressed_bytes_per_sec = answer_bytes / secs,
-                    disk_bytes_per_sec = disk_bytes / secs,
-                    disk_bytes,
-                    secs_left = left_blocks.checked_div(blocks_per_sec),
-                    "downloading"
-                );
+            _ = tick.tick() => {
+                let state = state.clone();
+                let free = tokio::task::spawn_blocking(move || state.free_bytes()).await?;
+                let free = free.wrap_err("failed to read the free disk space")?;
+                done.log(tasks.len(), free);
+                if free.is_some_and(|free| free < MIN_SPACE_BYTES) {
+                    stopped.get_or_insert_with(|| {
+                        format!(
+                            "less than {} GiB free on the state directory's disk",
+                            MIN_SPACE_BYTES >> 30
+                        )
+                    });
+                }
             }
         }
     }
-    // A chunk being written is finished or leaves only a temporary file; requests in flight
-    // are dropped.
+    // Only a signal leaves tasks here: their requests are dropped, and a chunk being written
+    // leaves at most a temporary file.
     tasks.shutdown().await;
 
-    let secs = started.elapsed().as_secs().max(1);
-    info!(
-        chunks = chunks_done,
-        missing = total.saturating_sub(chunks_done),
-        blocks = blocks_done,
-        decompressed_bytes = answer_bytes,
-        disk_bytes,
-        disk_bytes_per_block = disk_bytes.checked_div(blocks_done),
-        blocks_per_sec = blocks_done / secs,
-        secs,
-        "download ended"
-    );
+    let missing = done.summary();
     match stopped {
         None => Ok(()),
         Some(reason) => Err(eyre::eyre!(
-            "download incomplete, {} of {total} chunks missing: {reason}; run it again to continue",
-            total.saturating_sub(chunks_done)
+            "download incomplete, {missing} of {} chunks missing: {reason}; run it again to \
+             continue",
+            done.total_chunks
         )),
     }
 }
 
-/// Fetches one chunk and writes it to `path`. Returns the size of the answers after
-/// decompression (the bytes on the wire are not visible behind the HTTP client) and the size
-/// of the file written.
-async fn fetch_chunk<S: Source>(
-    source: &S,
-    chunk: Chunk,
-    path: PathBuf,
-) -> Result<(u64, u64), DownloadError> {
-    let mut pages = Vec::new();
-    let mut cursor = chunk.from;
-    while cursor < chunk.to {
-        let page = fetch_page(source, cursor, chunk.to).await?;
-        if page.next_block <= cursor {
-            return Err(DownloadError::NoProgress {
-                from: cursor,
-                to: chunk.to,
-            });
-        }
-        cursor = page.next_block;
-        pages.push(page.body);
-    }
-    let received = pages.iter().map(Bytes::len).sum::<usize>();
-    let written = tokio::task::spawn_blocking(move || {
-        write_atomic(&path, |file| {
-            let mut out = zstd::stream::Encoder::new(file, COMPRESSION_LEVEL)?;
-            for page in &pages {
-                out.write_all(page)?;
-            }
-            out.finish()?;
-            Ok(())
-        })?;
-        Ok::<_, io::Error>(std::fs::metadata(&path)?.len())
-    })
-    .await??;
-    Ok((u64::try_from(received).unwrap_or(u64::MAX), written))
+/// What the step has done so far, for the progress lines and the summary.
+#[derive(Debug)]
+struct Progress {
+    started: Instant,
+    total_chunks: usize,
+    total_blocks: u64,
+    chunks: usize,
+    blocks: u64,
+    /// Bytes of the chunk files written.
+    disk_bytes: u64,
+    /// What the requests in flight count as it happens.
+    meters: Arc<Meters>,
+    blocks_rate: Rate,
+    wire_rate: Rate,
+    /// Microseconds of decoding, so its recent share of a core can be told.
+    decode_rate: Rate,
 }
 
-/// Fetches one page, retrying what may succeed on another attempt.
-async fn fetch_page<S: Source>(
-    source: &S,
-    from: u64,
-    to: u64,
-) -> Result<crate::source::Page, SourceError> {
+impl Progress {
+    fn new(missing: &[Chunk], meters: Arc<Meters>) -> Self {
+        Self {
+            started: Instant::now(),
+            total_chunks: missing.len(),
+            total_blocks: missing.iter().map(|chunk| chunk.blocks()).sum(),
+            chunks: 0,
+            blocks: 0,
+            disk_bytes: 0,
+            meters,
+            blocks_rate: Rate::new(),
+            wire_rate: Rate::new(),
+            decode_rate: Rate::new(),
+        }
+    }
+
+    const fn chunk_done(&mut self, chunk: Chunk, disk_bytes: u64) {
+        self.chunks = self.chunks.saturating_add(1);
+        self.blocks = self.blocks.saturating_add(chunk.blocks());
+        self.disk_bytes = self.disk_bytes.saturating_add(disk_bytes);
+    }
+
+    /// Logs one progress line. The speeds are those of the last minute. `decode_cpu_percent`
+    /// is the processor time spent decoding answers to find their cursors, in percent of one
+    /// core: near 100 times the number of cores, the processor is the limit, not the line.
+    fn log(&mut self, in_flight: usize, free_bytes: Option<u64>) {
+        let blocks_per_sec = self.blocks_rate.per_sec(self.blocks);
+        let wire_bytes = self.meters.wire_bytes.load(Ordering::Relaxed);
+        let decode_micros = self.meters.decode_nanos.load(Ordering::Relaxed) / 1000;
+        info!(
+            chunks = self.chunks,
+            of = self.total_chunks,
+            blocks = self.blocks,
+            blocks_per_sec,
+            secs_left = self
+                .total_blocks
+                .saturating_sub(self.blocks)
+                .checked_div(blocks_per_sec),
+            in_flight,
+            wire_bytes_per_sec = self.wire_rate.per_sec(wire_bytes),
+            decode_cpu_percent = self.decode_rate.per_sec(decode_micros) / 10_000,
+            disk_bytes = self.disk_bytes,
+            free_bytes,
+            "downloading"
+        );
+        if free_bytes.is_some_and(|free| free < LOW_SPACE_BYTES) {
+            warn!(free_bytes, "the state directory's disk is running low");
+        }
+    }
+
+    /// Logs the summary and returns the number of chunks still missing.
+    fn summary(&self) -> usize {
+        let secs = self.started.elapsed().as_secs().max(1);
+        let missing = self.total_chunks.saturating_sub(self.chunks);
+        info!(
+            chunks = self.chunks,
+            missing,
+            blocks = self.blocks,
+            wire_bytes = self.meters.wire_bytes.load(Ordering::Relaxed),
+            disk_bytes = self.disk_bytes,
+            disk_bytes_per_block = self.disk_bytes.checked_div(self.blocks),
+            blocks_per_sec = self.blocks / secs,
+            secs,
+            "download ended"
+        );
+        missing
+    }
+}
+
+/// Fetches one chunk into the file at `path`, starting over when an attempt fails for a
+/// reason that may pass. Returns the size of the file written.
+async fn fetch_chunk(
+    source: &HyperSync,
+    meters: &Meters,
+    chunk: Chunk,
+    path: PathBuf,
+) -> Result<u64, DownloadError> {
     let mut backoff = BACKOFF_BASE;
     let mut attempt = 1;
     loop {
-        match source.fetch(from, to).await {
-            Ok(page) => return Ok(page),
-            Err(err) if err.is_retryable() && attempt < MAX_ATTEMPTS => {
+        match attempt_chunk(source, meters, chunk, &path).await {
+            Err(DownloadError::Source(err)) if err.is_retryable() && attempt < MAX_ATTEMPTS => {
                 // Up to half of the wait is random, so parallel requests do not retry together.
                 let wait = backoff.mul_f64(1.0 - fastrand::f64() / 2.0);
+                let (from, to) = (chunk.from, chunk.to);
                 if attempt > 1 {
-                    warn!(from, to, attempt, %err, ?wait, "request failed again, retrying");
+                    warn!(from, to, attempt, %err, ?wait, "chunk failed again, retrying");
                 } else {
-                    debug!(from, to, %err, ?wait, "request failed, retrying");
+                    debug!(from, to, %err, ?wait, "chunk failed, retrying");
                 }
                 sleep(wait).await;
                 backoff = backoff.saturating_mul(2).min(BACKOFF_CAP);
                 attempt += 1;
             }
-            Err(err) => return Err(err),
+            result => return result,
         }
     }
+}
+
+/// One attempt at a chunk: every answer is passed to a writer as it arrives, and the file is
+/// given its final name only if all of them arrived. The file starts with one byte naming
+/// the content encoding, which every answer of the chunk must then have.
+async fn attempt_chunk(
+    source: &HyperSync,
+    meters: &Meters,
+    chunk: Chunk,
+    path: &Path,
+) -> Result<u64, DownloadError> {
+    let (pieces_tx, pieces_rx) = mpsc::channel(WRITE_QUEUE_PIECES);
+    let (complete_tx, complete_rx) = oneshot::channel();
+    let writer = {
+        let path = path.to_owned();
+        tokio::task::spawn_blocking(move || write_chunk(&path, pieces_rx, complete_rx))
+    };
+
+    let fetched = async {
+        let mut chunk_encoding = None;
+        let mut cursor = chunk.from;
+        while cursor < chunk.to {
+            let accept = |encoding: Encoding| match chunk_encoding.replace(encoding) {
+                None => Ok(Some(Bytes::copy_from_slice(&[encoding as u8]))),
+                Some(first) if first == encoding => Ok(None),
+                Some(first) => Err(SourceError::Malformed(format!(
+                    "the service changed content encoding within a chunk, {first:?} to \
+                     {encoding:?}"
+                ))),
+            };
+            let answer = source
+                .fetch_into(cursor, chunk.to, &pieces_tx, meters, accept)
+                .await?;
+            if answer.next_block <= cursor {
+                return Err(DownloadError::NoProgress {
+                    from: cursor,
+                    to: chunk.to,
+                });
+            }
+            cursor = answer.next_block;
+        }
+        Ok(())
+    }
+    .await;
+
+    // The writer ends when the queue closes; it keeps the file only if told it is complete.
+    drop(pieces_tx);
+    if fetched.is_ok() {
+        // A writer that already failed is not listening; its error is returned below.
+        let _told = complete_tx.send(());
+    } else {
+        drop(complete_tx);
+    }
+    let written = writer.await?;
+    match fetched {
+        Ok(()) => Ok(written?),
+        // The writer failing is why the source found nobody taking the answer.
+        Err(DownloadError::Source(SourceError::Unwanted)) => Err(written
+            .err()
+            .map_or(SourceError::Unwanted.into(), DownloadError::Io)),
+        Err(err) => Err(err),
+    }
+}
+
+/// Writes the pieces of a chunk to its file as they arrive. The file gets its final name only
+/// if `complete` is signalled after the last piece. Returns the file's size. Blocking.
+fn write_chunk(
+    path: &Path,
+    mut pieces: mpsc::Receiver<Bytes>,
+    complete: oneshot::Receiver<()>,
+) -> io::Result<u64> {
+    let mut written = 0_u64;
+    write_atomic(path, |file| {
+        let mut out = BufWriter::new(file);
+        while let Some(piece) = pieces.blocking_recv() {
+            out.write_all(&piece)?;
+            written = written.saturating_add(u64::try_from(piece.len()).unwrap_or(u64::MAX));
+        }
+        complete.blocking_recv().map_err(|_abandoned| {
+            io::Error::new(io::ErrorKind::Interrupted, "the chunk was not completed")
+        })?;
+        out.flush()
+    })?;
+    Ok(written)
 }

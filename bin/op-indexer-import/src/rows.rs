@@ -5,11 +5,14 @@
 //! the L1 fee fields) are skipped. Nothing here is verified: see `verify`.
 
 use std::fs::File;
-use std::io;
+use std::io::{self, BufReader, Read};
 use std::path::Path;
 
 use alloy_primitives::{Address, B64, B256, Bytes, U64, U128, U256};
+use flate2::bufread::MultiGzDecoder;
 use serde::Deserialize;
+
+use crate::source::Encoding;
 
 /// One answer of the service.
 #[derive(Debug, Deserialize)]
@@ -37,8 +40,6 @@ pub(crate) struct BlockRow {
     pub(crate) sha3_uncles: B256,
     pub(crate) miner: Address,
     pub(crate) state_root: B256,
-    pub(crate) transactions_root: B256,
-    pub(crate) receipts_root: B256,
     pub(crate) difficulty: U256,
     pub(crate) gas_limit: U64,
     pub(crate) gas_used: U64,
@@ -58,7 +59,7 @@ pub(crate) struct BlockRow {
 pub(crate) struct TransactionRow {
     pub(crate) block_number: u64,
     pub(crate) transaction_index: u64,
-    pub(crate) hash: B256,
+    /// The sender. Not proven by any check: see `verify`.
     pub(crate) from: Option<Address>,
     pub(crate) to: Option<Address>,
     pub(crate) gas: U64,
@@ -130,19 +131,51 @@ pub(crate) struct Rows {
     pub(crate) logs: Vec<LogRow>,
 }
 
-/// Reads a downloaded chunk: one or more answers, compressed, one after the other. Blocking.
+/// Why a downloaded chunk could not be read.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RowsError {
+    #[error("failed to read the chunk: {0}")]
+    Io(#[from] io::Error),
+    #[error("a downloaded row is not in the expected form: {0}")]
+    Row(#[from] serde_json::Error),
+}
+
+/// Reads a downloaded chunk: one byte naming the content encoding, then one or more answers
+/// in that encoding, one after the other, as `download` received them. Blocking.
 ///
 /// # Errors
 ///
-/// Returns the I/O error; `InvalidData` if the content is not the expected JSON.
-pub(crate) fn read(path: &Path) -> io::Result<Rows> {
-    let data = zstd::stream::decode_all(File::open(path)?)?;
+/// Returns [`RowsError::Io`] if the file cannot be read or decompressed, and
+/// [`RowsError::Row`] if its content is not the expected JSON.
+pub(crate) fn read(path: &Path) -> Result<Rows, RowsError> {
     let mut rows = Rows::default();
-    for response in serde_json::Deserializer::from_slice(&data).into_iter::<Response>() {
-        for batch in response?.data {
-            rows.blocks.extend(batch.blocks);
-            rows.transactions.extend(batch.transactions);
-            rows.logs.extend(batch.logs);
+    {
+        // The text is dropped before the rows are sorted: both are large.
+        let mut file = BufReader::new(File::open(path)?);
+        let mut tag = [0_u8];
+        file.read_exact(&mut tag)?;
+        let [tag] = tag;
+        let mut data = Vec::new();
+        match Encoding::from_tag(tag) {
+            Some(Encoding::Identity) => file.read_to_end(&mut data)?,
+            Some(Encoding::Gzip) => MultiGzDecoder::new(file).read_to_end(&mut data)?,
+            Some(Encoding::Zstd) => {
+                zstd::stream::Decoder::with_buffer(file)?.read_to_end(&mut data)?
+            }
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unknown content encoding {tag}"),
+                )
+                .into());
+            }
+        };
+        for response in serde_json::Deserializer::from_slice(&data).into_iter::<Response>() {
+            for batch in response?.data {
+                rows.blocks.extend(batch.blocks);
+                rows.transactions.extend(batch.transactions);
+                rows.logs.extend(batch.logs);
+            }
         }
     }
     rows.blocks.sort_unstable_by_key(|block| block.number);

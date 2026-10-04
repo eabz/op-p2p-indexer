@@ -12,7 +12,6 @@ use std::time::{Duration, Instant};
 
 use alloy_primitives::{B256, Bytes};
 use futures_util::{SinkExt, StreamExt};
-use op_alloy_consensus::OpReceiptEnvelope;
 use reth_ecies::stream::ECIESStream;
 use reth_eth_wire::P2PStream;
 use reth_eth_wire::errors::P2PStreamError;
@@ -30,6 +29,10 @@ use crate::wire::{self, Request};
 
 /// Limit for one request; receipts answered within a second in the viability test.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Limit for writing one message to a peer. A peer that asks for data and does not read it
+/// would otherwise hold its session, and the answer, for ever.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Limit for telling a peer why we disconnect.
 const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -62,9 +65,12 @@ pub(crate) enum RequestError {
     Timeout,
     #[error("session closed")]
     SessionClosed,
-    /// The answer could not be decoded: a peer fault.
+    /// The answer could not be decoded.
     #[error("malformed response: {0}")]
     Malformed(String),
+    /// The answer holds more items than were asked for: a peer fault.
+    #[error("{got} items answered, {asked} asked for")]
+    Excess { asked: usize, got: usize },
 }
 
 /// How a session ended.
@@ -89,6 +95,8 @@ pub(crate) enum EndReason {
     Io(String),
     /// The peer broke the protocol (bad framing, oversized or malformed message).
     Protocol(String),
+    /// The peer did not read what we sent within [`WRITE_TIMEOUT`].
+    Stalled,
 }
 
 impl fmt::Display for EndReason {
@@ -99,6 +107,7 @@ impl fmt::Display for EndReason {
             Self::Closed => f.write_str("peer closed the connection"),
             Self::Io(err) => write!(f, "connection failed: {err}"),
             Self::Protocol(err) => write!(f, "protocol violation: {err}"),
+            Self::Stalled => f.write_str("peer stopped reading"),
         }
     }
 }
@@ -153,33 +162,20 @@ impl SessionHandle {
         *self.range.borrow()
     }
 
-    /// Requests the receipts of one block, in consensus form (bloom included). An empty answer
-    /// means the peer does not hold them. Nothing is verified here.
+    /// Requests the receipts of `blocks`, in request order. Each item is one block's receipts
+    /// as the peer sent them, not decoded (see [`wire::decode_receipts`], which is CPU work
+    /// for a blocking thread). A peer may answer for fewer blocks than asked: the answer is
+    /// then a prefix; an empty answer means the peer does not hold them. Nothing is verified.
     ///
     /// # Errors
     ///
     /// Returns [`RequestError::Timeout`] after [`REQUEST_TIMEOUT`], [`RequestError::SessionClosed`]
-    /// if the session ended, and [`RequestError::Malformed`] if the answer cannot be decoded.
-    pub(crate) async fn receipts(
-        &self,
-        block: B256,
-    ) -> Result<Vec<OpReceiptEnvelope>, RequestError> {
-        let body = self.request(Request::Receipts(vec![block])).await?;
-        wire::decode_receipts(&body).map_err(malformed)
-    }
-
-    /// Requests the receipts of several blocks, as [`Self::receipts`] returns them, in request
-    /// order. A peer may answer for fewer blocks than asked: the answer is then a prefix.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::receipts`].
-    pub(crate) async fn receipts_of(
-        &self,
-        blocks: Vec<B256>,
-    ) -> Result<Vec<Vec<OpReceiptEnvelope>>, RequestError> {
+    /// if the session ended, [`RequestError::Malformed`] if the answer cannot be cut into
+    /// items, and [`RequestError::Excess`] if it has more items than were asked for.
+    pub(crate) async fn receipts(&self, blocks: Vec<B256>) -> Result<Vec<Bytes>, RequestError> {
+        let asked = blocks.len();
         let body = self.request(Request::Receipts(blocks)).await?;
-        wire::decode_block_receipts(&body).map_err(malformed)
+        items(&body, asked)
     }
 
     /// Requests up to `limit` headers going down from the block with hash `start`, inclusive.
@@ -195,7 +191,7 @@ impl SessionHandle {
         limit: u64,
     ) -> Result<Vec<Bytes>, RequestError> {
         let body = self.request(Request::Headers { start, limit }).await?;
-        wire::decode_items(&body).map_err(malformed)
+        items(&body, usize::try_from(limit).unwrap_or(usize::MAX))
     }
 
     /// Requests the bodies of `blocks`, in request order. Each is the RLP the peer sent (its
@@ -206,8 +202,9 @@ impl SessionHandle {
     ///
     /// As [`Self::receipts`].
     pub(crate) async fn bodies(&self, blocks: Vec<B256>) -> Result<Vec<Bytes>, RequestError> {
+        let asked = blocks.len();
         let body = self.request(Request::Bodies(blocks)).await?;
-        wire::decode_items(&body).map_err(malformed)
+        items(&body, asked)
     }
 
     /// Sends `request` and waits for the body of its answer (the message without its id byte).
@@ -274,11 +271,22 @@ impl SessionDriver {
         let mut flush = interval(FLUSH_INTERVAL);
         flush.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let reason = loop {
+            // In this order on purpose: what the peer sends is read last, so a peer that
+            // floods the session cannot keep its own answers, our requests or the flush from
+            // running. The branches before it are bounded: a timer, our own requests, and at
+            // most a few answers in flight.
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => {
                     self.say_goodbye(DisconnectReason::ClientQuitting).await;
                     break EndReason::Cancelled;
+                }
+                // Pongs to the peer's pings wait in the stream's buffer until it is flushed.
+                _ = flush.tick() => {
+                    self.pending.retain(|_, (_, reply)| !reply.is_closed());
+                    if let Err(reason) = self.flush().await {
+                        break reason;
+                    }
                 }
                 command = self.commands.recv() => match command {
                     Some(Command::Request { request, reply }) => {
@@ -296,6 +304,12 @@ impl SessionDriver {
                         break EndReason::Cancelled;
                     }
                 },
+                // Never closed: `serving` holds the sending side.
+                Some(answer) = self.answers.recv() => {
+                    if let Err(reason) = self.write(answer).await {
+                        break reason;
+                    }
+                }
                 message = self.stream.next() => match message {
                     Some(Ok(message)) => {
                         if let Err(reason) = self.on_message(&message).await {
@@ -305,24 +319,6 @@ impl SessionDriver {
                     Some(Err(err)) => break end_reason(err),
                     None => break EndReason::Closed,
                 },
-                // Never closed: `serving` holds the sending side.
-                Some(answer) = self.answers.recv() => {
-                    if let Err(err) = self.stream.send(answer.0).await {
-                        break end_reason(err);
-                    }
-                }
-                // Pongs to the peer's pings wait in the stream's buffer until it is flushed.
-                _ = flush.tick() => {
-                    self.pending.retain(|_, (_, reply)| !reply.is_closed());
-                    if let Some(update) = self.serving.range_update()
-                        && let Err(err) = self.stream.feed(update.0).await
-                    {
-                        break end_reason(err);
-                    }
-                    if let Err(err) = self.stream.flush().await {
-                        break end_reason(err);
-                    }
-                }
             }
         };
         let lasted = self.established.elapsed();
@@ -344,6 +340,29 @@ impl SessionDriver {
         let _sent = timeout(DISCONNECT_TIMEOUT, self.stream.disconnect(reason)).await;
     }
 
+    /// Writes one message, giving the peer [`WRITE_TIMEOUT`] to take it.
+    async fn write(&mut self, message: Bytes) -> Result<(), EndReason> {
+        match timeout(WRITE_TIMEOUT, self.stream.send(message.0)).await {
+            Ok(sent) => sent.map_err(end_reason),
+            Err(_elapsed) => Err(EndReason::Stalled),
+        }
+    }
+
+    /// Announces our block range if it changed, and flushes the stream.
+    async fn flush(&mut self) -> Result<(), EndReason> {
+        let update = self.serving.range_update();
+        let flushed = timeout(WRITE_TIMEOUT, async {
+            if let Some(update) = update {
+                self.stream.feed(update.0).await?;
+            }
+            self.stream.flush().await
+        });
+        match flushed.await {
+            Ok(flushed) => flushed.map_err(end_reason),
+            Err(_elapsed) => Err(EndReason::Stalled),
+        }
+    }
+
     async fn send_request(
         &mut self,
         request: &Request,
@@ -353,10 +372,7 @@ impl SessionDriver {
         self.next_request_id = self.next_request_id.wrapping_add(1);
         self.pending
             .insert(request_id, (request.response_id(), reply));
-        self.stream
-            .send(request.encode(request_id).0)
-            .await
-            .map_err(end_reason)
+        self.write(request.encode(request_id)).await
     }
 
     /// Handles one message from the peer: a response to route, a request to answer or pass
@@ -400,9 +416,7 @@ impl SessionDriver {
             }
         } else {
             match self.serving.request(message_id, body) {
-                Handled::Now(response) => {
-                    self.stream.send(response.0).await.map_err(end_reason)?;
-                }
+                Handled::Now(response) => self.write(response).await?,
                 Handled::Later => {}
                 // Transaction and block announcements: this node does not follow them.
                 Handled::NotARequest => trace!(message_id, "ignored execution peer message"),
@@ -412,8 +426,16 @@ impl SessionDriver {
     }
 }
 
-fn malformed(err: alloy_rlp::Error) -> RequestError {
-    RequestError::Malformed(err.to_string())
+/// Cuts an answer into its items, of which there may be at most `asked`.
+fn items(body: &Bytes, asked: usize) -> Result<Vec<Bytes>, RequestError> {
+    let items = wire::decode_items(body).map_err(|err| RequestError::Malformed(err.to_string()))?;
+    if items.len() > asked {
+        return Err(RequestError::Excess {
+            asked,
+            got: items.len(),
+        });
+    }
+    Ok(items)
 }
 
 fn end_reason(err: P2PStreamError) -> EndReason {

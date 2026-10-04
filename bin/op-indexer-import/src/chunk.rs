@@ -92,8 +92,9 @@ pub(crate) fn read_link(path: &Path) -> io::Result<Link> {
 pub(crate) fn read(path: &Path) -> io::Result<(Link, Vec<VerifiedBlock>)> {
     let mut file = File::open(path)?;
     let link = read_link_from(&mut file)?;
-    let data = zstd::stream::decode_all(file)?;
-    let mut rest = data.as_slice();
+    // One buffer for the chunk: every value below is a slice of it, not a copy.
+    let data = Bytes::from(zstd::stream::decode_all(file)?);
+    let mut rest: &[u8] = &data;
     let mut blocks = Vec::new();
     while !rest.is_empty() {
         let hash = B256::from_slice(take(&mut rest, 32)?);
@@ -106,7 +107,7 @@ pub(crate) fn read(path: &Path) -> io::Result<(Link, Vec<VerifiedBlock>)> {
             .collect();
         let mut value = || -> io::Result<Bytes> {
             let len = take_length(&mut rest)?;
-            Ok(Bytes::copy_from_slice(take(&mut rest, len)?))
+            Ok(data.slice_ref(take(&mut rest, len)?))
         };
         let (header, body, receipts) = (value()?, value()?, value()?);
         blocks.push(VerifiedBlock {

@@ -86,35 +86,51 @@ impl Request {
     }
 }
 
-/// Cuts a `BlockHeaders` or `BlockBodies` body into its items: each header or body as the
-/// bytes the peer sent, sharing the buffer of `body`. Nothing inside an item is decoded, so a
-/// caller can hash and store exactly what was received.
+/// Cuts the body of an answer (`BlockHeaders`, `BlockBodies` or `Receipts`) into its items:
+/// each header, body or block's receipts as the bytes the peer sent, sharing the buffer of
+/// `body`. Nothing inside an item is decoded, so a caller can hash and store exactly what was
+/// received.
 pub(crate) fn decode_items(body: &Bytes) -> alloy_rlp::Result<Vec<Bytes>> {
     let mut buf: &[u8] = body;
-    if !alloy_rlp::Header::decode(&mut buf)?.list {
-        return Err(alloy_rlp::Error::UnexpectedString);
-    }
+    list(&mut buf)?;
     let _request_id = u64::decode(&mut buf)?;
-    let list = alloy_rlp::Header::decode(&mut buf)?;
-    if !list.list {
+    let payload = list(&mut buf)?;
+    Ok(items(payload)?
+        .into_iter()
+        .map(|item| body.slice_ref(item))
+        .collect())
+}
+
+/// Reads the header of an RLP list at the start of `buf` and returns its payload, leaving
+/// `buf` after it.
+fn list<'a>(buf: &mut &'a [u8]) -> alloy_rlp::Result<&'a [u8]> {
+    let header = alloy_rlp::Header::decode(buf)?;
+    if !header.list {
         return Err(alloy_rlp::Error::UnexpectedString);
     }
-    let mut rest = buf
-        .get(..list.payload_length)
+    let (payload, rest) = buf
+        .split_at_checked(header.payload_length)
         .ok_or(alloy_rlp::Error::InputTooShort)?;
+    *buf = rest;
+    Ok(payload)
+}
+
+/// Cuts the payload of an RLP list into its items, each with its own header. Only the
+/// headers are read.
+fn items(mut payload: &[u8]) -> alloy_rlp::Result<Vec<&[u8]>> {
     let mut items = Vec::new();
-    while !rest.is_empty() {
-        let mut after_header = rest;
+    while !payload.is_empty() {
+        let mut after_header = payload;
         let header = alloy_rlp::Header::decode(&mut after_header)?;
-        let length = rest
+        let length = payload
             .len()
             .saturating_sub(after_header.len())
             .saturating_add(header.payload_length);
-        let (item, remaining) = rest
+        let (item, rest) = payload
             .split_at_checked(length)
             .ok_or(alloy_rlp::Error::InputTooShort)?;
-        items.push(body.slice_ref(item));
-        rest = remaining;
+        items.push(item);
+        payload = rest;
     }
     Ok(items)
 }
@@ -128,34 +144,52 @@ pub(crate) fn request_id(mut body: &[u8]) -> Option<u64> {
     u64::decode(&mut body).ok()
 }
 
-/// Decodes a `Receipts` body answering a request for one block: the receipts of that block,
-/// empty if the peer does not hold them.
+/// Why one block's receipts in a `Receipts` answer cannot be used.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ReceiptsError {
+    /// Not one receipt per transaction: no honest peer sends that.
+    #[error("{got} receipts for a block with {expected} transactions")]
+    Count { expected: usize, got: usize },
+    /// The receipts cannot be decoded: malformed, or of a kind this build does not know.
+    #[error(transparent)]
+    Rlp(#[from] alloy_rlp::Error),
+}
+
+/// Decodes one block's receipts, an item of a `Receipts` answer, for a block with `expected`
+/// transactions. An empty list is returned as it is: the peer does not hold them.
+///
+/// The receipts are counted over their RLP headers first, and nothing is decoded unless there
+/// is one per transaction: an answer of millions of tiny receipts would otherwise be turned
+/// into as many blooms, hundreds of megabytes, before anything is checked.
 ///
 /// eth/69 ([EIP-7642]) sends each receipt as `[tx-type, status, cumulative-gas, logs]` without
 /// the bloom; OP deposit receipts carry the deposit nonce and the deposit receipt version after
 /// the logs when the block has them. op-alloy's `OpReceipt` decodes exactly that form. The
 /// bloom is rebuilt from the logs here, so callers get the consensus form.
 ///
+/// CPU work proportional to the block's logs: call it from a blocking thread.
+///
+/// # Errors
+///
+/// Returns [`ReceiptsError::Count`] if the list is not empty and does not have `expected`
+/// receipts, and [`ReceiptsError::Rlp`] if it cannot be decoded.
+///
 /// [EIP-7642]: https://eips.ethereum.org/EIPS/eip-7642
-pub(crate) fn decode_receipts(body: &[u8]) -> alloy_rlp::Result<Vec<OpReceiptEnvelope>> {
-    Ok(decode_block_receipts(body)?
+pub(crate) fn decode_receipts(
+    mut item: &[u8],
+    expected: usize,
+) -> Result<Vec<OpReceiptEnvelope>, ReceiptsError> {
+    let got = items(list(&mut &*item)?)?.len();
+    if got == 0 {
+        return Ok(Vec::new());
+    }
+    if got != expected {
+        return Err(ReceiptsError::Count { expected, got });
+    }
+    let receipts = Vec::<OpReceipt>::decode(&mut item)?;
+    Ok(receipts
         .into_iter()
-        .next()
-        .unwrap_or_default())
-}
-
-/// Decodes a `Receipts` body answering a request for several blocks: the receipts of each
-/// block the peer answered for, in request order, as [`decode_receipts`] returns them.
-pub(crate) fn decode_block_receipts(body: &[u8]) -> alloy_rlp::Result<Vec<Vec<OpReceiptEnvelope>>> {
-    let blocks = RequestPair::<Vec<Vec<OpReceipt>>>::decode(&mut &*body)?.message;
-    Ok(blocks
-        .into_iter()
-        .map(|receipts| {
-            receipts
-                .into_iter()
-                .map(|receipt| OpReceiptEnvelope::from(receipt.into_with_bloom()))
-                .collect()
-        })
+        .map(|receipt| OpReceiptEnvelope::from(receipt.into_with_bloom()))
         .collect())
 }
 

@@ -39,6 +39,10 @@ pub enum ElError {
         #[source]
         source: tokio::task::JoinError,
     },
+    /// The range sync reached blocks of the chain this build cannot read. No peer can serve
+    /// them differently, so the sync cannot continue.
+    #[error("range sync cannot continue: {0}")]
+    Sync(String),
     /// A channel a component needs was closed while the network was still running.
     #[error("execution network channel {channel} closed")]
     ChannelClosed {

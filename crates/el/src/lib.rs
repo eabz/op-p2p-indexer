@@ -21,6 +21,7 @@ mod discovery;
 mod error;
 mod fetch;
 mod metrics;
+mod pacing;
 mod peers;
 mod serve;
 mod session;
@@ -31,9 +32,9 @@ mod wire;
 use std::sync::Arc;
 
 use alloy_primitives::B256;
-use op_indexer_primitives::{ExecutionPeer, ReceiptsRequest, VerifiedReceipts};
+use op_indexer_primitives::{BlockRef, ExecutionPeer, ReceiptsRequest, VerifiedReceipts};
 use secp256k1::SecretKey;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -73,11 +74,14 @@ impl<P: BlockProvider> ExecutionNetwork<P> {
     ///
     /// `node_key` is the node's secp256k1 secret for the execution network. It must not be the
     /// consensus (libp2p) identity: both run a discv5 node, and one key in two of them would
-    /// publish conflicting node records. Blocks to fetch receipts for arrive on `requests`;
+    /// publish conflicting node records. `head` follows the newest block the node knows
+    /// (from gossip, or the newest block it holds when there is no gossip): sessions are opened
+    /// only once it has a value, because peers end a session whose status advertises genesis.
+    /// Blocks to fetch receipts for arrive on `requests`;
     /// verified receipts leave on `verified`. A peer worth saving for the next start (see
     /// [`ElConfig::saved_peers`]) is reported on `served`, without waiting: once per session
     /// we opened, at its first verified answer. Peers' requests for headers, bodies and
-    /// receipts are answered from `provider`.
+    /// receipts are answered from `provider`; with `None` the node serves nothing.
     ///
     /// # Errors
     ///
@@ -85,10 +89,11 @@ impl<P: BlockProvider> ExecutionNetwork<P> {
     pub fn new(
         config: ElConfig,
         node_key: B256,
+        head: watch::Receiver<Option<BlockRef>>,
         requests: mpsc::Receiver<ReceiptsRequest>,
         verified: mpsc::Sender<VerifiedReceipts>,
         served: mpsc::Sender<ExecutionPeer>,
-        provider: P,
+        provider: Option<P>,
     ) -> Result<Self, ElError> {
         let key = SecretKey::from_byte_array(&node_key.0).map_err(|_err| ElError::InvalidKey)?;
         let (block_server, serving) = serve::new(provider);
@@ -97,6 +102,7 @@ impl<P: BlockProvider> ExecutionNetwork<P> {
             config.chain,
             config.listen_addr.port(),
             serving,
+            head,
         ));
         Ok(Self {
             config,
@@ -172,7 +178,6 @@ impl<P: BlockProvider> ExecutionNetwork<P> {
             });
         }
         let (peer_set, peers) = PeerSet::new(
-            config.peer_set(),
             Arc::clone(&ctx),
             candidates_rx,
             accepted_rx,
@@ -192,7 +197,7 @@ impl<P: BlockProvider> ExecutionNetwork<P> {
             let stop = stop.clone();
             tasks.spawn(async move { ("range sync", syncer.run(stop).await) });
         }
-        let fetcher = Fetcher::new(config.chain, Arc::clone(&ctx), peers, requests, verified);
+        let fetcher = Fetcher::new(config.chain, peers, requests, verified);
         {
             let stop = stop.clone();
             tasks.spawn(async move { ("fetcher", fetcher.run(stop).await) });

@@ -54,7 +54,6 @@ pub(crate) struct PeerStatus {
     pub(crate) direction: Direction,
     /// The client's name and version, as it reports them.
     pub(crate) client: String,
-    pub(crate) eth_version: u8,
     pub(crate) fork_id: ForkId,
     /// First block the peer says it serves.
     pub(crate) earliest: Option<u64>,
@@ -104,47 +103,40 @@ impl SessionError {
     }
 }
 
-/// Opens sessions. A namespace: the session itself is a [`SessionHandle`] and its
-/// [`SessionDriver`].
-#[derive(Debug)]
-pub(crate) struct Session;
-
-impl Session {
-    /// Dials `candidate` and performs the whole handshake, each step under its own timeout.
-    ///
-    /// The caller must run the returned driver (`driver.run(cancel)`) for the session to live.
-    pub(crate) async fn connect(
-        ctx: &SessionContext,
-        candidate: &Candidate,
-    ) -> Result<(SessionHandle, SessionDriver), SessionError> {
-        let tcp = timeout(TCP_TIMEOUT, TcpStream::connect(candidate.addr))
-            .await
-            .map_err(|_elapsed| SessionError::Timeout { stage: "tcp" })?
-            .map_err(SessionError::Tcp)?;
-        // reth's handshake futures are tens of kilobytes; keep them off the caller's stack.
-        let connect = Box::pin(ECIESStream::connect(tcp, *ctx.key(), candidate.peer_id));
-        let ecies = timeout(ECIES_TIMEOUT, connect)
-            .await
-            .map_err(|_elapsed| SessionError::Timeout { stage: "ecies" })?
-            .map_err(|_closed| SessionError::Ecies)?;
-        Box::pin(handshake(ctx, ecies, candidate.addr, Direction::Outbound)).await
-    }
-
-    /// Performs the handshake on a connection a peer opened.
-    pub(super) async fn accept(
-        ctx: &SessionContext,
-        tcp: TcpStream,
-        addr: SocketAddr,
-    ) -> Result<(SessionHandle, SessionDriver), SessionError> {
-        let ecies = timeout(
-            ECIES_TIMEOUT,
-            Box::pin(ECIESStream::incoming(tcp, *ctx.key())),
-        )
+/// Dials `candidate` and performs the whole handshake, each step under its own timeout.
+///
+/// The caller must run the returned driver (`driver.run(cancel)`) for the session to live.
+pub(crate) async fn connect(
+    ctx: &SessionContext,
+    candidate: &Candidate,
+) -> Result<(SessionHandle, SessionDriver), SessionError> {
+    let tcp = timeout(TCP_TIMEOUT, TcpStream::connect(candidate.addr))
+        .await
+        .map_err(|_elapsed| SessionError::Timeout { stage: "tcp" })?
+        .map_err(SessionError::Tcp)?;
+    // reth's handshake futures are tens of kilobytes; keep them off the caller's stack.
+    let connect = Box::pin(ECIESStream::connect(tcp, *ctx.key(), candidate.peer_id));
+    let ecies = timeout(ECIES_TIMEOUT, connect)
         .await
         .map_err(|_elapsed| SessionError::Timeout { stage: "ecies" })?
         .map_err(|_closed| SessionError::Ecies)?;
-        Box::pin(handshake(ctx, ecies, addr, Direction::Inbound)).await
-    }
+    Box::pin(handshake(ctx, ecies, candidate.addr, Direction::Outbound)).await
+}
+
+/// Performs the handshake on a connection a peer opened.
+pub(super) async fn accept(
+    ctx: &SessionContext,
+    tcp: TcpStream,
+    addr: SocketAddr,
+) -> Result<(SessionHandle, SessionDriver), SessionError> {
+    let ecies = timeout(
+        ECIES_TIMEOUT,
+        Box::pin(ECIESStream::incoming(tcp, *ctx.key())),
+    )
+    .await
+    .map_err(|_elapsed| SessionError::Timeout { stage: "ecies" })?
+    .map_err(|_closed| SessionError::Ecies)?;
+    Box::pin(handshake(ctx, ecies, addr, Direction::Inbound)).await
 }
 
 /// The hello and status exchanges on an encrypted connection.
@@ -185,11 +177,8 @@ async fn handshake(
     }
 
     let fork_filter = ctx.fork_filter();
-    // The range advertised runs from the first block this node holds to the tip it knows:
-    // honest at both ends, and complete once an import has reached the tip. Until then blocks
-    // in the middle are not held and requests for them get empty answers. The end is the tip,
-    // not the last block held: peers end a session whose status does not look like a live
-    // node's (seen live). Sessions open only once a tip is known.
+    // What is advertised: the held range when it ends near the tip, else the tip alone (see
+    // `AdvertisedRange`). Sessions open only once a tip is known.
     let (serving, answers) = ctx.session_serving();
     let advertised = serving.advertised();
     let latest = advertised.map(|range| range.latest);
@@ -216,7 +205,6 @@ async fn handshake(
         addr,
         direction,
         client: their_hello.client_version,
-        eth_version: EthVersion::Eth69 as u8,
         fork_id: theirs.forkid,
         earliest: theirs.earliest_block,
         latest: theirs.latest_block,

@@ -14,13 +14,11 @@
 //! | `op_indexer_el_inbound_handshakes_failed_total` | counter | `stage` | Inbound connections that did not become a session. |
 //! | `op_indexer_el_inbound_refused_total` | counter | | Inbound sessions refused by the peer set: over the limit, already connected, or banned. |
 //! | `op_indexer_el_sessions_opened_total` | counter | `direction` | Sessions kept after the handshake: `outbound` or `inbound`. |
-//! | `op_indexer_el_sessions_alive` | gauge | | Sessions open now. |
-//! | `op_indexer_el_sessions_ended_total` | counter | `reason` | Sessions that ended: `cancelled`, `too_many_peers`, `useless_peer`, `disconnected`, `closed`, `io` or `protocol`. |
+//! | `op_indexer_el_sessions_ended_total` | counter | `reason` | Sessions that ended: `cancelled`, `too_many_peers`, `useless_peer`, `disconnected`, `closed`, `io`, `protocol` or `stalled` (did not read what it asked for). |
 //! | `op_indexer_el_session_duration_seconds` | histogram | | How long a session lasted. |
-//! | `op_indexer_el_peers_dropped_total` | counter | `reason` | Peers this node disconnected: `bad_data` (also remembered) or `unresponsive`. |
+//! | `op_indexer_el_peers_dropped_total` | counter | `reason` | Peers this node disconnected: `bad_data` (also banned), `undecodable` or `unresponsive`. |
 //! | `op_indexer_el_requests_total` | counter | `outcome` | Receipts requests sent to a peer: `verified`, `empty`, `timeout`, `closed`, `malformed` or `invalid`. |
 //! | `op_indexer_el_verification_failures_total` | counter | `kind` | Answers that failed verification: `count` or `root`. |
-//! | `op_indexer_el_blocks_delivered_total` | counter | | Blocks whose verified receipts were handed on. |
 //! | `op_indexer_el_receipts_delivered_total` | counter | | Receipts in those blocks. |
 //! | `op_indexer_el_queue_depth` | gauge | | Blocks waiting for receipts. |
 //! | `op_indexer_el_queue_dropped_total` | counter | | Requests dropped because the queue was full, oldest first. |
@@ -45,13 +43,11 @@ const DIALS: &str = "op_indexer_el_dials_total";
 const INBOUND_HANDSHAKES_FAILED: &str = "op_indexer_el_inbound_handshakes_failed_total";
 const INBOUND_REFUSED: &str = "op_indexer_el_inbound_refused_total";
 const SESSIONS_OPENED: &str = "op_indexer_el_sessions_opened_total";
-const SESSIONS_ALIVE: &str = "op_indexer_el_sessions_alive";
 const SESSIONS_ENDED: &str = "op_indexer_el_sessions_ended_total";
 const SESSION_DURATION: &str = "op_indexer_el_session_duration_seconds";
 const PEERS_DROPPED: &str = "op_indexer_el_peers_dropped_total";
 const REQUESTS: &str = "op_indexer_el_requests_total";
 const VERIFICATION_FAILURES: &str = "op_indexer_el_verification_failures_total";
-const BLOCKS_DELIVERED: &str = "op_indexer_el_blocks_delivered_total";
 const RECEIPTS_DELIVERED: &str = "op_indexer_el_receipts_delivered_total";
 const QUEUE_DEPTH: &str = "op_indexer_el_queue_depth";
 const QUEUE_DROPPED: &str = "op_indexer_el_queue_dropped_total";
@@ -101,6 +97,8 @@ pub(crate) enum EndLabel {
     Io,
     /// The peer broke the protocol.
     Protocol,
+    /// The peer did not read what it asked for.
+    Stalled,
 }
 
 /// Why this node disconnected a peer, the `reason` label of the dropped-peers counter.
@@ -108,25 +106,10 @@ pub(crate) enum EndLabel {
 pub(crate) enum DropReason {
     /// Its answer failed verification or could not be decoded.
     BadData,
+    /// Its answer could not be decoded.
+    Undecodable,
     /// It stopped answering requests.
     Unresponsive,
-}
-
-/// How a receipts request to one peer ended, the `outcome` label of the request counter.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum RequestOutcome {
-    /// The answer matched the receipts root.
-    Verified,
-    /// The peer does not hold the receipts.
-    Empty,
-    /// The peer did not answer in time.
-    Timeout,
-    /// The session ended before the answer.
-    Closed,
-    /// The answer could not be decoded.
-    Malformed,
-    /// The answer failed verification.
-    Invalid,
 }
 
 /// How an answer failed verification, the `kind` label.
@@ -163,6 +146,7 @@ impl EndLabel {
             Self::Closed => "closed",
             Self::Io => "io",
             Self::Protocol => "protocol",
+            Self::Stalled => "stalled",
         }
     }
 }
@@ -171,20 +155,8 @@ impl DropReason {
     const fn as_str(self) -> &'static str {
         match self {
             Self::BadData => "bad_data",
+            Self::Undecodable => "undecodable",
             Self::Unresponsive => "unresponsive",
-        }
-    }
-}
-
-impl RequestOutcome {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Verified => "verified",
-            Self::Empty => "empty",
-            Self::Timeout => "timeout",
-            Self::Closed => "closed",
-            Self::Malformed => "malformed",
-            Self::Invalid => "invalid",
         }
     }
 }
@@ -318,7 +290,6 @@ pub(crate) fn describe() {
         Unit::Count,
         "Sessions kept after the handshake, by direction"
     );
-    describe_gauge!(SESSIONS_ALIVE, Unit::Count, "Sessions open now");
     describe_counter!(SESSIONS_ENDED, Unit::Count, "Sessions ended, by reason");
     describe_histogram!(SESSION_DURATION, Unit::Seconds, "How long a session lasted");
     describe_counter!(
@@ -335,11 +306,6 @@ pub(crate) fn describe() {
         VERIFICATION_FAILURES,
         Unit::Count,
         "Answers that failed verification, by kind"
-    );
-    describe_counter!(
-        BLOCKS_DELIVERED,
-        Unit::Count,
-        "Blocks whose verified receipts were handed on"
     );
     describe_counter!(
         RECEIPTS_DELIVERED,
@@ -403,11 +369,6 @@ pub(crate) fn session_opened(direction: Direction) {
     counter!(SESSIONS_OPENED, "direction" => direction).increment(1);
 }
 
-/// Sets the number of sessions open now.
-pub(crate) fn sessions_alive(sessions: usize) {
-    gauge!(SESSIONS_ALIVE).set(small(sessions));
-}
-
 /// Records a session that ended after `lasted`.
 pub(crate) fn session_ended(reason: EndLabel, lasted: Duration) {
     counter!(SESSIONS_ENDED, "reason" => reason.as_str()).increment(1);
@@ -419,9 +380,10 @@ pub(crate) fn peer_dropped(reason: DropReason) {
     counter!(PEERS_DROPPED, "reason" => reason.as_str()).increment(1);
 }
 
-/// Records how a receipts request to one peer ended.
-pub(crate) fn request(outcome: RequestOutcome) {
-    counter!(REQUESTS, "outcome" => outcome.as_str()).increment(1);
+/// Records how a receipts request to one peer ended; `outcome` is the label
+/// (`fetch::Outcome::label`).
+pub(crate) fn request(outcome: &'static str) {
+    counter!(REQUESTS, "outcome" => outcome).increment(1);
 }
 
 /// Records an answer that failed verification.
@@ -431,7 +393,6 @@ pub(crate) fn verification_failed(kind: VerificationFailure) {
 
 /// Records a block's verified receipts handed on, `waited` after its request arrived.
 pub(crate) fn delivered(receipts: usize, waited: Duration) {
-    counter!(BLOCKS_DELIVERED).increment(1);
     counter!(RECEIPTS_DELIVERED).increment(count(receipts));
     histogram!(FETCH_DURATION).record(waited);
 }

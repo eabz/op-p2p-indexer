@@ -11,25 +11,22 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use alloy_consensus::BlockBody;
 use alloy_primitives::{BlockHash, BlockNumber, Bytes, keccak256};
-use alloy_rlp::Decodable;
 use fjall::{
     CompressionType, Database, Guard, Keyspace, KeyspaceCreateOptions, KvSeparationOptions,
     PersistMode, Readable,
 };
-use op_alloy_consensus::OpTxEnvelope;
-use op_indexer_primitives::{ArchivedBlock, BlockRef};
+use op_indexer_primitives::{BlockRead, BlockRef, BlockStart, ItemConvert, ReadLimits, split_body};
 use tokio::sync::{Mutex, MutexGuard};
 use tracing::debug;
 
-use crate::{BlockPart, InvalidBlockReason, ParseError, StorageError, Store, metrics};
+use crate::{InvalidBlockReason, ParseError, StorageError, Store, metrics};
 
-/// Most blocks written in one batch by an append of many blocks: with [`MAX_APPEND_BATCH_BYTES`]
-/// it bounds one journal record and how long other writers wait for the lock.
-const MAX_APPEND_BATCH_BLOCKS: usize = 1024;
-/// Most encoded bytes in one such batch (a single larger block still goes alone): an eighth of
-/// the journal limit, and one memtable.
+/// Most encoded bytes written in one batch by an append of many blocks (a single larger block
+/// still goes alone): an eighth of the journal limit, and one memtable. It bounds one journal
+/// record and how long other writers wait for the lock. There is no limit on the number of
+/// blocks: each batch is one synced commit, and small blocks (the legacy chain's are about
+/// 2 KB) would otherwise cost several commits where one will do.
 const MAX_APPEND_BATCH_BYTES: usize = 16 * 1024 * 1024;
 /// Block cache shared by the keyspaces. It holds the index and filter blocks of the trees and
 /// recently read data blocks; serving peers is not latency-critical, so it stays small and fixed
@@ -185,11 +182,9 @@ impl From<StorageError> for Failure {
 }
 
 /// Opens the database in the directory `path`, creates the keyspaces and checks the schema
-/// version, emptying the archive if it differs.
-///
-/// Returns the stored version entry when the archive was emptied because of it (another version,
-/// or bytes that are not a version at all), `None` otherwise (also for a new archive).
-pub(super) fn open(path: &Path) -> Result<(Tables, Option<Bytes>), Failure> {
+/// version. A new archive gets this build's version; one of another version is refused and
+/// left as it is.
+pub(super) fn open(path: &Path) -> Result<Tables, Failure> {
     let db = Database::builder(path)
         .cache_size(CACHE_SIZE_BYTES)
         .max_journaling_size(MAX_JOURNAL_BYTES)
@@ -213,23 +208,27 @@ pub(super) fn open(path: &Path) -> Result<(Tables, Option<Bytes>), Failure> {
     };
     let current = SCHEMA_VERSION.to_be_bytes();
     let stored = tables.meta.get(SCHEMA_VERSION_KEY)?;
-    if stored.as_deref() == Some(current.as_slice()) {
-        return Ok((tables, None));
+    let found = match stored.as_deref() {
+        Some(version) if version == current.as_slice() => return Ok(tables),
+        Some(version) => <[u8; 8]>::try_from(version).map_or_else(
+            |_length| format!("0x{}", alloy_primitives::hex::encode(version)),
+            |version| u64::from_be_bytes(version).to_string(),
+        ),
+        // No version and no blocks: a new archive.
+        None if tables.headers.first_key_value().is_none() => {
+            let mut batch = tables.durable_batch();
+            batch.insert(&tables.meta, SCHEMA_VERSION_KEY, current);
+            batch.commit()?;
+            return Ok(tables);
+        }
+        None => "none".to_owned(),
+    };
+    Err(StorageError::ArchiveSchema {
+        path: path.to_owned(),
+        found,
+        expected: SCHEMA_VERSION,
     }
-    // Cleared before the version is written: a crash in between clears again on next open.
-    for keyspace in [
-        &tables.headers,
-        &tables.bodies,
-        &tables.receipts,
-        &tables.numbers,
-    ] {
-        keyspace.clear()?;
-    }
-    let mut batch = tables.durable_batch();
-    batch.insert(&tables.meta, SCHEMA_VERSION_KEY, current);
-    batch.commit()?;
-    let emptied = stored.map(|version| Bytes::copy_from_slice(&version));
-    Ok((tables, emptied))
+    .into())
 }
 
 /// Appends `blocks`, which must be consecutive, oldest first, and extend the held range (or the
@@ -247,7 +246,7 @@ pub(super) fn append_batch(tables: &Tables, blocks: &[Entry]) -> Result<(), Fail
     // Read without the lock: a writer getting in between shows as `NotContiguous` below.
     let tip = end_ref(tables.headers.last_key_value())?;
     let mut rest = match tip {
-        Some(tip) => above(blocks, tip)?,
+        Some(tip) => above(tables, blocks, tip)?,
         None => blocks,
     };
     let appended = rest.len();
@@ -263,34 +262,45 @@ pub(super) fn append_batch(tables: &Tables, blocks: &[Entry]) -> Result<(), Fail
     Ok(())
 }
 
-/// The blocks of `blocks` (consecutive) above `tip`: all of them if the first extends it, those
-/// after the tip if the tip is among them.
-fn above(blocks: &[Entry], tip: BlockRef) -> Result<&[Entry], StorageError> {
-    let Some(first) = blocks.first() else {
+/// The blocks of `blocks` (consecutive) above `tip`: all of them if the first extends it,
+/// those after the tip if the tip is among them, and none if the list ends at or below the tip
+/// and its last block is held (the archive is one chain, so the blocks before it are too).
+fn above<'a>(tables: &Tables, blocks: &'a [Entry], tip: BlockRef) -> Result<&'a [Entry], Failure> {
+    let (Some(first), Some(last)) = (blocks.first(), blocks.last()) else {
         return Ok(blocks);
     };
-    let held = tip
-        .number
+    if first.block.number > tip.number {
+        first.extends(tip)?;
+        return Ok(blocks);
+    }
+    // The last block the archive should already hold: the one at the tip's height, or the
+    // last of a list that ends below it.
+    let overlap = tip.number.min(last.block.number);
+    let held = overlap
         .checked_sub(first.block.number)
         .and_then(|offset| usize::try_from(offset).ok())
         .and_then(|offset| Some((blocks.get(offset)?, blocks.get(offset.checked_add(1)?..)?)));
-    match held {
-        Some((at_tip, rest)) if at_tip.block == tip => Ok(rest),
-        Some((at_tip, _)) => Err(StorageError::NotContiguous {
+    let Some((at_overlap, rest)) = held else {
+        return Ok(blocks);
+    };
+    let stored = tables.numbers.get(at_overlap.block.hash.0)?;
+    let stored = stored.as_deref().map(decode_number).transpose()?;
+    if stored != Some(at_overlap.block.number) {
+        return Err(StorageError::NotContiguous {
             expected: tip,
-            got: at_tip.block,
-        }),
-        None => first.extends(tip).map(|()| blocks),
+            got: at_overlap.block,
+        }
+        .into());
     }
+    Ok(rest)
 }
 
-/// How many of `blocks` go into one batch: up to [`MAX_APPEND_BATCH_BLOCKS`], fewer when their
-/// encoded size passes [`MAX_APPEND_BATCH_BYTES`], and always at least one.
+/// How many of `blocks` go into one batch: as many as fit [`MAX_APPEND_BATCH_BYTES`], and
+/// always at least one.
 fn chunk_len(blocks: &[Entry]) -> usize {
     let mut bytes = 0_usize;
     blocks
         .iter()
-        .take(MAX_APPEND_BATCH_BLOCKS)
         .take_while(|block| {
             bytes = bytes.saturating_add(block.encoded_len());
             bytes <= MAX_APPEND_BATCH_BYTES
@@ -359,8 +369,13 @@ pub(super) fn set_receipts(
         .get(key)?
         .ok_or_else(|| missing("body", block.hash))?;
     let body = decompress(&body, "body", Some(block.hash))?;
-    let body = BlockBody::<OpTxEnvelope>::decode(&mut body.as_slice())
-        .map_err(|source| invalid_data("body", Some(block.hash), source.into()))?;
+    // Cut, not decoded: a body may hold a transaction the typed decoder refuses.
+    let body = split_body(&body).ok_or(StorageError::InvalidData {
+        store: Store::Archive,
+        what: "body",
+        block: Some(block.hash),
+        source: None,
+    })?;
     if body.transactions.len() != count {
         return Err(invalid(InvalidBlockReason::ReceiptCount).into());
     }
@@ -370,47 +385,126 @@ pub(super) fn set_receipts(
     Ok(true)
 }
 
-/// The archived block at `number`, decompressed, read from one snapshot.
-pub(super) fn block(
+/// Reads a run of headers, bodies or receipts from one snapshot, decompressed, up to `limits`.
+/// The run ends at the first block not held.
+pub(super) fn read(
     tables: &Tables,
-    number: BlockNumber,
-) -> Result<Option<ArchivedBlock>, Failure> {
+    read: &BlockRead,
+    limits: ReadLimits,
+    convert: Option<ItemConvert>,
+) -> Result<Vec<Bytes>, Failure> {
     let snapshot = tables.db.snapshot();
-    let key = number.to_be_bytes();
-    let Some(header) = snapshot.get(&tables.headers, key)? else {
-        return Ok(None);
+    let mut run = Run {
+        items: Vec::new(),
+        bytes: 0,
+        limits,
+        convert,
     };
-    let header = decompress(&header, "header", None)?;
-    let hash = keccak256(&header);
-    let body = snapshot
-        .get(&tables.bodies, key)?
-        .ok_or_else(|| missing("body", hash))?;
-    let receipts = snapshot
-        .get(&tables.receipts, key)?
-        .map(|receipts| decompress(&receipts, "receipts", Some(hash)))
-        .transpose()?;
-    Ok(Some(ArchivedBlock {
-        header: Bytes::from(header),
-        body: Bytes::from(decompress(&body, "body", Some(hash))?),
-        receipts: receipts.map(Bytes::from),
-    }))
+    let number_of = |hash: &BlockHash| -> Result<Option<BlockNumber>, Failure> {
+        let number = snapshot.get(&tables.numbers, hash.0)?;
+        Ok(number.as_deref().map(decode_number).transpose()?)
+    };
+    match read {
+        BlockRead::Headers {
+            start,
+            step,
+            rising,
+        } => {
+            let start = match start {
+                BlockStart::Number(number) => Some(*number),
+                BlockStart::Hash(hash) => number_of(hash)?,
+            };
+            let Some(start) = start else {
+                return Ok(run.items);
+            };
+            if *step == 1 {
+                // Consecutive headers are neighbours in the keyspace: one scan.
+                let key = start.to_be_bytes();
+                let scan: Box<dyn Iterator<Item = Guard>> = if *rising {
+                    Box::new(snapshot.range(&tables.headers, key..))
+                } else {
+                    Box::new(snapshot.range(&tables.headers, ..=key).rev())
+                };
+                let mut expected = Some(start);
+                for guard in scan {
+                    let (key, header) = guard.into_inner()?;
+                    // The first key at or past `start` is another block if `start` is not held.
+                    if Some(decode_number(&key)?) != expected || !run.push(&header, "header")? {
+                        break;
+                    }
+                    expected = expected.and_then(|number| step_from(number, 1, *rising));
+                }
+            } else {
+                let mut next = Some(start);
+                while let Some(number) = next {
+                    let Some(header) = snapshot.get(&tables.headers, number.to_be_bytes())? else {
+                        break;
+                    };
+                    if !run.push(&header, "header")? {
+                        break;
+                    }
+                    next = step_from(number, *step, *rising);
+                }
+            }
+        }
+        BlockRead::Bodies(hashes) | BlockRead::Receipts(hashes) => {
+            let (keyspace, what) = if matches!(read, BlockRead::Bodies(_)) {
+                (&tables.bodies, "body")
+            } else {
+                (&tables.receipts, "receipts")
+            };
+            for hash in hashes {
+                let Some(number) = number_of(hash)? else {
+                    break;
+                };
+                let Some(value) = snapshot.get(keyspace, number.to_be_bytes())? else {
+                    break;
+                };
+                if !run.push(&value, what)? {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(run.items)
 }
 
-/// One part of the archived block at `number`, decompressed; only its keyspace is read.
-pub(super) fn part(
-    tables: &Tables,
-    number: BlockNumber,
-    part: BlockPart,
-) -> Result<Option<Bytes>, Failure> {
-    let (keyspace, what) = match part {
-        BlockPart::Header => (&tables.headers, "header"),
-        BlockPart::Body => (&tables.bodies, "body"),
-        BlockPart::Receipts => (&tables.receipts, "receipts"),
-    };
-    let Some(value) = keyspace.get(number.to_be_bytes())? else {
-        return Ok(None);
-    };
-    Ok(Some(decompress(&value, what, None)?.into()))
+/// The block `step` blocks after `number` in a run, if there is one.
+const fn step_from(number: BlockNumber, step: u64, rising: bool) -> Option<BlockNumber> {
+    if rising {
+        number.checked_add(step)
+    } else {
+        number.checked_sub(step)
+    }
+}
+
+/// The items read so far, with where the run must end.
+struct Run {
+    items: Vec<Bytes>,
+    bytes: usize,
+    limits: ReadLimits,
+    convert: Option<ItemConvert>,
+}
+
+impl Run {
+    /// Decompresses a stored value, converts it if asked, and adds it. Returns whether the
+    /// run may take another item: within the limits, and the conversion did not refuse.
+    fn push(&mut self, compressed: &[u8], what: &'static str) -> Result<bool, StorageError> {
+        if self.items.len() >= self.limits.items {
+            return Ok(false);
+        }
+        let raw = decompress(compressed, what, None)?;
+        let item = match self.convert {
+            Some(convert) => match convert(&raw) {
+                Some(item) => item,
+                None => return Ok(false),
+            },
+            None => raw.into(),
+        };
+        self.bytes = self.bytes.saturating_add(item.len());
+        self.items.push(item);
+        Ok(self.items.len() < self.limits.items && self.bytes < self.limits.bytes)
+    }
 }
 
 /// The number of the archived block with `hash`.

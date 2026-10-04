@@ -32,7 +32,7 @@ mod retry;
 use std::fmt;
 
 use alloy_primitives::BlockNumber;
-use op_indexer_primitives::{L1Heads, UnsafeBlock};
+use op_indexer_primitives::{BlockRef, EncodedBlock, L1Heads, UnsafeBlock};
 use op_indexer_storage::{ArchiveRetention, ArchiveStore, CommittedStore, UnsafeStore};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
@@ -40,7 +40,6 @@ use tokio_util::sync::CancellationToken;
 
 pub use error::PipelineError;
 use promote::Promoter;
-pub use range::RangeChannels;
 pub use receipts::ReceiptsChannels;
 
 /// Writes gossiped blocks to the unsafe store and moves them to the committed store and the
@@ -55,7 +54,8 @@ pub struct Pipeline<U, C, A> {
     promoter: Promoter<U, C, A>,
     blocks: mpsc::Receiver<UnsafeBlock>,
     receipts: Option<ReceiptsChannels>,
-    range: Option<RangeChannels>,
+    range: Option<mpsc::Receiver<Vec<EncodedBlock>>>,
+    head: Option<watch::Sender<Option<BlockRef>>>,
 }
 
 /// One of the pipeline's tasks.
@@ -107,17 +107,30 @@ where
             blocks,
             receipts,
             range: None,
+            head: None,
         }
     }
 
-    /// Adds a range of blocks fetched from peers: its batches are written to the committed
-    /// store and appended to the archive, and `range.stored` follows how far.
-    ///
-    /// The archive must be empty or end at the block before the range, and keep every block:
-    /// promotion and the range task both append to it, and it holds one contiguous range.
+    /// Publishes the unsafe head on `head` whenever ingest moves it, for whatever has to know
+    /// the newest block the node holds.
     #[must_use]
-    pub fn with_range(mut self, range: RangeChannels) -> Self {
-        self.range = Some(range);
+    pub fn with_head(mut self, head: watch::Sender<Option<BlockRef>>) -> Self {
+        self.head = Some(head);
+        self
+    }
+
+    /// Adds a range of blocks fetched from peers: `batches` are verified blocks in ascending
+    /// order, each batch consecutive, written to the committed store and appended to the
+    /// archive. The range task ends when the channel closes.
+    ///
+    /// The archive must be empty or end at the block before the first batch, and keep every
+    /// block: it holds one contiguous range, which the range task extends. A batch a store
+    /// refuses stops the pipeline with the error.
+    ///
+    /// A builder method because [`Self::new`] is at the argument limit.
+    #[must_use]
+    pub fn with_range(mut self, batches: mpsc::Receiver<Vec<EncodedBlock>>) -> Self {
+        self.range = Some(batches);
         self
     }
 
@@ -147,6 +160,7 @@ where
             self.unsafe_store.clone(),
             self.blocks,
             requests,
+            self.head,
             stop.clone(),
         );
         tasks.spawn(async move { (Task::Ingest, ingest.await) });

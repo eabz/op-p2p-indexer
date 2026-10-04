@@ -22,11 +22,10 @@
 //! | `op_indexer_pipeline_promotion_holes_total` | counter | `reason` | Promotions that could not read their whole range from the unsafe store: `missing_ancestor`, `too_long` (the blocks may exist) or `parent_mismatch` (nothing left out, but the range is another chain than the committed safe head). |
 //! | `op_indexer_pipeline_promotion_blocks_missing_total` | counter | `reason` | Blocks those promotions left out of the committed store, for backfill. |
 //! | `op_indexer_pipeline_l1_reorgs_total` | counter | | Times the safe head moved back or changed hash, rolling the committed store back. |
-//! | `op_indexer_pipeline_archive_restarts_total` | counter | | Times the archive was emptied because a promoted block did not extend it. |
+//! | `op_indexer_pipeline_archive_skipped_blocks_total` | counter | | Promoted blocks not archived because they did not extend the archive's tip. |
 //! | `op_indexer_pipeline_safe_block_number` | gauge | | Number of the committed safe head. |
 //! | `op_indexer_pipeline_range_blocks_stored_total` | counter | | Blocks of a range sync written to the committed store and the archive. |
 //! | `op_indexer_pipeline_range_block_number` | gauge | | Last block of the range sync that is stored. |
-//! | `op_indexer_pipeline_range_stops_total` | counter | `reason` | Times the range task stopped on a batch it could not store: `sender_recovery` or `refused`. |
 
 use metrics::{
     Unit, counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram,
@@ -45,11 +44,10 @@ const BLOCKS_PROMOTED: &str = "op_indexer_pipeline_blocks_promoted_total";
 const PROMOTION_HOLES: &str = "op_indexer_pipeline_promotion_holes_total";
 const PROMOTION_BLOCKS_MISSING: &str = "op_indexer_pipeline_promotion_blocks_missing_total";
 const L1_REORGS: &str = "op_indexer_pipeline_l1_reorgs_total";
-const ARCHIVE_RESTARTS: &str = "op_indexer_pipeline_archive_restarts_total";
+const ARCHIVE_SKIPPED_BLOCKS: &str = "op_indexer_pipeline_archive_skipped_blocks_total";
 const SAFE_BLOCK_NUMBER: &str = "op_indexer_pipeline_safe_block_number";
 const RANGE_BLOCKS_STORED: &str = "op_indexer_pipeline_range_blocks_stored_total";
 const RANGE_BLOCK_NUMBER: &str = "op_indexer_pipeline_range_block_number";
-const RANGE_STOPS: &str = "op_indexer_pipeline_range_stops_total";
 const RECEIPT_REQUESTS: &str = "op_indexer_pipeline_receipt_requests_total";
 const RECEIPTS_ATTACHED: &str = "op_indexer_pipeline_receipts_attached_total";
 const RECEIPTS_UNMATCHED: &str = "op_indexer_pipeline_receipts_unmatched_total";
@@ -92,24 +90,6 @@ impl HoleReason {
             Self::MissingAncestor => "missing_ancestor",
             Self::TooLong => "too_long",
             Self::ParentMismatch => "parent_mismatch",
-        }
-    }
-}
-
-/// Why the range task stopped on a batch, the `reason` label.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum RangeStop {
-    /// A transaction's sender could not be recovered.
-    SenderRecovery,
-    /// A store refuses the batch: a block it cannot hold, or an archive that ends elsewhere.
-    Refused,
-}
-
-impl RangeStop {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::SenderRecovery => "sender_recovery",
-            Self::Refused => "refused",
         }
     }
 }
@@ -227,9 +207,9 @@ pub fn describe() {
         "Rollbacks of the committed store after the safe head moved back"
     );
     describe_counter!(
-        ARCHIVE_RESTARTS,
+        ARCHIVE_SKIPPED_BLOCKS,
         Unit::Count,
-        "Times the archive was emptied to start a new range"
+        "Promoted blocks not archived because they did not extend the archive"
     );
     describe_gauge!(
         SAFE_BLOCK_NUMBER,
@@ -245,11 +225,6 @@ pub fn describe() {
         RANGE_BLOCK_NUMBER,
         Unit::Count,
         "Last block of the range sync that is stored"
-    );
-    describe_counter!(
-        RANGE_STOPS,
-        Unit::Count,
-        "Times the range task stopped on a batch it could not store, by reason"
     );
 }
 
@@ -306,9 +281,9 @@ pub(crate) fn l1_reorg() {
     counter!(L1_REORGS).increment(1);
 }
 
-/// Records the archive being emptied to start a new range.
-pub(crate) fn archive_restart() {
-    counter!(ARCHIVE_RESTARTS).increment(1);
+/// Records promoted blocks that were not archived because they do not extend the archive.
+pub(crate) fn archive_skipped(blocks: usize) {
+    counter!(ARCHIVE_SKIPPED_BLOCKS).increment(count(blocks));
 }
 
 /// Sets the number of the committed safe head.
@@ -339,11 +314,6 @@ fn gauge_value(value: u64) -> f64 {
 pub(crate) fn range_stored(blocks: usize, last: u64) {
     counter!(RANGE_BLOCKS_STORED).increment(count(blocks));
     gauge!(RANGE_BLOCK_NUMBER).set(gauge_value(last));
-}
-
-/// Records the range task stopping on a batch it could not store.
-pub(crate) fn range_stopped(reason: RangeStop) {
-    counter!(RANGE_STOPS, "reason" => reason.as_str()).increment(1);
 }
 
 /// Records a request for a block's receipts.

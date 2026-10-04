@@ -109,8 +109,13 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 # Importer (`bin/op-indexer-import`) only. Command line: flags with environment fallbacks and
 # generated help.
 clap = { version = "4", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context"] }
-# HTTPS client for the archive service; compressed responses keep the transfer small.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "gzip", "zstd"] }
+# HTTPS client for the archive service. No decompression features: answers are stored as they
+# travel. No HTTP/2: every request gets its own connection.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# Decoding of gzip answers when the service does not send zstd (already in the tree).
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+# Free space of the state directory's filesystem (already in the tree; std has no call for it).
+rustix = { version = "1", default-features = false, features = ["std", "fs"] }
 # Compression of the downloaded and verified chunks on disk (already in the tree).
 zstd = { version = "0.13", default-features = false }
 

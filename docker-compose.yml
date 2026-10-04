@@ -40,7 +40,6 @@ services:
       OP_INDEXER_EL_ENABLED: ${OP_INDEXER_EL_ENABLED:-}
       OP_INDEXER_EL_LISTEN_ADDR: ${OP_INDEXER_EL_LISTEN_ADDR:-}
       OP_INDEXER_EL_BOOTNODES: ${OP_INDEXER_EL_BOOTNODES:-}
-      OP_INDEXER_EL_MAX_SESSIONS: ${OP_INDEXER_EL_MAX_SESSIONS:-}
       # The host's public IP and port, so peers can dial back; the container only sees its
       # own bridge address.
       OP_INDEXER_EL_ADVERTISED_ADDR: ${OP_INDEXER_EL_ADVERTISED_ADDR:-}
