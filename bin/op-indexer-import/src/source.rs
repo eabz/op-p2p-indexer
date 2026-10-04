@@ -1,4 +1,5 @@
-//! Where blocks are downloaded from: the [`Source`] trait and its `HyperSync` implementation.
+//! Where blocks are downloaded from: the [`Source`] trait and its `HyperSync` implementation,
+//! which also reads logs of the L1 chain for the lookup of dispute games (see `game`).
 //!
 //! A source answers "blocks `from..to`" with one page: a JSON document in the row schema of
 //! `rows`, kept on disk exactly as received, and the block the next request must start at (a
@@ -10,6 +11,7 @@
 use std::future::Future;
 use std::time::Duration;
 
+use alloy_primitives::B256;
 use bytes::Bytes;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use reqwest::{Client, StatusCode};
@@ -17,6 +19,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::cli::ApiToken;
+use crate::game::{L1Log, L1Logs, LogFilter};
+use crate::rows::{L1TransactionRow, LogRow};
 
 /// Limit for one request, response body included. A full chunk answered in about a second
 /// when measured.
@@ -102,6 +106,9 @@ const LOG_FIELDS: &[&str] = &[
     "topic3",
 ];
 
+/// L1 transaction fields requested with the logs of a lookup on L1.
+const L1_TRANSACTION_FIELDS: &[&str] = &["block_number", "transaction_index", "to", "input"];
+
 /// One answer of a source.
 #[derive(Debug)]
 pub(crate) struct Page {
@@ -126,6 +133,9 @@ pub(crate) enum SourceError {
     Transport(#[from] reqwest::Error),
     #[error("malformed answer: {0}")]
     Malformed(String),
+    /// A lookup on L1 failed: which request, and why.
+    #[error("{request}: {source}")]
+    Lookup { request: String, source: Box<Self> },
 }
 
 impl SourceError {
@@ -150,7 +160,8 @@ pub(crate) trait Source: Send + Sync + 'static {
 #[derive(Debug, Clone)]
 pub(crate) struct HyperSync {
     client: Client,
-    url: String,
+    query_url: String,
+    height_url: String,
 }
 
 impl HyperSync {
@@ -172,10 +183,40 @@ impl HyperSync {
             .timeout(REQUEST_TIMEOUT)
             .connect_timeout(CONNECT_TIMEOUT)
             .build()?;
+        let endpoint = endpoint.trim_end_matches('/');
         Ok(Self {
             client,
-            url: format!("{}/query", endpoint.trim_end_matches('/')),
+            query_url: format!("{endpoint}/query"),
+            height_url: format!("{endpoint}/height"),
         })
+    }
+}
+
+impl HyperSync {
+    /// Sends one query and returns the answer's body.
+    async fn query(&self, query: &serde_json::Value) -> Result<Bytes, SourceError> {
+        let request = self.client.post(&self.query_url).body(query.to_string());
+        Self::answer(request.send().await?).await
+    }
+
+    /// Maps the status of `response` to an error, or returns its body.
+    async fn answer(response: reqwest::Response) -> Result<Bytes, SourceError> {
+        let status = response.status();
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            return Err(SourceError::RateLimited);
+        }
+        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+            return Err(SourceError::Unauthorized(status.as_u16()));
+        }
+        let body = response.bytes().await?;
+        if !status.is_success() {
+            return Err(SourceError::Status {
+                status: status.as_u16(),
+                body: String::from_utf8_lossy(body.get(..body.len().min(200)).unwrap_or_default())
+                    .into_owned(),
+            });
+        }
+        Ok(body)
     }
 }
 
@@ -193,27 +234,7 @@ impl Source for HyperSync {
                 "log": LOG_FIELDS,
             },
         });
-        let response = self
-            .client
-            .post(&self.url)
-            .body(query.to_string())
-            .send()
-            .await?;
-        let status = response.status();
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            return Err(SourceError::RateLimited);
-        }
-        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-            return Err(SourceError::Unauthorized(status.as_u16()));
-        }
-        let body = response.bytes().await?;
-        if !status.is_success() {
-            return Err(SourceError::Status {
-                status: status.as_u16(),
-                body: String::from_utf8_lossy(body.get(..body.len().min(200)).unwrap_or_default())
-                    .into_owned(),
-            });
-        }
+        let body = self.query(&query).await?;
         // Megabytes of JSON are scanned to find the cursor: off the runtime.
         let (body, cursor) = tokio::task::spawn_blocking(move || {
             let cursor = serde_json::from_slice::<Cursor>(&body);
@@ -227,6 +248,106 @@ impl Source for HyperSync {
             next_block: cursor.next_block,
         })
     }
+}
+
+/// The L1 chain's endpoint: logs by contract and topics, each with the transaction that
+/// emitted it. Answers are a few logs, so they are parsed in place.
+impl L1Logs for HyperSync {
+    type Error = SourceError;
+
+    async fn height(&self) -> Result<u64, SourceError> {
+        let height = async {
+            let body = Self::answer(self.client.get(&self.height_url).send().await?).await?;
+            serde_json::from_slice::<Height>(&body)
+                .map(|answer| answer.height)
+                .map_err(|err| SourceError::Malformed(err.to_string()))
+        };
+        height.await.map_err(|err| SourceError::Lookup {
+            request: format!("GET {}", self.height_url),
+            source: Box::new(err),
+        })
+    }
+
+    async fn logs(&self, filter: &LogFilter) -> Result<Vec<L1Log>, SourceError> {
+        // No address would mean every contract.
+        if filter.addresses.is_empty() {
+            return Ok(Vec::new());
+        }
+        // A position without a topic matches any.
+        let topic = |topic: Option<B256>| topic.into_iter().collect::<Vec<_>>();
+        let mut logs = Vec::new();
+        let mut from = filter.from_block;
+        loop {
+            let query = json!({
+                "from_block": from,
+                "logs": [{
+                    "address": filter.addresses,
+                    "topics": [[filter.topic0], topic(filter.topic1), topic(filter.topic2)],
+                }],
+                "field_selection": {
+                    "log": LOG_FIELDS,
+                    "transaction": L1_TRANSACTION_FIELDS,
+                },
+            });
+            let answer = async {
+                let body = self.query(&query).await?;
+                serde_json::from_slice::<L1Answer>(&body)
+                    .map_err(|err| SourceError::Malformed(err.to_string()))
+            };
+            let answer = answer.await.map_err(|err| SourceError::Lookup {
+                request: format!("POST {} {query}", self.query_url),
+                source: Box::new(err),
+            })?;
+            for batch in answer.data {
+                logs.extend(batch.logs.iter().map(|log| {
+                    let transaction = batch.transactions.iter().find(|tx| {
+                        (tx.block_number, tx.transaction_index)
+                            == (log.block_number, log.transaction_index)
+                    });
+                    L1Log {
+                        block_number: log.block_number,
+                        log_index: log.log_index,
+                        address: log.address,
+                        topics: [log.topic0, log.topic1, log.topic2, log.topic3],
+                        transaction_to: transaction.and_then(|tx| tx.to),
+                        transaction_input: transaction
+                            .map(|tx| tx.input.clone())
+                            .unwrap_or_default(),
+                    }
+                }));
+            }
+            let at_head = answer
+                .archive_height
+                .is_none_or(|height| answer.next_block > height);
+            if at_head || answer.next_block <= from {
+                return Ok(logs);
+            }
+            from = answer.next_block;
+        }
+    }
+}
+
+/// The answer to the height request.
+#[derive(Debug, Deserialize)]
+struct Height {
+    height: u64,
+}
+
+/// An answer to a log query on L1.
+#[derive(Debug, Deserialize)]
+struct L1Answer {
+    data: Vec<L1Batch>,
+    next_block: u64,
+    /// Newest block the service has; absent means the answer reached it.
+    archive_height: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct L1Batch {
+    #[serde(default)]
+    logs: Vec<LogRow>,
+    #[serde(default)]
+    transactions: Vec<L1TransactionRow>,
 }
 
 /// The part of an answer the downloader reads; the rest is parsed by `verify`.

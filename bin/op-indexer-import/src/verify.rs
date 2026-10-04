@@ -13,8 +13,8 @@
 //!
 //! The bytes that passed these checks are what is written (see `chunk`): nothing is encoded
 //! again later. Once every chunk is verified, the chunks are linked to each other and the last
-//! block's hash is compared with the trusted anchor, which proves the whole range by the chain
-//! of parent hashes.
+//! block is checked against the anchor (a trusted hash, or the claim of a dispute game on L1:
+//! see `game`), which proves the whole range by the chain of parent hashes.
 //!
 //! A transaction signed with all zeros (an L1-to-L2 message of OP Mainnet's client before
 //! Bedrock) has no signer: it gets the zero address, and is counted.
@@ -35,13 +35,11 @@ use std::io;
 use std::path::Path;
 
 use alloy_consensus::proofs::{calculate_receipt_root, ordered_trie_root_with_encoder};
-use alloy_consensus::{
-    EMPTY_OMMER_ROOT_HASH, Eip658Value, Header, Receipt, ReceiptWithBloom, TxReceipt,
-};
+use alloy_consensus::{EMPTY_OMMER_ROOT_HASH, Eip658Value, Header, Receipt, ReceiptWithBloom};
 use alloy_eips::eip7685::EMPTY_REQUESTS_HASH;
 use alloy_primitives::{Address, B256, Bloom, Bytes, Log, LogData, keccak256, logs_bloom};
-use alloy_rlp::Encodable;
-use op_alloy_consensus::{OpDepositReceipt, OpReceiptEnvelope};
+use alloy_rlp::{Decodable, Encodable};
+use op_alloy_consensus::{DEPOSIT_TX_TYPE_ID, OpDepositReceipt, OpReceiptEnvelope};
 use op_indexer_primitives::{EncodedBlock, encode_receipts, encode_transaction};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -52,8 +50,8 @@ use crate::deposit::{
     DepositEvent, DepositForks, L1DepositSource, L1Origin, ReportedDeposit, Rule, rebuild_deposits,
 };
 use crate::rows::{self, BlockRow, LogRow, TransactionRow};
-use crate::state::{Chunk, Forks, Plan, State};
-use crate::transaction::{self, DEPOSIT_TYPE};
+use crate::state::{Anchor, Chunk, Forks, Plan, State};
+use crate::transaction;
 
 /// A rule a block failed.
 #[derive(Debug, thiserror::Error)]
@@ -269,15 +267,41 @@ fn link_chunks(state: &State, plan: &Plan) -> io::Result<Linked> {
                 chunk.from, link.first_parent, previous.last_hash
             ));
         }
-        if chunk.to > plan.last && link.last_hash != plan.anchor && linked.broken.is_none() {
-            linked.broken = Some(format!(
-                "block {}: hash is {}, the anchor is {}",
-                plan.last, link.last_hash, plan.anchor
-            ));
+        if chunk.to > plan.last && linked.broken.is_none() {
+            linked.broken = check_top(state, plan, chunk, link)?;
         }
         previous = Some(link);
     }
     Ok(linked)
+}
+
+/// Checks the last block of the range, in the verified `chunk`, against the plan's anchor.
+/// Returns what is wrong, if anything. Blocking.
+fn check_top(state: &State, plan: &Plan, chunk: Chunk, link: Link) -> io::Result<Option<String>> {
+    let game = match plan.anchor {
+        Anchor::None => return Ok(None),
+        Anchor::Hash(anchor) => {
+            return Ok((link.last_hash != anchor).then(|| {
+                format!(
+                    "block {}: hash is {}, the anchor is {anchor}",
+                    plan.last, link.last_hash
+                )
+            }));
+        }
+        Anchor::Game(game) => game,
+    };
+    // The game's claim covers the state root and the withdrawals root of the last header.
+    let (_, blocks) = chunk::read(&state.verified_path(chunk))?;
+    let header = blocks
+        .last()
+        .map(|block| Header::decode(&mut &block.encoded.header[..]))
+        .transpose()
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
+        .ok_or(io::ErrorKind::UnexpectedEof)?;
+    Ok(game
+        .check(link.last_hash, header.state_root, header.withdrawals_root)
+        .err()
+        .map(|err| err.to_string()))
 }
 
 /// Verifies the downloaded chunk at `raw` and writes it to `verified`. Blocking, CPU-bound.
@@ -354,7 +378,7 @@ fn verify_block(
             header: row.transactions_root,
         });
     }
-    let receipts_root = if timestamp >= forks.canyon_time {
+    let receipts_root = if timestamp >= forks.canyon {
         calculate_receipt_root(&body.receipts)
     } else {
         let hashed: Vec<_> = body.receipts.iter().map(without_deposit_fields).collect();
@@ -429,18 +453,19 @@ fn rebuild_body(
                 found: tx.transaction_index,
             });
         }
-        let (rebuilt, deposit_fields) = match by_rules.next() {
-            Some(deposit) => (
-                transaction::deposit(deposit.tx, tx.hash),
+        let (encoding, sender, deposit_fields) = if let Some(deposit) = by_rules.next() {
+            (
+                deposit.encoded,
+                Some(deposit.tx.from),
                 (deposit.deposit_nonce, deposit.deposit_receipt_version),
-            ),
-            None => (
-                transaction::rebuild(index, tx)?,
-                reported_deposit_fields(forks, timestamp, tx),
-            ),
+            )
+        } else {
+            let rebuilt = transaction::rebuild(index, tx)?;
+            let mut encoding = Vec::new();
+            encode_transaction(&rebuilt.transaction, &mut encoding);
+            let fields = reported_deposit_fields(forks, timestamp, tx);
+            (encoding, rebuilt.sender, fields)
         };
-        let mut encoding = Vec::new();
-        encode_transaction(&rebuilt.transaction, &mut encoding);
         let computed = keccak256(&encoding);
         if computed != tx.hash {
             return Err(Check::TransactionHash {
@@ -449,11 +474,11 @@ fn rebuild_body(
                 reported: tx.hash,
             });
         }
-        if rebuilt.sender.is_none() {
+        if sender.is_none() {
             body.zero_signatures = body.zero_signatures.saturating_add(1);
         }
         body.encodings.push(encoding);
-        body.senders.push(rebuilt.sender.unwrap_or(Address::ZERO));
+        body.senders.push(sender.unwrap_or(Address::ZERO));
 
         let _before = take_while(&mut logs, |log| log.transaction_index < index);
         let tx_logs = take_while(&mut logs, |log| log.transaction_index == index);
@@ -473,7 +498,7 @@ fn deposits_by_rules(
 ) -> Result<Vec<crate::deposit::RebuiltDeposit>, Check> {
     let leading = transactions
         .iter()
-        .take_while(|tx| tx.kind == Some(DEPOSIT_TYPE));
+        .take_while(|tx| tx.kind == Some(DEPOSIT_TX_TYPE_ID));
     if leading.clone().all(|tx| tx.source_hash.is_some()) {
         return Ok(Vec::new());
     }
@@ -495,8 +520,8 @@ fn deposits_by_rules(
         })
         .collect::<Result<Vec<_>, Check>>()?;
     let forks = DepositForks {
-        regolith_time: Some(forks.regolith_time),
-        canyon_time: Some(forks.canyon_time),
+        regolith_time: Some(forks.regolith),
+        canyon_time: Some(forks.canyon),
     };
     rebuild_deposits(&forks, row.number, row.timestamp.to(), &reported, &NoL1Logs).map_err(|err| {
         Check::Deposit {
@@ -532,16 +557,16 @@ fn reported_deposit_fields(
     timestamp: u64,
     tx: &TransactionRow,
 ) -> (Option<u64>, Option<u64>) {
-    if tx.kind != Some(DEPOSIT_TYPE) {
+    if tx.kind != Some(DEPOSIT_TX_TYPE_ID) {
         return (None, None);
     }
     let nonce = tx
         .deposit_nonce
-        .or_else(|| (timestamp >= forks.regolith_time).then_some(tx.nonce));
+        .or_else(|| (timestamp >= forks.regolith).then_some(tx.nonce));
     let version = tx.deposit_receipt_version.map(|version| version.to());
     (
         nonce.map(|nonce| nonce.to()),
-        version.or_else(|| (timestamp >= forks.canyon_time).then_some(1)),
+        version.or_else(|| (timestamp >= forks.canyon).then_some(1)),
     )
 }
 
@@ -565,7 +590,7 @@ fn rebuild_receipt(
         1 => OpReceiptEnvelope::Eip2930(receipt.with_bloom()),
         2 => OpReceiptEnvelope::Eip1559(receipt.with_bloom()),
         4 => OpReceiptEnvelope::Eip7702(receipt.with_bloom()),
-        DEPOSIT_TYPE => OpReceiptEnvelope::Deposit(ReceiptWithBloom {
+        DEPOSIT_TX_TYPE_ID => OpReceiptEnvelope::Deposit(ReceiptWithBloom {
             logs_bloom: logs_bloom(&receipt.logs),
             receipt: OpDepositReceipt {
                 inner: receipt,
@@ -612,7 +637,7 @@ fn encode_header(forks: &Forks, row: &BlockRow, logs_bloom: Bloom) -> Vec<u8> {
         excess_blob_gas: row.excess_blob_gas.map(|gas| gas.to()),
         parent_beacon_block_root: row.parent_beacon_block_root,
         // OP Stack blocks have no execution requests; the service has no column for the hash.
-        requests_hash: (row.withdrawals_root.is_some() && timestamp >= forks.isthmus_time)
+        requests_hash: (row.withdrawals_root.is_some() && timestamp >= forks.isthmus)
             .then_some(EMPTY_REQUESTS_HASH),
         ..Default::default()
     })

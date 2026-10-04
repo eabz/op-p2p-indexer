@@ -136,7 +136,7 @@ cargo build --release -p op-indexer-import
 ```
 
 The file is `target/release/op-indexer-import`. On the machine that runs it, with the defaults
-(OP Mainnet, blocks 0 to 105,235,062, state in `./import-state`):
+(OP Mainnet, from block 0 to the last block committed to L1, state in `./import-state`):
 
 ```bash
 op-indexer-import download --api-token <TOKEN> --requests 64
@@ -147,13 +147,27 @@ op-indexer-import verify
 ```
 
 ```bash
-op-indexer-import load --clickhouse-url http://127.0.0.1:8123 --archive-dir data/archive
+op-indexer-import load --archive-dir data/archive
 ```
 
 `op-indexer-import --help` and `<command> --help` list every flag, its environment variable
 and its default. Range flags (`--state-dir`, `--first-block`, `--last-block`, `--anchor-hash`,
-`--chunk-blocks`) must be the same for every step.
+`--legacy-only`, `--chunk-blocks`) must be the same for every step.
 
+- **The range's end**: with no range flags, `download` looks up the newest dispute game of
+  the chain on L1 (through HyperSync's L1 endpoint, same token), ends the range at that game's
+  L2 block, and records the game in `anchor.json` in the state directory. Every later run of
+  any step uses the recorded game; `verify` checks the last block's output root against the
+  game's claim. Delete `anchor.json` and run `download` again to extend the range to a newer
+  game: chunks already there are kept. `--legacy-only` ends at block 105,235,062 with its
+  known hash and needs no lookup; `--last-block <n> --anchor-hash <hash>` gives any end you
+  trust; `--last-block <n> --allow-unanchored-top` goes without an anchor (also the fallback
+  if the lookup fails).
+- **A state directory filled by an earlier legacy run** is continued by a default run: chunks
+  are files named by their block range, so every chunk already there is skipped. Only the
+  short last chunk of the legacy range (`…105235000-…105235063`) has no counterpart in the
+  longer range; its blocks are downloaded again as part of chunk `…105235000-…105236000`, and
+  the short file is never read again (it can be deleted).
 - **State directory**: `raw/` holds one compressed file per downloaded chunk (the service's
   answers as received), `verified/` one file per verified chunk (the consensus encodings that
   passed), `loaded/` one marker per loaded chunk. A file exists only when its chunk is
@@ -201,8 +215,28 @@ each transaction hashes to its reported hash and both roots match the header:
   contract's logs on L1, which HyperSync also serves.
 - *Deposit receipts*: the deposit nonce must be recoverable from the fields returned.
 
-Status: being tested on saved responses. If a block cannot be rebuilt and verified, it is not
-imported; the importer never stores data it could not verify.
+Status (2026-10-04): built, verified offline on blocks 105,235,063 and 105,235,064 only.
+
+- `verify` rebuilds legacy, EIP-2930, EIP-1559, EIP-7702 and deposit transactions, their
+  receipts, and headers of every fork (base fee, withdrawals root, blob fields, beacon root,
+  and from Isthmus the hash of an empty requests list, which has no column in HyperSync).
+- HyperSync's schema lists `source_hash`, `mint`, `deposit_nonce` and
+  `deposit_receipt_version` columns; `download` requests them. Where a deposit's source hash
+  is reported, the deposit is rebuilt from its row; the system-transaction flag is the one of
+  the two values that gives the reported hash. Whether the OP Mainnet endpoint fills these
+  columns is not known until the first request.
+- Where it is not reported, the block's deposits are rebuilt by the protocol's rules
+  (`deposit.rs`): the L1-attributes deposit from its own calldata, network upgrade deposits
+  from their intents. User deposits then need the deposit contract's logs on L1, which are
+  **not downloaded yet**: such a block fails `verify` with a named check.
+- Before Canyon the deposit nonce is not part of the hashed receipt: the root is checked
+  without it, and the stored receipt keeps the reported nonce, unproven.
+- Fork times are flags (`--regolith-time`, `--canyon-time`, `--isthmus-time`), OP Mainnet by
+  default. For a post-Bedrock range set `--first-block`, `--last-block` and `--anchor-hash`.
+- Not verified on any sample: typed transactions (the JSON form of `access_list` and
+  `authorization_list` is assumed to be the Ethereum RPC's), user deposits, blocks from Canyon
+  on. A block that cannot be rebuilt and verified is not imported; the importer never stores
+  data it could not verify.
 
 ## 10. Any chain
 
@@ -210,3 +244,44 @@ Everything chain-specific is configuration, not code: the HyperSync endpoint, th
 range, the anchor (a trusted block hash the range must link to), the fork activations that
 change encodings, and for OP Stack chains the L1 endpoint and bridge contract. A chain without
 a legacy era or deposits needs only the endpoint, the range and the anchor.
+
+## 11. Where the import stops, and the top anchor
+
+The archive service's newest blocks are unsafe: not yet committed to L1. And parent hashes
+only prove that a range is one chain, not that it is the canonical one. The legacy range has a
+trusted hash at its top (section 3.2); a range that reaches the present needs one too.
+
+- **End of a range that reaches the present:** with `--latest-game`, the L2 block of the
+  newest game of the configured `DisputeGameFactory` and game type on L1. `download` looks it
+  up (`game.rs`: the factory's `DisputeGameCreated` logs of the last day, and the L2 block
+  from the calldata of the `create` call) and writes the game's address, L2 block, root claim
+  and L1 block to `<state>/anchor.json`, so `verify` and `load` stay offline and a resumed
+  download keeps the same end; delete the file to move to a newer game. With
+  `--resolved-only` the newest game resolved in the proposer's favour is used instead
+  (searched over 30 days). `--latest-game` excludes `--last-block` and `--anchor-hash`; with
+  no flags the range is the legacy default. The lookup uses the service's L1 endpoint, so it
+  counts against the token's window like any download.
+- **The check is mandatory.** `verify` computes the output root of that block from its
+  downloaded header, `keccak256(bytes32(0) ‖ state root ‖ withdrawals root ‖ block hash)`, and
+  requires it to equal the game's root claim. A mismatch fails `verify` with both values, and
+  nothing is loaded. The block's hash is then the top anchor, in addition to the link to the
+  block below the range.
+- **What it proves:** the whole range is the chain a game on L1 claims; the proposer proposes
+  blocks that are already safe, so the range is committed to L1. The import ends up to about
+  an hour behind the safe head (OP Mainnet creates a game about hourly).
+- **What it does not prove:** that the claim is right. A new game is a bonded claim nobody
+  has challenged yet. The resolved-only flag removes that, at the price of ending days back.
+- **Before Isthmus** the header does not carry the message passer's storage root, so the
+  output root cannot be computed from what is downloaded. A range whose last block is before
+  Isthmus (another chain, or an explicit `--last-block`) and has no `--anchor-hash` is
+  anchored only from below; it needs `--allow-unanchored-top` to proceed, and the tool says so.
+- A game not created by a plain call of the factory's `create` with a one-word extra data
+  (created through another contract, or another kind of game) is refused with a message
+  rather than misread.
+- Chain configuration, with OP Mainnet's defaults: the factory
+  `0xe5965Ab5962eDc7477C8520243A95517CD252fA9` (superchain registry,
+  `superchain/configs/mainnet/op.toml`, `DisputeGameFactoryProxy`), the game type (0, the
+  permissionless fault dispute game; the type the chain currently respects is set on L1 and
+  was not checked), and the L1 endpoint. The extra-data encoding is from
+  `FaultDisputeGame.sol` in the Optimism monorepo.
+- The legacy-only default range (0 to 105,235,062) keeps its trusted hash and needs no lookup.

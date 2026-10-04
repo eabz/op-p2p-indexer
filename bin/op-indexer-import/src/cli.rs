@@ -7,24 +7,37 @@ use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use alloy_primitives::{B256, b256};
+use alloy_primitives::{Address, B256, address, b256};
 use clap::{Args, Parser, Subcommand};
 
 use crate::load::LoadArgs;
 
+/// OP Mainnet's last block before Bedrock: the default end of the range.
+pub(crate) const OP_MAINNET_LAST_LEGACY_BLOCK: u64 = 105_235_062;
+
 /// Hash of OP Mainnet block 105,235,062, the last block before Bedrock: the parent hash in
 /// the header of the Bedrock block 105,235,063 (hash `0xdbf6a80f…afd3`, the published Bedrock
 /// genesis of OP Mainnet, which every execution peer agreed on in `docs/el-viability.md`).
-const OP_MAINNET_LAST_LEGACY_HASH: B256 =
+pub(crate) const OP_MAINNET_LAST_LEGACY_HASH: B256 =
     b256!("0x21a168dfa5e727926063a28ba16fd5ee84c814e847c81a699c7a0ea551e4ca50");
 
-/// Downloads a block range from an external archive, verifies every block against a trusted
-/// block hash, and loads it into the local block archive the node serves from. No database
-/// is needed: ClickHouse is optional, written only with `--clickhouse-url`.
+/// OP Mainnet's `DisputeGameFactoryProxy` on Ethereum Mainnet (superchain registry,
+/// `superchain/configs/mainnet/op.toml`).
+const OP_MAINNET_DISPUTE_GAME_FACTORY: Address =
+    address!("0xe5965Ab5962eDc7477C8520243A95517CD252fA9");
+
+/// Downloads a chain's blocks from an external archive, verifies every block, and loads
+/// them into the local block archive the node serves from. No database is needed: ClickHouse
+/// is optional, written only with `--clickhouse-url`.
 ///
 /// Run `download`, then `verify`, then `load`, or `run` for all three. Every step keeps its
 /// progress in the state directory and can be stopped and started again: nothing completed
-/// is redone. The defaults import OP Mainnet's blocks before Bedrock (0 to 105,235,062) from
+/// is redone.
+///
+/// With no range flags the range is OP Mainnet from block 0 to the last block known to be
+/// committed to L1: the block of the newest dispute game, which `download` looks up once and
+/// records in the state directory. `--legacy-only` imports only the blocks before Bedrock (0
+/// to 105235062); `--first-block` and `--last-block` give any other range. Blocks come from
 /// Envio `HyperSync`.
 #[derive(Debug, Parser)]
 #[command(name = "op-indexer-import", version)]
@@ -56,8 +69,8 @@ pub(crate) enum Command {
 /// same values for each.
 #[derive(Debug, Clone, Args)]
 pub(crate) struct RangeArgs {
-    /// Directory for downloaded and verified chunks. Needs roughly 100 to 160 GB for the
-    /// whole OP Mainnet legacy range.
+    /// Directory for downloaded and verified chunks, and the record of the range's end. Use
+    /// the same one for every step.
     #[arg(
         long,
         global = true,
@@ -73,23 +86,44 @@ pub(crate) struct RangeArgs {
         default_value_t = 0
     )]
     pub(crate) first_block: u64,
-    /// Last block of the range (default: OP Mainnet's last block before Bedrock).
+    /// Last block of the range, in place of the default: the L2 block of the newest dispute
+    /// game on L1, the last block known to be committed to L1. `download` looks that game up
+    /// once and records it in `anchor.json` in the state directory; every later run uses the
+    /// recorded one, and `verify` checks the block against the game's claim (delete the file
+    /// to move to a newer game).
     #[arg(
         long,
         global = true,
         env = "OP_INDEXER_IMPORT_LAST_BLOCK",
-        default_value_t = 105_235_062
+        conflicts_with = "legacy_only"
     )]
-    pub(crate) last_block: u64,
-    /// Trusted hash of the last block of the range. Every block is verified by the chain of
-    /// parent hashes down from it (default: OP Mainnet block 105,235,062).
+    pub(crate) last_block: Option<u64>,
+    /// With `--last-block`: the trusted hash of that block. Every block is verified by the
+    /// chain of parent hashes down from it.
     #[arg(
         long,
         global = true,
         env = "OP_INDEXER_IMPORT_ANCHOR_HASH",
-        default_value_t = OP_MAINNET_LAST_LEGACY_HASH
+        requires = "last_block"
     )]
-    pub(crate) anchor_hash: B256,
+    pub(crate) anchor_hash: Option<B256>,
+    /// With `--last-block`, go without `--anchor-hash`: the range is then only checked to be
+    /// one chain, not to be the canonical one.
+    #[arg(
+        long,
+        global = true,
+        env = "OP_INDEXER_IMPORT_ALLOW_UNANCHORED_TOP",
+        requires = "last_block"
+    )]
+    pub(crate) allow_unanchored_top: bool,
+    /// Import only OP Mainnet's blocks before Bedrock: the range ends at block 105235062,
+    /// checked against its known hash. Needs no lookup on L1.
+    #[arg(long, global = true, env = "OP_INDEXER_IMPORT_LEGACY_ONLY")]
+    pub(crate) legacy_only: bool,
+    /// Does nothing: ending the range at the newest dispute game is the default. Accepted so
+    /// that earlier command lines keep working.
+    #[arg(long, global = true, hide = true)]
+    pub(crate) latest_game: bool,
     /// Blocks per chunk: one file on disk, and one request when the service answers it in
     /// full. Keep it the same across runs, or chunks are downloaded again.
     #[arg(
@@ -153,6 +187,28 @@ pub(crate) struct DownloadArgs {
         value_parser = clap::value_parser!(u64).range(1..=4096)
     )]
     pub(crate) requests: u64,
+    /// `HyperSync` endpoint of the L1 chain the dispute games are on (default: Ethereum
+    /// Mainnet), for the lookup of the range's last block. Uses the same API token.
+    #[arg(
+        long,
+        env = "OP_INDEXER_IMPORT_L1_ENDPOINT",
+        default_value = "https://eth.hypersync.xyz"
+    )]
+    pub(crate) l1_endpoint: String,
+    /// The chain's `DisputeGameFactory` on L1 (default: OP Mainnet's).
+    #[arg(
+        long,
+        env = "OP_INDEXER_IMPORT_DISPUTE_GAME_FACTORY",
+        default_value_t = OP_MAINNET_DISPUTE_GAME_FACTORY
+    )]
+    pub(crate) dispute_game_factory: Address,
+    /// The game type whose games are used; it must be a fault dispute game.
+    #[arg(long, env = "OP_INDEXER_IMPORT_GAME_TYPE", default_value_t = 0)]
+    pub(crate) game_type: u32,
+    /// Use only a game resolved in the proposer's favour, which is days older than the newest
+    /// game.
+    #[arg(long, env = "OP_INDEXER_IMPORT_RESOLVED_ONLY")]
+    pub(crate) resolved_only: bool,
 }
 
 /// Settings of `verify`.

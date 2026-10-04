@@ -169,8 +169,6 @@ const KARST_INTENTS: [&str; 31] = [
     "L2ProxyAdmin Upgrade Predeploys",
 ];
 
-/// The only version of the `TransactionDeposited` event.
-const DEPOSIT_EVENT_VERSION: U256 = U256::ZERO;
 /// Bytes of `opaqueData` before the transaction's `data`: mint, value, gas limit, creation flag.
 const OPAQUE_FIXED_BYTES: usize = 32 + 32 + 8 + 1;
 /// An ABI word.
@@ -243,7 +241,7 @@ pub(crate) trait L1DepositSource {
 pub(crate) struct RebuiltDeposit {
     pub(crate) tx: TxDeposit,
     /// The transaction's EIP-2718 encoding: the bytes whose keccak is the reported hash.
-    pub(crate) encoded: Bytes,
+    pub(crate) encoded: Vec<u8>,
     /// The receipt's deposit nonce: set from Regolith on.
     pub(crate) deposit_nonce: Option<u64>,
     /// The receipt's deposit receipt version: 1 from Canyon on.
@@ -454,7 +452,8 @@ fn user_deposit(
     event: &DepositEvent,
     origin: &L1Origin,
 ) -> Result<TxDeposit, Rule> {
-    if event.version != DEPOSIT_EVENT_VERSION {
+    // Version 0 is the only version of the event.
+    if !event.version.is_zero() {
         return Err(Rule::EventVersion(event.version));
     }
     let opaque = opaque_data(&event.data).ok_or(Rule::EventData)?;
@@ -473,19 +472,20 @@ fn user_deposit(
     let tx = TxDeposit {
         source_hash: UserDepositSource::new(origin.hash, event.log_index).source_hash(),
         from: event.from,
-        to: to.map_or(TxKind::Create, TxKind::Call),
+        to: to.into(),
         mint,
         value: U256::from_be_bytes(value),
         gas_limit: u64::from_be_bytes(gas),
         is_system_transaction: false,
-        input: Bytes::copy_from_slice(data),
+        // The reported calldata, which is compared with the event's below: no copy.
+        input: reported.input.clone(),
     };
     let differs = [
         ("from", tx.from != reported.from),
         ("to", to != reported.to),
         ("value", tx.value != reported.value),
         ("gas", tx.gas_limit != reported.gas),
-        ("input", tx.input != *reported.input),
+        ("input", data != reported.input.as_ref()),
     ];
     match differs.into_iter().find(|(_, differs)| *differs) {
         Some((name, _)) => Err(Rule::EventMismatch(name)),
@@ -506,18 +506,22 @@ fn upgrade_deposit(
         .iter()
         .enumerate()
         .map(|(index, intent)| format!("Karst {index}: {intent}"));
+    let base = TxDeposit {
+        source_hash: B256::ZERO,
+        from: reported.from,
+        to: reported.to.into(),
+        mint: 0,
+        value: reported.value,
+        gas_limit: reported.gas,
+        is_system_transaction: false,
+        input: reported.input.clone(),
+    };
     plain
         .chain(karst)
         .find_map(|intent| {
             let tx = TxDeposit {
                 source_hash: UpgradeDepositSource::new(intent).source_hash(),
-                from: reported.from,
-                to: reported.to.map_or(TxKind::Create, TxKind::Call),
-                mint: 0,
-                value: reported.value,
-                gas_limit: reported.gas,
-                is_system_transaction: false,
-                input: reported.input.clone(),
+                ..base.clone()
             };
             let kind = "network upgrade deposit";
             checked(tx, reported, kind, deposit_nonce, deposit_receipt_version).ok()
@@ -562,7 +566,7 @@ fn checked(
     }
     Ok(RebuiltDeposit {
         tx,
-        encoded: encoded.into(),
+        encoded,
         deposit_nonce,
         deposit_receipt_version,
     })

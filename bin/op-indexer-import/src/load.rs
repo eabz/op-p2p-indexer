@@ -147,10 +147,16 @@ pub(crate) async fn run(
             info!(chunks = loaded, up_to = chunk.to, "loading");
         }
     }
+    let range = archive
+        .range()
+        .await
+        .wrap_err("failed to read the block archive")?;
     info!(
         loaded,
         already_loaded = skipped,
         clickhouse = committed.is_some(),
+        archive_first = range.map(|(first, _)| first.number),
+        archive_last = range.map(|(_, last)| last.number),
         "load finished: chunks appended to the block archive"
     );
     Ok(())

@@ -110,6 +110,15 @@ pub(crate) struct LogRow {
     pub(crate) topic3: Option<B256>,
 }
 
+/// An L1 transaction, as far as the lookup of dispute games reads it.
+#[derive(Debug, Deserialize)]
+pub(crate) struct L1TransactionRow {
+    pub(crate) block_number: u64,
+    pub(crate) transaction_index: u64,
+    pub(crate) to: Option<Address>,
+    pub(crate) input: Bytes,
+}
+
 /// The rows of a chunk, each kind in block order.
 #[derive(Debug, Default)]
 pub(crate) struct Rows {

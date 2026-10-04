@@ -86,7 +86,9 @@ pub(crate) async fn run<S: Source>(
     let mut progress = interval(PROGRESS_INTERVAL);
     progress.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let started = Instant::now();
-    let (mut chunks_done, mut blocks_done, mut bytes_done) = (0_usize, 0_u64, 0_u64);
+    let (mut chunks_done, mut blocks_done) = (0_usize, 0_u64);
+    // Bytes of the answers once decompressed, and of the chunk files written.
+    let (mut answer_bytes, mut disk_bytes) = (0_u64, 0_u64);
     let mut stopped = None;
 
     loop {
@@ -103,10 +105,11 @@ pub(crate) async fn run<S: Source>(
                 break;
             }
             finished = tasks.join_next() => match finished {
-                Some(Ok((chunk, Ok(bytes)))) => {
+                Some(Ok((chunk, Ok((answers, written))))) => {
                     chunks_done = chunks_done.saturating_add(1);
                     blocks_done = blocks_done.saturating_add(chunk.blocks());
-                    bytes_done = bytes_done.saturating_add(bytes);
+                    answer_bytes = answer_bytes.saturating_add(answers);
+                    disk_bytes = disk_bytes.saturating_add(written);
                 }
                 Some(Ok((chunk, Err(err)))) => {
                     stopped = Some(format!("blocks {}..{}: {err}", chunk.from, chunk.to));
@@ -126,7 +129,9 @@ pub(crate) async fn run<S: Source>(
                     chunks = chunks_done,
                     of = total,
                     blocks_per_sec,
-                    received_bytes_per_sec = bytes_done / secs,
+                    decompressed_bytes_per_sec = answer_bytes / secs,
+                    disk_bytes_per_sec = disk_bytes / secs,
+                    disk_bytes,
                     secs_left = left_blocks.checked_div(blocks_per_sec),
                     "downloading"
                 );
@@ -142,8 +147,9 @@ pub(crate) async fn run<S: Source>(
         chunks = chunks_done,
         missing = total.saturating_sub(chunks_done),
         blocks = blocks_done,
-        received_bytes = bytes_done,
-        bytes_per_block = bytes_done.checked_div(blocks_done),
+        decompressed_bytes = answer_bytes,
+        disk_bytes,
+        disk_bytes_per_block = disk_bytes.checked_div(blocks_done),
         blocks_per_sec = blocks_done / secs,
         secs,
         "download ended"
@@ -157,12 +163,14 @@ pub(crate) async fn run<S: Source>(
     }
 }
 
-/// Fetches one chunk and writes it to `path`. Returns the bytes received.
+/// Fetches one chunk and writes it to `path`. Returns the size of the answers after
+/// decompression (the bytes on the wire are not visible behind the HTTP client) and the size
+/// of the file written.
 async fn fetch_chunk<S: Source>(
     source: &S,
     chunk: Chunk,
     path: PathBuf,
-) -> Result<u64, DownloadError> {
+) -> Result<(u64, u64), DownloadError> {
     let mut pages = Vec::new();
     let mut cursor = chunk.from;
     while cursor < chunk.to {
@@ -177,7 +185,7 @@ async fn fetch_chunk<S: Source>(
         pages.push(page.body);
     }
     let received = pages.iter().map(Bytes::len).sum::<usize>();
-    tokio::task::spawn_blocking(move || {
+    let written = tokio::task::spawn_blocking(move || {
         write_atomic(&path, |file| {
             let mut out = zstd::stream::Encoder::new(file, COMPRESSION_LEVEL)?;
             for page in &pages {
@@ -185,10 +193,11 @@ async fn fetch_chunk<S: Source>(
             }
             out.finish()?;
             Ok(())
-        })
+        })?;
+        Ok::<_, io::Error>(std::fs::metadata(&path)?.len())
     })
     .await??;
-    Ok(u64::try_from(received).unwrap_or(u64::MAX))
+    Ok((u64::try_from(received).unwrap_or(u64::MAX), written))
 }
 
 /// Fetches one page, retrying what may succeed on another attempt.

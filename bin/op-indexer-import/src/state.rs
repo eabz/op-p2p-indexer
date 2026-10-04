@@ -1,6 +1,7 @@
 //! The state directory: which chunks the range is cut into and where each one's files are.
 //!
 //! ```text
+//! <state>/anchor.json                 the dispute game that anchors the range, if one does
 //! <state>/raw/<from>-<to>.json.zst    downloaded chunk: the service's answers, compressed
 //! <state>/verified/<from>-<to>.blk    verified chunk: consensus encodings, see `chunk`
 //! <state>/loaded/<from>-<to>.archive     empty marker: the block archive holds the chunk
@@ -10,11 +11,14 @@
 //! A file that exists is complete: files are written under a temporary name and renamed.
 //! Holds no credentials. Does not know what the files contain.
 
+use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use alloy_primitives::B256;
+
+use crate::game::GameAnchor;
 
 /// Blocks `from..to` (`to` excluded): one file per step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,12 +41,34 @@ pub(crate) struct Plan {
     pub(crate) first: u64,
     /// Last block.
     pub(crate) last: u64,
-    /// Trusted hash of the last block.
-    pub(crate) anchor: B256,
+    /// What the last block is checked against.
+    pub(crate) anchor: Anchor,
     /// Blocks per chunk; never zero.
     pub(crate) chunk_blocks: u64,
     /// Fork activations that change how blocks are encoded.
     pub(crate) forks: Forks,
+}
+
+/// What proves that the last block of the range is the canonical one; every block below is
+/// then proven by the chain of parent hashes.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Anchor {
+    /// A block hash the operator trusts.
+    Hash(B256),
+    /// The claim of a dispute game on L1 about the last block.
+    Game(GameAnchor),
+    /// Nothing: the range is only checked to be one chain. Asked for explicitly.
+    None,
+}
+
+impl fmt::Display for Anchor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Hash(hash) => write!(f, "hash {hash}"),
+            Self::Game(game) => write!(f, "dispute game {} on L1", game.game),
+            Self::None => f.write_str("none"),
+        }
+    }
 }
 
 /// The fork activations of an OP Stack chain that change an encoding `verify` rebuilds, in
@@ -51,11 +77,11 @@ pub(crate) struct Plan {
 pub(crate) struct Forks {
     /// Regolith: the L1-attributes deposit stops being a system transaction, and deposit
     /// receipts record the sender's nonce.
-    pub(crate) regolith_time: u64,
+    pub(crate) regolith: u64,
     /// Canyon: the deposit nonce and receipt version become part of the hashed receipt.
-    pub(crate) canyon_time: u64,
+    pub(crate) canyon: u64,
     /// Isthmus: the header carries the hash of an empty requests list.
-    pub(crate) isthmus_time: u64,
+    pub(crate) isthmus: u64,
 }
 
 impl Plan {
@@ -89,6 +115,7 @@ pub(crate) enum Target {
 /// Paths inside the state directory.
 #[derive(Debug, Clone)]
 pub(crate) struct State {
+    anchor: PathBuf,
     raw: PathBuf,
     verified: PathBuf,
     loaded: PathBuf,
@@ -102,6 +129,7 @@ impl State {
     /// Returns the I/O error if a directory cannot be created.
     pub(crate) fn open(root: &Path) -> io::Result<Self> {
         let state = Self {
+            anchor: root.join("anchor.json"),
             raw: root.join("raw"),
             verified: root.join("verified"),
             loaded: root.join("loaded"),
@@ -110,6 +138,11 @@ impl State {
         fs::create_dir_all(&state.verified)?;
         fs::create_dir_all(&state.loaded)?;
         Ok(state)
+    }
+
+    /// File recording the dispute game that anchors the range, when one does.
+    pub(crate) fn anchor_path(&self) -> &Path {
+        &self.anchor
     }
 
     /// File of the downloaded chunk.
