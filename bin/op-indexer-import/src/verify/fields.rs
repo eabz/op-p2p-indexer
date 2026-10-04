@@ -109,8 +109,14 @@ fn transaction(tx: &TransactionRow, canyon: bool, mut found: impl FnMut(Row, &'s
     );
     // A receipt from before Byzantium has a state root in place of the status.
     let status = ("status", tx.status.is_none() && tx.root.is_none());
-    let pad = ("", false);
-    let (row, fields): (Row, [(&'static str, bool); 8]) = match tx.kind.unwrap_or_default() {
+    let mut emit = |row: Row, fields: &[(&'static str, bool)]| {
+        for &(field, lacks) in fields {
+            if lacks {
+                found(row, field);
+            }
+        }
+    };
+    match tx.kind.unwrap_or_default() {
         0 => {
             // A legacy transaction signed with all zeros has no sender.
             let zero_signature = [tx.v, tx.r, tx.s]
@@ -118,15 +124,15 @@ fn transaction(tx: &TransactionRow, canyon: bool, mut found: impl FnMut(Row, &'s
                 .all(|value| value.is_some_and(|value| value.is_zero()));
             let from = ("from", from.1 && !zero_signature);
             let v = ("v", tx.v.is_none());
-            ("legacy", [v, r, s, gas_price, from, status, pad, pad])
+            emit("legacy", &[v, r, s, gas_price, from, status]);
         }
-        1 => (
+        1 => emit(
             "eip2930",
-            [chain_id, typed_v, r, s, gas_price, from, status, pad],
+            &[chain_id, typed_v, r, s, gas_price, from, status],
         ),
-        2 => (
+        2 => emit(
             "eip1559",
-            [
+            &[
                 chain_id,
                 typed_v,
                 r,
@@ -137,46 +143,35 @@ fn transaction(tx: &TransactionRow, canyon: bool, mut found: impl FnMut(Row, &'s
                 status,
             ],
         ),
-        4 => {
-            let to = ("to", tx.to.is_none());
-            let authorizations = ("authorization_list", tx.lacks_authorization_list());
-            for (field, lacks) in [to, authorizations] {
-                if lacks {
-                    found("eip7702", field);
-                }
-            }
-            (
-                "eip7702",
-                [
-                    chain_id,
-                    typed_v,
-                    r,
-                    s,
-                    max_fee,
-                    max_priority_fee,
-                    from,
-                    status,
-                ],
-            )
-        }
-        op_alloy_consensus::DEPOSIT_TX_TYPE_ID => {
-            let source_hash = ("source_hash", tx.source_hash.is_none());
-            let nonce = ("deposit_nonce", canyon && tx.deposit_nonce.is_none());
-            let version = (
-                "deposit_receipt_version",
-                canyon && tx.deposit_receipt_version.is_none(),
-            );
-            (
-                "deposit",
-                [source_hash, from, nonce, version, status, pad, pad, pad],
-            )
-        }
+        4 => emit(
+            "eip7702",
+            &[
+                chain_id,
+                typed_v,
+                r,
+                s,
+                max_fee,
+                max_priority_fee,
+                from,
+                ("to", tx.to.is_none()),
+                ("authorization_list", tx.lacks_authorization_list()),
+                status,
+            ],
+        ),
+        op_alloy_consensus::DEPOSIT_TX_TYPE_ID => emit(
+            "deposit",
+            &[
+                ("source_hash", tx.source_hash.is_none()),
+                from,
+                ("deposit_nonce", canyon && tx.deposit_nonce.is_none()),
+                (
+                    "deposit_receipt_version",
+                    canyon && tx.deposit_receipt_version.is_none(),
+                ),
+                status,
+            ],
+        ),
         // `verify` names the type itself.
-        _ => return,
-    };
-    for (field, lacks) in fields {
-        if lacks {
-            found(row, field);
-        }
+        _ => {}
     }
 }

@@ -13,7 +13,6 @@
 //! requests in flight finish and are written, and the step ends with a summary of what is
 //! missing. It never spins.
 
-use std::fs;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -32,7 +31,9 @@ use crate::backoff::Backoff;
 use crate::chunk::{self, ChunkFile};
 use crate::progress::{self, Rate};
 use crate::source::{Encoding, HyperSync, Meters, SourceError};
-use crate::state::{Chunk, LOW_SPACE_BYTES, MIN_SPACE_BYTES, Plan, State, write_atomic};
+use crate::state::{
+    Chunk, LOW_SPACE_BYTES, MIN_SPACE_BYTES, Plan, State, remove_if_exists, write_atomic,
+};
 
 /// Pieces of an answer waiting to be written, per chunk. A piece is what the HTTP client
 /// hands over at once, tens of kilobytes; with the decoder that finds the cursor a request
@@ -146,10 +147,7 @@ pub(crate) async fn run(
                 {
                     // A fill belongs to the download it was fetched for: one left from an
                     // earlier download of the chunk goes before the new one is written.
-                    match fs::remove_file(state.fill_path(chunk)) {
-                        Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err),
-                        _ => {}
-                    }
+                    remove_if_exists(&state.fill_path(chunk))?;
                     missing.push(chunk);
                 }
             }

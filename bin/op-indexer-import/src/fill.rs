@@ -30,6 +30,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use alloy_eips::BlockNumHash;
 use alloy_eips::eip7702::SignedAuthorization;
 use eyre::WrapErr;
 use serde::{Deserialize, Serialize};
@@ -41,7 +42,7 @@ use tracing::{info, warn};
 use crate::chunk::{self, ChunkFile};
 use crate::progress::{self, Rate};
 use crate::rows::{self, LogRow, Rows, TransactionRow};
-use crate::rpc::{BATCH_CALLS, FilledBlock, Hole, Rpc, Wanted};
+use crate::rpc::{BATCH_CALLS, FilledBlock, Rpc, Wanted};
 use crate::state::{Chunk, Plan, State, read_json, write_json};
 use crate::verify::{Forks, IN_FLIGHT_BYTES, Missing, encode_access_list, holes, missing};
 
@@ -84,10 +85,7 @@ pub(crate) fn apply(rows: &mut Rows, fill: Fill) -> u64 {
         added = true;
     }
     if added {
-        rows.transactions
-            .sort_unstable_by_key(|tx| (tx.block_number, tx.transaction_index));
-        rows.logs
-            .sort_unstable_by_key(|log| (log.block_number, log.transaction_index, log.log_index));
+        rows.sort();
     }
     for transaction in fill.transactions {
         let key = (transaction.block_number, transaction.transaction_index);
@@ -177,7 +175,7 @@ struct Fetch {
     /// The blocks with authorization lists to fetch.
     wanted: Vec<Wanted>,
     /// The blocks to fetch whole.
-    holes: Vec<Hole>,
+    holes: Vec<BlockNumHash>,
 }
 
 impl Fetch {
@@ -194,7 +192,8 @@ fn tally(tally: &mut Tally, field: Missing, count: u64, first: u64) {
 }
 
 /// Lists every field the rows of the downloaded chunks not verified yet lack, logs them, and
-/// fetches the authorization lists missing from `rpc` into the chunks' fills. Up to `threads`
+/// fetches what can be fetched (authorization lists, holes) from `rpc` into the chunks' fills.
+/// Up to `threads`
 /// chunks are read at once, within [`IN_FLIGHT_BYTES`] of downloaded bytes.
 ///
 /// # Errors
@@ -343,10 +342,7 @@ fn scan(forks: &Forks, raw: &Path, fill: &Path) -> eyre::Result<Scanned> {
         tally(&mut scanned.missing, field, 1, block);
     });
     scanned.fetch.holes = holes(forks, &rows)
-        .map(|block| Hole {
-            number: block.number,
-            hash: block.hash,
-        })
+        .map(|block| BlockNumHash::new(block.number, block.hash))
         .collect();
     let mut lists: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
     for tx in rows

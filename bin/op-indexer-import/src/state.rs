@@ -290,10 +290,7 @@ impl State {
     ///
     /// Returns the I/O error of removing the file.
     pub(crate) fn clear_verified(&self) -> io::Result<()> {
-        match fs::remove_file(self.root.join("verified.json")) {
-            Err(err) if err.kind() != io::ErrorKind::NotFound => Err(err),
-            _ => Ok(()),
-        }
+        remove_if_exists(&self.root.join("verified.json"))
     }
 
     /// Free space on the directory's filesystem, in bytes; `None` where the system has no call
@@ -358,6 +355,18 @@ pub(crate) fn write_atomic(
     // The contents are synced first, so a crash never leaves a short file under the final
     // name; the rename itself becomes durable when the directory is synced ([`sync_dir`]).
     fs::rename(&temporary, path)
+}
+
+/// Removes the file at `path`, if there is one. Blocking.
+///
+/// # Errors
+///
+/// Returns the I/O error, unless the file was not there.
+pub(crate) fn remove_if_exists(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Err(err) if err.kind() != io::ErrorKind::NotFound => Err(err),
+        _ => Ok(()),
+    }
 }
 
 /// Syncs the directory `path`, so the files renamed into it so far survive a power loss.

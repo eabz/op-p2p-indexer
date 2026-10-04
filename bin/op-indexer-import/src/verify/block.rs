@@ -32,8 +32,7 @@ use super::{Check, ChunkError, Forks, Stats, receipt, transaction};
 use crate::chunk::{self, Link, VerifiedBlock};
 use crate::fill::{self, Fill};
 use crate::rows::{self, BlockRow, LogRow, TransactionRow};
-use crate::state::Chunk;
-use crate::state::read_json;
+use crate::state::{Chunk, read_json};
 
 /// Verifies the downloaded chunk at `raw`, with what its fill at `fill` holds, and writes it
 /// to `verified`. Blocking, CPU-bound.

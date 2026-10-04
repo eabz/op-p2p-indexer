@@ -158,6 +158,15 @@ pub(crate) struct Rows {
 }
 
 impl Rows {
+    /// Puts each kind of row in block order, which the lookups here and the rebuild rely on.
+    pub(crate) fn sort(&mut self) {
+        self.blocks.sort_unstable_by_key(|block| block.number);
+        self.transactions
+            .sort_unstable_by_key(|tx| (tx.block_number, tx.transaction_index));
+        self.logs
+            .sort_unstable_by_key(|log| (log.block_number, log.transaction_index, log.log_index));
+    }
+
     /// Whether the chunk has transaction rows for block `number`.
     pub(crate) fn has_transactions(&self, number: u64) -> bool {
         let at = self
@@ -236,11 +245,7 @@ pub(crate) fn read(path: &Path) -> Result<Rows, RowsError> {
             }
         }
     }
-    rows.blocks.sort_unstable_by_key(|block| block.number);
-    rows.transactions
-        .sort_unstable_by_key(|tx| (tx.block_number, tx.transaction_index));
-    rows.logs
-        .sort_unstable_by_key(|log| (log.block_number, log.transaction_index, log.log_index));
+    rows.sort();
     // Answers of one chunk do not overlap, but nothing downstream should depend on that.
     rows.blocks.dedup_by_key(|block| block.number);
     rows.transactions

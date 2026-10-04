@@ -10,6 +10,7 @@
 
 use std::time::Duration;
 
+use alloy_eips::BlockNumHash;
 use alloy_eips::eip2930::AccessList;
 use alloy_eips::eip7702::SignedAuthorization;
 use alloy_primitives::{Address, B256, Bytes, U8, U64, U128, U256};
@@ -47,14 +48,6 @@ pub(crate) struct Wanted {
     /// The block's hash in the download, which the endpoint's must equal.
     pub(crate) hash: B256,
     pub(crate) indexes: Vec<u64>,
-}
-
-/// A block whose header the service sent without its transactions and logs.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Hole {
-    pub(crate) number: u64,
-    /// The block's hash in the download, which the endpoint's must equal.
-    pub(crate) hash: B256,
 }
 
 /// A whole block's transactions and receipts, in the RPC's form: the parts the rebuild reads.
@@ -223,23 +216,20 @@ impl Rpc {
         Ok(lists)
     }
 
-    /// The transactions and receipts of `holes`, in their order, read with one batch request
+    /// The transactions and receipts of the blocks `holes`, in their order, read with one batch request
     /// (two calls a block: at most half of [`BATCH_CALLS`] blocks). A block whose receipts
     /// the endpoint will not give at once is read again receipt by receipt.
     ///
     /// # Errors
     ///
     /// Returns [`RpcError`] once the attempts are spent or the error cannot pass.
-    pub(crate) async fn whole_blocks(&self, holes: &[Hole]) -> Result<Vec<FilledBlock>, RpcError> {
+    pub(crate) async fn whole_blocks(
+        &self,
+        holes: &[BlockNumHash],
+    ) -> Result<Vec<FilledBlock>, RpcError> {
         let calls: Vec<_> = holes
             .iter()
-            .flat_map(|hole| {
-                let number = format!("{:#x}", hole.number);
-                [
-                    block_call(hole.number),
-                    ("eth_getBlockReceipts", json!([number])),
-                ]
-            })
+            .flat_map(|hole| [block_call(hole.number), receipts_call(hole.number)])
             .collect();
         let mut answers = self.batch(&calls).await?.into_iter();
         let mut filled = Vec::new();
@@ -394,6 +384,11 @@ fn block_call(number: u64) -> Call {
         "eth_getBlockByNumber",
         json!([format!("{number:#x}"), true]),
     )
+}
+
+/// The call for the receipts of block `number`.
+fn receipts_call(number: u64) -> Call {
+    ("eth_getBlockReceipts", json!([format!("{number:#x}")]))
 }
 
 /// Parses a call's result.
