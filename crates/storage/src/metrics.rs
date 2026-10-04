@@ -17,7 +17,8 @@
 //! | `op_indexer_storage_receipts_attached_total` | counter | | Blocks that got receipts after they were stored in Redis. |
 //! | `op_indexer_storage_blocks_pruned_total` | counter | | Blocks removed from Redis by pruning. |
 //! | `op_indexer_storage_rows_inserted_total` | counter | `table` | Rows written to ClickHouse. |
-//! | `op_indexer_storage_rollbacks_total` | counter | | ClickHouse rollbacks to a safe head: L1 reorgs, and one at each start that clears what a stopped promotion left. |
+//! | `op_indexer_storage_rollbacks_total` | counter | | ClickHouse rollbacks to a safe head: one per L1 reorg of the safe head. |
+//! | `op_indexer_storage_retries_total` | counter | `store` | Store calls repeated by `retry` after a transient error. |
 //! | `op_indexer_storage_archive_blocks_removed_total` | counter | | Blocks removed from the archive by trimming and truncating, partial runs included. |
 //! | `op_indexer_storage_archive_disk_bytes` | gauge | | Size of the archive directory, journal and blob files included. |
 //! | `op_indexer_storage_archive_fragmented_blob_bytes` | gauge | | Stale bytes in the archive's blob files, which blob garbage collection will reclaim. |
@@ -40,6 +41,7 @@ const RECEIPTS_ATTACHED: &str = "op_indexer_storage_receipts_attached_total";
 const BLOCKS_PRUNED: &str = "op_indexer_storage_blocks_pruned_total";
 const ROWS_INSERTED: &str = "op_indexer_storage_rows_inserted_total";
 const ROLLBACKS: &str = "op_indexer_storage_rollbacks_total";
+const RETRIES: &str = "op_indexer_storage_retries_total";
 const ARCHIVE_BLOCKS_REMOVED: &str = "op_indexer_storage_archive_blocks_removed_total";
 const ARCHIVE_DISK_BYTES: &str = "op_indexer_storage_archive_disk_bytes";
 const ARCHIVE_FRAGMENTED_BLOB_BYTES: &str = "op_indexer_storage_archive_fragmented_blob_bytes";
@@ -54,8 +56,10 @@ pub(crate) enum Operation {
     Migrate,
     /// `insert` of the unsafe or the committed store.
     Insert,
-    /// [`ArchiveStore::append`](crate::ArchiveStore::append).
-    Append,
+    /// [`ArchiveStore::append_batch`](crate::ArchiveStore::append_batch).
+    AppendBatch,
+    /// [`FjallArchive::bulk_append`](crate::archive_store::FjallArchive::bulk_append).
+    BulkAppend,
     /// [`ArchiveStore::number_of`](crate::ArchiveStore::number_of).
     NumberOf,
     /// [`ArchiveStore::range`](crate::ArchiveStore::range).
@@ -74,6 +78,8 @@ pub(crate) enum Operation {
     Head,
     /// `block` of the unsafe store or the archive.
     Block,
+    /// [`ArchiveStore::read`](crate::ArchiveStore::read).
+    Read,
     /// [`CommittedStore::rollback_to`](crate::CommittedStore::rollback_to).
     RollbackTo,
     /// [`CommittedStore::l1_heads`](crate::CommittedStore::l1_heads).
@@ -101,7 +107,9 @@ impl Operation {
             Self::Connect => "connect",
             Self::Migrate => "migrate",
             Self::Insert => "insert",
-            Self::Append => "append",
+            Self::Read => "read",
+            Self::AppendBatch => "append_batch",
+            Self::BulkAppend => "bulk_append",
             Self::NumberOf => "number_of",
             Self::Range => "range",
             Self::TruncateAbove => "truncate_above",
@@ -157,6 +165,11 @@ pub fn describe() {
         "Blocks removed from Redis by pruning"
     );
     describe_counter!(ROWS_INSERTED, Unit::Count, "Rows written to ClickHouse");
+    describe_counter!(
+        RETRIES,
+        Unit::Count,
+        "Store calls repeated after a transient error, by store"
+    );
     describe_counter!(
         ROLLBACKS,
         Unit::Count,
@@ -230,6 +243,11 @@ pub(crate) fn blocks_pruned(blocks: usize) {
 /// Records rows written to a ClickHouse table.
 pub(crate) fn rows_inserted(table: Table, rows: usize) {
     counter!(ROWS_INSERTED, "table" => table.as_str()).increment(count(rows));
+}
+
+/// Records a store call repeated after a transient error.
+pub(crate) fn retried(store: Store) {
+    counter!(RETRIES, "store" => store.as_str()).increment(1);
 }
 
 /// Records a ClickHouse rollback to a safe head.

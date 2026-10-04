@@ -7,21 +7,24 @@
 use std::ops::ControlFlow;
 use std::time::UNIX_EPOCH;
 
-use op_indexer_primitives::{UnsafeBlock, UnsafeEvent};
+use op_indexer_primitives::{BlockRef, ReceiptsRequest, UnsafeBlock, UnsafeEvent};
 use op_indexer_storage::{StorageError, Store, UnsafeStore};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::PipelineError;
 use crate::metrics::{self, DropReason};
+use crate::receipts;
 use crate::recover::{RecoverError, recover};
 use crate::retry::{RetryError, retry};
 
 /// Name of the one store call ingest makes, for errors and retry logs.
 const INSERT: &str = "unsafe insert";
 
-/// Stores every block received on `blocks` until the channel closes or `cancel` fires.
+/// Stores every block received on `blocks` until the channel closes or `cancel` fires, and
+/// asks for the receipts of each block it stores on `receipts`, when there is a fetcher, and
+/// publishes the unsafe head on `head` whenever it moves, when something follows it.
 ///
 /// On cancellation the blocks already in the channel are still stored, without waiting for
 /// more; a store that is failing then is not waited for.
@@ -34,8 +37,12 @@ const INSERT: &str = "unsafe insert";
 pub(crate) async fn run<U: UnsafeStore>(
     store: U,
     mut blocks: mpsc::Receiver<UnsafeBlock>,
+    receipts: Option<mpsc::Sender<ReceiptsRequest>>,
+    head: Option<watch::Sender<Option<BlockRef>>>,
     cancel: CancellationToken,
 ) -> Result<(), PipelineError> {
+    let (receipts, head) = (receipts.as_ref(), head.as_ref());
+
     loop {
         tokio::select! {
             biased;
@@ -44,14 +51,16 @@ pub(crate) async fn run<U: UnsafeStore>(
                 // A closed channel is the network shutting down.
                 let Some(block) = block else { return Ok(()) };
                 metrics::channel_depth(blocks.len());
-                if ingest(&store, block, &cancel).await?.is_break() {
+                let ingested = ingest(&store, block, receipts, head, &cancel);
+                if ingested.await?.is_break() {
                     return Ok(());
                 }
             }
         }
     }
     while let Ok(block) = blocks.try_recv() {
-        if ingest(&store, block, &cancel).await?.is_break() {
+        let ingested = ingest(&store, block, receipts, head, &cancel);
+        if ingested.await?.is_break() {
             break;
         }
     }
@@ -62,6 +71,8 @@ pub(crate) async fn run<U: UnsafeStore>(
 async fn ingest<U: UnsafeStore>(
     store: &U,
     block: UnsafeBlock,
+    receipts: Option<&mpsc::Sender<ReceiptsRequest>>,
+    head: Option<&watch::Sender<Option<BlockRef>>>,
     cancel: &CancellationToken,
 ) -> Result<ControlFlow<()>, PipelineError> {
     let (number, hash, timestamp_secs) = (block.number(), block.hash, block.timestamp_secs());
@@ -69,7 +80,7 @@ async fn ingest<U: UnsafeStore>(
         Ok(block) => block,
         Err(RecoverError::Task(err)) => return Err(PipelineError::Task(err)),
         // The sequencer signed the block, so this is not expected.
-        Err(err @ RecoverError::Sender { .. }) => {
+        Err(err @ (RecoverError::Sender { .. } | RecoverError::Decode { .. })) => {
             warn!(number, %hash, %err, "dropped block");
             metrics::block_dropped(DropReason::SenderRecovery);
             return Ok(ControlFlow::Continue(()));
@@ -100,12 +111,23 @@ async fn ingest<U: UnsafeStore>(
     // Not stored: a retry of an insert that had been applied, or a block the store already
     // had or no longer wants. Its events, if any, went to the stream the first time.
     if outcome.stored {
-        metrics::block_ingested();
         metrics::ingest_lag(unix_now_secs().saturating_sub(timestamp_secs));
+        if let Some(requests) = receipts {
+            // Never waited on; a dropped request is counted and asked again at the next start.
+            let _sent = receipts::request(requests, &block);
+        }
     }
     debug!(number, %hash, stored = outcome.stored, "ingested block");
     for event in &outcome.events {
         record(event);
+        let moved = match event {
+            UnsafeEvent::NewHead { head, .. } => Some(*head),
+            UnsafeEvent::Reorg(reorg) => Some(reorg.new_head),
+            UnsafeEvent::Filled(_) | UnsafeEvent::Receipts(_) | UnsafeEvent::Pruned { .. } => None,
+        };
+        if let (Some(head), Some(moved)) = (head, moved) {
+            head.send_replace(Some(moved));
+        }
     }
     Ok(ControlFlow::Continue(()))
 }
@@ -127,7 +149,6 @@ fn record(event: &UnsafeEvent) {
                 depth = reorg.replaced.len(),
                 "unsafe chain reorganized"
             );
-            metrics::reorg(reorg.replaced.len());
         }
         UnsafeEvent::Filled(block) => {
             info!(number = block.number, hash = %block.hash, "gap in the unsafe chain filled");

@@ -16,6 +16,7 @@ alloy-rlp.workspace = true
 # `serde`: hashes and addresses in the JSON stored in Redis.
 alloy-primitives = { workspace = true, features = ["serde"] }
 clickhouse.workspace = true
+fastrand.workspace = true
 fjall.workspace = true
 metrics.workspace = true
 op-alloy-consensus = { workspace = true, features = ["serde"] }
@@ -28,8 +29,11 @@ sha2.workspace = true
 snap.workspace = true
 thiserror.workspace = true
 # `rt` for `spawn_blocking` (fjall is synchronous) and `sync` for the archive's fair writer
-# lock, so appends are not starved between the batches of a trim.
-tokio = { workspace = true, features = ["rt", "sync", "time"] }
+# lock, so appends are not starved between the batches of a trim; `macros` to write a bulk
+# insert's tables at once.
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+# `CancellationToken`, which ends a retry.
+tokio-util.workspace = true
 tracing.workspace = true
 
 [lints]

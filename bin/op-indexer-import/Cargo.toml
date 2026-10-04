@@ -1,0 +1,40 @@
+[package]
+name = "op-indexer-import"
+description = "Command-line tool: downloads a block range from an external archive, verifies it, and loads it into the indexer's stores"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+op-indexer-chainspec.workspace = true
+op-indexer-primitives.workspace = true
+op-indexer-storage.workspace = true
+
+alloy-consensus.workspace = true
+alloy-eips = { workspace = true, features = ["serde"] }
+# `asm-keccak`: `verify` is hash-bound (two tries per block and the header); the assembly
+# implementation is the faster one on x86-64. It needs a C toolchain at build time, as zstd does.
+alloy-primitives = { workspace = true, features = ["serde", "asm-keccak"] }
+alloy-rlp.workspace = true
+op-alloy-consensus.workspace = true
+
+bytes.workspace = true
+clap.workspace = true
+eyre.workspace = true
+fastrand.workspace = true
+flate2.workspace = true
+reqwest.workspace = true
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+mimalloc.workspace = true
+zstd.workspace = true
+
+[lints]
+workspace = true

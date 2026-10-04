@@ -7,22 +7,24 @@
 //! Does not validate or encode blocks (the caller passes RLP), spawn threads, or name the
 //! operation in its errors: [`Failure::into_storage_error`] attaches it.
 
+mod append;
+mod bulk;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use alloy_consensus::BlockBody;
 use alloy_primitives::{BlockHash, BlockNumber, Bytes, keccak256};
-use alloy_rlp::Decodable;
 use fjall::{
     CompressionType, Database, Guard, Keyspace, KeyspaceCreateOptions, KvSeparationOptions,
     PersistMode, Readable,
 };
-use op_alloy_consensus::OpTxEnvelope;
-use op_indexer_primitives::{ArchivedBlock, BlockRef};
+use op_indexer_primitives::{BlockRead, BlockRef, BlockStart, ItemConvert, ReadLimits, split_body};
 use tokio::sync::{Mutex, MutexGuard};
 use tracing::debug;
 
+pub(super) use self::append::{Entry, append_batch};
+pub(super) use self::bulk::{Prepared, bulk_append};
 use crate::{InvalidBlockReason, ParseError, StorageError, Store, metrics};
 
 /// Block cache shared by the keyspaces. It holds the index and filter blocks of the trees and
@@ -43,7 +45,7 @@ const MAX_MEMTABLE_BYTES: u64 = 16 * 1024 * 1024;
 const WORKER_THREADS: usize = 2;
 /// Name of the schema version entry in `meta`.
 const SCHEMA_VERSION_KEY: &str = "schema_version";
-/// Layout version of the keyspaces. An archive written with another version is emptied on open.
+/// Layout version of the keyspaces. An archive written with another version is refused on open.
 const SCHEMA_VERSION: u64 = 1;
 /// Most blocks removed in one batch by [`truncate_above`] and [`trim`], so one batch stays small
 /// and the writer lock is held briefly: appends go in between batches.
@@ -75,17 +77,6 @@ pub(super) struct Tables {
     /// whole removal was done. Not fjall's single-writer transaction database, which would
     /// change every keyspace type.
     writer: Arc<Mutex<()>>,
-}
-
-/// A block encoded for the archive: RLP, not yet compressed.
-#[derive(Debug)]
-pub(super) struct EncodedBlock {
-    pub(super) number: BlockNumber,
-    pub(super) hash: BlockHash,
-    pub(super) parent_hash: BlockHash,
-    pub(super) header: Vec<u8>,
-    pub(super) body: Vec<u8>,
-    pub(super) receipts: Option<Vec<u8>>,
 }
 
 /// Why a keyspace operation failed, before the operation's name is attached
@@ -154,11 +145,9 @@ impl From<StorageError> for Failure {
 }
 
 /// Opens the database in the directory `path`, creates the keyspaces and checks the schema
-/// version, emptying the archive if it differs.
-///
-/// Returns the stored version entry when the archive was emptied because of it (another version,
-/// or bytes that are not a version at all), `None` otherwise (also for a new archive).
-pub(super) fn open(path: &Path) -> Result<(Tables, Option<Bytes>), Failure> {
+/// version. A new archive gets this build's version; one of another version is refused and
+/// left as it is.
+pub(super) fn open(path: &Path) -> Result<Tables, Failure> {
     let db = Database::builder(path)
         .cache_size(CACHE_SIZE_BYTES)
         .max_journaling_size(MAX_JOURNAL_BYTES)
@@ -182,63 +171,27 @@ pub(super) fn open(path: &Path) -> Result<(Tables, Option<Bytes>), Failure> {
     };
     let current = SCHEMA_VERSION.to_be_bytes();
     let stored = tables.meta.get(SCHEMA_VERSION_KEY)?;
-    if stored.as_deref() == Some(current.as_slice()) {
-        return Ok((tables, None));
-    }
-    // Cleared before the version is written: a crash in between clears again on next open.
-    for keyspace in [
-        &tables.headers,
-        &tables.bodies,
-        &tables.receipts,
-        &tables.numbers,
-    ] {
-        keyspace.clear()?;
-    }
-    let mut batch = tables.durable_batch();
-    batch.insert(&tables.meta, SCHEMA_VERSION_KEY, current);
-    batch.commit()?;
-    let emptied = stored.map(|version| Bytes::copy_from_slice(&version));
-    Ok((tables, emptied))
-}
-
-/// Appends `block` if it extends the held range; a no-op if it is already the tip.
-pub(super) fn append(tables: &Tables, block: &EncodedBlock) -> Result<(), Failure> {
-    let header = compress(&block.header, block.number)?;
-    let body = compress(&block.body, block.number)?;
-    let receipts = block
-        .receipts
-        .as_deref()
-        .map(|receipts| compress(receipts, block.number))
-        .transpose()?;
-
-    let writer = tables.lock();
-    if let Some(tip) = end_ref(tables.headers.last_key_value())? {
-        if tip.number == block.number && tip.hash == block.hash {
-            return Ok(());
+    let found = match stored.as_deref() {
+        Some(version) if version == current.as_slice() => return Ok(tables),
+        Some(version) => <[u8; 8]>::try_from(version).map_or_else(
+            |_length| format!("0x{}", alloy_primitives::hex::encode(version)),
+            |version| u64::from_be_bytes(version).to_string(),
+        ),
+        // No version and no blocks: a new archive.
+        None if tables.headers.first_key_value().is_none() => {
+            let mut batch = tables.durable_batch();
+            batch.insert(&tables.meta, SCHEMA_VERSION_KEY, current);
+            batch.commit()?;
+            return Ok(tables);
         }
-        // The parent the block claims. Block 0 has none, so it never extends a held range; its
-        // `got` is reported at number 0.
-        let parent = block.number.checked_sub(1);
-        let got = BlockRef {
-            number: parent.unwrap_or(0),
-            hash: block.parent_hash,
-        };
-        if parent.is_none() || got != tip {
-            return Err(StorageError::NotContiguous { expected: tip, got }.into());
-        }
+        None => "none".to_owned(),
+    };
+    Err(StorageError::ArchiveSchema {
+        path: path.to_owned(),
+        found,
+        expected: SCHEMA_VERSION,
     }
-    let key = block.number.to_be_bytes();
-    let mut batch = tables.durable_batch();
-    batch.insert(&tables.headers, key, header);
-    batch.insert(&tables.bodies, key, body);
-    if let Some(receipts) = receipts {
-        batch.insert(&tables.receipts, key, receipts);
-    }
-    batch.insert(&tables.numbers, block.hash.0, key);
-    batch.commit()?;
-    drop(writer);
-    record_usage(tables);
-    Ok(())
+    .into())
 }
 
 /// Stores `receipts` (RLP, `count` of them) for `block`. `Ok(false)` if it is not archived.
@@ -267,8 +220,13 @@ pub(super) fn set_receipts(
         .get(key)?
         .ok_or_else(|| missing("body", block.hash))?;
     let body = decompress(&body, "body", Some(block.hash))?;
-    let body = BlockBody::<OpTxEnvelope>::decode(&mut body.as_slice())
-        .map_err(|source| invalid_data("body", Some(block.hash), source.into()))?;
+    // Cut, not decoded: a body may hold a transaction the typed decoder refuses.
+    let body = split_body(&body).ok_or(StorageError::InvalidData {
+        store: Store::Archive,
+        what: "body",
+        block: Some(block.hash),
+        source: None,
+    })?;
     if body.transactions.len() != count {
         return Err(invalid(InvalidBlockReason::ReceiptCount).into());
     }
@@ -278,30 +236,126 @@ pub(super) fn set_receipts(
     Ok(true)
 }
 
-/// The archived block at `number`, decompressed, read from one snapshot.
-pub(super) fn block(
+/// Reads a run of headers, bodies or receipts from one snapshot, decompressed, up to `limits`.
+/// The run ends at the first block not held.
+pub(super) fn read(
     tables: &Tables,
-    number: BlockNumber,
-) -> Result<Option<ArchivedBlock>, Failure> {
+    read: &BlockRead,
+    limits: ReadLimits,
+    convert: Option<ItemConvert>,
+) -> Result<Vec<Bytes>, Failure> {
     let snapshot = tables.db.snapshot();
-    let key = number.to_be_bytes();
-    let Some(header) = snapshot.get(&tables.headers, key)? else {
-        return Ok(None);
+    let mut run = Run {
+        items: Vec::new(),
+        bytes: 0,
+        limits,
+        convert,
     };
-    let header = decompress(&header, "header", None)?;
-    let hash = keccak256(&header);
-    let body = snapshot
-        .get(&tables.bodies, key)?
-        .ok_or_else(|| missing("body", hash))?;
-    let receipts = snapshot
-        .get(&tables.receipts, key)?
-        .map(|receipts| decompress(&receipts, "receipts", Some(hash)))
-        .transpose()?;
-    Ok(Some(ArchivedBlock {
-        header: Bytes::from(header),
-        body: Bytes::from(decompress(&body, "body", Some(hash))?),
-        receipts: receipts.map(Bytes::from),
-    }))
+    let number_of = |hash: &BlockHash| -> Result<Option<BlockNumber>, Failure> {
+        let number = snapshot.get(&tables.numbers, hash.0)?;
+        Ok(number.as_deref().map(decode_number).transpose()?)
+    };
+    match read {
+        BlockRead::Headers {
+            start,
+            step,
+            rising,
+        } => {
+            let start = match start {
+                BlockStart::Number(number) => Some(*number),
+                BlockStart::Hash(hash) => number_of(hash)?,
+            };
+            let Some(start) = start else {
+                return Ok(run.items);
+            };
+            if *step == 1 {
+                // Consecutive headers are neighbours in the keyspace: one scan.
+                let key = start.to_be_bytes();
+                let scan: Box<dyn Iterator<Item = Guard>> = if *rising {
+                    Box::new(snapshot.range(&tables.headers, key..))
+                } else {
+                    Box::new(snapshot.range(&tables.headers, ..=key).rev())
+                };
+                let mut expected = Some(start);
+                for guard in scan {
+                    let (key, header) = guard.into_inner()?;
+                    // The first key at or past `start` is another block if `start` is not held.
+                    if Some(decode_number(&key)?) != expected || !run.push(&header, "header")? {
+                        break;
+                    }
+                    expected = expected.and_then(|number| step_from(number, 1, *rising));
+                }
+            } else {
+                let mut next = Some(start);
+                while let Some(number) = next {
+                    let Some(header) = snapshot.get(&tables.headers, number.to_be_bytes())? else {
+                        break;
+                    };
+                    if !run.push(&header, "header")? {
+                        break;
+                    }
+                    next = step_from(number, *step, *rising);
+                }
+            }
+        }
+        BlockRead::Bodies(hashes) | BlockRead::Receipts(hashes) => {
+            let (keyspace, what) = if matches!(read, BlockRead::Bodies(_)) {
+                (&tables.bodies, "body")
+            } else {
+                (&tables.receipts, "receipts")
+            };
+            for hash in hashes {
+                let Some(number) = number_of(hash)? else {
+                    break;
+                };
+                let Some(value) = snapshot.get(keyspace, number.to_be_bytes())? else {
+                    break;
+                };
+                if !run.push(&value, what)? {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(run.items)
+}
+
+/// The block `step` blocks after `number` in a run, if there is one.
+const fn step_from(number: BlockNumber, step: u64, rising: bool) -> Option<BlockNumber> {
+    if rising {
+        number.checked_add(step)
+    } else {
+        number.checked_sub(step)
+    }
+}
+
+/// The items read so far, with where the run must end.
+struct Run {
+    items: Vec<Bytes>,
+    bytes: usize,
+    limits: ReadLimits,
+    convert: Option<ItemConvert>,
+}
+
+impl Run {
+    /// Decompresses a stored value, converts it if asked, and adds it. Returns whether the
+    /// run may take another item: within the limits, and the conversion did not refuse.
+    fn push(&mut self, compressed: &[u8], what: &'static str) -> Result<bool, StorageError> {
+        if self.items.len() >= self.limits.items {
+            return Ok(false);
+        }
+        let raw = decompress(compressed, what, None)?;
+        let item = match self.convert {
+            Some(convert) => match convert(&raw) {
+                Some(item) => item,
+                None => return Ok(false),
+            },
+            None => raw.into(),
+        };
+        self.bytes = self.bytes.saturating_add(item.len());
+        self.items.push(item);
+        Ok(self.items.len() < self.limits.items && self.bytes < self.limits.bytes)
+    }
 }
 
 /// The number of the archived block with `hash`.
@@ -458,6 +512,43 @@ fn decode_number(bytes: &[u8]) -> Result<BlockNumber, StorageError> {
             block: None,
             source: None,
         })
+}
+
+/// Checks that `block`, whose header names `parent_hash`, is the child of `parent`.
+fn extends(block: BlockRef, parent_hash: BlockHash, parent: BlockRef) -> Result<(), StorageError> {
+    // The parent the block claims. Block 0 has none, so it never extends anything; its `got`
+    // is reported at number 0.
+    let number = block.number.checked_sub(1);
+    let got = BlockRef {
+        number: number.unwrap_or(0),
+        hash: parent_hash,
+    };
+    if number.is_none() || got != parent {
+        return Err(StorageError::NotContiguous {
+            expected: parent,
+            got,
+        });
+    }
+    Ok(())
+}
+
+/// A block's header, body and receipts as stored: compressed.
+type Compressed = (Vec<u8>, Vec<u8>, Option<Vec<u8>>);
+
+/// The stored values of block `number`: its header, body and receipts (RLP), compressed.
+fn compress_values(
+    number: BlockNumber,
+    header: &[u8],
+    body: &[u8],
+    receipts: Option<&[u8]>,
+) -> Result<Compressed, StorageError> {
+    Ok((
+        compress(header, number)?,
+        compress(body, number)?,
+        receipts
+            .map(|receipts| compress(receipts, number))
+            .transpose()?,
+    ))
 }
 
 fn compress(rlp: &[u8], number: BlockNumber) -> Result<Vec<u8>, StorageError> {

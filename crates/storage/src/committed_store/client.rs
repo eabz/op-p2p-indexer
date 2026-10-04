@@ -5,9 +5,11 @@
 
 use std::time::{Duration, UNIX_EPOCH};
 
-use alloy_primitives::ChainId;
-use clickhouse::{Client, RowOwned, RowWrite};
+use alloy_primitives::{BlockNumber, ChainId};
+use clickhouse::sql::Identifier;
+use clickhouse::{Client, Row, RowOwned, RowWrite};
 use op_indexer_primitives::{BlockRef, DecodedBlock, L1Heads};
+use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 use tracing::info;
 
@@ -34,6 +36,12 @@ const MAX_INSERT_BLOCKS: usize = 256;
 /// one part, and still acknowledges only after the data is written.
 const ASYNC_INSERT: [(&str, &str); 2] = [("async_insert", "1"), ("wait_for_async_insert", "1")];
 
+/// Limit for writing one table's rows of a bulk insert, which can be hundreds of thousands.
+const BULK_INSERT_TIMEOUT: Duration = Duration::from_secs(300);
+/// Settings of a bulk insert: synchronous, so the statement ends when the data is written and
+/// one large insert makes one part per partition, not one per small insert.
+const BULK_INSERT: [(&str, &str); 1] = [("async_insert", "0")];
+
 /// Reads the applied migrations, oldest first, in the column order of `MigrationRow`.
 const APPLIED_MIGRATIONS: &str =
     "SELECT version, name, checksum, applied_at FROM schema_migrations ORDER BY version";
@@ -48,15 +56,75 @@ const BLOCK_TABLES: [(&str, &str); 4] = [
     ("logs", "block_number"),
 ];
 
+/// A row of `imported_ranges`.
+#[derive(Debug, Row, Serialize, Deserialize)]
+struct ImportedRange {
+    chain_id: ChainId,
+    first: BlockNumber,
+    last: BlockNumber,
+    /// Seconds since the Unix epoch.
+    #[serde(rename = "loaded_at")]
+    loaded_at_secs: u32,
+}
+
+/// The rows of a set of blocks, built by [`ClickHouseStore::bulk_rows`] and written by
+/// [`ClickHouseStore::bulk_insert`]. Several sets can be joined into one insert.
+#[derive(Debug, Default)]
+pub struct BulkRows {
+    rows: Rows,
+    blocks: usize,
+}
+
+impl BulkRows {
+    /// Adds the rows of `other`.
+    pub fn append(&mut self, mut other: Self) {
+        self.rows.blocks.append(&mut other.rows.blocks);
+        self.rows.transactions.append(&mut other.rows.transactions);
+        self.rows.receipts.append(&mut other.rows.receipts);
+        self.rows.logs.append(&mut other.rows.logs);
+        self.blocks = self.blocks.saturating_add(other.blocks);
+    }
+
+    /// Rows in every table together.
+    #[must_use]
+    pub const fn rows(&self) -> usize {
+        self.rows
+            .blocks
+            .len()
+            .saturating_add(self.rows.transactions.len())
+            .saturating_add(self.rows.receipts.len())
+            .saturating_add(self.rows.logs.len())
+    }
+
+    /// Blocks the rows are of.
+    #[must_use]
+    pub const fn blocks(&self) -> usize {
+        self.blocks
+    }
+
+    /// Transactions the rows hold.
+    #[must_use]
+    pub const fn transactions(&self) -> usize {
+        self.rows.transactions.len()
+    }
+}
+
 /// The committed store on ClickHouse. Cheap to clone: clones share the HTTP connection pool.
 ///
 /// `Client`'s `Debug` hides the credentials, so deriving it here is safe.
 #[derive(Debug, Clone)]
 pub struct ClickHouseStore {
+    /// The configured database's name, which [`Self::migrate`] creates if it is missing.
+    database: String,
+    /// Queries without a database, for creating it: a request naming a database that does
+    /// not exist is refused before it runs.
+    server: Client,
     /// Queries, DDL and deletes, limited to [`QUERY_TIMEOUT`] on the server.
     queries: Client,
     /// Inserts: async, acknowledged once written, limited to [`INSERT_TIMEOUT`] on the server.
     inserts: Client,
+    /// Bulk inserts: synchronous, limited to [`BULK_INSERT_TIMEOUT`] on the server.
+    bulk: Client,
     chain_id: ChainId,
 }
 
@@ -64,25 +132,36 @@ impl ClickHouseStore {
     /// Creates a store for `chain_id` from `config`, with LZ4 compression. Makes no request: use
     /// [`Self::ping`] to check the server is reachable, then [`Self::migrate`].
     pub fn new(config: &ClickHouseConfig, chain_id: ChainId) -> Self {
-        let mut client = Client::default()
+        let mut server = Client::default()
             .with_url(&config.url)
-            .with_database(&config.database)
             .with_user(&config.user)
             .with_compression(clickhouse::Compression::Lz4);
         if let Some(password) = &config.password {
-            client = client.with_password(password);
+            server = server.with_password(password);
         }
+        let client = server.clone().with_database(&config.database);
+        let server = server.with_setting(MAX_EXECUTION_TIME, QUERY_TIMEOUT.as_secs().to_string());
         let queries = client
             .clone()
             .with_setting(MAX_EXECUTION_TIME, QUERY_TIMEOUT.as_secs().to_string());
+        let mut bulk = client.clone().with_setting(
+            MAX_EXECUTION_TIME,
+            BULK_INSERT_TIMEOUT.as_secs().to_string(),
+        );
+        for (name, value) in BULK_INSERT {
+            bulk = bulk.with_setting(name, value);
+        }
         let mut inserts =
             client.with_setting(MAX_EXECUTION_TIME, INSERT_TIMEOUT.as_secs().to_string());
         for (name, value) in ASYNC_INSERT {
             inserts = inserts.with_setting(name, value);
         }
         Self {
+            database: config.database.clone(),
+            server,
             queries,
             inserts,
+            bulk,
             chain_id,
         }
     }
@@ -95,18 +174,24 @@ impl ClickHouseStore {
     /// not answer within the timeout.
     pub async fn ping(&self) -> Result<(), StorageError> {
         metrics::timed(Store::Committed, Operation::Connect, async {
+            // Without the database, which may not exist before the first `migrate`.
             within(
                 QUERY_TIMEOUT,
                 "ping",
-                self.queries.query("SELECT 1").execute(),
+                self.server.query("SELECT 1").execute(),
             )
             .await
         })
         .await
     }
 
-    /// Brings the schema up to date: creates `schema_migrations` if missing, checks the applied
-    /// migrations against the embedded ones, then applies and records the pending ones in order.
+    /// Brings the schema up to date: creates the configured database if missing (a new server,
+    /// ClickHouse Cloud's among them, has only `default`), creates `schema_migrations` if
+    /// missing, checks the applied migrations against the embedded ones, then applies and
+    /// records the pending ones in order.
+    ///
+    /// Creating the database is not a migration: the database is configuration, the
+    /// migrations are what goes inside it, and only they are recorded and checksummed.
     ///
     /// Run it before anything else uses the store, from one indexer instance at a time.
     ///
@@ -124,6 +209,15 @@ impl ClickHouseStore {
         metrics::timed(Store::Committed, Operation::Migrate, async {
             within(
                 QUERY_TIMEOUT,
+                "create database",
+                self.server
+                    .query("CREATE DATABASE IF NOT EXISTS ?")
+                    .bind(Identifier(&self.database))
+                    .execute(),
+            )
+            .await?;
+            within(
+                QUERY_TIMEOUT,
                 "migrate",
                 self.queries.query(SCHEMA_MIGRATIONS).execute(),
             )
@@ -134,7 +228,7 @@ impl ClickHouseStore {
                 self.queries.query(APPLIED_MIGRATIONS).fetch_all(),
             )
             .await?;
-            for migration in migrations::pending(&applied)? {
+            for migration in migrations::pending(&applied, &self.database)? {
                 within(
                     QUERY_TIMEOUT,
                     "migrate",
@@ -182,6 +276,138 @@ impl ClickHouseStore {
             insert.end().await
         })
         .await
+    }
+
+    /// Builds the rows of `blocks` for [`Self::bulk_insert`], stamped with the current time as
+    /// their version. CPU work proportional to the blocks: call it from a blocking thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::InvalidBlock`] or [`StorageError::UnsupportedTransaction`] for
+    /// a block that does not fit the schema.
+    pub fn bulk_rows(&self, blocks: &[DecodedBlock]) -> Result<BulkRows, StorageError> {
+        let version_micros = now_micros();
+        let mut rows = Rows::default();
+        for block in blocks {
+            validate_block(block)?;
+            rows.push(self.chain_id, block, version_micros)?;
+        }
+        Ok(BulkRows {
+            rows,
+            blocks: blocks.len(),
+        })
+    }
+
+    /// Writes `rows` in one synchronous insert per table, the three child tables at once and
+    /// `blocks` after them, so a `blocks` row means its transactions, receipts and logs are stored, as
+    /// [`CommittedStore::insert`] guarantees. For loading history in large batches, several at
+    /// once on separate connections; the live path stays [`CommittedStore::insert`].
+    ///
+    /// Writing the same rows again is harmless: the tables keep one row per position. A retry
+    /// sends identical rows (same version), which a replicated server also recognises as a
+    /// repeated insert.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the server cannot be reached, refuses the rows or does not
+    /// answer in time; [`StorageError::severity`] says whether to retry.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping it part-way may leave some tables with the rows and `blocks` without them;
+    /// writing the same rows again completes it.
+    pub async fn bulk_insert(&self, rows: &BulkRows) -> Result<(), StorageError> {
+        metrics::timed(Store::Committed, Operation::Insert, async {
+            let rows_of = &rows.rows;
+            // The child tables at once, each on its own connection; `blocks` once they hold
+            // their rows.
+            tokio::try_join!(
+                self.bulk_table(Table::Transactions, "transactions", &rows_of.transactions),
+                self.bulk_table(Table::Receipts, "receipts", &rows_of.receipts),
+                self.bulk_table(Table::Logs, "logs", &rows_of.logs),
+            )?;
+            self.bulk_table(Table::Blocks, "blocks", &rows_of.blocks)
+                .await?;
+            metrics::blocks_inserted(Store::Committed, rows.blocks);
+            Ok(())
+        })
+        .await
+    }
+
+    /// Returns the block ranges recorded by [`Self::record_imported`] for this chain, as
+    /// `(first, last)` pairs, in no particular order. The database is the record of what a
+    /// bulk load has written: a dropped or different database has none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the server cannot be reached or the query fails.
+    pub async fn imported_ranges(&self) -> Result<Vec<(BlockNumber, BlockNumber)>, StorageError> {
+        let ranges: Vec<ImportedRange> = within(
+            QUERY_TIMEOUT,
+            "imported_ranges",
+            self.queries
+                .query("SELECT ?fields FROM imported_ranges FINAL WHERE chain_id = ?")
+                .bind(self.chain_id)
+                .fetch_all(),
+        )
+        .await?;
+        Ok(ranges
+            .into_iter()
+            .map(|range| (range.first, range.last))
+            .collect())
+    }
+
+    /// Records that every block of each `(first, last)` range is in all four block tables.
+    /// Call it only after [`Self::bulk_insert`] of those blocks has returned. Recording a
+    /// range again is harmless.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the server cannot be reached or refuses the rows.
+    pub async fn record_imported(
+        &self,
+        ranges: &[(BlockNumber, BlockNumber)],
+    ) -> Result<(), StorageError> {
+        let loaded_at_secs = u32::try_from(now_micros() / 1_000_000).unwrap_or(u32::MAX);
+        let rows: Vec<ImportedRange> = ranges
+            .iter()
+            .map(|&(first, last)| ImportedRange {
+                chain_id: self.chain_id,
+                first,
+                last,
+                loaded_at_secs,
+            })
+            .collect();
+        if rows.is_empty() {
+            return Ok(());
+        }
+        within(QUERY_TIMEOUT, "record_imported", async {
+            let mut insert = self.bulk.insert::<ImportedRange>("imported_ranges").await?;
+            for row in &rows {
+                insert.write(row).await?;
+            }
+            insert.end().await
+        })
+        .await
+    }
+
+    async fn bulk_table<T>(&self, table: Table, name: &str, rows: &[T]) -> Result<(), StorageError>
+    where
+        T: RowOwned + RowWrite,
+    {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        within(BULK_INSERT_TIMEOUT, "bulk insert", async {
+            let mut insert = self.bulk.insert::<T>(name).await?;
+            for row in rows {
+                insert.write(row).await?;
+            }
+            insert.end().await
+        })
+        .await?;
+        metrics::rows_inserted(table, rows.len());
+        Ok(())
     }
 
     /// Writes `rows` to a block-data table and counts them.
@@ -268,10 +494,12 @@ impl CommittedStore for ClickHouseStore {
         .await
     }
 
-    /// Records `safe` as the safe head, then deletes every row above it: `blocks` first, then
-    /// transactions, receipts and logs. Writing the head first means an interrupted rollback
-    /// never leaves the recorded safe head on a deleted block; calling it again finishes the
-    /// deletes. The finalized head is not touched.
+    /// Records `safe` as the safe head, then deletes every row above it: first the recorded
+    /// imported ranges that reach above it, then `blocks`, transactions, receipts and logs.
+    /// Writing the head first means an interrupted rollback never leaves the recorded safe
+    /// head on a deleted block; deleting the ranges before the rows means a bulk load never
+    /// skips a range whose rows are gone. Calling it again finishes the deletes. The finalized
+    /// head is not touched.
     async fn rollback_to(&self, safe: BlockRef) -> Result<(), StorageError> {
         metrics::timed(Store::Committed, Operation::RollbackTo, async {
             let heads = L1Heads {
@@ -279,6 +507,18 @@ impl CommittedStore for ClickHouseStore {
                 finalized: None,
             };
             self.write_heads("rollback_to", heads).await?;
+            // A range reaching above `safe` loses some of its rows: a later bulk load must
+            // write it again.
+            within(
+                QUERY_TIMEOUT,
+                "rollback_to",
+                self.queries
+                    .query("DELETE FROM imported_ranges WHERE chain_id = ? AND last > ?")
+                    .bind(self.chain_id)
+                    .bind(safe.number)
+                    .execute(),
+            )
+            .await?;
             for (table, column) in BLOCK_TABLES {
                 let delete = format!("DELETE FROM {table} WHERE chain_id = ? AND {column} > ?");
                 within(

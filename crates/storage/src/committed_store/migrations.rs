@@ -17,7 +17,8 @@ pub(super) const SCHEMA_MIGRATIONS: &str =
     include_str!("../../migrations/clickhouse/schema_migrations.sql");
 
 /// Every migration, in the order it must be applied. Until the first release the initial ones
-/// may be edited in place (drop the local tables afterwards); after it, never: add a new one.
+/// may be edited in place (a database that recorded them is then refused with the checksum
+/// error, and must be dropped with `DROP DATABASE`); after it, never: add a new one.
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -43,6 +44,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 5,
         name: "chain_state",
         sql: include_str!("../../migrations/clickhouse/0005_chain_state.sql"),
+    },
+    Migration {
+        version: 6,
+        name: "imported_ranges",
+        sql: include_str!("../../migrations/clickhouse/0006_imported_ranges.sql"),
     },
 ];
 
@@ -87,9 +93,13 @@ impl Migration {
 ///
 /// # Errors
 ///
-/// Returns [`StorageError::MigrationChecksum`] if an applied migration was edited since, and
+/// Returns [`StorageError::MigrationChecksum`] if an applied migration of `database` was
+/// edited since, and
 /// [`StorageError::UnknownMigration`] if one is not embedded in this binary.
-pub(super) fn pending(applied: &[MigrationRow]) -> Result<Vec<&'static Migration>, StorageError> {
+pub(super) fn pending(
+    applied: &[MigrationRow],
+    database: &str,
+) -> Result<Vec<&'static Migration>, StorageError> {
     for row in applied {
         let migration = MIGRATIONS
             .iter()
@@ -101,6 +111,7 @@ pub(super) fn pending(applied: &[MigrationRow]) -> Result<Vec<&'static Migration
             return Err(StorageError::MigrationChecksum {
                 version: row.version,
                 name: row.name.clone(),
+                database: database.to_owned(),
             });
         }
     }

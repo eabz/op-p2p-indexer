@@ -1,0 +1,43 @@
+[package]
+name = "op-indexer-l1"
+description = "L1 over p2p: dispute games of the chain read from Ethereum execution peers and verified against trusted L1 block hashes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+op-indexer-chainspec.workspace = true
+op-indexer-el.workspace = true
+op-indexer-primitives.workspace = true
+
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+alloy-hardforks.workspace = true
+alloy-primitives.workspace = true
+alloy-rlp.workspace = true
+blst.workspace = true
+discv5.workspace = true
+enr.workspace = true
+ethereum_ssz.workspace = true
+ethereum_ssz_derive.workspace = true
+fastrand.workspace = true
+futures-util.workspace = true
+libp2p = { workspace = true, features = ["identify", "request-response"] }
+sha2.workspace = true
+snap.workspace = true
+ssz_types.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+tokio-util.workspace = true
+tracing.workspace = true
+tree_hash.workspace = true
+tree_hash_derive.workspace = true
+unsigned-varint.workspace = true
+
+[lints]
+workspace = true
+
+# The crates' library names are `ssz` and `ssz_derive`, which cargo-machete doesn't map back.
+[package.metadata.cargo-machete]
+ignored = ["ethereum_ssz", "ethereum_ssz_derive"]

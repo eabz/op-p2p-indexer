@@ -19,6 +19,10 @@ pub enum PipelineError {
         #[source]
         source: StorageError,
     },
+    /// A block of the range sync, verified against the chain, cannot be decoded or has a
+    /// transaction without a recoverable sender: this build cannot store the range.
+    #[error("the range sync cannot be stored: {0}")]
+    RangeBlock(String),
     /// A pipeline task panicked or was aborted.
     #[error("pipeline task failed")]
     Task(#[source] JoinError),

@@ -24,17 +24,22 @@ pub mod committed_store;
 mod config;
 mod error;
 pub mod metrics;
+mod retry;
 pub mod unsafe_store;
 mod validate;
 
 use std::fmt;
 
-use alloy_primitives::{BlockHash, BlockNumber};
+use alloy_primitives::{BlockHash, BlockNumber, Bytes};
 use op_alloy_consensus::OpReceiptEnvelope;
-use op_indexer_primitives::{ArchivedBlock, BlockRef, DecodedBlock, InsertOutcome, L1Heads};
+use op_indexer_primitives::{
+    BlockRead, BlockRef, DecodedBlock, EncodedBlock, InsertOutcome, ItemConvert, L1Heads,
+    ReadLimits,
+};
 
 pub use config::{ArchiveConfig, ArchiveRetention, ClickHouseConfig, RedisConfig, StorageConfig};
 pub use error::{InvalidBlockReason, ParseError, Severity, StorageError};
+pub use retry::{RetryError, retry};
 
 /// One of the three stores, for errors and metric labels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -160,6 +165,17 @@ pub trait UnsafeStore {
         hash: BlockHash,
     ) -> impl Future<Output = Result<Option<DecodedBlock>, StorageError>> + Send;
 
+    /// Returns the canonical block at height `number`, or `None` if no canonical block is
+    /// stored there: it is below what the store still holds, above the head, or in a gap.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the store cannot be reached or stored data cannot be decoded.
+    fn canonical(
+        &self,
+        number: BlockNumber,
+    ) -> impl Future<Output = Result<Option<DecodedBlock>, StorageError>> + Send;
+
     /// Records the L1 safe and finalized heads.
     ///
     /// # Errors
@@ -223,21 +239,43 @@ pub trait CommittedStore {
 /// The archive holds one range of blocks, each the parent of the next. Every write is one
 /// fjall batch, applied entirely or not at all, so a crash or a dropped future leaves the range
 /// contiguous. Nothing is retried. Each call runs on a blocking thread, so dropping its future
-/// does not stop it: `append` and `set_receipts` still run to completion.
+/// does not stop it: `append_batch` and `set_receipts` still run to completion.
 /// The returned futures are `Send`, so a store can be driven from any task.
 pub trait ArchiveStore {
-    /// Appends the next block. It must extend the held range (number = last + 1 and parent
-    /// hash = last hash) unless the archive is empty. Appending the block already at the tip is
-    /// a no-op. A block with receipts stores them at once.
+    /// Appends consecutive blocks, oldest first, in their original encoding. (For bulk loads
+    /// the fjall archive also has `FjallArchive::bulk_append`.) The bytes are stored unchanged, so they must be bytes the
+    /// caller has verified (import, range sync) or encoded from a verified block that
+    /// survives the round trip (promoted gossip blocks). A block with receipts stores them at
+    /// once.
+    ///
+    /// The archive checks what it can without decoding a body: each header hashes to its
+    /// `hash`, each block is the child of the one before it, and the first one extends the held
+    /// range unless the archive is empty. It does **not** check that the body and the receipts
+    /// belong to the header: the caller must have verified the transactions root and the
+    /// receipts root over exactly these bytes.
+    ///
+    /// Blocks the archive already holds are skipped, so repeating a call is harmless: the
+    /// leading blocks up to the tip when the tip is among them, and the whole list when it
+    /// ends at or below the tip with its last block held. An empty list is a no-op.
+    ///
+    /// The whole list is checked before anything is written. It is then written in durable
+    /// fjall batches of bounded size, each applied entirely or not at all. If a later batch
+    /// fails, the earlier ones stay: [`range`](Self::range) tells where to resume.
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError::NotContiguous`] if the block does not extend the range,
-    /// [`StorageError::InvalidBlock`] or [`StorageError::UnsupportedTransaction`] if it fails
-    /// the shared validation or its header does not hash to its `hash`, and another
-    /// [`StorageError`] if the archive cannot be written.
-    fn append(&self, block: &DecodedBlock)
-    -> impl Future<Output = Result<(), StorageError>> + Send;
+    /// Returns [`StorageError::InvalidBlock`] if a header does not hash to its `hash`,
+    /// [`StorageError::InvalidData`] if a header is not a header, [`StorageError::NotContiguous`]
+    /// if a block is not the child of the one before it or the list does not extend the held
+    /// range, and another [`StorageError`] if the archive cannot be written.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future does not stop the call: it runs to its end on a blocking thread.
+    fn append_batch(
+        &self,
+        blocks: Vec<EncodedBlock>,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
     /// Attaches receipts to an archived block. `Ok(false)` if it is not archived.
     ///
@@ -252,15 +290,23 @@ pub trait ArchiveStore {
         receipts: &[OpReceiptEnvelope],
     ) -> impl Future<Output = Result<bool, StorageError>> + Send;
 
-    /// Returns the encoded block at `number`, or `None` outside the held range.
+    /// Reads a run of headers, bodies or receipts, each as the RLP the archive holds, in one
+    /// call on one snapshot: what answers a peer's request. The run ends at the first block
+    /// that is not held (or whose receipts are not set), and at `limits`.
+    ///
+    /// With `convert`, each item is passed through it before it counts against the limits
+    /// and is returned; an item it returns `None` for ends the run. It runs on the blocking
+    /// thread of the read.
     ///
     /// # Errors
     ///
     /// Returns [`StorageError`] if the archive cannot be read.
-    fn block(
+    fn read(
         &self,
-        number: BlockNumber,
-    ) -> impl Future<Output = Result<Option<ArchivedBlock>, StorageError>> + Send;
+        read: BlockRead,
+        limits: ReadLimits,
+        convert: Option<ItemConvert>,
+    ) -> impl Future<Output = Result<Vec<Bytes>, StorageError>> + Send;
 
     /// Returns the number of the archived block with this hash.
     ///

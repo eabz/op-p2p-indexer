@@ -4,6 +4,7 @@
 
 use std::fmt;
 use std::num::ParseIntError;
+use std::path::PathBuf;
 
 use alloy_primitives::hex::FromHexError;
 use alloy_primitives::{BlockHash, BlockNumber};
@@ -20,10 +21,18 @@ const REDIS_BUSY_CODES: [&str; 6] = [
     "CLUSTERDOWN",
     "MASTERDOWN",
 ];
-/// ClickHouse error codes of a server under load, from its `ErrorCodes.cpp`: 159
-/// `TIMEOUT_EXCEEDED`, 202 `TOO_MANY_SIMULTANEOUS_QUERIES`, 241 `MEMORY_LIMIT_EXCEEDED`,
-/// 252 `TOO_MANY_PARTS`.
-const CLICKHOUSE_BUSY_CODES: [u32; 4] = [159, 202, 241, 252];
+/// ClickHouse error codes of a server that is busy or briefly unavailable, from its
+/// `ErrorCodes.cpp`: 159 `TIMEOUT_EXCEEDED`, 202 `TOO_MANY_SIMULTANEOUS_QUERIES`, 209
+/// `SOCKET_TIMEOUT`, 210 `NETWORK_ERROR`, 241 `MEMORY_LIMIT_EXCEEDED` (usually the server's
+/// total memory, under merges or other queries, not our statement), 242 `TABLE_IS_READ_ONLY`
+/// and 999 `KEEPER_EXCEPTION` (a replicated or cloud service changing replicas: the store is
+/// briefly unavailable, like a lost connection), 252 `TOO_MANY_PARTS`, 319
+/// `UNKNOWN_STATUS_OF_INSERT` (the connection broke mid-insert: repeating it is safe, inserts
+/// are idempotent here).
+///
+/// A caller that retries without a time limit (the pipeline) repeats a statement that can
+/// never fit in the server's memory forever, with a warning on each attempt.
+const CLICKHOUSE_BUSY_CODES: [u32; 9] = [159, 202, 209, 210, 241, 242, 252, 319, 999];
 /// What a ClickHouse error response starts with, before the numeric code.
 const CLICKHOUSE_CODE_PREFIX: &str = "Code: ";
 
@@ -206,8 +215,24 @@ pub enum StorageError {
     NotContiguous {
         /// The tip of the archive, which the block must extend.
         expected: BlockRef,
-        /// The parent the block claims: its number minus one and its parent hash.
+        /// The parent the block claims (its number minus one and its parent hash), or the
+        /// block of the list that the archive holds another block in place of.
         got: BlockRef,
+    },
+    /// The archive directory was written with another schema version. Nothing is deleted: the
+    /// operator removes the directory, or runs the build that wrote it.
+    #[error(
+        "the block archive in {} has schema version {found}, this build reads version \
+         {expected}; delete the directory to start a new archive",
+        path.display()
+    )]
+    ArchiveSchema {
+        /// The archive directory.
+        path: PathBuf,
+        /// The version found: a number, or the bytes stored where it should be.
+        found: String,
+        /// The version this build writes.
+        expected: u64,
     },
     /// A block to store does not fit the schema.
     #[error("block {number} cannot be stored: {reason}")]
@@ -234,13 +259,21 @@ pub enum StorageError {
         /// EIP-2718 type of the transaction.
         tx_type: u8,
     },
-    /// An applied ClickHouse migration differs from the one embedded in this binary.
-    #[error("migration {version} ({name}) was edited after it was applied")]
+    /// An applied ClickHouse migration differs from the one embedded in this binary: the
+    /// schema changed before the first release, after this database was created.
+    #[error(
+        "migration {version} ({name}) in ClickHouse database `{database}` differs from this \
+         build's: the schema changed after the database was created. If the database holds no \
+         data yet, drop it (`DROP DATABASE {database}`) and run again, which creates it with \
+         the new schema; if it holds data you want, keep using the build that created it"
+    )]
     MigrationChecksum {
         /// Version of the migration.
         version: u32,
         /// Name of the migration.
         name: String,
+        /// The database holding it.
+        database: String,
     },
     /// ClickHouse has a migration this binary does not know: the binary is older than the schema.
     #[error("applied migration {version} is unknown to this binary")]
@@ -270,6 +303,19 @@ impl fmt::Display for InvalidBlockReason {
 }
 
 impl StorageError {
+    /// Whether the error is the block archive's directory being open in another process:
+    /// fjall locks it, so one process uses it at a time.
+    #[must_use]
+    pub const fn is_archive_locked(&self) -> bool {
+        matches!(
+            self,
+            Self::Fjall {
+                source: fjall::Error::Locked,
+                ..
+            }
+        )
+    }
+
     /// Classifies the error: retry it, handle it, or stop for an operator.
     #[must_use]
     pub fn severity(&self) -> Severity {
@@ -292,6 +338,7 @@ impl StorageError {
             | Self::Decode { .. }
             | Self::MissingField { .. }
             | Self::InvalidData { .. }
+            | Self::ArchiveSchema { .. }
             | Self::InvalidBlock { .. }
             | Self::Oversized { .. }
             | Self::UnsupportedTransaction { .. }

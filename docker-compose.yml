@@ -35,9 +35,35 @@ services:
       # Blocks kept in the local archive (the archive directory in the data volume): a block
       # count, `all` to keep every block, or 0 to disable it. Empty means 30 days.
       OP_INDEXER_ARCHIVE_RETENTION_BLOCKS: ${OP_INDEXER_ARCHIVE_RETENTION_BLOCKS:-}
+      # Execution p2p (devp2p), which fetches the receipts gossip does not carry. Off unless
+      # OP_INDEXER_EL_ENABLED is true; the others only apply then.
+      OP_INDEXER_EL_ENABLED: ${OP_INDEXER_EL_ENABLED:-}
+      OP_INDEXER_EL_LISTEN_ADDR: ${OP_INDEXER_EL_LISTEN_ADDR:-}
+      OP_INDEXER_EL_BOOTNODES: ${OP_INDEXER_EL_BOOTNODES:-}
+      # The host's public IP and port, so peers can dial back; the container only sees its
+      # own bridge address.
+      OP_INDEXER_EL_ADVERTISED_ADDR: ${OP_INDEXER_EL_ADVERTISED_ADDR:-}
+      # true: fetch every block between the archive's last block and the chain's head from
+      # execution peers, once. Needs OP_INDEXER_ARCHIVE_RETENTION_BLOCKS=all.
+      OP_INDEXER_EL_SYNC: ${OP_INDEXER_EL_SYNC:-}
+      # true: follow Ethereum L1 for what it commits to, and promote on it. Needs the
+      # checkpoint: the root of a recent finalized beacon block, from a source you trust.
+      OP_INDEXER_L1_ENABLED: ${OP_INDEXER_L1_ENABLED:-}
+      OP_INDEXER_L1_CHECKPOINT: ${OP_INDEXER_L1_CHECKPOINT:-}
+      OP_INDEXER_L1_LISTEN_ADDR: ${OP_INDEXER_L1_LISTEN_ADDR:-}
+      OP_INDEXER_L1_BEACON_LISTEN_ADDR: ${OP_INDEXER_L1_BEACON_LISTEN_ADDR:-}
+      OP_INDEXER_L1_ADVERTISED_ADDR: ${OP_INDEXER_L1_ADVERTISED_ADDR:-}
     ports:
       - "9222:9222/tcp"
       - "9222:9222/udp"
+      # The chain's execution p2p; unused unless OP_INDEXER_EL_ENABLED=true.
+      - "30303:30303/tcp"
+      - "30303:30303/udp"
+      # L1: execution p2p and the beacon light client; unused unless OP_INDEXER_L1_ENABLED=true.
+      - "30304:30304/tcp"
+      - "30304:30304/udp"
+      - "9001:9001/tcp"
+      - "9001:9001/udp"
     volumes:
       # The data directory (the image sets OP_INDEXER_DATA_DIR=/data): `node/` holds the node
       # identity and known peers, `archive/` the local block archive.

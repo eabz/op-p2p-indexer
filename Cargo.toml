@@ -11,6 +11,8 @@ publish = false
 [workspace.dependencies]
 # Internal crates.
 op-indexer-chainspec = { path = "crates/chainspec" }
+op-indexer-el = { path = "crates/el" }
+op-indexer-l1 = { path = "crates/l1" }
 op-indexer-p2p = { path = "crates/p2p" }
 op-indexer-pipeline = { path = "crates/pipeline" }
 op-indexer-primitives = { path = "crates/primitives" }
@@ -30,6 +32,8 @@ alloy-rlp = { version = "0.3", default-features = false, features = ["std"] }
 # `Encodable2718` for the raw transaction bytes stored in ClickHouse, and `Withdrawals` to
 # rebuild a block body read back from Redis.
 alloy-eips = { version = "2", default-features = false, features = ["std"] }
+# Ethereum mainnet's hardfork schedule, for the fork id the `l1` crate shows L1 peers.
+alloy-hardforks = { version = "0.4", default-features = false }
 
 # TCP + Noise + yamux transport with a secp256k1 identity, gossipsub for block gossip,
 # `macros` to compose gossipsub with connection limits.
@@ -42,6 +46,24 @@ enr = { version = "0.14", default-features = false, features = ["k256"] }
 # Already in the tree via multiaddr; used for the `opstack` ENR entry.
 unsigned-varint = "0.8"
 
+# Execution p2p (`crates/el`): RLPx (ECIES transport, p2p hello) and the eth wire handshake and
+# message types. reth's crates exist on crates.io only as 0.0.0 placeholders, so they come from
+# git, pinned to a release tag; only the four crates `el` calls. No published alternative is
+# maintained, and hand-writing the encrypted transport is not an option we want.
+reth-ecies = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-eth-wire = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-eth-wire-types = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-network-peers = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+# The fork id (EIP-2124) peers check in the node record and the eth status.
+alloy-eip2124 = { version = "0.2", default-features = false, features = ["std"] }
+# The node key type reth's transport takes (same version as reth).
+secp256k1 = { version = "0.30", default-features = false, features = ["std", "global-context", "recovery"] }
+# Peer id of an `enode://` bootnode, to ask it for its node record (already in the tree through
+# libp2p and discv5).
+libp2p-identity = { version = "0.2", default-features = false, features = ["secp256k1", "peerid"] }
+# `StreamExt` / `SinkExt` to drive reth's p2p stream.
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+
 # Embedded store for the node state (p2p) and the local block archive (storage): pure Rust,
 # log-structured, one directory per store. Its only default feature, `lz4`, is off: archived
 # values are already snappy-compressed and the node state is tiny.
@@ -51,6 +73,14 @@ op-alloy-rpc-types-engine = { version = "2", default-features = false, features 
 alloy-rpc-types-engine = { version = "2", default-features = false, features = ["ssz"] }
 # The `Decode` trait and error for the payload SSZ types (same version op-alloy uses).
 ethereum_ssz = { version = "0.10", default-features = false }
+# Beacon light client (`crates/l1`): derived SSZ decoding, hash tree roots and the fixed-size
+# SSZ collections of the consensus types (all sigp's, as `ethereum_ssz`).
+ethereum_ssz_derive = "0.10"
+tree_hash = "0.12"
+tree_hash_derive = "0.12"
+ssz_types = { version = "0.14", default-features = false }
+# BLS12-381 signatures of the sync committee (already in the tree through alloy's KZG).
+blst = { version = "0.3", default-features = false }
 # Gossip payloads and archived blocks are snappy block-compressed; message IDs and ClickHouse
 # migration checksums are SHA-256 (0.10, as op-alloy).
 sha2 = "0.10"
@@ -61,7 +91,10 @@ snap = "1.1"
 redis = { version = "1", default-features = false, features = ["tokio-comp", "connection-manager", "script"] }
 # Committed store: the official ClickHouse client (HTTP). The `Row` derive and batched inserts are
 # built in; `lz4` for request compression.
-clickhouse = { version = "0.15", default-features = false, features = ["lz4"] }
+# `rustls-tls-ring` + `rustls-tls-webpki-roots` for `https://` (ClickHouse Cloud is HTTPS
+# only): the provider and root store reqwest already uses here, so no new crate versions, no
+# C build of aws-lc, and no dependency on the host's certificate files. `http://` still works.
+clickhouse = { version = "0.15", default-features = false, features = ["lz4", "rustls-tls-ring", "rustls-tls-webpki-roots"] }
 # Redis values are JSON; ClickHouse rows are serde structs.
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
@@ -82,10 +115,28 @@ thiserror = "2"
 tracing = "0.1"
 # Metrics facade (as in reth): recording is a no-op until the binary installs a recorder.
 metrics = { version = "0.24", default-features = false }
-# Jitter for the pipeline's retry backoff (already in the tree through fjall).
+# Jitter: storage's retry backoff, the importer's download retries, and the peer schedules of
+# `el` and `l1` (already in the tree through fjall).
 fastrand = { version = "2", default-features = false, features = ["std"] }
 # Log output in the binary; `chrono` for the short UTC timestamps.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi", "chrono"] }
+
+# Importer (`bin/op-indexer-import`) only. Command line: flags with environment fallbacks and
+# generated help.
+clap = { version = "4", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context"] }
+# HTTPS client for the archive service. No decompression features: answers are stored as they
+# travel. No HTTP/2: every request gets its own connection.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# Decoding of gzip answers when the service does not send zstd (already in the tree).
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+# Free space of the state directory's filesystem and the open-files limit (already in the
+# tree; std has no call for either).
+rustix = { version = "1", default-features = false, features = ["std", "fs", "process"] }
+# Compression of the downloaded and verified chunks on disk (already in the tree).
+zstd = { version = "0.13", default-features = false }
+# The importer's allocator: `verify` builds rows and receipts on every core at once, and is
+# about 9% faster with it at eight threads than with the system allocator.
+mimalloc = { version = "0.1", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

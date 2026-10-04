@@ -3,8 +3,18 @@
 //! Values come from the Superchain Registry
 //! (<https://github.com/ethereum-optimism/superchain-registry>) and op-node's default bootnodes.
 //! Add a chain by adding a constant and listing it in [`ChainSpec::ALL`].
+//!
+//! The fork activations are configuration this project keeps current: the fork id execution
+//! peers check ([EIP-2124]) is derived from them, and a node with a stale list only peers with
+//! nodes that missed the same upgrade. Add every new hardfork here when it is scheduled.
+//!
+//! [EIP-2124]: https://eips.ethereum.org/EIPS/eip-2124
 
-use alloy_primitives::{Address, ChainId, address};
+mod game;
+
+use alloy_primitives::{Address, B256, BlockNumber, ChainId, address, b256};
+
+pub use game::{Claim, ClaimError, CreatedGame, created_topic};
 
 /// Static parameters of one OP Stack chain.
 #[derive(Debug)]
@@ -13,8 +23,45 @@ pub struct ChainSpec {
     pub chain_id: ChainId,
     /// Address of the sequencer key that signs gossiped unsafe blocks.
     pub unsafe_block_signer: Address,
-    /// Discovery bootnodes, as `enr:` records or `enode://` URLs, preferred first.
+    /// Discovery bootnodes, as `enr:` records or `enode://` URLs, preferred first. Consensus
+    /// and execution nodes share one discv5 network, so the execution network uses them too.
     pub bootnodes: &'static [&'static str],
+    /// Hash of the chain's block 0, which execution peers exchange in the eth status.
+    pub genesis_hash: B256,
+    /// Blocks at which a hardfork activated, ascending.
+    pub fork_blocks: &'static [BlockNumber],
+    /// Activation time of Canyon. Deposit receipts hash differently before it: the deposit
+    /// nonce is not part of the hashed receipt.
+    pub canyon_time: u64,
+    /// Activation time of Ecotone.
+    pub ecotone_time: u64,
+    /// Activation time of Fjord.
+    pub fjord_time: u64,
+    /// Activation time of Granite.
+    pub granite_time: u64,
+    /// Activation time of Holocene.
+    pub holocene_time: u64,
+    /// Activation time of Jovian.
+    pub jovian_time: u64,
+    /// Activation time of Karst.
+    pub karst_time: u64,
+    /// Activation time of Regolith. From it on the L1-attributes deposit is not a system
+    /// transaction and deposit receipts record the sender's nonce.
+    pub regolith_time: u64,
+    /// Activation time of Isthmus. From it on the header carries the storage root of the
+    /// message passer as its withdrawals root, and the hash of an empty requests list.
+    pub isthmus_time: u64,
+    /// The Bedrock block: the first block of the current chain format. Blocks before it are
+    /// the legacy chain. From it on blocks are [`Self::block_time_secs`] apart.
+    pub bedrock_block: BlockNumber,
+    /// Timestamp (seconds) of the Bedrock block.
+    pub bedrock_time: u64,
+    /// Hash of the last legacy block: the parent hash in the Bedrock block's header.
+    pub last_legacy_hash: B256,
+    /// Seconds between two blocks from Bedrock on.
+    pub block_time_secs: u64,
+    /// The chain's `DisputeGameFactory` on L1, whose games claim the chain's output roots.
+    pub dispute_game_factory: Address,
 }
 
 /// OP Mainnet (chain id 10).
@@ -41,11 +88,53 @@ pub const OP_MAINNET: ChainSpec = ChainSpec {
         "enr:-J24QHmGyBwUZXIcsGYMaUqGGSl4CFdx9Tozu-vQCn5bHIQbR7On7dZbU61vYvfrJr30t0iahSqhc64J46MnUO2JvQaGAYiOoCKKgmlkgnY0gmlwhAPnCzSHb3BzdGFja4OFQgCJc2VjcDI1NmsxoQINc4fSijfbNIiGhcgvwjsjxVFJHUstK9L1T8OTKUjgloN0Y3CCJAaDdWRwgiQG",
         "enr:-J24QG3ypT4xSu0gjb5PABCmVxZqBjVw9ca7pvsI8jl4KATYAnxBmfkaIuEqy9sKvDHKuNCsy57WwK9wTt2aQgcaDDyGAYiOoGAXgmlkgnY0gmlwhDbGmZaHb3BzdGFja4OFQgCJc2VjcDI1NmsxoQIeAK_--tcLEiu7HvoUlbV52MspE0uCocsx1f_rYvRenIN0Y3CCJAaDdWRwgiQG",
     ],
+    // Sent by every OP Mainnet execution peer in its eth status (observed 2026-10-04).
+    genesis_hash: b256!("0x7ca38a1916c42007829c55e69d3e9a73265554b586a499015373241b8a3fa48b"),
+    // Berlin and the Bedrock transition (which also carries London and the merge forks), as in
+    // `alloy-op-hardforks` and op-geth's OP Mainnet chain config.
+    fork_blocks: &[3_950_000, 105_235_063],
+    // The time forks, as in `superchain/configs/mainnet/op.toml` of the superchain registry
+    // (read 2026-10-03). Karst's time was first learned from execution peers, whose fork hash
+    // `c29239af` it reproduces.
+    canyon_time: 1_704_992_401,
+    ecotone_time: 1_710_374_401,
+    fjord_time: 1_720_627_201,
+    granite_time: 1_726_070_401,
+    holocene_time: 1_736_445_601,
+    jovian_time: 1_764_691_201,
+    karst_time: 1_783_526_401,
+    // Regolith is active from the Bedrock block on OP Mainnet (superchain registry).
+    regolith_time: 0,
+    isthmus_time: 1_746_806_401,
+    bedrock_block: 105_235_063,
+    bedrock_time: 1_686_068_903,
+    // The parent hash in the header of the Bedrock block (hash `0xdbf6a80f…afd3`), which every
+    // execution peer served identically (`docs/el-viability.md`).
+    last_legacy_hash: b256!("0x21a168dfa5e727926063a28ba16fd5ee84c814e847c81a699c7a0ea551e4ca50"),
+    block_time_secs: 2,
+    // `DisputeGameFactoryProxy` in `superchain/configs/mainnet/op.toml` of the registry.
+    dispute_game_factory: address!("0xe5965Ab5962eDc7477C8520243A95517CD252fA9"),
 };
 
 impl ChainSpec {
     /// Every supported chain.
     pub const ALL: &'static [&'static Self] = &[&OP_MAINNET];
+
+    /// The hardforks that activate at a timestamp and change the fork id, ascending. Regolith
+    /// is not one of them: it has no activation of its own in the fork id.
+    #[must_use]
+    pub const fn fork_times(&self) -> [u64; 8] {
+        [
+            self.canyon_time,
+            self.ecotone_time,
+            self.fjord_time,
+            self.granite_time,
+            self.holocene_time,
+            self.isthmus_time,
+            self.jovian_time,
+            self.karst_time,
+        ]
+    }
 
     /// Returns the spec for `chain_id`, if supported.
     pub fn by_chain_id(chain_id: ChainId) -> Option<&'static Self> {

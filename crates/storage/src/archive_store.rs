@@ -30,14 +30,17 @@ mod tables;
 use std::fmt;
 use std::path::Path;
 
-use alloy_primitives::{BlockHash, BlockNumber, keccak256};
+use alloy_consensus::Header;
+use alloy_primitives::{BlockHash, BlockNumber, Bytes, keccak256};
+use alloy_rlp::Decodable;
 use op_alloy_consensus::OpReceiptEnvelope;
-use op_indexer_primitives::{ArchivedBlock, BlockRef, DecodedBlock};
-use tracing::warn;
+use op_indexer_primitives::{
+    BlockRead, BlockRef, EncodedBlock, ItemConvert, ReadLimits, encode_receipts,
+};
 
-use self::tables::{EncodedBlock, Failure, Tables};
+use self::tables::{Entry, Failure, Prepared, Tables};
 use crate::metrics::{self, Operation};
-use crate::validate::{validate_block, validate_receipts};
+use crate::validate::validate_receipts;
 use crate::{ArchiveStore, InvalidBlockReason, StorageError, Store};
 
 /// The block archive in one fjall database directory. Cheap to clone: clones share the open
@@ -66,27 +69,19 @@ impl fmt::Debug for FjallArchive {
 }
 
 impl FjallArchive {
-    /// Opens the archive in the directory `path`, creating it and its keyspaces if needed. An
-    /// archive written with another schema version is emptied, with a warning: it can be rebuilt
-    /// from the committed store. fjall locks the directory, so one process opens it at a time.
+    /// Opens the archive in the directory `path`, creating it and its keyspaces if needed.
+    /// fjall locks the directory, so one process opens it at a time.
     ///
     /// Does blocking disk I/O, including replaying the journal after a crash: call it at startup
     /// or from a blocking thread.
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError::Fjall`] if the directory cannot be created, opened, locked or
-    /// written.
+    /// Returns [`StorageError::ArchiveSchema`] if the directory holds an archive of another
+    /// schema version (it is left as it is), and [`StorageError::Fjall`] if the directory
+    /// cannot be created, opened, locked or written.
     pub fn open(path: &Path) -> Result<Self, StorageError> {
-        let (tables, emptied) =
-            tables::open(path).map_err(|failure| failure.into_storage_error("open"))?;
-        if let Some(version) = emptied {
-            warn!(
-                path = %path.display(),
-                %version,
-                "block archive had another schema version; emptied it"
-            );
-        }
+        let tables = tables::open(path).map_err(|failure| failure.into_storage_error("open"))?;
         Ok(Self { tables })
     }
 
@@ -115,14 +110,69 @@ impl FjallArchive {
     }
 }
 
+impl FjallArchive {
+    /// Appends blocks the importer prepared, for its bulk load only: written straight into
+    /// new table and blob files, all keyspaces at once, without the journal. Several times
+    /// faster than [`ArchiveStore::append_batch`] for long lists, and as durable when it
+    /// returns; each call writes new files, so it is for lists of hundreds of megabytes, not
+    /// a few blocks. A crash during a call leaves the held range as it was (see
+    /// `tables::bulk`). Not retried by its caller: a failed call can leave unregistered files,
+    /// which the next open of the archive removes.
+    ///
+    /// `blocks` must be consecutive, oldest first, and extend the archive's last block (or
+    /// the archive is empty). No other write may run at the same time; the writer lock
+    /// ensures it in this process.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::NotContiguous`] if `blocks` do not extend the archive, and
+    /// [`StorageError::Fjall`] if writing fails.
+    pub async fn bulk_append(&self, blocks: Vec<PreparedBlock>) -> Result<(), StorageError> {
+        self.blocking(Operation::BulkAppend, "bulk_append", move |tables| {
+            let blocks: Vec<Prepared> = blocks.into_iter().map(|block| block.0).collect();
+            tables::bulk_append(tables, &blocks)
+        })
+        .await
+    }
+}
+
+/// A block checked and compressed for [`FjallArchive::bulk_append`], off the writer: its
+/// header hashes to its hash, and its number and parent are read from it.
+#[derive(Debug)]
+pub struct PreparedBlock(Prepared);
+
+impl PreparedBlock {
+    /// Prepares `block`. CPU work only (decoding the header, hashing it, compressing the
+    /// values): call it on a blocking thread, as many in parallel as there are cores.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::InvalidData`] if the header does not decode,
+    /// [`StorageError::InvalidBlock`] if it does not hash to the block's hash, and
+    /// [`StorageError::Oversized`] if a value is too large to compress.
+    pub fn new(block: &EncodedBlock) -> Result<Self, StorageError> {
+        let checked = checked_header(block.hash, &block.header)?;
+        let prepared = Prepared::new(
+            BlockRef {
+                number: checked.number,
+                hash: block.hash,
+            },
+            checked.parent_hash,
+            &block.header,
+            &block.body,
+            block.receipts.as_ref().map(|receipts| &receipts[..]),
+        )?;
+        Ok(Self(prepared))
+    }
+}
+
 impl ArchiveStore for FjallArchive {
-    /// Validates and encodes the block on the calling task, then compresses and writes it in
-    /// one durable batch on a blocking thread.
-    async fn append(&self, block: &DecodedBlock) -> Result<(), StorageError> {
-        // The error goes into the timed call on purpose, so an invalid block is counted.
-        let encoded = encode(block);
-        self.blocking(Operation::Append, "append", move |tables| {
-            tables::append(tables, &encoded?)
+    /// Hashes, compresses and writes on a blocking thread. One batch holds at most 16 MiB of
+    /// RLP, and the writer lock is taken once per batch.
+    async fn append_batch(&self, blocks: Vec<EncodedBlock>) -> Result<(), StorageError> {
+        self.blocking(Operation::AppendBatch, "append_batch", move |tables| {
+            let entries: Vec<Entry> = blocks.into_iter().map(entry).collect::<Result<_, _>>()?;
+            tables::append_batch(tables, &entries)
         })
         .await
     }
@@ -132,7 +182,7 @@ impl ArchiveStore for FjallArchive {
         block: BlockRef,
         receipts: &[OpReceiptEnvelope],
     ) -> Result<bool, StorageError> {
-        // As in `append`: the error goes into the timed call, so invalid receipts are counted.
+        // The error goes into the timed call on purpose, so invalid receipts are counted.
         let checked = validate_receipts(block.number, receipts);
         let count = receipts.len();
         let receipts = encode_receipts(receipts);
@@ -143,9 +193,14 @@ impl ArchiveStore for FjallArchive {
         .await
     }
 
-    async fn block(&self, number: BlockNumber) -> Result<Option<ArchivedBlock>, StorageError> {
-        self.blocking(Operation::Block, "block", move |tables| {
-            tables::block(tables, number)
+    async fn read(
+        &self,
+        read: BlockRead,
+        limits: ReadLimits,
+        convert: Option<ItemConvert>,
+    ) -> Result<Vec<Bytes>, StorageError> {
+        self.blocking(Operation::Read, "read", move |tables| {
+            tables::read(tables, &read, limits, convert)
         })
         .await
     }
@@ -177,30 +232,41 @@ impl ArchiveStore for FjallArchive {
     }
 }
 
-/// Validates `block` and encodes it as RLP, checking that the header hashes to its hash.
-fn encode(block: &DecodedBlock) -> Result<EncodedBlock, StorageError> {
-    validate_block(block)?;
-    let header = &block.block.header;
-    let header_rlp = alloy_rlp::encode(header);
-    if keccak256(&header_rlp) != block.hash {
-        return Err(StorageError::InvalidBlock {
-            number: header.number,
-            reason: InvalidBlockReason::HeaderHash,
-        });
-    }
-    Ok(EncodedBlock {
-        number: header.number,
-        hash: block.hash,
-        parent_hash: header.parent_hash,
-        header: header_rlp,
-        body: alloy_rlp::encode(&block.block.body),
-        receipts: block.receipts.as_deref().map(encode_receipts),
+/// The archive entry of a block handed over in its original encoding: its bytes unchanged, with
+/// the number and parent hash read from the header, which must hash to the block's hash.
+fn entry(block: EncodedBlock) -> Result<Entry, StorageError> {
+    let EncodedBlock {
+        hash,
+        header,
+        body,
+        receipts,
+    } = block;
+    let checked = checked_header(hash, &header)?;
+    Ok(Entry {
+        block: BlockRef {
+            number: checked.number,
+            hash,
+        },
+        parent_hash: checked.parent_hash,
+        header,
+        body,
+        receipts,
     })
 }
 
-/// The RLP list of `receipts` in network encoding.
-fn encode_receipts(receipts: &[OpReceiptEnvelope]) -> Vec<u8> {
-    let mut out = Vec::new();
-    alloy_rlp::encode_list(receipts, &mut out);
-    out
+/// The decoded `header`, which must hash to `hash`.
+fn checked_header(hash: BlockHash, header: &[u8]) -> Result<Header, StorageError> {
+    let decoded = Header::decode(&mut &header[..]).map_err(|source| StorageError::InvalidData {
+        store: Store::Archive,
+        what: "header to append",
+        block: Some(hash),
+        source: Some(source.into()),
+    })?;
+    if keccak256(header) != hash {
+        return Err(StorageError::InvalidBlock {
+            number: decoded.number,
+            reason: InvalidBlockReason::HeaderHash,
+        });
+    }
+    Ok(decoded)
 }
