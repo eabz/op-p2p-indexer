@@ -28,7 +28,6 @@ mod types;
 mod verify;
 
 use std::net::SocketAddr;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy_primitives::B256;
 use libp2p::{Multiaddr, noise};
@@ -116,8 +115,7 @@ impl LightClient {
     pub async fn run(self, cancel: CancellationToken) -> Result<(), BeaconError> {
         let Self { config, trusted } = self;
         let spec = &MAINNET;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH);
-        let epoch = spec.slot_at(now.map_or(0, |since| since.as_secs())) / SLOTS_PER_EPOCH;
+        let epoch = spec.now_slot() / SLOTS_PER_EPOCH;
         let digest = spec.fork_digest(epoch);
 
         info!(

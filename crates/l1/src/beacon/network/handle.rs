@@ -3,7 +3,7 @@
 
 use alloy_primitives::{B256, Bytes};
 use libp2p::PeerId;
-use libp2p::gossipsub::MessageId;
+use libp2p::gossipsub::{MessageAcceptance, MessageId};
 use tokio::sync::{mpsc, oneshot};
 use tracing::debug;
 
@@ -86,19 +86,13 @@ pub(in crate::beacon) enum Command {
     },
 }
 
-/// What the light client found a gossip message to be ([gossip validation]).
+/// What the light client found a gossip message to be ([gossip validation]): accepted
+/// (it verified and is newer than what was held, so it is forwarded to the mesh), rejected
+/// (it does not verify, by the fault of who sent it) or ignored (a duplicate, older than
+/// what is held, or not verifiable yet).
 ///
 /// [gossip validation]: https://github.com/ethereum/consensus-specs/blob/master/specs/altair/light-client/p2p-interface.md#the-gossip-domain-gossipsub
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::beacon) enum Verdict {
-    /// It verified and is newer than what was held: it is forwarded to the mesh.
-    Accept,
-    /// It does not verify, by the fault of who sent it: not forwarded, and it counts
-    /// against the peer.
-    Reject,
-    /// A duplicate, older than what is held, or not verifiable yet: not forwarded.
-    Ignore,
-}
+pub(in crate::beacon) type Verdict = MessageAcceptance;
 
 /// The light client's side of the network.
 #[derive(Debug, Clone)]
@@ -135,7 +129,7 @@ impl NetworkHandle {
     pub(in crate::beacon) fn report_gossip(&self, id: MessageId, peer: PeerId, verdict: Verdict) {
         let command = Command::Gossip { id, peer, verdict };
         if self.commands.try_send(command).is_err() {
-            debug!(%peer, ?verdict, "verdict on a gossip message dropped");
+            debug!(%peer, "verdict on a gossip message dropped");
         }
     }
 

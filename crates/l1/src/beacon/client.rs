@@ -18,7 +18,9 @@
 //! Does not touch the swarm, pick peers or frame messages: see `network`.
 
 use std::collections::HashSet;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::future::Future;
+use std::pin::Pin;
+use std::time::Duration;
 
 use alloy_primitives::{B256, Bytes};
 use libp2p::PeerId;
@@ -28,8 +30,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use super::BeaconError;
-use super::network::{Gossip, NetworkHandle, Request, RequestError, Topic, Verdict};
-use super::rpc::{self, StatusData};
+use super::network::{Gossip, NetworkHandle, Request, RequestError, Response, Topic, Verdict};
+use super::rpc::StatusData;
 use super::spec::{BeaconSpec, ForkDigest, SLOTS_PER_EPOCH, SLOTS_PER_PERIOD};
 use super::verify::{Accepted, Store, VerifyError};
 use crate::TrustedL1Block;
@@ -58,6 +60,19 @@ enum Kind {
     Updates,
     Finality,
     Optimistic,
+}
+
+/// The answer to the request in flight, once it comes.
+type Answer = Pin<Box<dyn Future<Output = Result<Response, RequestError>> + Send>>;
+
+/// Resolves with the answer to the request in flight; never, if there is none.
+async fn answered(
+    pending: &mut Option<(Kind, Answer)>,
+) -> Option<(Kind, Result<Response, RequestError>)> {
+    match pending {
+        Some((kind, answer)) => Some((*kind, answer.await)),
+        None => std::future::pending().await,
+    }
 }
 
 /// A verified answer: the store after it, and what it changed.
@@ -127,6 +142,9 @@ impl Client {
     pub(super) async fn run(mut self, cancel: CancellationToken) -> Result<(), BeaconError> {
         let mut tick = interval(TICK);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // The request in flight. It is awaited beside gossip, not instead of it: an answer
+        // can take many seconds, and a gossip message is only forwarded while it is fresh.
+        let mut pending: Option<(Kind, Answer)> = None;
         loop {
             let (peer, kind, payloads, gossip) = tokio::select! {
                 biased;
@@ -141,19 +159,20 @@ impl Client {
                     };
                     (peer, kind, vec![data], Some(id))
                 }
-                _ = tick.tick() => {
-                    let Some((kind, request)) = self.due()? else {
-                        continue;
-                    };
-                    let answer = tokio::select! {
-                        biased;
-                        () = cancel.cancelled() => return Ok(()),
-                        answer = self.network.request(request) => answer,
-                    };
+                Some((kind, answer)) = answered(&mut pending) => {
+                    pending = None;
                     match self.payloads(kind, answer) {
                         Some((peer, payloads)) => (peer, kind, payloads, None),
                         None => continue,
                     }
+                }
+                _ = tick.tick(), if pending.is_none() => {
+                    if let Some((kind, request)) = self.due()? {
+                        let network = self.network.clone();
+                        let answer = async move { network.request(request).await };
+                        pending = Some((kind, Box::pin(answer)));
+                    }
+                    continue;
                 }
             };
             if self.store.is_none() && kind != Kind::Bootstrap {
@@ -164,7 +183,7 @@ impl Client {
                 continue;
             }
             let (spec, checkpoint, store) = (self.spec, self.checkpoint, self.store.clone());
-            let now_slot = self.now_slot();
+            let now_slot = self.spec.now_slot();
             let verifying = tokio::task::spawn_blocking(move || {
                 verify(spec, checkpoint, store, kind, &payloads, now_slot)
             });
@@ -191,11 +210,6 @@ impl Client {
         }
     }
 
-    fn now_slot(&self) -> u64 {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH);
-        self.spec.slot_at(now.map_or(0, |since| since.as_secs()))
-    }
-
     /// What to ask for now, if anything.
     fn due(&mut self) -> Result<Option<(Kind, Request)>, BeaconError> {
         let Some(store) = &self.store else {
@@ -208,7 +222,7 @@ impl Client {
             return Ok(Some((Kind::Bootstrap, Request::Bootstrap(self.checkpoint))));
         };
         let now = Instant::now();
-        let now_slot = self.now_slot();
+        let now_slot = self.spec.now_slot();
         let (period, clock_period) = (store.period(), now_slot / SLOTS_PER_PERIOD);
         // With the next committee known, updates signed in the next period verify and the
         // store rotates by itself when one of them finalizes a block there.
@@ -221,10 +235,10 @@ impl Client {
                 COMMITTEE_RETRY
             };
             self.next_committee_attempt = now + retry;
-            let count = clock_period.saturating_sub(period).saturating_add(1);
+            // The network asks for no more than a peer may send at once.
             let request = Request::UpdatesByRange {
                 start_period: period,
-                count: count.min(rpc::MAX_UPDATES),
+                count: clock_period.saturating_sub(period).saturating_add(1),
             };
             return Ok(Some((Kind::Updates, request)));
         }
@@ -245,7 +259,7 @@ impl Client {
     fn payloads(
         &mut self,
         kind: Kind,
-        answer: Result<super::network::Response, RequestError>,
+        answer: Result<Response, RequestError>,
     ) -> Option<(PeerId, Vec<Bytes>)> {
         let response = match answer {
             Ok(response) => response,
@@ -254,6 +268,11 @@ impl Client {
                     && kind == Kind::Bootstrap
                 {
                     self.refused.insert(peer);
+                }
+                if kind == Kind::Updates {
+                    // Nobody was asked, or nobody answered: ask again soon, not after the
+                    // long wait that follows an answer.
+                    self.next_committee_attempt = Instant::now() + CATCH_UP_RETRY;
                 }
                 debug!(?kind, %err, "light-client request not answered");
                 return None;

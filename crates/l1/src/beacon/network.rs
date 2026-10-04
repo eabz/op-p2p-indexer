@@ -26,8 +26,9 @@
 
 mod behaviour;
 mod handle;
+mod peers;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -52,57 +53,25 @@ pub(super) use self::handle::{
 
 use self::behaviour::{Asked, Behaviour, BehaviourEvent, RpcEvent};
 use self::handle::{COMMAND_CAPACITY, Command, Reply};
+use self::peers::Peers;
 use super::BeaconError;
-use super::discovery::{Candidate, Discovery};
+use super::discovery::Discovery;
 use super::rpc::{self, Chunk, Codec, StatusData};
 use super::spec::ForkDigest;
 
-/// Peers serving light-client data to stay connected to.
-const TARGET_PEERS: usize = 6;
-/// Peers kept at most, counting those that dialed us.
-const MAX_PEERS: usize = 12;
-/// Dials in progress at once.
-const MAX_DIALS: usize = 4;
-/// Limit for a dial, the handshake and the peer's identify answer.
-const DIAL_TIMEOUT: Duration = Duration::from_secs(20);
-/// Limit for one request, from sending it to the end of its answer.
+/// Limit for one request to find a peer, and again for the peer to answer.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a connection may sit unused. Requests take turns among the peers, so only a
 /// peer that serves nothing sits idle.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// How often candidates are dialed.
 const TICK: Duration = Duration::from_secs(1);
-/// Requests in a row a peer may leave unanswered or answer without data before it is dropped.
-const MAX_FAILURES: u32 = 3;
-/// Peers remembered as not worth dialing; the set is emptied when it is full.
-const MAX_AVOIDED: usize = 4096;
-/// Candidates waiting to be dialed; discovery finds more when these are used up.
-const MAX_CANDIDATES: usize = 512;
-/// Peers that served and hung up, waiting to be dialed again.
-const MAX_REDIALS: usize = 64;
-/// How long a peer that hung up is left alone. Peers with no room say so and close; their
-/// room changes over minutes.
-const REDIAL_AFTER: Duration = Duration::from_secs(120);
 /// Candidates in transit from discovery, which drops what does not fit.
 const CANDIDATE_CAPACITY: usize = 256;
 /// Gossip messages waiting for the light client: two arrive per slot, so this is a minute of
 /// them. What does not fit is dropped; the next slot brings newer ones.
 const GOSSIP_CAPACITY: usize = 16;
-/// A connected peer that lists the light-client protocols.
-#[derive(Debug)]
-struct Peer {
-    agent: String,
-    /// Where it was dialed; `None` if it dialed us.
-    addr: Option<Multiaddr>,
-    /// Requests in a row it left unanswered or answered without data.
-    failures: u32,
-    /// Whether it answered a bootstrap request without data.
-    lacks_bootstrap: bool,
-    /// When it was asked last, as a count of requests; 0 if never.
-    asked_at: u64,
-}
-
-/// A request no peer could be asked yet.
+/// A request and who gets its answer: waiting for a peer, or for the peer's answer.
 #[derive(Debug)]
 struct Waiting {
     request: Request,
@@ -121,21 +90,12 @@ pub(super) struct Network {
     gossip: mpsc::Sender<Gossip>,
     finality_topic: TopicHash,
     optimistic_topic: TopicHash,
-    peers: HashMap<PeerId, Peer>,
-    /// Dials in progress: when each began, and the address.
-    dialing: HashMap<PeerId, (Instant, Multiaddr)>,
-    candidates: VecDeque<Candidate>,
-    /// Peers that were not dropped but hung up, oldest first, with when each may be dialed
-    /// again: discovery reports a node once, so without them the supply of peers runs dry.
-    redials: VecDeque<(Instant, Candidate)>,
-    avoided: HashSet<PeerId>,
+    peers: Peers,
     /// Bounded by the commands taken and [`REQUEST_TIMEOUT`]: every request sent ends in an
     /// answer or a failure event.
-    pending: HashMap<(Asked, OutboundRequestId), Reply>,
+    pending: HashMap<(Asked, OutboundRequestId), Waiting>,
     /// Requests waiting for a peer to ask, oldest first; each at most [`REQUEST_TIMEOUT`].
     waiting: VecDeque<Waiting>,
-    /// Requests sent so far.
-    asked: u64,
 }
 
 impl std::fmt::Debug for Network {
@@ -148,8 +108,8 @@ impl std::fmt::Debug for Network {
     }
 }
 
-/// Creates the network, its handle and the stream of gossip messages. Binds nothing yet:
-/// [`Network::run`] does.
+/// Creates the network, its handle and the stream of gossip messages. Binds the TCP
+/// listener; [`Network::run`] binds discovery's UDP socket.
 ///
 /// The node gets a new identity at each start. `digest` is the fork digest peers must be on;
 /// `status` is what the node reports about itself in `Status`, and follows the light client's
@@ -158,8 +118,8 @@ impl std::fmt::Debug for Network {
 /// # Errors
 ///
 /// Returns [`BeaconError::Transport`] or [`BeaconError::Gossip`] if the transport or
-/// gossipsub cannot be set up, and [`BeaconError::Listen`] if the listen address is not one
-/// the transport takes.
+/// gossipsub cannot be set up, and [`BeaconError::Listen`] if the listen address cannot be
+/// bound.
 pub(super) fn new(
     listen_addr: SocketAddr,
     bootnodes: Vec<String>,
@@ -195,14 +155,9 @@ pub(super) fn new(
         gossip,
         finality_topic,
         optimistic_topic,
-        peers: HashMap::new(),
-        dialing: HashMap::new(),
-        candidates: VecDeque::new(),
-        redials: VecDeque::new(),
-        avoided: HashSet::new(),
+        peers: Peers::default(),
         pending: HashMap::new(),
         waiting: VecDeque::new(),
-        asked: 0,
     };
     let handle = NetworkHandle {
         commands: commands_tx,
@@ -236,29 +191,20 @@ impl Network {
                         self.send(Waiting { request, reply, since: Instant::now() });
                     }
                     Some(Command::Invalid(peer)) => {
-                        let agent = self.peers.get(&peer).map(|state| state.agent.clone());
+                        let agent = self.peers.agent(&peer);
                         warn!(%peer, agent, "beacon peer sent data that does not verify");
                         self.drop_peer(peer, "its data did not verify");
                     }
                     Some(Command::Gossip { id, peer, verdict }) => {
-                        let acceptance = match verdict {
-                            Verdict::Accept => MessageAcceptance::Accept,
-                            Verdict::Reject => MessageAcceptance::Reject,
-                            Verdict::Ignore => MessageAcceptance::Ignore,
-                        };
-                        self.judge_gossip(&id, &peer, acceptance);
+                        self.judge_gossip(&id, &peer, verdict);
                     }
                     None => break,
                 },
-                Some(candidate) = found.recv() => {
-                    if self.candidates.len() < MAX_CANDIDATES {
-                        self.candidates.push_back(candidate);
-                    }
-                }
+                Some(candidate) = found.recv() => self.peers.found(candidate),
                 event = self.swarm.select_next_some() => self.on_event(event),
                 _ = tick.tick() => {
                     self.dial();
-                    self.retry_waiting();
+                    self.expire_waiting();
                 }
             }
         }
@@ -270,64 +216,32 @@ impl Network {
 
     /// Dials candidates while peers are wanted, and gives up dials that take too long.
     fn dial(&mut self) {
-        let Self {
-            dialing,
-            peers,
-            swarm,
-            ..
-        } = self;
-        dialing.retain(|peer, (since, _)| {
-            let waiting = since.elapsed() < DIAL_TIMEOUT;
-            if !waiting && !peers.contains_key(peer) {
-                // Connected without saying what it serves, or not connected: nothing to keep.
-                let _closed = swarm.disconnect_peer_id(*peer);
-            }
-            waiting
-        });
-        while self.dialing.len() < MAX_DIALS
-            && self.peers.len().saturating_add(self.dialing.len()) < TARGET_PEERS
-            && let Some(candidate) = self.next_candidate()
-        {
-            let peer = candidate.peer;
-            if self.avoided.contains(&peer)
-                || self.peers.contains_key(&peer)
-                || self.dialing.contains_key(&peer)
-            {
-                continue;
-            }
-            let dial = DialOpts::peer_id(peer)
+        for peer in self.peers.expired_dials() {
+            // Not connected any more: nothing to close.
+            let _closed = self.swarm.disconnect_peer_id(peer);
+        }
+        while let Some(candidate) = self.peers.next_dial() {
+            let dial = DialOpts::peer_id(candidate.peer)
                 .addresses(vec![candidate.addr.clone()])
                 .build();
             if self.swarm.dial(dial).is_ok() {
-                self.dialing.insert(peer, (Instant::now(), candidate.addr));
+                self.peers.dialed(candidate);
             }
         }
     }
 
-    /// The next node to dial: one discovery found, else a peer whose time to be dialed
-    /// again has come.
-    fn next_candidate(&mut self) -> Option<Candidate> {
-        if let Some(candidate) = self.candidates.pop_front() {
-            return Some(candidate);
-        }
-        let (due, _) = self.redials.front()?;
-        if *due > Instant::now() {
-            return None;
-        }
-        self.redials.pop_front().map(|(_, candidate)| candidate)
-    }
-
     /// Sends a request to the peer that failed least and, among those, was asked longest
-    /// ago. Without a peer the request waits for one, until it is [`REQUEST_TIMEOUT`] old.
+    /// ago. Without a peer the request waits for the next one that connects.
     fn send(&mut self, waiting: Waiting) {
         let bootstrap = matches!(waiting.request, Request::Bootstrap(_));
-        let picked = self
-            .peers
-            .iter_mut()
-            .filter(|(_, state)| !(bootstrap && state.lacks_bootstrap))
-            .min_by_key(|(_, state)| (state.failures, state.asked_at));
-        let Some((peer, state)) = picked else {
-            if waiting.since.elapsed() < REQUEST_TIMEOUT && self.waiting.len() < COMMAND_CAPACITY {
+        let Some(peer) = self.peers.pick(bootstrap) else {
+            // Every place may be taken by peers that lack the bootstrap: one of them is
+            // closed so another node is dialed. It stays known.
+            if let Some(peer) = self.peers.in_the_way() {
+                self.peers.lost(peer);
+                let _closed = self.swarm.disconnect_peer_id(peer);
+            }
+            if self.waiting.len() < COMMAND_CAPACITY {
                 self.waiting.push_back(waiting);
             } else {
                 // The light client stopped waiting: nothing to do.
@@ -335,9 +249,6 @@ impl Network {
             }
             return;
         };
-        let peer = *peer;
-        self.asked = self.asked.saturating_add(1);
-        state.asked_at = self.asked;
         let (asked, payload) = match waiting.request {
             Request::Bootstrap(root) => (Asked::Bootstrap, root.to_vec()),
             Request::UpdatesByRange {
@@ -353,13 +264,24 @@ impl Network {
         debug!(%peer, ?asked, "light-client request sent");
         let behaviour = self.swarm.behaviour_mut().requests(asked);
         let id = behaviour.send_request(&peer, payload);
-        self.pending.insert((asked, id), waiting.reply);
+        self.pending.insert((asked, id), waiting);
     }
 
-    /// Tries the waiting requests again: a peer may have connected, or their time is up.
+    /// Sends the waiting requests: a peer connected.
     fn retry_waiting(&mut self) {
         for waiting in std::mem::take(&mut self.waiting) {
             self.send(waiting);
+        }
+    }
+
+    /// Ends the waiting requests no peer turned up for in time.
+    fn expire_waiting(&mut self) {
+        while let Some(waiting) = self
+            .waiting
+            .pop_front_if(|waiting| waiting.since.elapsed() >= REQUEST_TIMEOUT)
+        {
+            // The light client stopped waiting: nothing to do.
+            let _sent = waiting.reply.send(Err(RequestError::NoPeer));
         }
     }
 
@@ -374,24 +296,14 @@ impl Network {
         } = event
         {
             debug!(%peer, %error, "beacon peer dial failed");
-            self.dialing.remove(&peer);
+            self.peers.dial_ended(&peer);
         } else if let SwarmEvent::ConnectionClosed { peer_id, cause, .. } = event {
-            if let Some(state) = self.peers.remove(&peer_id) {
+            // Not dropped by us: worth another dial later.
+            if self.peers.lost(peer_id) {
                 let cause = cause.map(|cause| cause.to_string());
                 debug!(peer = %peer_id, cause, "beacon peer disconnected");
-                // Not dropped by us: worth another dial later.
-                if let Some(addr) = state.addr
-                    && self.redials.len() < MAX_REDIALS
-                {
-                    let candidate = Candidate {
-                        peer: peer_id,
-                        addr,
-                    };
-                    self.redials
-                        .push_back((Instant::now() + REDIAL_AFTER, candidate));
-                }
             }
-            self.dialing.remove(&peer_id);
+            self.peers.dial_ended(&peer_id);
         }
     }
 
@@ -409,8 +321,7 @@ impl Network {
             BehaviourEvent::Limits(never) => match never {},
             BehaviourEvent::Status(event) => self.on_status(event),
             BehaviourEvent::Ping(event) => {
-                // The answer is our metadata sequence number, which never changes.
-                self.answer(event, |behaviour| &mut behaviour.ping, vec![0; 8]);
+                self.answer(event, |behaviour| &mut behaviour.ping, rpc::ping());
             }
             BehaviourEvent::MetadataV2(event) => {
                 let metadata = rpc::metadata(false);
@@ -439,33 +350,26 @@ impl Network {
     }
 
     fn on_identified(&mut self, peer: PeerId, info: &identify::Info) {
-        let addr = self.dialing.remove(&peer).map(|(_, addr)| addr);
-        if self.peers.contains_key(&peer) {
+        let addr = self.peers.dial_ended(&peer);
+        if self.peers.is_connected(&peer) {
             return;
         }
         let serves = info
             .protocols
             .iter()
             .any(|name| name.as_ref() == rpc::BOOTSTRAP);
-        if !serves || self.avoided.contains(&peer) {
+        if !serves || self.peers.is_avoided(&peer) {
             self.drop_peer(peer, "it does not serve light-client data");
             return;
         }
-        if self.peers.len() >= MAX_PEERS {
-            // Not avoided: it may be wanted later.
+        if self.peers.is_full() {
+            // No room; it is not held against the peer.
             let _closed = self.swarm.disconnect_peer_id(peer);
             return;
         }
         debug!(%peer, agent = info.agent_version, "beacon peer connected");
-        let state = Peer {
-            agent: info.agent_version.clone(),
-            addr,
-            failures: 0,
-            lacks_bootstrap: false,
-            asked_at: 0,
-        };
-        self.peers.insert(peer, state);
-        let status = rpc::status(self.digest, *self.status.borrow());
+        self.peers.connected(peer, info.agent_version.clone(), addr);
+        let status = self.status_ssz();
         self.swarm
             .behaviour_mut()
             .status
@@ -479,7 +383,7 @@ impl Network {
         match event {
             request_response::Event::Message { peer, message, .. } => match message {
                 request_response::Message::Request { channel, .. } => {
-                    let status = rpc::status(self.digest, *self.status.borrow());
+                    let status = self.status_ssz();
                     // The peer hung up before the answer: nothing to do.
                     let _sent = self
                         .swarm
@@ -498,11 +402,23 @@ impl Network {
             },
             request_response::Event::OutboundFailure { peer, error, .. } => {
                 debug!(%peer, %error, "beacon peer did not answer the status");
-                self.drop_peer(peer, "it did not answer the status");
+                // A connection that closed says nothing about the peer: full peers hang up
+                // before answering, and are dialed again later.
+                if matches!(
+                    error,
+                    OutboundFailure::Timeout | OutboundFailure::UnsupportedProtocols
+                ) {
+                    self.drop_peer(peer, "it did not answer the status");
+                }
             }
             request_response::Event::InboundFailure { .. }
             | request_response::Event::ResponseSent { .. } => {}
         }
+    }
+
+    /// The SSZ of the `Status` this node reports now.
+    fn status_ssz(&self) -> Vec<u8> {
+        rpc::status(self.digest, *self.status.borrow())
     }
 
     /// Answers a peer's request on one of the protocols that are only served.
@@ -556,28 +472,31 @@ impl Network {
                 debug!(%peer, ?asked, %err, "malformed light-client answer");
                 Err(RequestError::Malformed(peer))
             }
+            Err(OutboundFailure::Timeout) => Err(RequestError::Unanswered(peer)),
             Err(error) => {
-                debug!(%peer, ?asked, %error, "light-client request failed");
+                // The connection went away, which says nothing about what the peer holds:
+                // the request goes to another peer, as if it had not been sent.
+                debug!(%peer, ?asked, %error, "light-client request lost with its connection");
+                self.peers.lost(peer);
+                if pending.since.elapsed() < REQUEST_TIMEOUT {
+                    self.send(pending);
+                    return;
+                }
                 Err(RequestError::Unanswered(peer))
             }
         };
         match &result {
-            Ok(response) if !response.chunks.is_empty() => {
-                if let Some(state) = self.peers.get_mut(&peer) {
-                    state.failures = 0;
-                }
-            }
+            Ok(response) if !response.chunks.is_empty() => self.peers.answered(&peer),
             Err(RequestError::Malformed(_)) => self.drop_peer(peer, "its answer was malformed"),
             // An answer without data: it does not hold what was asked, or serves nothing
             // though it lists the protocol.
             Ok(_) | Err(RequestError::Refused(..)) => {
                 self.failed(peer, asked == Asked::Bootstrap);
             }
-            // A connection that closed says nothing about what the peer holds.
             Err(_) => self.failed(peer, false),
         }
         // The light client stopped waiting: nothing to do.
-        let _sent = pending.send(result);
+        let _sent = pending.reply.send(result);
     }
 
     /// Hands a gossip message to the light client, whose verdict decides whether it is
@@ -614,13 +533,8 @@ impl Network {
 
     /// Counts a request the peer did not answer with data; drops the peer after a few in a
     /// row.
-    fn failed(&mut self, peer: PeerId, bootstrap: bool) {
-        let Some(state) = self.peers.get_mut(&peer) else {
-            return;
-        };
-        state.lacks_bootstrap |= bootstrap;
-        state.failures = state.failures.saturating_add(1);
-        if state.failures >= MAX_FAILURES {
+    fn failed(&mut self, peer: PeerId, lacks_bootstrap: bool) {
+        if self.peers.failed(&peer, lacks_bootstrap) {
             self.drop_peer(peer, "it serves no light-client data");
         }
     }
@@ -628,11 +542,7 @@ impl Network {
     /// Disconnects a peer and does not dial it again.
     fn drop_peer(&mut self, peer: PeerId, reason: &'static str) {
         debug!(%peer, reason, "beacon peer dropped");
-        if self.avoided.len() >= MAX_AVOIDED {
-            self.avoided.clear();
-        }
-        self.avoided.insert(peer);
-        self.peers.remove(&peer);
+        self.peers.avoid(peer);
         // Not connected any more: nothing to close.
         let _closed = self.swarm.disconnect_peer_id(peer);
     }

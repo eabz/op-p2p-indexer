@@ -91,7 +91,10 @@ snap = "1.1"
 redis = { version = "1", default-features = false, features = ["tokio-comp", "connection-manager", "script"] }
 # Committed store: the official ClickHouse client (HTTP). The `Row` derive and batched inserts are
 # built in; `lz4` for request compression.
-clickhouse = { version = "0.15", default-features = false, features = ["lz4"] }
+# `rustls-tls-ring` + `rustls-tls-webpki-roots` for `https://` (ClickHouse Cloud is HTTPS
+# only): the provider and root store reqwest already uses here, so no new crate versions, no
+# C build of aws-lc, and no dependency on the host's certificate files. `http://` still works.
+clickhouse = { version = "0.15", default-features = false, features = ["lz4", "rustls-tls-ring", "rustls-tls-webpki-roots"] }
 # Redis values are JSON; ClickHouse rows are serde structs.
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }

@@ -284,6 +284,12 @@ pub(super) fn status_digest(ssz: &[u8]) -> Option<ForkDigest> {
     ssz.first_chunk::<4>().copied()
 }
 
+/// The SSZ of this node's answer to a `Ping`: its metadata sequence number, which never
+/// changes.
+pub(super) fn ping() -> Vec<u8> {
+    vec![0; 8]
+}
+
 /// The SSZ of this node's metadata: sequence number 0 and no subnets; with `fulu`, also the
 /// custody group count, [`CUSTODY_REQUIREMENT`] ([GetMetaData v3]). A light client attests
 /// nothing and keeps no data columns, but peers hang up on a count below the minimum.

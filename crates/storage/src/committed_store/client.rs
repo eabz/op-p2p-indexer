@@ -6,6 +6,7 @@
 use std::time::{Duration, UNIX_EPOCH};
 
 use alloy_primitives::ChainId;
+use clickhouse::sql::Identifier;
 use clickhouse::{Client, RowOwned, RowWrite};
 use op_indexer_primitives::{BlockRef, DecodedBlock, L1Heads};
 use tokio::time::timeout;
@@ -53,6 +54,11 @@ const BLOCK_TABLES: [(&str, &str); 4] = [
 /// `Client`'s `Debug` hides the credentials, so deriving it here is safe.
 #[derive(Debug, Clone)]
 pub struct ClickHouseStore {
+    /// The configured database's name, which [`Self::migrate`] creates if it is missing.
+    database: String,
+    /// Queries without a database, for creating it: a request naming a database that does
+    /// not exist is refused before it runs.
+    server: Client,
     /// Queries, DDL and deletes, limited to [`QUERY_TIMEOUT`] on the server.
     queries: Client,
     /// Inserts: async, acknowledged once written, limited to [`INSERT_TIMEOUT`] on the server.
@@ -64,14 +70,15 @@ impl ClickHouseStore {
     /// Creates a store for `chain_id` from `config`, with LZ4 compression. Makes no request: use
     /// [`Self::ping`] to check the server is reachable, then [`Self::migrate`].
     pub fn new(config: &ClickHouseConfig, chain_id: ChainId) -> Self {
-        let mut client = Client::default()
+        let mut server = Client::default()
             .with_url(&config.url)
-            .with_database(&config.database)
             .with_user(&config.user)
             .with_compression(clickhouse::Compression::Lz4);
         if let Some(password) = &config.password {
-            client = client.with_password(password);
+            server = server.with_password(password);
         }
+        let client = server.clone().with_database(&config.database);
+        let server = server.with_setting(MAX_EXECUTION_TIME, QUERY_TIMEOUT.as_secs().to_string());
         let queries = client
             .clone()
             .with_setting(MAX_EXECUTION_TIME, QUERY_TIMEOUT.as_secs().to_string());
@@ -81,6 +88,8 @@ impl ClickHouseStore {
             inserts = inserts.with_setting(name, value);
         }
         Self {
+            database: config.database.clone(),
+            server,
             queries,
             inserts,
             chain_id,
@@ -95,18 +104,24 @@ impl ClickHouseStore {
     /// not answer within the timeout.
     pub async fn ping(&self) -> Result<(), StorageError> {
         metrics::timed(Store::Committed, Operation::Connect, async {
+            // Without the database, which may not exist before the first `migrate`.
             within(
                 QUERY_TIMEOUT,
                 "ping",
-                self.queries.query("SELECT 1").execute(),
+                self.server.query("SELECT 1").execute(),
             )
             .await
         })
         .await
     }
 
-    /// Brings the schema up to date: creates `schema_migrations` if missing, checks the applied
-    /// migrations against the embedded ones, then applies and records the pending ones in order.
+    /// Brings the schema up to date: creates the configured database if missing (a new server,
+    /// ClickHouse Cloud's among them, has only `default`), creates `schema_migrations` if
+    /// missing, checks the applied migrations against the embedded ones, then applies and
+    /// records the pending ones in order.
+    ///
+    /// Creating the database is not a migration: the database is configuration, the
+    /// migrations are what goes inside it, and only they are recorded and checksummed.
     ///
     /// Run it before anything else uses the store, from one indexer instance at a time.
     ///
@@ -122,6 +137,15 @@ impl ClickHouseStore {
     /// recorded only after it is applied. Calling it again finishes.
     pub async fn migrate(&self) -> Result<(), StorageError> {
         metrics::timed(Store::Committed, Operation::Migrate, async {
+            within(
+                QUERY_TIMEOUT,
+                "create database",
+                self.server
+                    .query("CREATE DATABASE IF NOT EXISTS ?")
+                    .bind(Identifier(&self.database))
+                    .execute(),
+            )
+            .await?;
             within(
                 QUERY_TIMEOUT,
                 "migrate",

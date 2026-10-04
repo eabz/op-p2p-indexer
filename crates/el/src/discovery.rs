@@ -454,7 +454,7 @@ const fn is_public(ip: Ipv4Addr) -> bool {
 
 /// Turns an `enode://<key>@<ip>:<port>[?discport=<udp port>]` URL into the discv5 contact
 /// address `/ip4/<ip>/udp/<port>/p2p/<peer id>`.
-fn enode_discovery_addr(enode: &str) -> Option<String> {
+pub fn enode_discovery_addr(enode: &str) -> Option<String> {
     let record: NodeRecord = enode.parse().ok()?;
     // discv5 names a node by the libp2p peer id of its uncompressed public key.
     let key = [[0x04].as_slice(), record.id.as_slice()].concat();

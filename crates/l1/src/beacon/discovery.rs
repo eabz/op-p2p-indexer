@@ -90,7 +90,7 @@ impl Discovery {
         for bootnode in bootnodes {
             let record = if bootnode.starts_with("enr:") {
                 bootnode.parse::<Enr>().ok()
-            } else if let Some(addr) = enode_discovery_addr(bootnode) {
+            } else if let Some(addr) = enode_addr(bootnode) {
                 let asked = timeout(BOOTNODE_TIMEOUT, discv5.request_enr(addr)).await;
                 asked.ok().and_then(Result::ok)
             } else {
@@ -193,16 +193,7 @@ fn candidate(record: &Enr) -> Option<Candidate> {
     })
 }
 
-/// Turns an `enode://<key>@<ip>:<port>[?discport=<udp port>]` URL into the address discv5
-/// asks for the node's record at.
-fn enode_discovery_addr(enode: &str) -> Option<Multiaddr> {
-    let (key, endpoint) = enode.strip_prefix("enode://")?.split_once('@')?;
-    let (endpoint, query) = endpoint.split_once('?').unwrap_or((endpoint, ""));
-    let (ip, port) = endpoint.rsplit_once(':')?;
-    let udp = query.strip_prefix("discport=").unwrap_or(port);
-    let mut sec1 = vec![4];
-    sec1.extend(alloy_primitives::hex::decode(key).ok()?);
-    let key = secp256k1::PublicKey::try_from_bytes(&sec1).ok()?;
-    let peer = PeerId::from_public_key(&PublicKey::from(key));
-    format!("/ip4/{ip}/udp/{udp}/p2p/{peer}").parse().ok()
+/// The address discv5 asks an `enode://` bootnode for its record at.
+fn enode_addr(enode: &str) -> Option<Multiaddr> {
+    op_indexer_el::enode_discovery_addr(enode)?.parse().ok()
 }

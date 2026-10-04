@@ -37,6 +37,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 pub use config::ElConfig;
+pub use discovery::enode_discovery_addr;
 pub use error::ElError;
 pub use network::{ETH_RECORD_KEY, NetworkSpec, OPEL_RECORD_KEY, PeerConfig, PeerNetwork};
 pub use peers::{Peers, Report};

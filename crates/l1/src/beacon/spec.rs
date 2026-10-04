@@ -7,6 +7,8 @@
 //!
 //! Does not talk to anyone and verifies nothing: see `verify`.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use alloy_primitives::{B256, FixedBytes, b256};
 use sha2::{Digest, Sha256};
 
@@ -73,6 +75,12 @@ impl BeaconSpec {
     /// The slot at `now_secs` (seconds since the Unix epoch); 0 before genesis.
     pub(super) const fn slot_at(&self, now_secs: u64) -> u64 {
         now_secs.saturating_sub(self.genesis_time_secs) / self.seconds_per_slot
+    }
+
+    /// The slot the wall clock is in.
+    pub(super) fn now_slot(&self) -> u64 {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH);
+        self.slot_at(now.map_or(0, |since| since.as_secs()))
     }
 
     /// The version of the fork in force at `epoch`.
