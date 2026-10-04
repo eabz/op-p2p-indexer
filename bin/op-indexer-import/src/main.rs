@@ -20,6 +20,7 @@
 //! indexer never links this binary and never talks to the archive service. See
 //! `docs/import.md`.
 
+mod backoff;
 mod chunk;
 mod cli;
 mod download;

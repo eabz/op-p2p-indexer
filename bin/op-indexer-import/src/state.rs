@@ -366,7 +366,12 @@ fn sync_dir(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
 
-fn read_json<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
+/// Reads the JSON file at `path`, if there is one. Blocking.
+///
+/// # Errors
+///
+/// Returns the I/O error, or `InvalidData` if the file does not parse.
+pub(crate) fn read_json<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
     let content = match fs::read(path) {
         Ok(content) => content,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -383,7 +388,12 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
     })
 }
 
-fn write_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
+/// Writes `value` as JSON to `path`, atomically and durably. Blocking.
+///
+/// # Errors
+///
+/// Returns the I/O error.
+pub(crate) fn write_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
     let content = serde_json::to_vec_pretty(value)?;
     write_atomic(path, |file| file.write_all(&content))?;
     path.parent().map_or(Ok(()), sync_dir)

@@ -27,17 +27,12 @@ use tokio::time::{MissedTickBehavior, interval, sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::backoff::Backoff;
 use crate::chunk::{self, ChunkFile};
 use crate::progress::{self, Rate};
 use crate::source::{Encoding, HyperSync, Meters, SourceError};
 use crate::state::{Chunk, LOW_SPACE_BYTES, MIN_SPACE_BYTES, Plan, State, write_atomic};
 
-/// Attempts per chunk before the step stops.
-const MAX_ATTEMPTS: u32 = 6;
-/// Wait before the second attempt; doubled for each further one.
-const BACKOFF_BASE: Duration = Duration::from_millis(500);
-/// Longest wait between two attempts.
-const BACKOFF_CAP: Duration = Duration::from_secs(20);
 /// Pieces of an answer waiting to be written, per chunk. A piece is what the HTTP client
 /// hands over at once, tens of kilobytes; with the decoder that finds the cursor a request
 /// in flight holds about a megabyte.
@@ -398,13 +393,14 @@ async fn fetch_chunk(
     chunk: Chunk,
     path: PathBuf,
 ) -> Result<u64, DownloadError> {
-    let mut backoff = BACKOFF_BASE;
-    let mut attempt = 1;
+    let mut backoff = Backoff::new();
     loop {
         match attempt_chunk(source, meters, chunk, &path).await {
-            Err(err) if err.may_pass() && attempt < MAX_ATTEMPTS => {
-                // Up to half of the wait is random, so parallel requests do not retry together.
-                let wait = backoff.mul_f64(1.0 - fastrand::f64() / 2.0);
+            Err(err) if err.may_pass() => {
+                let attempt = backoff.attempt();
+                let Some(wait) = backoff.next() else {
+                    return Err(err);
+                };
                 let (from, to) = (chunk.from, chunk.to);
                 if attempt > 1 {
                     warn!(from, to, attempt, %err, ?wait, "chunk failed again, retrying");
@@ -412,8 +408,6 @@ async fn fetch_chunk(
                     debug!(from, to, %err, ?wait, "chunk failed, retrying");
                 }
                 sleep(wait).await;
-                backoff = backoff.saturating_mul(2).min(BACKOFF_CAP);
-                attempt += 1;
             }
             result => return result,
         }

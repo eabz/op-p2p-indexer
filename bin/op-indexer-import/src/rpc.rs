@@ -1,6 +1,7 @@
 //! The chain's JSON-RPC endpoint, read-only: what the archive service leaves out of some rows
 //! (see `fill`). One method, `eth_getBlockByNumber` with full transactions (public endpoints
-//! do not all allow the per-transaction methods; Unichain's does not), one block per request.
+//! do not all allow the per-transaction methods; Unichain's does not), several blocks per
+//! request as one JSON-RPC batch.
 //!
 //! Nothing read here is trusted: it goes into the rebuilt transaction, and the block's header
 //! hash proves it or `verify` fails. The answer's block hash is compared with the one the
@@ -9,7 +10,7 @@
 use std::time::Duration;
 
 use alloy_eips::eip7702::SignedAuthorization;
-use alloy_primitives::{B256, U64};
+use alloy_primitives::B256;
 use reqwest::header::{CONTENT_TYPE, HeaderValue};
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
@@ -17,26 +18,31 @@ use serde_json::json;
 use tokio::time::sleep;
 use tracing::debug;
 
-/// The chain's public JSON-RPC endpoint, by chain id, where `download` may need one.
-const ENDPOINTS: &[(u64, &str)] = &[(130, "https://mainnet.unichain.org")];
+use crate::backoff::Backoff;
 
-/// Limit for one request, a block with every transaction included.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Blocks asked for in one request: a batch of that many calls, each answered with every
+/// transaction of its block.
+pub(crate) const BATCH_BLOCKS: usize = 20;
+/// Limit for one request.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// Limit for connecting to the endpoint.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Attempts per block before the step stops.
-const MAX_ATTEMPTS: u32 = 6;
-/// Wait before the second attempt; doubled for each further one.
-const BACKOFF_BASE: Duration = Duration::from_millis(500);
-/// Longest wait between two attempts.
-const BACKOFF_CAP: Duration = Duration::from_secs(20);
 
-/// The chain's public JSON-RPC endpoint, if this build knows one.
-pub(crate) fn default_endpoint(chain_id: u64) -> Option<&'static str> {
-    ENDPOINTS
-        .iter()
-        .find(|(id, _)| *id == chain_id)
-        .map(|(_, endpoint)| *endpoint)
+/// The chain's public JSON-RPC endpoint, where `download` may need one and this build knows it.
+pub(crate) const fn default_endpoint(chain_id: u64) -> Option<&'static str> {
+    match chain_id {
+        130 => Some("https://mainnet.unichain.org"),
+        _ => None,
+    }
+}
+
+/// A block whose transactions `indexes` lack their authorization list.
+#[derive(Debug)]
+pub(crate) struct Wanted {
+    pub(crate) number: u64,
+    /// The block's hash in the download, which the endpoint's must equal.
+    pub(crate) hash: B256,
+    pub(crate) indexes: Vec<u64>,
 }
 
 /// Why a block could not be read from the endpoint.
@@ -112,52 +118,48 @@ impl Rpc {
         &self.url
     }
 
-    /// The authorization lists of transactions `indexes` of block `number`, whose hash must be
-    /// `hash`, in the order of `indexes`. Retries what may pass, with capped, jittered backoff.
+    /// The authorization lists `blocks` want, in their order (block by block, index by index),
+    /// read with one batch request. Retries what may pass, with the importer's backoff.
     ///
     /// # Errors
     ///
     /// Returns [`RpcError`] once the attempts are spent or the error cannot pass.
     pub(crate) async fn authorization_lists(
         &self,
-        number: u64,
-        hash: B256,
-        indexes: &[u64],
+        blocks: &[Wanted],
     ) -> Result<Vec<Vec<SignedAuthorization>>, RpcError> {
-        let mut backoff = BACKOFF_BASE;
-        let mut attempt = 1;
+        let mut backoff = Backoff::new();
         loop {
-            match self.attempt(number, hash, indexes).await {
-                Err(err) if err.is_retryable() && attempt < MAX_ATTEMPTS => {
-                    // Up to half of the wait is random, so parallel requests do not retry together.
-                    let wait = backoff.mul_f64(1.0 - fastrand::f64() / 2.0);
-                    debug!(number, %err, ?wait, "RPC request failed, retrying");
+            match self.attempt(blocks).await {
+                Err(err) if err.is_retryable() => {
+                    let Some(wait) = backoff.next() else {
+                        return Err(err);
+                    };
+                    debug!(%err, ?wait, "RPC request failed, retrying");
                     sleep(wait).await;
-                    backoff = backoff.saturating_mul(2).min(BACKOFF_CAP);
-                    attempt += 1;
                 }
                 result => return result,
             }
         }
     }
 
-    async fn attempt(
-        &self,
-        number: u64,
-        hash: B256,
-        indexes: &[u64],
-    ) -> Result<Vec<Vec<SignedAuthorization>>, RpcError> {
-        let call = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "eth_getBlockByNumber",
-            "params": [format!("{number:#x}"), true],
-        });
+    async fn attempt(&self, blocks: &[Wanted]) -> Result<Vec<Vec<SignedAuthorization>>, RpcError> {
+        let calls: Vec<_> = (0_usize..)
+            .zip(blocks)
+            .map(|(id, block)| {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "eth_getBlockByNumber",
+                    "params": [format!("{:#x}", block.number), true],
+                })
+            })
+            .collect();
         let response = self
             .client
             .post(&self.url)
             .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
-            .body(call.to_string())
+            .body(serde_json::Value::Array(calls).to_string())
             .send()
             .await?;
         let status = response.status();
@@ -172,39 +174,53 @@ impl Rpc {
                     .into_owned(),
             });
         }
-        let answer: Answer =
+        let mut answers: Vec<Answer> =
             serde_json::from_slice(&body).map_err(|err| RpcError::Malformed(err.to_string()))?;
-        if let Some(error) = answer.error {
-            return Err(RpcError::Refused {
-                code: error.code,
-                message: error.message,
-            });
+        // A batch may be answered in any order.
+        answers.sort_unstable_by_key(|answer| answer.id);
+        if answers.len() != blocks.len() {
+            return Err(RpcError::Malformed(format!(
+                "{} answers to {} calls",
+                answers.len(),
+                blocks.len()
+            )));
         }
-        let block = answer.result.ok_or(RpcError::NoBlock(number))?;
-        if block.hash != hash {
-            return Err(RpcError::OtherBlock {
-                number,
-                expected: hash,
-                got: block.hash,
-            });
-        }
-        let mut transactions = block.transactions;
-        indexes
-            .iter()
-            .map(|&index| {
-                transactions
-                    .iter_mut()
-                    .find(|transaction| transaction.transaction_index.to::<u64>() == index)
+        let mut lists = Vec::new();
+        for (wanted, answer) in blocks.iter().zip(answers) {
+            if let Some(error) = answer.error {
+                return Err(RpcError::Refused {
+                    code: error.code,
+                    message: error.message,
+                });
+            }
+            let number = wanted.number;
+            let block = answer.result.ok_or(RpcError::NoBlock(number))?;
+            if block.hash != wanted.hash {
+                return Err(RpcError::OtherBlock {
+                    number,
+                    expected: wanted.hash,
+                    got: block.hash,
+                });
+            }
+            let mut transactions = block.transactions;
+            for &index in &wanted.indexes {
+                // Transactions come in block order; the header hash proves what is taken.
+                let list = usize::try_from(index)
+                    .ok()
+                    .and_then(|at| transactions.get_mut(at))
                     .and_then(|transaction| transaction.authorization_list.take())
-                    .ok_or(RpcError::NoAuthorizations { number, index })
-            })
-            .collect()
+                    .ok_or(RpcError::NoAuthorizations { number, index })?;
+                lists.push(list);
+            }
+        }
+        Ok(lists)
     }
 }
 
 /// A JSON-RPC answer.
 #[derive(Debug, Deserialize)]
 struct Answer {
+    id: usize,
     result: Option<Block>,
     error: Option<CallError>,
 }
@@ -226,6 +242,5 @@ struct Block {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Transaction {
-    transaction_index: U64,
     authorization_list: Option<Vec<SignedAuthorization>>,
 }

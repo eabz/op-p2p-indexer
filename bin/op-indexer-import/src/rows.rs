@@ -109,6 +109,20 @@ pub(crate) struct TransactionRow {
     pub(crate) deposit_receipt_version: Option<U64>,
 }
 
+impl TransactionRow {
+    /// Whether this is an EIP-7702 transaction whose authorization list the service left out:
+    /// the fill has none, and the row has none, no bytes, or a list of zero entries (the
+    /// service's encoding starts with the count). EIP-7702 refuses an empty list.
+    pub(crate) fn lacks_authorization_list(&self) -> bool {
+        self.kind == Some(4)
+            && self.filled_authorization_list.is_none()
+            && self
+                .authorization_list
+                .as_ref()
+                .is_none_or(|list| list.get(..8).is_none_or(|count| count == [0_u8; 8]))
+    }
+}
+
 /// A log.
 #[derive(Debug, Deserialize)]
 pub(crate) struct LogRow {
@@ -141,6 +155,16 @@ pub(crate) struct Rows {
     pub(crate) transactions: Vec<TransactionRow>,
     /// By block number, then transaction index, then log index.
     pub(crate) logs: Vec<LogRow>,
+}
+
+impl Rows {
+    /// The block numbered `number`, if the chunk has it.
+    pub(crate) fn block(&self, number: u64) -> Option<&BlockRow> {
+        let at = self
+            .blocks
+            .binary_search_by_key(&number, |block| block.number);
+        at.ok().and_then(|at| self.blocks.get(at))
+    }
 }
 
 /// Why a downloaded chunk could not be read.

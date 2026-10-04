@@ -52,7 +52,7 @@ const LINK_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Compressed size of the chunks verified at once, whatever the number of threads; one chunk
 /// is always allowed. A chunk takes about twenty times its compressed size while it is
 /// verified (its text, then its rows), so this bounds `verify` to roughly 5 GB.
-const IN_FLIGHT_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const IN_FLIGHT_BYTES: u64 = 256 * 1024 * 1024;
 
 /// A rule a block failed.
 #[derive(Debug, thiserror::Error)]
@@ -216,10 +216,13 @@ pub(crate) async fn run(
             })
         {
             in_flight_bytes = in_flight_bytes.saturating_add(bytes);
-            let (raw, fill) = (state.raw_path(chunk), state.fill_path(chunk));
-            let verified = state.verified_path(chunk);
+            let (raw, fill, verified) = (
+                state.raw_path(chunk),
+                state.fill_path(chunk),
+                state.verified_path(chunk),
+            );
             tasks.spawn_blocking(move || {
-                let result = block::verify_chunk(&forks, chunk, (&raw, &fill), &verified);
+                let result = block::verify_chunk(&forks, chunk, &raw, &fill, &verified);
                 (chunk, bytes, result)
             });
         }
@@ -239,18 +242,17 @@ pub(crate) async fn run(
                         error!(%err, file = %file.display(), "chunk failed verification");
                     }
                     // A row left without a field says itself what to run.
-                    let unfilled =
-                        matches!(err, ChunkError::Block { check: Check::Unfilled { .. }, .. });
+                    let hint = if matches!(
+                        err,
+                        ChunkError::Block { check: Check::Unfilled { .. }, .. }
+                    ) {
+                        ""
+                    } else {
+                        "; delete it, and its fill if there is one, and download again if the \
+                         data is wrong"
+                    };
                     failure.get_or_insert_with(|| {
-                        if unfilled {
-                            format!("{err} (chunk {})", file.display())
-                        } else {
-                            format!(
-                                "{err} (chunk {}; delete it, and its fill if there is one, and \
-                                 download again if the data is wrong)",
-                                file.display()
-                            )
-                        }
+                        format!("{err} (chunk {}{hint})", file.display())
                     });
                 }
                 Some(Err(err)) => {
