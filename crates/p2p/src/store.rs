@@ -513,7 +513,9 @@ fn decode_checkpoint(key: &[u8], hash: &[u8]) -> Option<BlockRef> {
     })
 }
 
-/// Decodes one entry of the execution peers table; `None` if it has another shape.
+/// Decodes one entry of the execution peers table: the time it last served (8 bytes) and its
+/// address; `None` if it has another shape, such as an entry of an earlier build, which is
+/// then forgotten.
 fn decode_execution_peer(id: &[u8], value: &[u8]) -> Option<ExecutionPeer> {
     let (served, addr) = value.split_first_chunk::<8>()?;
     Some(ExecutionPeer {

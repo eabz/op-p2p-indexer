@@ -4,7 +4,7 @@
 //! Execution peers of our chain are few (about 25 on our fork) and mostly full: a dial usually
 //! ends with "too many peers" or a dropped handshake, and a slot opens only when a full peer's
 //! own sessions churn. So getting a session is a matter of asking every known peer and asking
-//! again soon. While it has fewer outbound sessions than its target ([`MAX_SESSIONS`]) the peer
+//! again soon. While it has fewer outbound sessions than its target (`max_sessions`) the peer
 //! set dials peers that are due, at most as many at once as sessions are missing, so dialing
 //! never opens more than the target.
 //!
@@ -12,16 +12,23 @@
 //!
 //! | Last dial | Next dial after |
 //! |---|---|
-//! | "too many peers", or a session the peer ended with it | [`FULL_PEER_RETRY`], 60 to 90 s |
-//! | dropped during the encrypted handshake (what a full reth node does) | the same, doubling with each drop in a row, up to 8 to 12 min |
+//! | "too many peers", or dropped during the encrypted handshake (how a full reth node refuses) | [`FULL_PEER_RETRY`], 60 to 90 s, doubling with each refusal in a row, up to 8 to 12 min |
+//! | a session the peer ended with "too many peers" | [`FULL_PEER_RETRY`] |
 //! | TCP failure, timeout, a failed hello or status | the redial interval (5 to 7.5 min), doubling up to 40 to 60 min |
 //! | a session that ended for another reason (closed, I/O error, other disconnect) | the redial interval |
 //! | another fork or chain, no shared protocol, it called us useless, it broke the protocol | [`LONG_BACKOFF`], 1 to 1.5 h |
 //! | its data failed verification | not for [`BAN_DURATION`] |
 //!
 //! It is never a tight loop: no peer is dialed more often than once per [`FULL_PEER_RETRY`],
-//! at most [`MAX_DIALS_IN_FLIGHT`] dials run at once, and at most 60 start in any minute. The
-//! waits, the bans and the choice of whom to dial next are in `schedule`.
+//! at most [`MAX_DIALS_IN_FLIGHT`] dials run at once, and at most 30 start in any minute.
+//!
+//! On a network op-p2p-indexers share (`NetworkSpec::indexers_only_below`), one outbound slot,
+//! and one inbound, beyond `max_sessions` is kept for an indexer; otherwise indexers compete
+//! like any peer.
+//! Outbound sessions we have not used for [`IDLE_RELEASE`] are closed, keeping [`KEEP_IDLE`]
+//! for the receipts of new blocks; the outbound target then drops to what is kept, and rises
+//! back to `max_sessions` once every kept session has been in use for a while. A released peer
+//! waits [`RELEASED_REDIAL`] before it is dialed again.
 //!
 //! Nothing is dialed or accepted until the node knows a block to advertise as its tip (the
 //! binary provides it): peers end a session at once with a node whose status says it is at
@@ -53,14 +60,29 @@ use self::schedule::{
 use crate::ElError;
 use crate::discovery::Candidate;
 use crate::metrics::{self, DialOutcome, DropReason, EndLabel};
+use crate::network::PeerConfig;
 use crate::session::{
     self, Accepted, Direction, EndReason, SessionContext, SessionDriver, SessionEnd, SessionError,
-    SessionHandle, unix_now,
+    SessionHandle, host, unix_now,
 };
+use crate::warn_limit::WarnLimit;
 
-/// Sessions the node keeps in each direction: this many it dials, and as many again it
-/// accepts. A handful is enough for a node that asks slowly.
-const MAX_SESSIONS: usize = 8;
+/// Outbound sessions kept open while unused: enough for the receipts of new blocks. Others
+/// that go unused for [`IDLE_RELEASE`] are closed, so the slot goes back to the full node that
+/// lent it. Sessions with op-p2p-indexers and sessions peers opened are not closed for it.
+const KEEP_IDLE: usize = 2;
+/// Shortest time between two warnings about dropped peer reports.
+const DROP_WARN_INTERVAL: Duration = Duration::from_mins(1);
+/// How long an outbound session may go without a request of ours before it is released.
+const IDLE_RELEASE: Duration = Duration::from_mins(10);
+/// A kept session used within this long counts as busy.
+const BUSY: Duration = Duration::from_mins(1);
+/// Status ticks in a row (a minute each) with every kept session busy before the outbound
+/// target lowered by a release goes back to `max_sessions`.
+const BUSY_TICKS: u32 = 5;
+/// Wait before a peer whose session we released unused is dialed again: much longer than an
+/// ordinary redial, so releasing does not turn into dialing the same peers in a loop.
+const RELEASED_REDIAL: Duration = Duration::from_mins(30);
 /// How often the peer set looks for peers that have become due for a dial. New candidates and
 /// finished dials are acted on at once; this only catches waits that ran out.
 const DIAL_TICK: Duration = Duration::from_secs(1);
@@ -81,6 +103,8 @@ const STATUS_INTERVAL: Duration = Duration::from_mins(1);
 pub struct Peers {
     sessions: watch::Receiver<Arc<[SessionHandle]>>,
     reports: mpsc::Sender<Report>,
+    /// Limits the warning about dropped reports, shared by every clone.
+    dropped: Arc<WarnLimit>,
 }
 
 /// What a requester tells the peer set about a peer.
@@ -95,6 +119,9 @@ pub enum Report {
     Served(PeerId),
     /// The peer stopped answering requests: drop it, it may be dialed again later.
     Unresponsive(PeerId),
+    /// The indexer says it holds blocks before Bedrock but answers "not held" for them again
+    /// and again: drop it for a long while, so another indexer can take the slot.
+    NotHolding(PeerId),
 }
 
 /// The peer set. [`PeerSet::run`] is its task.
@@ -116,6 +143,16 @@ pub(crate) struct PeerSet {
     tasks: JoinSet<Option<Done>>,
     /// Numbers sessions, so the end of an old session cannot remove a newer one of that peer.
     next_generation: u64,
+    /// Sessions kept in each direction (`PeerConfig::max_sessions`); one more is dialed for an
+    /// op-p2p-indexer on a network they share.
+    max_sessions: usize,
+    /// The dial for the indexer slot, while it is in [`Self::dialing`].
+    slot_dial: Option<PeerId>,
+    /// Outbound sessions dialed for (the indexer slot aside): `max_sessions`, or [`KEEP_IDLE`]
+    /// after a session was released unused, until the kept ones are busy for a while.
+    outbound_target: usize,
+    /// Status ticks in a row with every kept session busy.
+    busy_ticks: u32,
 }
 
 /// An open session.
@@ -151,6 +188,7 @@ impl Peers {
         let peers = Self {
             sessions,
             reports: reports_tx,
+            dropped: Arc::default(),
         };
         (peers, reports, published)
     }
@@ -173,8 +211,10 @@ impl Peers {
     /// Reports a peer to the peer set. Never waits: if the peer set is busy or gone the report
     /// is dropped, and the peer is reported again when it fails again.
     pub fn report(&self, report: Report) {
-        if let Err(err) = self.reports.try_send(report) {
-            debug!(%err, "peer report dropped");
+        if let Err(err) = self.reports.try_send(report)
+            && let Some(held_back) = self.dropped.allow(DROP_WARN_INTERVAL)
+        {
+            warn!(%err, held_back, "execution peer report dropped: the peer set is busy");
         }
     }
 }
@@ -186,12 +226,12 @@ impl PeerSet {
         ctx: Arc<SessionContext>,
         candidates: mpsc::Receiver<Candidate>,
         accepted: mpsc::Receiver<Accepted>,
-        saved: &[ExecutionPeer],
+        config: &PeerConfig,
         served: mpsc::Sender<ExecutionPeer>,
         reports: mpsc::Receiver<Report>,
         published: watch::Sender<Arc<[SessionHandle]>>,
     ) -> Self {
-        let schedule = Schedule::new(ctx.spec().label, saved);
+        let schedule = Schedule::new(ctx.spec().label, &config.saved_peers);
         Self {
             ctx,
             candidates,
@@ -204,6 +244,10 @@ impl PeerSet {
             dialing: HashSet::new(),
             tasks: JoinSet::new(),
             next_generation: 0,
+            max_sessions: config.max_sessions,
+            outbound_target: config.max_sessions,
+            busy_ticks: 0,
+            slot_dial: None,
         }
     }
 
@@ -245,7 +289,10 @@ impl PeerSet {
                 },
                 Some(report) = self.reports.recv() => self.reported(report),
                 _ = dial_tick.tick() => {}
-                _ = status_tick.tick() => self.log_status(&mut last_status),
+                _ = status_tick.tick() => {
+                    self.log_status(&mut last_status);
+                    self.release_idle();
+                }
             }
             // After every event: a new candidate or a finished dial may allow another dial.
             self.start_dials(&cancel);
@@ -296,23 +343,45 @@ impl PeerSet {
     }
 
     /// Dials peers that are due: at most as many as outbound sessions are missing from
-    /// [`MAX_SESSIONS`], counting the dials in flight, so no more than that many sessions are
-    /// ever opened by dialing. Dials nothing until a tip is known.
+    /// `max_sessions`, counting the dials in flight, so no more than that many sessions are
+    /// ever opened by dialing. On a network op-p2p-indexers share, one more slot is kept for an
+    /// indexer (see [`Self::holds_slot`]). Dials nothing until a tip is known.
     fn start_dials(&mut self, cancel: &CancellationToken) {
         if !self.ctx.has_tip() {
             return;
         }
-        let missing = MAX_SESSIONS
-            .saturating_sub(self.count(Direction::Outbound))
-            .saturating_sub(self.dialing.len());
-        if missing == 0 {
-            return;
+        let below = self.ctx.spec().indexers_only_below;
+        // The indexer slot is extra: its session, or the dial for it, is not counted against
+        // the ordinary slots.
+        let slot_held = self.slot_holder(Direction::Outbound).is_some();
+        let slot_dialing = self
+            .slot_dial
+            .is_some_and(|peer| self.dialing.contains(&peer));
+        let outbound = self
+            .count(Direction::Outbound)
+            .saturating_add(self.dialing.len())
+            .saturating_sub(usize::from(slot_held) + usize::from(slot_dialing));
+        let in_flight = MAX_DIALS_IN_FLIGHT.saturating_sub(self.dialing.len());
+        let (sessions, dialing, ctx) = (&self.sessions, &self.dialing, &self.ctx);
+        let in_use = |peer: &PeerId| sessions.contains_key(peer) || dialing.contains(peer);
+        let for_anyone = self.outbound_target.saturating_sub(outbound).min(in_flight);
+        let mut due = self.schedule.take_due(for_anyone, in_use, |_| true);
+        // One slot beyond the ordinary ones is kept for an indexer, only one discovery saw
+        // carrying the flag in this run: a peer calling itself one takes that slot at most.
+        // Not on a chain with nothing before Bedrock, and not past the ordinary slots: an
+        // indexer that turned out to hold nothing before Bedrock counts as an ordinary peer.
+        if below.is_some_and(|bedrock| bedrock > 0)
+            && !slot_held
+            && !slot_dialing
+            && outbound <= self.max_sessions
+            && due.len() < in_flight
+        {
+            let indexer = self
+                .schedule
+                .take_due(1, in_use, |peer| ctx.is_indexer(peer));
+            self.slot_dial = indexer.first().map(|candidate| candidate.peer_id);
+            due.extend(indexer);
         }
-        let wanted = missing.min(MAX_DIALS_IN_FLIGHT.saturating_sub(self.dialing.len()));
-        let (sessions, dialing) = (&self.sessions, &self.dialing);
-        let due = self.schedule.take_due(wanted, |peer| {
-            sessions.contains_key(peer) || dialing.contains(peer)
-        });
         for candidate in due {
             let peer = candidate.peer_id;
             self.dialing.insert(peer);
@@ -359,7 +428,20 @@ impl PeerSet {
     fn accept(&mut self, accepted: Accepted, cancel: &CancellationToken) {
         let Accepted { handle, driver } = accepted;
         let peer = handle.status().peer_id;
-        let full = self.count(Direction::Inbound) >= MAX_SESSIONS;
+        // The indexer slot is extra: its session is not counted against the ordinary slots,
+        // and an indexer with blocks before Bedrock may take it when it is free.
+        let slot_held = self.slot_holder(Direction::Inbound).is_some();
+        let ordinary = self
+            .count(Direction::Inbound)
+            .saturating_sub(usize::from(slot_held));
+        let takes_slot = !slot_held && self.holds_slot(&handle);
+        // One session per address (a /64 for IPv6): one host cannot take every slot.
+        let from = host(handle.status().addr.ip());
+        let same_host = self.sessions.values().any(|live| {
+            let status = live.handle.status();
+            status.direction == Direction::Inbound && host(status.addr.ip()) == from
+        });
+        let full = (ordinary >= self.max_sessions && !takes_slot) || same_host;
         // Without a tip the handshake advertised genesis: the peer would leave.
         if !self.ctx.has_tip()
             || full
@@ -382,6 +464,7 @@ impl PeerSet {
             addr = %status.addr,
             client = %status.client,
             direction = ?status.direction,
+            eth = %status.version,
             latest = ?status.latest,
             "execution session opened"
         );
@@ -467,6 +550,10 @@ impl PeerSet {
                 let tell = DisconnectReason::UselessPeer;
                 (peer, DropReason::Undecodable, tell, LONG_BACKOFF)
             }
+            Report::NotHolding(peer) => {
+                let tell = DisconnectReason::UselessPeer;
+                (peer, DropReason::NotHolding, tell, LONG_BACKOFF)
+            }
             Report::Unresponsive(peer) => {
                 let tell = DisconnectReason::UselessPeer;
                 (peer, DropReason::Unresponsive, tell, REDIAL_INTERVAL)
@@ -506,6 +593,77 @@ impl PeerSet {
         if let Err(err) = self.served.try_send(served) {
             debug!(%peer, %err, "served peer not reported");
         }
+    }
+
+    /// Closes outbound sessions we have not sent a request on for [`IDLE_RELEASE`], keeping
+    /// the [`KEEP_IDLE`] used most recently and the op-p2p-indexer used most recently: a full
+    /// node's slot is not held for nothing. The outbound target then drops to [`KEEP_IDLE`],
+    /// so no other peer is dialed in their place; it goes back to `max_sessions` once every
+    /// kept session has been busy (used within [`BUSY`]) for [`BUSY_TICKS`] ticks in a row.
+    fn release_idle(&mut self) {
+        let mut ours: Vec<&SessionHandle> = self
+            .sessions
+            .values()
+            .map(|live| &live.handle)
+            .filter(|handle| handle.status().direction == Direction::Outbound)
+            .collect();
+        ours.sort_unstable_by_key(|handle| handle.idle());
+        // The indexer slot's session is not released for being unused; other indexers are
+        // ordinary peers here.
+        let kept_indexer = ours
+            .iter()
+            .find(|handle| self.holds_slot(handle))
+            .map(|handle| handle.peer_id());
+        let mut released = false;
+        for handle in ours
+            .iter()
+            .filter(|handle| Some(handle.peer_id()) != kept_indexer)
+            .skip(KEEP_IDLE)
+        {
+            if handle.idle() >= IDLE_RELEASE {
+                debug!(peer = %handle.peer_id(), "releasing an unused execution session");
+                handle.disconnect(DisconnectReason::DisconnectRequested);
+                // However the session then ends, the later wait holds.
+                self.schedule.wait(&handle.peer_id(), RELEASED_REDIAL);
+                released = true;
+            }
+        }
+        if released {
+            self.outbound_target = KEEP_IDLE.min(self.max_sessions);
+            self.busy_ticks = 0;
+        } else if ours
+            .iter()
+            .filter(|handle| Some(handle.peer_id()) != kept_indexer)
+            .all(|handle| handle.idle() < BUSY)
+        {
+            // Busy for a while, not one burst: only then is the target raised again.
+            self.busy_ticks = self.busy_ticks.saturating_add(1);
+            if self.busy_ticks >= BUSY_TICKS {
+                self.outbound_target = self.max_sessions;
+            }
+        } else {
+            self.busy_ticks = 0;
+        }
+    }
+
+    /// Whether `handle`'s peer can hold the indexer slot: an op-p2p-indexer that says it holds
+    /// blocks before Bedrock, the ones only indexers share.
+    fn holds_slot(&self, handle: &SessionHandle) -> bool {
+        handle.status().indexer
+            && self
+                .ctx
+                .spec()
+                .indexers_only_below
+                .is_some_and(|bedrock| handle.range().earliest < bedrock)
+    }
+
+    /// The session holding the indexer slot in `direction`, if any: the first that can.
+    fn slot_holder(&self, direction: Direction) -> Option<PeerId> {
+        self.sessions
+            .values()
+            .map(|live| &live.handle)
+            .find(|handle| handle.status().direction == direction && self.holds_slot(handle))
+            .map(SessionHandle::peer_id)
     }
 
     /// Sessions open in one direction.

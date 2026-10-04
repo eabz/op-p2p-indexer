@@ -8,29 +8,32 @@
 
 mod state;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use alloy_primitives::BlockNumber;
 use libp2p::connection_limits::{self, ConnectionLimits};
 use libp2p::futures::StreamExt;
+use libp2p::gossipsub::TopicHash;
 use libp2p::identity::{Keypair, secp256k1};
 use libp2p::multiaddr::Protocol;
 use libp2p::swarm::NetworkBehaviour;
-use libp2p::{Multiaddr, noise, tcp, yamux};
-use op_indexer_primitives::UnsafeBlock;
+use libp2p::{Multiaddr, Swarm, noise, tcp, yamux};
+use op_indexer_primitives::{PayloadVersion, UnsafeBlock};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::{MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use self::state::State;
+pub(crate) use self::state::unix_now_secs;
 use crate::block::BlockValidator;
 use crate::discovery::{Discovery, DiscoveryError};
 use crate::gossip::{self, GossipError};
 use crate::metrics;
-use crate::{NetworkConfig, NodeStore};
+use crate::{NetworkConfig, NodeStore, PayloadSource};
 
 /// Peers found by discovery and waiting to be dialed. Each lookup round reports the routing
 /// table's peers of our chain; extras are dropped and reported again by the next round.
@@ -74,14 +77,82 @@ pub struct Network {
     store: Arc<NodeStore>,
     blocks: mpsc::Sender<UnsafeBlock>,
     safe_head: watch::Receiver<BlockNumber>,
+    payloads: Arc<dyn PayloadSource>,
 }
 
-/// The swarm's protocols: connection limits enforced for every connection, then gossipsub.
+/// The swarm's protocols: connection limits enforced for every connection, gossipsub, ping
+/// (the spec asks for it, for insight into network health), and the `payload_by_number`
+/// server.
 #[derive(NetworkBehaviour)]
 #[behaviour(prelude = "libp2p::swarm::derive_prelude")]
 struct Behaviour {
     limits: connection_limits::Behaviour,
     gossipsub: gossip::Behaviour,
+    ping: libp2p::ping::Behaviour,
+    payloads: libp2p::request_response::Behaviour<crate::sync::Codec>,
+    /// Banned peers: their connections are refused.
+    bans: libp2p::allow_block_list::Behaviour<libp2p::allow_block_list::BlockedPeers>,
+}
+
+/// Builds the swarm, listening, and the block topics it subscribed to.
+fn swarm(
+    config: &NetworkConfig,
+    keypair: secp256k1::Keypair,
+) -> Result<(Swarm<Behaviour>, HashMap<TopicHash, PayloadVersion>), NetworkError> {
+    let chain = config.chain;
+    let (gossipsub, topics) =
+        gossip::behaviour(chain.chain_id, Duration::from_secs(chain.block_time_secs))?;
+    let limits = connection_limits::Behaviour::new(
+        ConnectionLimits::default()
+            .with_max_established(Some(config.max_peers))
+            // Inbound may take at most half, so discovery dials always have room.
+            .with_max_established_incoming(Some(config.max_peers / 2))
+            .with_max_established_per_peer(Some(1))
+            .with_max_pending_incoming(Some(MAX_PENDING_CONNECTIONS))
+            .with_max_pending_outgoing(Some(MAX_PENDING_CONNECTIONS)),
+    );
+    let mut swarm = libp2p::SwarmBuilder::with_existing_identity(Keypair::from(keypair))
+        .with_tokio()
+        .with_tcp(
+            tcp::Config::default(),
+            noise::Config::new,
+            yamux::Config::default,
+        )
+        .map_err(NetworkError::Transport)?
+        .with_behaviour(|_| Behaviour {
+            limits,
+            gossipsub,
+            ping: libp2p::ping::Behaviour::default(),
+            payloads: crate::sync::behaviour(chain.chain_id),
+            bans: libp2p::allow_block_list::Behaviour::default(),
+        })
+        .unwrap_or_else(|never| match never {})
+        .with_swarm_config(|swarm| swarm.with_idle_connection_timeout(IDLE_CONNECTION_TIMEOUT))
+        .build();
+    let listen =
+        Multiaddr::from(config.listen_addr.ip()).with(Protocol::Tcp(config.listen_addr.port()));
+    swarm
+        .listen_on(listen.clone())
+        .map_err(|err| NetworkError::Listen(listen, err))?;
+    Ok((swarm, topics))
+}
+
+/// Sends a `payload_by_number` answer; returns whether it is on its way.
+fn answer(
+    swarm: &mut Swarm<Behaviour>,
+    channel: libp2p::request_response::ResponseChannel<Vec<u8>>,
+    response: Vec<u8>,
+) -> bool {
+    // The peer may have given up waiting; its request is then gone.
+    let sent = swarm
+        .behaviour_mut()
+        .payloads
+        .send_response(channel, response)
+        .is_ok();
+    if !sent {
+        debug!("payload_by_number: the peer left before its answer");
+    }
+    sent
 }
 
 impl Network {
@@ -89,13 +160,15 @@ impl Network {
     /// remembers peers that deliver them in `store`.
     ///
     /// `safe_head` is the highest L2 block known to be committed to L1; 0 until an L1 source is
-    /// wired. Missed blocks at or below it are not reported as a gap.
-    pub const fn new(
+    /// wired. Missed blocks at or below it are not reported as a gap. `payloads` holds the
+    /// blocks served to peers that ask for them by number.
+    pub fn new(
         config: NetworkConfig,
         keypair: secp256k1::Keypair,
         store: Arc<NodeStore>,
         blocks: mpsc::Sender<UnsafeBlock>,
         safe_head: watch::Receiver<BlockNumber>,
+        payloads: Arc<dyn PayloadSource>,
     ) -> Self {
         Self {
             config,
@@ -103,6 +176,7 @@ impl Network {
             store,
             blocks,
             safe_head,
+            payloads,
         }
     }
 
@@ -119,41 +193,19 @@ impl Network {
             store,
             blocks,
             safe_head,
+            payloads,
         } = self;
         let chain = config.chain;
         metrics::describe();
 
-        let (gossipsub, topics) =
-            gossip::behaviour(chain.chain_id, Duration::from_secs(chain.block_time_secs))?;
-        let limits = connection_limits::Behaviour::new(
-            ConnectionLimits::default()
-                .with_max_established(Some(config.max_peers))
-                // Inbound may take at most half, so discovery dials always have room.
-                .with_max_established_incoming(Some(config.max_peers / 2))
-                .with_max_established_per_peer(Some(1))
-                .with_max_pending_incoming(Some(MAX_PENDING_CONNECTIONS))
-                .with_max_pending_outgoing(Some(MAX_PENDING_CONNECTIONS)),
-        );
-        let mut discovery = Discovery::new(&keypair, config.listen_addr, chain.chain_id)?;
+        let mut discovery = Discovery::new(
+            &keypair,
+            config.listen_addr,
+            config.advertised_addr,
+            chain.chain_id,
+        )?;
         discovery.start().await?;
-
-        let mut swarm = libp2p::SwarmBuilder::with_existing_identity(Keypair::from(keypair))
-            .with_tokio()
-            .with_tcp(
-                tcp::Config::default(),
-                noise::Config::new,
-                yamux::Config::default,
-            )
-            .map_err(NetworkError::Transport)?
-            .with_behaviour(|_| Behaviour { limits, gossipsub })
-            .unwrap_or_else(|never| match never {})
-            .with_swarm_config(|swarm| swarm.with_idle_connection_timeout(IDLE_CONNECTION_TIMEOUT))
-            .build();
-        let listen =
-            Multiaddr::from(config.listen_addr.ip()).with(Protocol::Tcp(config.listen_addr.port()));
-        swarm
-            .listen_on(listen.clone())
-            .map_err(|err| NetworkError::Listen(listen, err))?;
+        let (mut swarm, topics) = swarm(&config, keypair)?;
         info!(peer_id = %swarm.local_peer_id(), chain_id = chain.chain_id, "p2p node starting");
 
         let (discovered_tx, mut discovered_rx) = mpsc::channel(DISCOVERED_PEERS_CAPACITY);
@@ -166,8 +218,17 @@ impl Network {
             cancel.child_token(),
         ));
 
-        let validator = BlockValidator::new(chain.chain_id, chain.unsafe_block_signer);
-        let mut state = State::new(topics, validator, blocks, store, peer_count_tx, safe_head);
+        let validator = BlockValidator::new(chain);
+        let server = crate::sync::Server::new(chain, payloads);
+        let mut state = State::new(
+            topics,
+            validator,
+            blocks,
+            store,
+            peer_count_tx,
+            safe_head,
+            server,
+        );
 
         state.dial_known_peers(&mut swarm).await;
 
@@ -183,6 +244,16 @@ impl Network {
                     Err(err) => warn!(%err, "validation task failed"),
                 },
                 event = swarm.select_next_some() => state.on_swarm_event(&mut swarm, event),
+                Some(ready) = state.server.next_answer() => match ready {
+                    Ok(ready) => {
+                        if answer(&mut swarm, ready.channel, ready.response)
+                            && let Some(permit) = ready.permit
+                        {
+                            state.server.writing(ready.request_id, permit);
+                        }
+                    }
+                    Err(err) => warn!(%err, "payload_by_number task failed"),
+                },
                 Some(addr) = discovered_rx.recv() => state.dial(&mut swarm, addr),
                 Some(result) = state.persists.join_next() => match result {
                     Ok(Ok(())) => metrics::known_peer_saved(),

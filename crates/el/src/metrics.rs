@@ -16,11 +16,12 @@
 //! | `op_indexer_el_candidates_discovered_total` | counter | `network` | Peers of our chain and fork handed to the peer set by discovery, repeats included. |
 //! | `op_indexer_el_dials_total` | counter | `network`, `outcome` | Dial attempts: `connected`, `too_many_peers`, `handshake_dropped`, `unreachable`, `timeout`, `wrong_fork`, `incompatible` or `failed`. |
 //! | `op_indexer_el_inbound_handshakes_failed_total` | counter | `network`, `stage` | Inbound connections that did not become a session. |
+//! | `op_indexer_el_inbound_dropped_total` | counter | `network` | Inbound connections closed before the handshake: all pending places, or the address's, were taken. |
 //! | `op_indexer_el_inbound_refused_total` | counter | `network` | Inbound sessions refused by the peer set: over the limit, already connected, or banned. |
 //! | `op_indexer_el_sessions_opened_total` | counter | `network`, `direction` | Sessions kept after the handshake: `outbound` or `inbound`. |
 //! | `op_indexer_el_sessions_ended_total` | counter | `network`, `reason` | Sessions that ended: `cancelled`, `too_many_peers`, `useless_peer`, `disconnected`, `closed`, `io`, `protocol` or `stalled` (did not read what it asked for). |
 //! | `op_indexer_el_session_duration_seconds` | histogram | `network` | How long a session lasted. |
-//! | `op_indexer_el_peers_dropped_total` | counter | `network`, `reason` | Peers this node disconnected: `bad_data` (also banned), `undecodable` or `unresponsive`. |
+//! | `op_indexer_el_peers_dropped_total` | counter | `network`, `reason` | Peers this node disconnected: `bad_data` (also banned), `undecodable`, `unresponsive` or `not_holding` (an indexer without its blocks before Bedrock). |
 //! | `op_indexer_el_requests_total` | counter | `outcome` | Receipts requests sent to a peer: `verified`, `empty`, `timeout`, `closed`, `malformed` or `invalid`. |
 //! | `op_indexer_el_verification_failures_total` | counter | `kind` | Answers that failed verification: `count` or `root`. |
 //! | `op_indexer_el_receipts_delivered_total` | counter | | Receipts in those blocks. |
@@ -45,6 +46,7 @@ use crate::session::Direction;
 const CANDIDATES_DISCOVERED: &str = "op_indexer_el_candidates_discovered_total";
 const DIALS: &str = "op_indexer_el_dials_total";
 const INBOUND_HANDSHAKES_FAILED: &str = "op_indexer_el_inbound_handshakes_failed_total";
+const INBOUND_DROPPED: &str = "op_indexer_el_inbound_dropped_total";
 const INBOUND_REFUSED: &str = "op_indexer_el_inbound_refused_total";
 const SESSIONS_OPENED: &str = "op_indexer_el_sessions_opened_total";
 const SESSIONS_ENDED: &str = "op_indexer_el_sessions_ended_total";
@@ -114,6 +116,8 @@ pub(crate) enum DropReason {
     Undecodable,
     /// It stopped answering requests.
     Unresponsive,
+    /// An indexer that answered "not held" for the blocks before Bedrock it says it holds.
+    NotHolding,
 }
 
 /// How an answer failed verification, the `kind` label.
@@ -161,6 +165,7 @@ impl DropReason {
             Self::BadData => "bad_data",
             Self::Undecodable => "undecodable",
             Self::Unresponsive => "unresponsive",
+            Self::NotHolding => "not_holding",
         }
     }
 }
@@ -186,7 +191,7 @@ pub(crate) enum ServeKind {
 }
 
 impl ServeKind {
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Headers => "headers",
             Self::Bodies => "bodies",
@@ -285,6 +290,11 @@ pub(crate) fn describe() {
         "Inbound connections that did not become a session, by handshake stage"
     );
     describe_counter!(
+        INBOUND_DROPPED,
+        Unit::Count,
+        "Inbound connections closed before the handshake, all pending places taken"
+    );
+    describe_counter!(
         INBOUND_REFUSED,
         Unit::Count,
         "Inbound sessions refused by the peer set"
@@ -357,6 +367,11 @@ pub(crate) fn dial(network: &'static str, outcome: DialOutcome) {
 /// Records an inbound connection whose handshake failed at `stage`.
 pub(crate) fn inbound_handshake_failed(network: &'static str, stage: &'static str) {
     counter!(INBOUND_HANDSHAKES_FAILED, "network" => network, "stage" => stage).increment(1);
+}
+
+/// Records an inbound connection closed before its handshake.
+pub(crate) fn inbound_dropped(network: &'static str) {
+    counter!(INBOUND_DROPPED, "network" => network).increment(1);
 }
 
 /// Records an inbound session the peer set refused.

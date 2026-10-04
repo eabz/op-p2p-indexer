@@ -1,5 +1,6 @@
-//! Local block archive on fjall: a contiguous range of committed blocks, kept in the encoding
-//! execution-network peers ask for, so serving them never touches ClickHouse.
+//! Local block archive on fjall: the committed store. A contiguous range of committed blocks,
+//! kept in the encoding execution-network peers ask for, with each transaction's sender and
+//! the committed L1 heads.
 //!
 //! - [`FjallArchive`]: the [`ArchiveStore`] implementation, cheap to clone.
 //! - `tables`: the fjall keyspaces and the synchronous operations on them.
@@ -8,22 +9,20 @@
 //! keccak is the block hash), the body as `alloy_consensus::BlockBody<OpTxEnvelope>` encodes it
 //! (transactions in network encoding, ommers, optional withdrawals: one `BlockBodies` entry), and
 //! the receipts as an RLP list of `OpReceiptEnvelope` network encodings (with bloom: one
-//! `Receipts` entry up to eth/68). Senders are not stored. The message shapes are those of the
-//! devp2p eth protocol: <https://github.com/ethereum/devp2p/blob/master/caps/eth.md>.
+//! `Receipts` entry up to eth/68). Senders are 20-byte addresses, one per transaction,
+//! uncompressed. The message shapes are those of the devp2p eth protocol:
+//! <https://github.com/ethereum/devp2p/blob/master/caps/eth.md>.
 //!
-//! Does not decide which blocks are archived or how many are kept: the caller appends, truncates
-//! and trims.
+//! Does not decide which blocks are archived: the caller appends. Nothing removes blocks; the
+//! archive keeps every block it is given.
 //!
-//! **Space.** fjall is log-structured: [`ArchiveStore::trim`] and
-//! [`ArchiveStore::truncate_above`] write tombstones, and the
-//! space comes back later, when background compaction rewrites the trees and drops blob files
-//! nothing references. A trim with no writes after it frees nothing; the space returns as
-//! further appends trigger flushes and compactions. Appends always follow in this indexer, so
-//! there is no forced compaction. Disk use therefore runs above the live data by roughly a few
-//! blob files (64 MiB each) plus the journal (at most 128 MiB): a constant, not a multiple of
-//! the window. With a tiny window that constant dominates; at the windows this archive is for,
-//! it is a few percent. The `archive_*` gauges show disk use, stale blob bytes and running
-//! compactions after each write.
+//! **Space.** fjall is log-structured: a value written again (receipts set, a block appended
+//! twice) leaves a stale copy, and the space comes back later, when background compaction
+//! rewrites the trees and drops blob files nothing references. Disk use therefore runs above
+//! the live data by roughly a few blob files (64 MiB each) plus the journal (at most 128 MiB):
+//! a constant. In a small archive that constant dominates; in a full history it is a few
+//! percent. The `archive_*` gauges show disk use, stale blob bytes and running compactions
+//! after each write.
 
 mod tables;
 
@@ -31,24 +30,23 @@ use std::fmt;
 use std::path::Path;
 
 use alloy_consensus::Header;
-use alloy_primitives::{BlockHash, BlockNumber, Bytes, keccak256};
+use alloy_primitives::{Address, BlockHash, BlockNumber, Bytes, keccak256};
 use alloy_rlp::Decodable;
 use op_alloy_consensus::OpReceiptEnvelope;
 use op_indexer_primitives::{
-    BlockRead, BlockRef, ChainIdentity, EncodedBlock, ItemConvert, ReadLimits, encode_receipts,
+    ArchivedBlock, BlockRead, BlockRef, ChainIdentity, EncodedBlock, ItemConvert, L1Heads,
+    ReadLimits, encode_receipts, split_body,
 };
 
 use self::tables::{Entry, Failure, Prepared, Tables};
 use crate::metrics::{self, Operation};
-use crate::validate::validate_receipts;
 use crate::{ArchiveStore, InvalidBlockReason, StorageError, Store};
 
 /// The block archive in one fjall database directory. Cheap to clone: clones share the open
 /// database.
 ///
 /// Every call runs on a blocking thread, so the futures never block the runtime. Dropping a
-/// future does not cancel its blocking call: an append or `set_receipts` still completes, and a
-/// `trim` or `truncate_above` keeps removing until it is done or its deadline (60 s) passes.
+/// future does not cancel its blocking call: an append or `set_receipts` still completes.
 /// Single reads and writes have no timeout: a local disk either answers or the process has
 /// bigger problems.
 ///
@@ -144,7 +142,8 @@ impl FjallArchive {
 }
 
 /// A block checked and compressed for [`FjallArchive::bulk_append`], off the writer: its
-/// header hashes to its hash, and its number and parent are read from it.
+/// header hashes to its hash, it has one sender per transaction, and its number and parent are
+/// read from it.
 #[derive(Debug)]
 pub struct PreparedBlock(Prepared);
 
@@ -154,11 +153,16 @@ impl PreparedBlock {
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError::InvalidData`] if the header does not decode,
-    /// [`StorageError::InvalidBlock`] if it does not hash to the block's hash, and
-    /// [`StorageError::Oversized`] if a value is too large to compress.
-    pub fn new(block: &EncodedBlock) -> Result<Self, StorageError> {
-        let checked = checked_header(block.hash, &block.header)?;
+    /// Returns [`StorageError::InvalidData`] if the header or the body does not decode,
+    /// [`StorageError::InvalidBlock`] if the header does not hash to the block's hash or the
+    /// senders are not one per transaction, and [`StorageError::Oversized`] if a value is too
+    /// large to compress.
+    pub fn new(block: &ArchivedBlock) -> Result<Self, StorageError> {
+        let ArchivedBlock {
+            encoded: block,
+            senders,
+        } = block;
+        let checked = checked(block, senders)?;
         let prepared = Prepared::new(
             BlockRef {
                 number: checked.number,
@@ -168,6 +172,7 @@ impl PreparedBlock {
             &block.header,
             &block.body,
             block.receipts.as_ref().map(|receipts| &receipts[..]),
+            senders,
         )?;
         Ok(Self(prepared))
     }
@@ -176,7 +181,7 @@ impl PreparedBlock {
 impl ArchiveStore for FjallArchive {
     /// Hashes, compresses and writes on a blocking thread. One batch holds at most 16 MiB of
     /// RLP, and the writer lock is taken once per batch.
-    async fn append_batch(&self, blocks: Vec<EncodedBlock>) -> Result<(), StorageError> {
+    async fn append_batch(&self, blocks: Vec<ArchivedBlock>) -> Result<(), StorageError> {
         self.blocking(Operation::AppendBatch, "append_batch", move |tables| {
             let entries: Vec<Entry> = blocks.into_iter().map(entry).collect::<Result<_, _>>()?;
             tables::append_batch(tables, &entries)
@@ -189,12 +194,9 @@ impl ArchiveStore for FjallArchive {
         block: BlockRef,
         receipts: &[OpReceiptEnvelope],
     ) -> Result<bool, StorageError> {
-        // The error goes into the timed call on purpose, so invalid receipts are counted.
-        let checked = validate_receipts(block.number, receipts);
         let count = receipts.len();
         let receipts = encode_receipts(receipts);
         self.blocking(Operation::SetReceipts, "set_receipts", move |tables| {
-            checked?;
             tables::set_receipts(tables, block, &receipts, count)
         })
         .await
@@ -212,6 +214,42 @@ impl ArchiveStore for FjallArchive {
         .await
     }
 
+    async fn blocks(
+        &self,
+        from: BlockNumber,
+        limits: ReadLimits,
+    ) -> Result<Vec<ArchivedBlock>, StorageError> {
+        self.blocking(Operation::Blocks, "blocks", move |tables| {
+            tables::blocks(tables, from, limits)
+        })
+        .await
+    }
+
+    async fn pending_receipts(
+        &self,
+        from: BlockNumber,
+        limit: usize,
+    ) -> Result<(Vec<BlockRef>, u64), StorageError> {
+        self.blocking(
+            Operation::PendingReceipts,
+            "pending_receipts",
+            move |tables| tables::pending_receipts(tables, from, limit),
+        )
+        .await
+    }
+
+    async fn heads(&self) -> Result<L1Heads, StorageError> {
+        self.blocking(Operation::Heads, "heads", tables::heads)
+            .await
+    }
+
+    async fn set_heads(&self, heads: L1Heads) -> Result<(), StorageError> {
+        self.blocking(Operation::SetL1Heads, "set_heads", move |tables| {
+            tables::set_heads(tables, heads)
+        })
+        .await
+    }
+
     async fn number_of(&self, hash: BlockHash) -> Result<Option<BlockNumber>, StorageError> {
         self.blocking(Operation::NumberOf, "number_of", move |tables| {
             tables::number_of(tables, hash)
@@ -223,32 +261,22 @@ impl ArchiveStore for FjallArchive {
         self.blocking(Operation::Range, "range", tables::range)
             .await
     }
-
-    async fn truncate_above(&self, number: BlockNumber) -> Result<(), StorageError> {
-        self.blocking(Operation::TruncateAbove, "truncate_above", move |tables| {
-            tables::truncate_above(tables, number)
-        })
-        .await
-    }
-
-    async fn trim(&self, retain: u64) -> Result<u64, StorageError> {
-        self.blocking(Operation::Trim, "trim", move |tables| {
-            tables::trim(tables, retain)
-        })
-        .await
-    }
 }
 
 /// The archive entry of a block handed over in its original encoding: its bytes unchanged, with
 /// the number and parent hash read from the header, which must hash to the block's hash.
-fn entry(block: EncodedBlock) -> Result<Entry, StorageError> {
-    let EncodedBlock {
-        hash,
-        header,
-        body,
-        receipts,
+fn entry(block: ArchivedBlock) -> Result<Entry, StorageError> {
+    let checked = checked(&block.encoded, &block.senders)?;
+    let ArchivedBlock {
+        encoded:
+            EncodedBlock {
+                hash,
+                header,
+                body,
+                receipts,
+            },
+        senders,
     } = block;
-    let checked = checked_header(hash, &header)?;
     Ok(Entry {
         block: BlockRef {
             number: checked.number,
@@ -258,7 +286,27 @@ fn entry(block: EncodedBlock) -> Result<Entry, StorageError> {
         header,
         body,
         receipts,
+        senders,
     })
+}
+
+/// The decoded header of `block`, which must hash to the block's hash, after checking that
+/// `senders` are one per transaction of its body (cut, not decoded).
+fn checked(block: &EncodedBlock, senders: &[Address]) -> Result<Header, StorageError> {
+    let header = checked_header(block.hash, &block.header)?;
+    let body = split_body(&block.body).ok_or(StorageError::InvalidData {
+        store: Store::Archive,
+        what: "body to append",
+        block: Some(block.hash),
+        source: None,
+    })?;
+    if body.transactions.len() != senders.len() {
+        return Err(StorageError::InvalidBlock {
+            number: header.number,
+            reason: InvalidBlockReason::SenderCount,
+        });
+    }
+    Ok(header)
 }
 
 /// The decoded `header`, which must hash to `hash`.

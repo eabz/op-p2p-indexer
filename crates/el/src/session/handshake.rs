@@ -25,14 +25,16 @@ use crate::discovery::Candidate;
 /// Limit for opening the TCP connection.
 const TCP_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// Limit for the encrypted handshake.
-const ECIES_TIMEOUT: Duration = Duration::from_secs(10);
+/// Limit for the encrypted handshake: a round trip, so short; a connection that holds a
+/// pending inbound place without speaking frees it soon.
+const ECIES_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Limit for the hello exchange.
-const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Limit for the status exchange.
-const STATUS_TIMEOUT: Duration = Duration::from_secs(15);
+/// Limit for the status exchange, short like the others: an inbound connection holds a
+/// pending place until it ends.
+const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What this node calls itself in the hello.
 const CLIENT_VERSION: &str = concat!("op-indexer/", env!("CARGO_PKG_VERSION"));
@@ -61,6 +63,12 @@ pub(crate) struct PeerStatus {
     pub(crate) latest: Option<u64>,
     /// Hash of the peer's head.
     pub(crate) head_hash: B256,
+    /// Whether the peer is a known op-p2p-indexer: blocks held back from other peers are
+    /// shared with it.
+    pub(crate) indexer: bool,
+    /// The eth version the session speaks: 69, or 68 with a peer that does not speak 69. An
+    /// eth/68 peer is served but never asked: see `SessionHandle::is_askable`.
+    pub(crate) version: EthVersion,
 }
 
 /// Why a session could not be established.
@@ -148,7 +156,11 @@ async fn handshake(
 ) -> Result<(SessionHandle, SessionDriver), SessionError> {
     let peer_id = ecies.remote_id();
     let hello = HelloMessage::builder(pk2id(&ctx.key().public_key(SECP256K1)))
-        .protocols([Protocol::eth(EthVersion::Eth69)])
+        // eth/69; and eth/68 where we serve, so peers that do not speak 69 can sync from us.
+        .protocols(
+            std::iter::once(Protocol::eth(EthVersion::Eth69))
+                .chain(ctx.serves().then(|| Protocol::eth(EthVersion::Eth68))),
+        )
         .client_version(CLIENT_VERSION)
         .port(ctx.listen_port())
         .build();
@@ -172,18 +184,24 @@ async fn handshake(
             SessionError::Hello(None)
         }
     })?;
-    if p2p.shared_capabilities().eth().is_err() {
-        return Err(SessionError::NoSharedEth);
-    }
+    // The highest version both sides speak (RLPx, message ID-based multiplexing).
+    let version = p2p
+        .shared_capabilities()
+        .eth_version()
+        .map_err(|_none| SessionError::NoSharedEth)?;
 
     let fork_filter = ctx.fork_filter();
-    // What is advertised: the held range as it is, else the tip alone (see
-    // `AdvertisedRange`). Sessions open only once a tip is known.
-    let (serving, answers) = ctx.session_serving();
+    let indexer = ctx.is_indexer(&peer_id);
+    // What is advertised: the held range as it is (from the Bedrock block on, for a peer that
+    // is not an indexer), else the tip alone (see `AdvertisedRange`). Sessions open only once
+    // a tip is known.
+    let (serving, answers) = ctx.session_serving(indexer, version);
     let advertised = serving.advertised();
     let latest = advertised.map(|range| range.latest);
+    // eth/68 carries a total difficulty (0; peers check only its size) and the head hash;
+    // eth/69 carries the range.
     let status = UnifiedStatus {
-        version: EthVersion::Eth69,
+        version,
         chain: ctx.spec().network_id.into(),
         genesis: ctx.spec().genesis_hash,
         forkid: fork_filter.current(),
@@ -209,6 +227,8 @@ async fn handshake(
         earliest: theirs.earliest_block,
         latest: theirs.latest_block,
         head_hash: theirs.blockhash,
+        indexer,
+        version,
     };
     Ok(driver::new(peer, eth.into_inner(), serving, answers))
 }

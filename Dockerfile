@@ -42,9 +42,14 @@ USER indexer
 ENV OP_INDEXER_DATA_DIR=/data
 VOLUME /data
 
+# The gRPC stream listens on every interface inside the container; publish the port only
+# where consumers may reach it: the stream has no authentication.
+ENV OP_INDEXER_STREAM_LISTEN_ADDR=0.0.0.0:50051
+
 # OP Stack p2p (libp2p TCP + discv5 UDP) on 9222; the chain's execution p2p (RLPx TCP + discv5
 # UDP) on 30303, used only when OP_INDEXER_EL_ENABLED=true; L1's execution p2p on 30304 and
-# the beacon light client on 9001, used only when OP_INDEXER_L1_ENABLED=true.
-EXPOSE 9222/tcp 9222/udp 30303/tcp 30303/udp 30304/tcp 30304/udp 9001/tcp 9001/udp
+# the beacon light client on 9001, used only when OP_INDEXER_L1_ENABLED=true; the gRPC stream
+# on 50051.
+EXPOSE 9222/tcp 9222/udp 30303/tcp 30303/udp 30304/tcp 30304/udp 9001/tcp 9001/udp 50051/tcp
 
 ENTRYPOINT ["/usr/local/bin/op-indexer"]

@@ -39,10 +39,11 @@ mod headers;
 mod schedule;
 mod segment;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
 use alloy_primitives::{B256, BlockNumber};
+use op_indexer_chainspec::ChainSpec;
 use op_indexer_primitives::{BlockRef, EncodedBlock, SyncRange};
 use reth_network_peers::PeerId;
 use tokio::sync::{mpsc, oneshot};
@@ -55,7 +56,7 @@ use self::headers::HEADERS_PER_REQUEST;
 use self::schedule::Schedule;
 use crate::ElError;
 use crate::metrics::{self, SyncOutcome};
-use crate::peers::{Peers, closed};
+use crate::peers::{Peers, Report, closed};
 use crate::session::{RequestError, SessionHandle};
 
 /// Blocks between two checkpoints: what one session fetches as a unit and the size of a batch
@@ -73,6 +74,9 @@ const STARVED_INTERVAL: Duration = Duration::from_mins(1);
 /// every peer that says it holds the anchor's height has: a block no peer serves (one a reorg
 /// left behind, mostly) would otherwise keep the round open for ever.
 const ANCHOR_REFUSALS: usize = 3;
+/// "Not held" answers in a row for blocks before Bedrock after which an indexer is dropped:
+/// it advertises them and does not serve them, and holds the indexer slot.
+const MAX_INDEXER_MISSES: u32 = 3;
 
 /// What a range sync fetches, known once its anchor is.
 #[derive(Debug)]
@@ -130,7 +134,7 @@ pub struct RangeSync {
 /// [`ElError::ChannelClosed`] if the peer set stopped while the node was running, and
 /// [`ElError::Task`] if verification panicked.
 pub(crate) async fn run(
-    canyon_time: u64,
+    chain: &'static ChainSpec,
     peers: Peers,
     sync: RangeSync,
     cancel: CancellationToken,
@@ -149,13 +153,7 @@ pub(crate) async fn run(
         // No more plans: nothing left to sync.
         let Some(mut plan) = plan else { break };
         let ended = std::mem::replace(&mut plan.ended, oneshot::channel().0);
-        let syncer = Syncer::new(
-            canyon_time,
-            peers.clone(),
-            plan,
-            blocks.clone(),
-            verified.clone(),
-        );
+        let syncer = Syncer::new(chain, peers.clone(), plan, blocks.clone(), verified.clone());
         let Some(end) = syncer.run(&cancel).await? else {
             break;
         };
@@ -170,6 +168,8 @@ pub(crate) async fn run(
 #[derive(Debug)]
 struct Syncer {
     canyon_time: u64,
+    /// Blocks below this are asked of op-p2p-indexers only: the chain's Bedrock block.
+    indexers_only_below: BlockNumber,
     peers: Peers,
     schedule: Schedule,
     /// First block of the range.
@@ -201,6 +201,8 @@ struct Syncer {
     anchor_served: bool,
     /// Peers that said they do not hold the anchor, while none has served it.
     anchor_refused: HashSet<PeerId>,
+    /// "Not held" answers in a row for blocks before Bedrock, per indexer.
+    indexer_misses: HashMap<PeerId, u32>,
     /// The block the first block must name as parent; `None` for any.
     extends: Option<BlockRef>,
     /// How the round ends before it is complete, once that is known: the chain down from the
@@ -295,7 +297,7 @@ impl Failure {
 impl Syncer {
     /// Creates the syncer for `plan`. Sends nothing until [`Self::run`].
     fn new(
-        canyon_time: u64,
+        chain: &'static ChainSpec,
         peers: Peers,
         plan: SyncPlan,
         blocks: mpsc::Sender<Vec<EncodedBlock>>,
@@ -317,7 +319,8 @@ impl Syncer {
             .collect();
         checkpoints.insert(anchor.number, anchor.hash);
         let mut syncer = Self {
-            canyon_time,
+            canyon_time: chain.canyon_time,
+            indexers_only_below: chain.bedrock_block,
             peers,
             schedule: Schedule::default(),
             first,
@@ -336,6 +339,7 @@ impl Syncer {
             starved_warned: None,
             anchor_served: false,
             anchor_refused: HashSet::new(),
+            indexer_misses: HashMap::new(),
             extends,
             given_up: None,
         };
@@ -384,7 +388,10 @@ impl Syncer {
                     if !alive {
                         return closed("sessions", cancel).map(|()| None);
                     }
-                    self.schedule.retain(&self.peers.sessions());
+                    let sessions = self.peers.sessions();
+                    self.schedule.retain(&sessions);
+                    self.indexer_misses
+                        .retain(|peer, _| sessions.iter().any(|session| session.peer_id() == *peer));
                 }
                 () = async {
                     match wake {
@@ -430,10 +437,20 @@ impl Syncer {
         }
         let number = self.anchor.number;
         self.peers.sessions().iter().all(|session| {
-            let range = session.range();
-            !(range.earliest <= number && number <= range.latest)
+            !self.serves(session, number, number)
                 || self.anchor_refused.contains(&session.status().peer_id)
         })
+    }
+
+    /// Whether `session`'s peer may be asked for blocks `first` to `last`: it says it holds
+    /// them, and blocks before Bedrock are asked of op-p2p-indexers only, which share them
+    /// with each other; other peers are left alone for those.
+    fn serves(&self, session: &SessionHandle, first: BlockNumber, last: BlockNumber) -> bool {
+        let range = session.range();
+        session.is_askable()
+            && range.earliest <= first
+            && last <= range.latest
+            && (first >= self.indexers_only_below || session.status().indexer)
     }
 
     /// Records the header chain reaching the first block, whose parent is `below`: it must be
@@ -505,9 +522,7 @@ impl Syncer {
     /// walk while it lasts, then segments, failed ones first. `None` if there is nothing the
     /// peer holds, or nothing to do right now.
     fn next_job(&mut self, session: &SessionHandle) -> Option<Job> {
-        let range = session.range();
-        let holds =
-            |first: BlockNumber, last: BlockNumber| range.earliest <= first && last <= range.latest;
+        let holds = |first: BlockNumber, last: BlockNumber| self.serves(session, first, last);
         if let Some(start) = self.walk_from() {
             // One page at a time: each starts where the one before ended.
             let page_first = start
@@ -644,6 +659,15 @@ impl Syncer {
         if let Some(report) = self.schedule.finished(peer, Some(&failure)) {
             self.peers.report(report);
         }
+        // Only indexers are asked for blocks before Bedrock.
+        if first < self.indexers_only_below && matches!(failure, Failure::NotHeld) {
+            let misses = self.indexer_misses.entry(peer).or_default();
+            *misses = misses.saturating_add(1);
+            if *misses >= MAX_INDEXER_MISSES {
+                self.indexer_misses.remove(&peer);
+                self.peers.report(Report::NotHolding(peer));
+            }
+        }
         match failure {
             Failure::Unsupported(reason) => Err(ElError::Sync(reason)),
             Failure::Panicked(source) => Err(ElError::Task {
@@ -663,6 +687,7 @@ impl Syncer {
 
     fn succeeded(&mut self, peer: PeerId) {
         metrics::sync_request(SyncOutcome::Verified);
+        self.indexer_misses.remove(&peer);
         // A success is never reported to the peer set.
         let _report = self.schedule.finished(peer, None);
     }
@@ -693,10 +718,7 @@ impl Syncer {
             let sessions = self.peers.sessions();
             let usable = sessions
                 .iter()
-                .filter(|session| {
-                    let range = session.range();
-                    range.earliest <= page_first && lowest.number <= range.latest
-                })
+                .filter(|session| self.serves(session, page_first, lowest.number))
                 .count();
             let waiting = match (usable, lowest == self.anchor) {
                 (0, true) => "range sync: waiting for a peer that holds the anchor",

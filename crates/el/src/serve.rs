@@ -31,15 +31,16 @@ mod provider;
 mod session;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use alloy_primitives::Bytes;
+use alloy_primitives::{BlockNumber, Bytes};
 use alloy_rlp::{Decodable, Encodable, Header};
 use op_alloy_consensus::{OpReceipt, OpReceiptEnvelope};
-use op_indexer_primitives::{BlockRead, BlockStart, ItemConvert, ReadLimits};
+use op_indexer_primitives::{BlockRead, BlockRef, BlockStart, ItemConvert, ReadLimits};
 use reth_eth_wire_types::message::RequestPair;
 use reth_eth_wire_types::{
-    BlockHashOrNumber, GetBlockBodies, GetBlockHeaders, GetReceipts, HeadersDirection,
+    BlockHashOrNumber, EthVersion, GetBlockBodies, GetBlockHeaders, GetReceipts, HeadersDirection,
 };
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
@@ -52,6 +53,7 @@ use self::provider::HeldRange;
 pub(crate) use self::session::{Handled, Serving, SessionServing};
 use crate::ElError;
 use crate::metrics::{self, ServeKind, ServeOutcome};
+use crate::warn_limit::WarnLimit;
 use crate::wire;
 
 /// Most headers, bodies or blocks of receipts in one response: what reth and geth serve.
@@ -69,13 +71,72 @@ const MAX_QUEUED: usize = 64;
 /// provider; this keeps serving to a few of them whatever the number of peers.
 const MAX_CONCURRENT: usize = 4;
 
+/// Shortest time between two reads of the held range when the head moves: a block or two.
+const HEAD_REFRESH: Duration = Duration::from_secs(2);
 /// How often the held range is read from the provider.
 const RANGE_REFRESH: Duration = Duration::from_secs(10);
+/// Reads of the held range failed in a row after which requests are answered empty without
+/// reading, until one succeeds again: about 80 s of a provider that cannot be read. Only that
+/// read counts: it touches no particular block, so one corrupt stored item that peers keep
+/// asking for fails their requests, not serving as a whole.
+const MAX_FAILURES: u32 = 8;
+/// Shortest time between two warnings about the same kind of failed read.
+const FAILURE_WARN_INTERVAL: Duration = Duration::from_mins(1);
+
+/// How the provider has been doing, shared by the server and the reads it spawns.
+#[derive(Debug, Default)]
+struct Health {
+    /// Reads of the held range failed in a row.
+    failures: AtomicU32,
+    /// One warning limit per kind of request.
+    warned: [WarnLimit; 3],
+    /// The warning limit for reads of the held range.
+    range_warned: WarnLimit,
+}
+
+impl Health {
+    /// Whether the held range could not be read [`MAX_FAILURES`] times in a row.
+    fn is_failing(&self) -> bool {
+        self.failures.load(Ordering::Relaxed) >= MAX_FAILURES
+    }
+
+    fn succeeded(&self) {
+        self.failures.store(0, Ordering::Relaxed);
+    }
+
+    /// Warns about a failed read, at most once a minute per cause (`kind`, or `None` for the
+    /// held range, which is also counted towards [`MAX_FAILURES`]).
+    fn failed(&self, kind: Option<ServeKind>, err: &dyn std::fmt::Display) {
+        let (warned, failures) = if let Some(kind) = kind {
+            (
+                self.warned.get(kind as usize),
+                self.failures.load(Ordering::Relaxed),
+            )
+        } else {
+            let failures = self.failures.fetch_add(1, Ordering::Relaxed);
+            (Some(&self.range_warned), failures.saturating_add(1))
+        };
+        if let Some(held_back) = warned.and_then(|warned| warned.allow(FAILURE_WARN_INTERVAL)) {
+            let what = kind.map_or("the range of blocks held", ServeKind::as_str);
+            warn!(
+                %err,
+                held_back,
+                failures,
+                "could not read {what} to serve; after {MAX_FAILURES} failed reads of the held \
+                 range in a row, peers are answered empty until the provider recovers"
+            );
+        }
+    }
+}
 
 /// A peer's request on its way to the server.
 #[derive(Debug)]
 struct Request {
     kind: ServeKind,
+    /// Blocks below this are not served to the peer: answered as not held.
+    lowest: BlockNumber,
+    /// The session's eth version, whose receipts format the answer uses.
+    version: EthVersion,
     id: u64,
     /// The request without its message id byte.
     body: Bytes,
@@ -86,28 +147,36 @@ struct Request {
 /// The task that answers requests from the provider and keeps the held range current.
 #[derive(Debug)]
 pub(crate) struct Server<P> {
-    /// `None` when the node holds no blocks to serve: every request is answered empty.
-    provider: Option<Arc<P>>,
+    provider: Arc<P>,
+    /// The newest block the node knows: the held range is read again when it moves.
+    head: watch::Receiver<Option<BlockRef>>,
     requests: mpsc::Receiver<Request>,
     range: watch::Sender<Option<HeldRange>>,
     /// Whether what is advertised has been logged once.
     logged: bool,
+    health: Arc<Health>,
 }
 
-/// Builds the server over `provider` (`None`: nothing to serve) and what sessions use to
-/// reach it. The held range is unknown (nothing held) until the server runs.
-pub(crate) fn new<P: BlockProvider>(provider: Option<P>) -> (Server<P>, Serving) {
+/// Builds the server over `provider` and what sessions use to reach it. The held range is
+/// unknown (nothing held) until the server runs, and is read again whenever `head` moves.
+pub(crate) fn new<P: BlockProvider>(
+    provider: P,
+    head: watch::Receiver<Option<BlockRef>>,
+) -> (Server<P>, Serving) {
     let (requests_tx, requests_rx) = mpsc::channel(MAX_QUEUED);
     let (range_tx, range_rx) = watch::channel(None);
     let server = Server {
-        provider: provider.map(Arc::new),
+        provider: Arc::new(provider),
+        head,
         requests: requests_rx,
         range: range_tx,
         logged: false,
+        health: Arc::default(),
     };
     let serving = Serving {
         requests: requests_tx,
         range: range_rx,
+        enabled: true,
     };
     (server, serving)
 }
@@ -119,7 +188,11 @@ pub(crate) fn disabled() -> Serving {
     // keeps its initial "nothing held".
     let (requests, _) = mpsc::channel(1);
     let (_, range) = watch::channel(None);
-    Serving { requests, range }
+    Serving {
+        requests,
+        range,
+        enabled: false,
+    }
 }
 
 impl<P: BlockProvider> Server<P> {
@@ -133,6 +206,7 @@ impl<P: BlockProvider> Server<P> {
         let mut refresh = interval(RANGE_REFRESH);
         refresh.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut answering = JoinSet::new();
+        let mut last_read = tokio::time::Instant::now();
         loop {
             tokio::select! {
                 biased;
@@ -142,24 +216,34 @@ impl<P: BlockProvider> Server<P> {
                         return Err(ElError::Task { task: "serve request", source });
                     }
                 }
-                _ = refresh.tick() => self.refresh_range().await,
+                _ = refresh.tick() => {
+                    self.refresh_range().await;
+                    last_read = tokio::time::Instant::now();
+                }
+                // The held range ends at the head: it is read again as the head moves, at
+                // most once per `HEAD_REFRESH`. A closed head means the binary is stopping;
+                // the periodic refresh carries on.
+                Ok(()) = self.head.changed(), if last_read.elapsed() >= HEAD_REFRESH => {
+                    self.refresh_range().await;
+                    last_read = tokio::time::Instant::now();
+                }
                 request = self.requests.recv(), if answering.len() < MAX_CONCURRENT => {
                     // Closed: every session and the context are gone.
                     let Some(request) = request else { return Ok(()) };
-                    answering.spawn(answer(self.provider.clone(), request).in_current_span());
+                    let (provider, health) = (Arc::clone(&self.provider), Arc::clone(&self.health));
+                    answering.spawn(answer(provider, health, request).in_current_span());
                 }
             }
         }
     }
 
-    /// Reads the held range from the provider. A failed read keeps the last one.
+    /// Reads the held range from the provider. A failed read keeps the last one: nothing new
+    /// is advertised while the provider fails.
     async fn refresh_range(&mut self) {
-        let held = match &self.provider {
-            Some(provider) => provider.range().await,
-            None => Ok(None),
-        };
+        let held = self.provider.range().await;
         match held {
             Ok(held) => {
+                self.health.succeeded();
                 let before = self.range.send_replace(held);
                 // The last block moves with every promotion; what is worth a line is the
                 // kind of range advertised and where it starts.
@@ -181,7 +265,7 @@ impl<P: BlockProvider> Server<P> {
                     }
                 }
             }
-            Err(err) => warn!(%err, "could not read the range of blocks to serve"),
+            Err(err) => self.health.failed(None, &err),
         }
     }
 }
@@ -205,16 +289,20 @@ const fn response_id(kind: ServeKind) -> u8 {
 }
 
 /// Answers one request from `provider` and hands the answer to its session.
-async fn answer<P: BlockProvider>(provider: Option<Arc<P>>, request: Request) {
+/// While the provider is failing, answers empty without reading.
+async fn answer<P: BlockProvider>(provider: Arc<P>, health: Arc<Health>, request: Request) {
     let Request {
         kind,
+        lowest,
+        version,
         id,
         body,
         answer,
     } = request;
-    let items = match provider {
-        Some(provider) => gather(&*provider, kind, &body).await,
-        None => Ok(Vec::new()),
+    let items = if health.is_failing() {
+        Ok(Vec::new())
+    } else {
+        gather(&*provider, kind, lowest, version, &body).await
     };
     let (items, outcome) = match items {
         Ok(items) if items.is_empty() => (items, ServeOutcome::Empty),
@@ -224,7 +312,7 @@ async fn answer<P: BlockProvider>(provider: Option<Arc<P>>, request: Request) {
             (Vec::new(), ServeOutcome::Malformed)
         }
         Err(Fault::Provider(err)) => {
-            warn!(?kind, %err, "could not read blocks to serve");
+            health.failed(Some(kind), &err);
             (Vec::new(), ServeOutcome::Failed)
         }
     };
@@ -238,16 +326,19 @@ async fn answer<P: BlockProvider>(provider: Option<Arc<P>>, request: Request) {
 }
 
 /// Reads the items answering the request in `body`: one call of the provider, which applies
-/// the limits and ends the run at the first block that is not held (a response is a run of
-/// blocks, not a selection).
+/// the limits and ends the run at the first block that is not held, or is below `lowest` (a
+/// response is a run of blocks, not a selection).
 async fn gather<P: BlockProvider>(
     provider: &P,
     kind: ServeKind,
+    lowest: BlockNumber,
+    version: EthVersion,
     mut body: &[u8],
 ) -> Result<Vec<Bytes>, Fault<P::Error>> {
     let mut limits = ReadLimits {
         items: MAX_ITEMS,
         bytes: SOFT_RESPONSE_BYTES,
+        lowest,
     };
     let (read, convert): (BlockRead, Option<ItemConvert>) = match kind {
         ServeKind::Headers => {
@@ -276,7 +367,9 @@ async fn gather<P: BlockProvider>(
         ServeKind::Receipts => {
             let request = RequestPair::<GetReceipts>::decode(&mut body);
             let hashes = request.map_err(Fault::Malformed)?.message.0;
-            (BlockRead::Receipts(hashes), Some(without_blooms))
+            // Held with their blooms, as eth/68 sends them; eth/69 drops the bloom.
+            let convert = (version >= EthVersion::Eth69).then_some(without_blooms as ItemConvert);
+            (BlockRead::Receipts(hashes), convert)
         }
     };
     provider

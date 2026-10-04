@@ -4,10 +4,14 @@
 use std::collections::HashMap;
 
 use alloy_consensus::{BlockBody, Header};
+use alloy_eips::eip2718::Encodable2718;
 use alloy_eips::eip4895::Withdrawals;
-use alloy_primitives::{Address, BlockHash};
+use alloy_primitives::{Address, BlockHash, Bytes};
 use op_alloy_consensus::{OpBlock, OpReceiptEnvelope, OpTxEnvelope};
-use op_indexer_primitives::{BlockRef, BlockSource, DecodedBlock, Reorg, UnsafeEvent};
+use op_indexer_primitives::{
+    BlockRef, BlockSource, DecodedBlock, Reorg, UnsafeEvent, encode_body, receipts_root,
+    transactions_root,
+};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -29,8 +33,8 @@ pub(super) struct EncodedBlock {
 
 /// Encodes a block's fields as JSON in alloy's serde form, each transaction with its `from`.
 ///
-/// Expects a block that passed [`validate_block`](crate::validate::validate_block), which rejects what the scripts or the
-/// committed store could not hold.
+/// Expects a block that passed [`validate_block`](crate::validate::validate_block), which
+/// rejects what the scripts and this layout could not hold.
 pub(super) fn encode_block(block: &DecodedBlock) -> Result<EncodedBlock, StorageError> {
     let transactions = &block.block.body.transactions;
     let transactions = transactions
@@ -56,8 +60,6 @@ pub(super) fn encode_block(block: &DecodedBlock) -> Result<EncodedBlock, Storage
         },
         source: match block.source {
             BlockSource::Gossip => "gossip",
-            BlockSource::L1 => "l1",
-            BlockSource::Import => "import",
             BlockSource::Sync => "sync",
         },
     })
@@ -98,19 +100,11 @@ pub(super) fn decode_block(
         .transpose()?;
     let source = match field(fields, "source", block)? {
         "gossip" => BlockSource::Gossip,
-        "l1" => BlockSource::L1,
-        "import" => BlockSource::Import,
         "sync" => BlockSource::Sync,
         _ => return Err(invalid("block source", block, None)),
     };
 
-    // Only the header and the transactions are stored. OP Stack blocks have no ommers, and
-    // their withdrawals list is empty from the fork that added the withdrawals root.
-    let body = BlockBody {
-        transactions,
-        ommers: Vec::new(),
-        withdrawals: header.withdrawals_root.map(|_| Withdrawals::default()),
-    };
+    let body = body(&header, transactions);
     Ok(DecodedBlock {
         block: OpBlock::new(header, body),
         hash,
@@ -118,6 +112,60 @@ pub(super) fn decode_block(
         receipts,
         source,
     })
+}
+
+/// A block's body from its header and transactions. Only the header and the transactions are
+/// stored: OP Stack blocks have no ommers, and their withdrawals list is empty from the fork
+/// that added the withdrawals root.
+fn body(header: &Header, transactions: Vec<OpTxEnvelope>) -> BlockBody<OpTxEnvelope> {
+    BlockBody {
+        transactions,
+        ommers: Vec::new(),
+        withdrawals: header.withdrawals_root.map(|_| Withdrawals::default()),
+    }
+}
+
+/// The header of stored block `hash`, from its `header` field.
+pub(super) fn decode_header(hash: BlockHash, json: &str) -> Result<Header, StorageError> {
+    from_json("header", json, Some(hash))
+}
+
+/// The consensus encoding (RLP) of stored block `hash`'s body, from its header and its
+/// `transactions` field, without the senders; `None` if the transactions root over exactly
+/// these transaction encodings is not the header's.
+pub(super) fn body_rlp(
+    hash: BlockHash,
+    header: &Header,
+    transactions: &str,
+) -> Result<Option<Bytes>, StorageError> {
+    let transactions: Vec<OpTxEnvelope> = from_json("transactions", transactions, Some(hash))?;
+    let encodings: Vec<Vec<u8>> = transactions
+        .iter()
+        .map(Encodable2718::encoded_2718)
+        .collect();
+    if transactions_root(&encodings) != header.transactions_root {
+        return Ok(None);
+    }
+    Ok(Some(encode_body(
+        &encodings,
+        header.withdrawals_root.is_some(),
+    )))
+}
+
+/// The consensus encoding of stored block `hash`'s receipts, from its `receipts` field: the
+/// form [`op_indexer_primitives::encode_receipts`] gives; `None` if their receipts root (by
+/// the rules at the block's time, `canyon_time` the chain's Canyon) is not the header's.
+pub(super) fn receipts_rlp(
+    hash: BlockHash,
+    header: &Header,
+    receipts: &str,
+    canyon_time: u64,
+) -> Result<Option<Bytes>, StorageError> {
+    let receipts: Vec<OpReceiptEnvelope> = from_json("receipts", receipts, Some(hash))?;
+    if receipts_root(&receipts, header.timestamp, canyon_time) != header.receipts_root {
+        return Ok(None);
+    }
+    Ok(Some(op_indexer_primitives::encode_receipts(&receipts)))
 }
 
 /// Decodes the events a script replied with, each a map of the fields it wrote to the stream.
@@ -142,7 +190,7 @@ pub(super) fn block_ref(
 }
 
 /// Decodes one event: every type the scripts write to the stream (section 3.3).
-fn decode_event(fields: &HashMap<String, String>) -> Result<UnsafeEvent, StorageError> {
+pub(super) fn decode_event(fields: &HashMap<String, String>) -> Result<UnsafeEvent, StorageError> {
     match field(fields, "type", None)? {
         "head" => Ok(UnsafeEvent::NewHead {
             head: block_ref(fields, "number", "hash")?,

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use alloy_primitives::{BlockNumber, Bytes};
 use alloy_rlp::Encodable;
 use op_indexer_primitives::BlockRef;
-use reth_eth_wire_types::BlockRangeUpdate;
+use reth_eth_wire_types::{BlockRangeUpdate, EthVersion};
 use tokio::sync::{mpsc, watch};
 
 use super::{HeldRange, MAX_ITEMS, Request, response, response_id};
@@ -32,9 +32,10 @@ const MAX_IN_FLIGHT_PER_PEER: usize = 4;
 /// is refused before it is copied or decoded: a 10 MiB request holds 300,000 hashes.
 const MAX_REQUEST_BYTES: usize = MAX_ITEMS * 33 + 32;
 
-/// Shortest time between two `BlockRangeUpdate`s to one peer. The range moves with every
-/// block; peers only need it roughly (reth announces once per epoch, about six minutes).
-const RANGE_UPDATE_INTERVAL: Duration = Duration::from_mins(1);
+/// Shortest time between two `BlockRangeUpdate`s to one peer: "about once every two minutes"
+/// (devp2p `caps/eth.md`, `BlockRangeUpdate`), which is also at most once per 32 blocks on the
+/// chains served (EIP-7642).
+const RANGE_UPDATE_INTERVAL: Duration = Duration::from_mins(2);
 
 /// The range a session tells its peer, in the status and in `BlockRangeUpdate`: only blocks
 /// this node serves, or its tip alone.
@@ -59,15 +60,24 @@ pub(crate) struct AdvertisedRange {
 pub(crate) struct Serving {
     pub(super) requests: mpsc::Sender<Request>,
     pub(super) range: watch::Receiver<Option<HeldRange>>,
+    /// Whether anything answers requests: `false` for a network the node only asks.
+    pub(super) enabled: bool,
 }
 
 impl Serving {
+    /// Whether this node serves blocks on this network.
+    pub(crate) const fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
     /// The serving side of one new session, and the channel its answers arrive on. `tip`
     /// follows the newest block the node knows. The session is taken to advertise the current
     /// range in its status.
     pub(crate) fn session(
         &self,
         tip: watch::Receiver<Option<BlockRef>>,
+        lowest: BlockNumber,
+        version: EthVersion,
     ) -> (SessionServing, mpsc::Receiver<Bytes>) {
         let (answers_tx, answers_rx) = mpsc::channel(MAX_IN_FLIGHT_PER_PEER);
         let now = Instant::now();
@@ -76,6 +86,8 @@ impl Serving {
             answers: answers_tx,
             held: self.range.clone(),
             tip,
+            lowest,
+            version,
             advertised: None,
             advertised_at: now,
             window_start: now,
@@ -104,6 +116,12 @@ pub(crate) struct SessionServing {
     answers: mpsc::Sender<Bytes>,
     held: watch::Receiver<Option<HeldRange>>,
     tip: watch::Receiver<Option<BlockRef>>,
+    /// The lowest block this peer is served and told about: 0 for an op-p2p-indexer, the
+    /// network's Bedrock block for anyone else (`NetworkSpec::indexers_only_below`).
+    lowest: BlockNumber,
+    /// The session's eth version: receipts are served in its format, and `BlockRangeUpdate`
+    /// exists from eth/69 on.
+    version: EthVersion,
     /// The range the peer was last told.
     advertised: Option<AdvertisedRange>,
     advertised_at: Instant,
@@ -121,14 +139,15 @@ impl SessionServing {
     /// The range to advertise now; `None` until the node knows a tip.
     fn range(&self) -> Option<AdvertisedRange> {
         let tip = (*self.tip.borrow())?;
-        let held = *self.held.borrow();
+        // Blocks below `lowest` are not this peer's to ask for.
+        let held = (*self.held.borrow()).filter(|(_, last)| last.number >= self.lowest);
         Some(held.map_or(
             AdvertisedRange {
                 earliest: tip.number,
                 latest: tip,
             },
             |(first, last)| AdvertisedRange {
-                earliest: first.number,
+                earliest: first.number.max(self.lowest),
                 latest: last,
             },
         ))
@@ -168,6 +187,8 @@ impl SessionServing {
         };
         let request = Request {
             kind,
+            lowest: self.lowest,
+            version: self.version,
             id: request_id,
             body: Bytes::copy_from_slice(body),
             answer,
@@ -184,7 +205,8 @@ impl SessionServing {
     /// last told and [`RANGE_UPDATE_INTERVAL`] has passed. The tip moves with every block, so in
     /// practice one goes out every interval.
     pub(crate) fn range_update(&mut self) -> Option<Bytes> {
-        if self.advertised_at.elapsed() < RANGE_UPDATE_INTERVAL {
+        if self.version < EthVersion::Eth69 || self.advertised_at.elapsed() < RANGE_UPDATE_INTERVAL
+        {
             return None;
         }
         let range = self.range()?;

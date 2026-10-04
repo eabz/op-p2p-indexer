@@ -36,6 +36,9 @@ pub(super) const RETENTION_HEIGHTS_PER_INSERT: u32 = 16;
 pub(super) const PRUNE_HEIGHTS_PER_CALL: u32 = 1024;
 /// Blocks removed from one height per step; a height holding more takes another step.
 pub(super) const REMOVE_BLOCKS_PER_STEP: u32 = 64;
+/// Heights `canonical_run` reads per chunk: one chunk is all a refresh of the served range
+/// usually needs, and all a run that does not link, or whose receipts lag, costs.
+pub(super) const RUN_CHUNK_HEIGHTS: usize = 256;
 /// Most blocks one [`ancestry`](crate::UnsafeStore::ancestry) call loads, bounding its memory
 /// and round trips.
 pub(super) const MAX_ANCESTRY_BLOCKS: u64 = 1024;

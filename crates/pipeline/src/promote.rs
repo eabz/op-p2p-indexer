@@ -1,5 +1,5 @@
-//! Promotion: moves blocks from the unsafe store to the committed store and the archive when
-//! the L1 safe head passes them, and the reconciliation that runs before it at startup.
+//! Promotion: moves blocks from the unsafe store to the archive (the committed store) when the
+//! L1 safe head passes them, and the reconciliation that runs before it at startup.
 //!
 //! Does not decide what is safe (the L1 heads arrive on a channel), does not fill holes
 //! (backfill belongs to the `el` crate), and does not retry by itself: every store call goes
@@ -7,23 +7,25 @@
 //!
 //! # One promotion
 //!
-//! `C` is the safe head recorded in the committed store, `S` the new one.
+//! `C` is the safe head recorded in the archive, `S` the new one.
 //!
-//! 1. If `S` is at `C`'s height with another hash, or below `C` with the archive holding
-//!    another block at `S`'s height (an L1 reorg): roll the committed store back to `S`, and
-//!    truncate the archive above it if the archive ends at or below `C`. A block of the
-//!    committed chain below `C`, or one the archive cannot tell about, is nothing to do: a
-//!    rollback deletes committed blocks and is only done on evidence.
+//! 1. If `S` is at or below `C`, nothing is done: the heads only rise (the commitment task
+//!    never publishes a lower safe head), so there is no rollback.
 //! 2. Record the heads in the unsafe store.
 //! 3. Read the blocks above `C` up to `S` from the unsafe store, walking down from `S` one
 //!    ancestry call (1,024 blocks) at a time.
-//! 4. Part by part, oldest first: insert them into the committed store; append them to the
-//!    archive if they extend it, and trim it to its window.
-//! 5. Record the heads in the committed store: the marker that the range is committed.
-//! 6. Prune the unsafe store up to `S` and publish `S`'s number.
+//! 4. Part by part, oldest first: append them to the archive if they extend it, each block's
+//!    transactions and receipts roots checked first over exactly the bytes written; the part
+//!    ends before a block that does not match, which is logged as an error and counted.
+//! 5. Record the heads in the archive: the marker that the range is committed. The heads never
+//!    name a block the archive lacks: the safe head recorded is the newest block of `S`'s chain
+//!    the archive holds (`S` when the whole range went in), and the finalized head only if it
+//!    is not above it. When nothing was appended but the archive holds `S` (range sync stored
+//!    it), `S` is recorded. When the archive holds nothing of `S`'s chain above `C`, only the
+//!    finalized head may change; range sync, required with the L1 side, fills the gap.
+//! 6. Prune the unsafe store up to the recorded safe head and publish its number.
 //!
-//! Before the first safe head is recorded there is no `C`: block `S` alone is promoted, and the
-//! committed store begins there.
+//! Before the first safe head is recorded there is no `C`: block `S` alone is promoted.
 //!
 //! # Crash safety
 //!
@@ -34,9 +36,8 @@
 //!
 //! | Crash after | What is left | Why repeating is safe |
 //! |---|---|---|
-//! | 1, the rollback | The committed store is at `S`; the archive may still hold blocks above it. | The rollback records `S` before it deletes, so `C` is `S`. The archive's blocks above `S` are of the old chain: the next promoted range does not extend them and is not archived (below). |
 //! | 2 | The unsafe store knows `S`; nothing is committed. | Startup writes `C` back; the range is still stored. |
-//! | 4, part or all of it | Rows or archived blocks above `C`; the marker still says `C`. | The repeat inserts the same rows again and finds the same blocks in the archive, which skips them. Only if the safe chain differs after the restart do rows and archived blocks of the stopped attempt stay: see the limits. |
+//! | 4, part or all of it | Archived blocks above `C`; the marker still says `C`. | The repeat finds the same blocks in the archive, which skips them. Only if the safe chain differs after the restart do archived blocks of the stopped attempt stay: see the limits. |
 //! | 5 | The range is committed; the unsafe store still holds it. | Startup prunes up to `C` and publishes it. |
 //!
 //! # The archive is never emptied here
@@ -48,46 +49,39 @@
 //!   are skipped). Otherwise it is not archived: the archive is behind (a gap that range sync
 //!   fills) or holds another chain at that height. This is logged, at most once per
 //!   [`ARCHIVE_WARN_INTERVAL`], and the blocks are counted.
-//! - Startup removes nothing from the archive or the committed store: blocks above `C` may
-//!   be an import or a sync that reached further, which cannot be told from a stopped
-//!   promotion.
-//! - Trimming to the retention window happens only while the archive is no larger than the
-//!   window plus what was just appended, so it removes at most as many blocks as were
-//!   appended. An archive that already holds more than the window (an import) is not trimmed.
-//! - Blocks are removed only by an L1 reorg of the safe head (step 1), and only when the
-//!   archive ends at or below `C`: at most `C - S` blocks, the depth of the reorg. An archive
-//!   that reaches above `C` was not written by promotion alone and is left as it is.
+//! - Startup removes nothing from the archive: blocks above `C` may be an import or a sync
+//!   that reached further, which cannot be told from a stopped promotion.
+//! - Nothing removes blocks: the archive keeps every block, and the heads only rise.
 //!
 //! # Limits, for the L1 and backfill work
 //!
 //! - **Holes.** When the whole range cannot be read, the readable part next to `S` is promoted
 //!   and the rest, next to `C`, is left out: below a block missing from the unsafe store, or
 //!   beyond [`MAX_PROMOTED_PARTS`]. Everything from `S` down to the break is on `S`'s
-//!   chain, so it is safe. The hole is logged and counted with the blocks left out, `S` is
-//!   recorded, and promotion continues from there; backfill finds the hole by block number.
-//!   If `S` itself is missing, nothing is promoted. The blocks promoted after a hole do not
-//!   extend the archive and are not archived until range sync has filled the hole.
-//! - **A promotion stopped before its marker, followed by another safe chain.** Rows above
-//!   `C` of the stopped attempt stay in the committed store (the insert replaces a row only by
-//!   the same block), and its blocks stay at the archive's tip, so later ranges are not
-//!   archived. Both need a crash between steps 4 and 5 and an L1 reorg of the safe head
-//!   before the restart; backfill repairs the rows, and the operator the archive.
-//! - **A range that does not build on `C`.** It is `S`'s chain, so it is promoted; the
-//!   committed block at `C`'s height then belongs to another chain, as in the next point.
-//! - **A reorg that changes the block at `S`'s height.** The rollback deletes above `S`'s
-//!   height, so the committed row at that height is still the old chain's block. The pipeline
-//!   cannot rewrite it: the unsafe store was pruned up to the old `C`.
+//!   chain, so it is safe. The hole is logged and counted with the blocks left out. The blocks
+//!   after a hole do not extend the archive, so they are not archived and the recorded safe
+//!   head stays below the hole (step 5); the unsafe store keeps them until range sync has
+//!   filled the hole and a later promotion appends them, or until they expire. If `S` itself
+//!   is missing, nothing is promoted.
+//! - **A promotion stopped before its marker, followed by another safe chain.** The blocks
+//!   of the stopped attempt stay at the archive's tip, so later ranges are not archived. It
+//!   needs a crash between steps 4 and 5 and another safe chain before the restart; the
+//!   operator repairs the archive.
+//! - **A range that does not build on `C`.** It is `S`'s chain, so it is promoted if it
+//!   extends the archive; the archived block at `C`'s height then belongs to another chain,
+//!   which the pipeline cannot rewrite (the unsafe store was pruned up to `C`): the operator
+//!   repairs the archive.
 
 use std::time::{Duration, Instant};
 
 use alloy_primitives::BlockNumber;
-use op_indexer_primitives::{BlockRef, DecodedBlock, EncodedBlock, L1Heads};
-use op_indexer_storage::{
-    ArchiveRetention, ArchiveStore, CommittedStore, StorageError, Store, UnsafeStore,
+use op_indexer_primitives::{
+    ArchivedBlock, BlockRef, DecodedBlock, L1Heads, receipts_root, split_body, transactions_root,
 };
+use op_indexer_storage::{ArchiveStore, StorageError, Store, UnsafeStore};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::PipelineError;
 use crate::metrics::{self, HoleReason};
@@ -105,20 +99,21 @@ const MAX_RANGE_READS: usize = 4;
 /// range is a hole.
 const MAX_PROMOTED_PARTS: usize = 16;
 
-/// Shortest time between two warnings that promoted blocks are not archived, or that the
-/// archive is not trimmed. Either state lasts until something else changes the archive.
+/// Shortest time between two warnings that promoted blocks are not archived. The state lasts
+/// until something else changes the archive.
 const ARCHIVE_WARN_INTERVAL: Duration = Duration::from_mins(10);
 
 /// The promotion task and its startup reconciliation.
 #[derive(Debug)]
-pub(crate) struct Promoter<U, C, A> {
+pub(crate) struct Promoter<U, A> {
     unsafe_store: U,
-    committed_store: C,
-    /// The archive and how much it keeps; `None` when it is disabled.
-    archive: Option<(A, ArchiveRetention)>,
+    /// The archive, the committed store.
+    archive: A,
+    /// The chain's Canyon time, for receipts roots.
+    canyon_time: u64,
     l1_heads: watch::Receiver<L1Heads>,
     safe_number: watch::Sender<BlockNumber>,
-    /// The heads recorded in the committed store, as of the last write this task made.
+    /// The heads recorded in the archive, as of the last write this task made.
     committed: L1Heads,
     /// When an archive warning was last logged.
     archive_warned: Option<Instant>,
@@ -144,25 +139,24 @@ enum Stop {
     Fatal(PipelineError),
 }
 
-impl<U, C, A> Promoter<U, C, A>
+impl<U, A> Promoter<U, A>
 where
     U: UnsafeStore + Clone + Send + Sync + 'static,
-    C: CommittedStore + Clone + Send + Sync + 'static,
     A: ArchiveStore + Clone + Send + Sync + 'static,
 {
     /// Creates the task. Makes no store call: [`Self::reconcile`] must run before
     /// [`Self::run`].
     pub(crate) fn new(
         unsafe_store: U,
-        committed_store: C,
-        archive: Option<(A, ArchiveRetention)>,
+        archive: A,
+        canyon_time: u64,
         l1_heads: watch::Receiver<L1Heads>,
         safe_number: watch::Sender<BlockNumber>,
     ) -> Self {
         Self {
             unsafe_store,
-            committed_store,
             archive,
+            canyon_time,
             l1_heads,
             safe_number,
             committed: L1Heads::default(),
@@ -170,10 +164,10 @@ where
         }
     }
 
-    /// Brings the unsafe store in line with the committed store's heads, which are the truth
-    /// after a restart: writes the heads to it (it may have been wiped), prunes it up to the
-    /// safe head and publishes the safe number. Removes nothing from the committed store or
-    /// the archive (see the module documentation). Returns `Ok(())` if cancelled part-way.
+    /// Brings the unsafe store in line with the archive's heads, which are the truth after a
+    /// restart: writes the heads to it (it may have been wiped), prunes it up to the safe head
+    /// and publishes the safe number. Removes nothing from the archive (see the module
+    /// documentation). Returns `Ok(())` if cancelled part-way.
     ///
     /// # Errors
     ///
@@ -185,7 +179,7 @@ where
         finish(self.reconcile_stores(cancel).await)
     }
 
-    /// The heads the committed store recorded, as read by [`Self::reconcile`]: where the heads
+    /// The heads the archive recorded, as read by [`Self::reconcile`]: where the heads
     /// promotion acts on start, which nothing may publish below.
     pub(crate) const fn committed_heads(&self) -> L1Heads {
         self.committed
@@ -218,8 +212,8 @@ where
     }
 
     async fn reconcile_stores(&mut self, cancel: &CancellationToken) -> Result<(), Stop> {
-        self.committed = call(cancel, Store::Committed, "committed l1_heads", || {
-            self.committed_store.l1_heads()
+        self.committed = call(cancel, Store::Archive, "archive heads", || {
+            self.archive.heads()
         })
         .await?;
         let heads = self.committed;
@@ -250,32 +244,66 @@ where
             }
         };
 
-        // Not above `C` and not `C`. Only a different block at that height is an L1 reorg; a
-        // block of the committed chain below `C` is a head that is behind, and nothing to do.
-        // The commitment task never publishes such a head; this guards the committed store
-        // against any other source of heads.
-        let behind = committed_safe.filter(|committed| safe.number <= committed.number);
-        let reorged = behind.is_some();
-        if let Some(committed) = behind {
-            if !self.replaced(safe, committed, cancel).await? {
-                debug!(
-                    ?safe,
-                    ?committed,
-                    "a safe head behind the committed one; nothing to do"
-                );
-                return Ok(());
-            }
-            self.roll_back(safe, cancel).await?;
+        // Heads only rise: the commitment task never publishes a safe head at or below the
+        // committed one. One from anywhere else is behind, and nothing to do.
+        if committed_safe.is_some_and(|committed| safe.number <= committed.number) {
+            debug!(
+                ?safe,
+                committed = ?committed_safe,
+                "a safe head at or below the committed one; nothing to do"
+            );
+            return Ok(());
         }
         self.set_unsafe_heads(heads, cancel).await?;
-        if !reorged {
-            self.commit_range(committed_safe, safe, cancel).await?;
+        // The heads recorded never name a block the archive lacks: the safe head is the newest
+        // block of `S`'s chain it appended, or `S` itself when the archive already holds it
+        // (range sync stored it, and the unsafe store may not have it).
+        let appended = self.commit_range(committed_safe, safe, cancel).await?;
+        let held = if appended.is_some() {
+            appended
+        } else {
+            let archive = &self.archive;
+            let number = call(cancel, Store::Archive, "archive number_of", || {
+                archive.number_of(safe.hash)
+            })
+            .await?;
+            (number == Some(safe.number)).then_some(safe)
+        };
+        let Some(held) = held else {
+            if self.archive_warning_due() {
+                warn!(
+                    ?safe,
+                    committed = ?committed_safe,
+                    "the archive holds nothing of the safe chain above the committed safe head; \
+                     the committed heads stay until range sync fills the gap"
+                );
+            }
+            return self
+                .set_committed_heads(
+                    L1Heads {
+                        safe: None,
+                        ..heads
+                    },
+                    cancel,
+                )
+                .await;
+        };
+        if held != safe {
+            info!(
+                ?safe,
+                recorded = ?held,
+                "the archive ends below the safe head; recorded its tip"
+            );
         }
-        self.set_committed_heads(heads, cancel).await?;
-        self.prune_and_publish(safe, cancel).await
+        let recorded = L1Heads {
+            safe: Some(held),
+            finalized: heads.finalized,
+        };
+        self.set_committed_heads(recorded, cancel).await?;
+        self.prune_and_publish(held, cancel).await
     }
 
-    /// What the committed store holds once `heads` are recorded: a `None` head means "unknown"
+    /// What the archive holds once `heads` are recorded: a `None` head means "unknown"
     /// and leaves the recorded one in place.
     fn merged(&self, heads: L1Heads) -> L1Heads {
         L1Heads {
@@ -284,109 +312,25 @@ where
         }
     }
 
-    /// Whether `safe`, at or below the committed safe head `committed`, is a block of another
-    /// chain than the committed one: at the committed head's height with another hash, or below it with
-    /// the archive holding another block at that height. When the archive cannot tell (it
-    /// does not reach that height, or there is none), the answer is no: a rollback deletes
-    /// committed blocks, and is only done on evidence.
-    async fn replaced(
-        &self,
-        safe: BlockRef,
-        committed: BlockRef,
-        cancel: &CancellationToken,
-    ) -> Result<bool, Stop> {
-        if safe.number == committed.number {
-            return Ok(safe.hash != committed.hash);
-        }
-        let Some((archive, _)) = &self.archive else {
-            warn!(
-                ?safe,
-                ?committed,
-                "a safe head below the committed one cannot be checked without the archive; not rolling back"
-            );
-            return Ok(false);
-        };
-        let held = call(cancel, Store::Archive, "archive number_of", || {
-            archive.number_of(safe.hash)
-        })
-        .await?;
-        if held == Some(safe.number) {
-            return Ok(false);
-        }
-        let range = call(cancel, Store::Archive, "archive range", || archive.range()).await?;
-        let covers =
-            range.is_some_and(|(first, tip)| (first.number..=tip.number).contains(&safe.number));
-        if !covers {
-            warn!(
-                ?safe,
-                ?committed,
-                "a safe head below the committed one is outside the archive; not rolling back"
-            );
-        }
-        Ok(covers)
-    }
-
-    /// Step 1: rolls the committed store back to `safe`, and truncates the archive above it if
-    /// the archive ends at or below the committed safe head, which bounds the removal by the
-    /// depth of the reorg.
-    async fn roll_back(&mut self, safe: BlockRef, cancel: &CancellationToken) -> Result<(), Stop> {
-        let committed = self.committed.safe;
-        warn!(
-            ?committed,
-            ?safe,
-            "L1 reorg: the safe head moved back; rolling the committed store back"
-        );
-        call(cancel, Store::Committed, "committed rollback_to", || {
-            self.committed_store.rollback_to(safe)
-        })
-        .await?;
-        // The rollback recorded `safe` as the committed safe head.
-        self.committed.safe = Some(safe);
-
-        let Some((archive, _)) = &self.archive else {
-            return Ok(());
-        };
-        let range = call(cancel, Store::Archive, "archive range", || archive.range()).await?;
-        let Some((_, tip)) = range.filter(|(_, tip)| tip.number > safe.number) else {
-            return Ok(());
-        };
-        if committed.is_some_and(|committed| tip.number <= committed.number) {
-            return call(cancel, Store::Archive, "archive truncate_above", || {
-                archive.truncate_above(safe.number)
-            })
-            .await;
-        }
-        // Blocks above the committed safe head were not all written by promotion.
-        warn!(
-            ?tip,
-            ?committed,
-            ?safe,
-            "the archive reaches above the committed safe head; not truncating it after the reorg"
-        );
-        Ok(())
-    }
-
     /// Steps 3 and 4: reads the blocks above `committed`, or above the archive's last block
-    /// when that is higher and below `safe`, up to `safe` and writes them to the committed
-    /// store and the archive, oldest part first. When only the part next to `safe` can be
-    /// read, that part is written and the rest is a hole.
+    /// when that is higher and below `safe`, up to `safe` and appends them to the archive,
+    /// oldest part first. When only the part next to `safe` can be read, that part is written
+    /// and the rest is a hole. Returns the newest block it appended (all of `safe`'s chain,
+    /// above `committed`), which is what may be recorded as committed; `None` if none.
     async fn commit_range(
         &mut self,
         committed: Option<BlockRef>,
         safe: BlockRef,
         cancel: &CancellationToken,
-    ) -> Result<(), Stop> {
+    ) -> Result<Option<BlockRef>, Stop> {
         // The block the range is read above: the archive's last block when it is above the
         // committed safe head and below `safe`, so the archive is extended from where it ends
         // and blocks it holds are not read again; else the committed safe head. Without
-        // either the committed store begins at `safe`.
-        let tip = match &self.archive {
-            Some((archive, _)) => {
-                let range = call(cancel, Store::Archive, "archive range", || archive.range());
-                range.await?.map(|(_, tip)| tip)
-            }
-            None => None,
-        };
+        // either the committed chain begins at `safe`.
+        let range = call(cancel, Store::Archive, "archive range", || {
+            self.archive.range()
+        });
+        let tip = range.await?.map(|(_, tip)| tip);
         let base = match (committed, tip) {
             (committed, Some(tip))
                 if tip.number < safe.number
@@ -413,12 +357,12 @@ where
             (Some(reason), Some(base)) => report_hole(reason, base, stop_at, safe),
             (Some(_), None) => info!(
                 safe = ?safe,
-                "the first safe head is not in the unsafe store; the committed store begins after it"
+                "the first safe head is not in the unsafe store; the committed chain begins after it"
             ),
             (None, _) => {}
         }
         let mut promoted = blocks.len();
-        self.write_blocks(&blocks, cancel).await?;
+        let mut reached = self.write_blocks(&blocks, cancel).await?;
         drop(blocks);
         for pair in heads.windows(2) {
             let [above, head] = *pair else { continue };
@@ -439,17 +383,21 @@ where
                 None => {}
             }
             promoted = promoted.saturating_add(read.blocks.len());
-            self.write_blocks(&read.blocks, cancel).await?;
+            match self.write_blocks(&read.blocks, cancel).await? {
+                Some(newest) => reached = Some(newest),
+                // The parts above build on this one: they cannot extend the archive either.
+                None => break,
+            }
         }
         if promoted > 0 {
             info!(
                 from = stop_at.saturating_add(1),
                 to = safe.number,
                 blocks = promoted,
-                "promoted blocks to the committed store"
+                "promoted blocks to the archive"
             );
         }
-        Ok(())
+        Ok(reached)
     }
 
     /// Walks the range above `floor` up to `safe` downwards, one [`Self::read_range`] at a
@@ -484,29 +432,6 @@ where
                 }
             }
         }
-    }
-
-    /// Step 4 for one part of the range: inserts `blocks` into the committed store and
-    /// archives them.
-    async fn write_blocks(
-        &mut self,
-        blocks: &[DecodedBlock],
-        cancel: &CancellationToken,
-    ) -> Result<(), Stop> {
-        if blocks.is_empty() {
-            return Ok(());
-        }
-        call(cancel, Store::Committed, "committed insert", || {
-            self.committed_store.insert(blocks)
-        })
-        .await?;
-        self.archive_range(blocks, cancel).await?;
-        let without_receipts = blocks
-            .iter()
-            .filter(|block| block.receipts.is_none())
-            .count();
-        metrics::blocks_promoted(blocks.len(), without_receipts);
-        Ok(())
     }
 
     /// Reads the blocks above `floor` up to `safe`. If that range cannot be read, reads the part
@@ -561,20 +486,41 @@ where
         })
     }
 
-    /// Appends `blocks` to the archive if they extend its tip, and trims it to its retention
-    /// window. Blocks that do not extend it are not archived; nothing is removed to make room
-    /// for them.
-    async fn archive_range(
+    /// Step 4 for one part of the range: appends `blocks` to the archive if they extend its
+    /// tip and match their header's roots. Blocks that do not are not archived, nor any after
+    /// them. Returns the newest of them if the
+    /// archive now holds them.
+    async fn write_blocks(
         &mut self,
         blocks: &[DecodedBlock],
         cancel: &CancellationToken,
-    ) -> Result<(), Stop> {
+    ) -> Result<Option<BlockRef>, Stop> {
         const APPEND: &str = "archive append_batch";
-        let Some((archive, retention)) = self.archive.clone() else {
-            return Ok(());
+        let archive = self.archive.clone();
+        // The bytes archived for a promoted block are encoded here, from the gossip block, and
+        // checked against its header: the archive checks only the header's hash.
+        let mut encoded: Vec<ArchivedBlock> = Vec::with_capacity(blocks.len());
+        for block in blocks {
+            let archived = ArchivedBlock::from(block);
+            if !roots_match(block, &archived, self.canyon_time) {
+                error!(
+                    number = block.block.header.number,
+                    hash = %block.hash,
+                    "a promoted block's transactions or receipts do not match its header's roots; \
+                     it and the blocks after it are not archived"
+                );
+                metrics::root_mismatch();
+                break;
+            }
+            encoded.push(archived);
+        }
+        let blocks = blocks.get(..encoded.len()).unwrap_or_default();
+        let Some(newest) = blocks.last().map(|block| BlockRef {
+            number: block.block.header.number,
+            hash: block.hash,
+        }) else {
+            return Ok(None);
         };
-        // The bytes archived for a promoted block are encoded here, from the gossip block.
-        let encoded: Vec<EncodedBlock> = blocks.iter().map(EncodedBlock::from).collect();
         let appended = retry(cancel, Store::Archive, APPEND, || {
             archive.append_batch(encoded.clone())
         });
@@ -590,35 +536,16 @@ where
                         "promoted blocks do not extend the archive and are not archived"
                     );
                 }
-                return Ok(());
+                return Ok(None);
             }
             Err(other) => return Err(stop(APPEND)(other)),
         }
-
-        let ArchiveRetention::Blocks(retain) = retention else {
-            return Ok(());
-        };
-        let range = call(cancel, Store::Archive, "archive range", || archive.range()).await?;
-        let held = range.map_or(0, |(first, last)| {
-            last.number.saturating_sub(first.number).saturating_add(1)
-        });
-        let appended = u64::try_from(blocks.len()).unwrap_or(u64::MAX);
-        // More than the window before this append: not an archive promotion filled alone.
-        if held > retain.saturating_add(appended) {
-            if self.archive_warning_due() {
-                warn!(
-                    held,
-                    retain,
-                    "the archive holds more blocks than its retention window; not trimming it"
-                );
-            }
-            return Ok(());
-        }
-        call(cancel, Store::Archive, "archive trim", || {
-            archive.trim(retain)
-        })
-        .await
-        .map(|_removed| ())
+        let without_receipts = blocks
+            .iter()
+            .filter(|block| block.receipts.is_none())
+            .count();
+        metrics::blocks_promoted(blocks.len(), without_receipts);
+        Ok(Some(newest))
     }
 
     /// Whether an archive warning may be logged now; at most one per
@@ -646,14 +573,22 @@ where
         .await
     }
 
-    /// Step 5: records `heads` in the committed store.
+    /// Step 5: records `heads` in the archive.
     async fn set_committed_heads(
         &mut self,
         heads: L1Heads,
         cancel: &CancellationToken,
     ) -> Result<(), Stop> {
-        call(cancel, Store::Committed, "committed set_l1_heads", || {
-            self.committed_store.set_l1_heads(heads)
+        // A finalized head above the recorded safe head may be a block the archive lacks.
+        let safe = self.merged(heads).safe;
+        let heads = L1Heads {
+            finalized: heads
+                .finalized
+                .filter(|finalized| safe.is_some_and(|safe| finalized.number <= safe.number)),
+            ..heads
+        };
+        call(cancel, Store::Archive, "archive set_heads", || {
+            self.archive.set_heads(heads)
         })
         .await?;
         self.committed = self.merged(heads);
@@ -675,6 +610,18 @@ where
         metrics::safe_block_number(safe.number);
         Ok(())
     }
+}
+
+/// Whether the transactions root and, when the block has receipts, the receipts root over
+/// exactly the bytes about to be archived are the header's.
+fn roots_match(block: &DecodedBlock, archived: &ArchivedBlock, canyon_time: u64) -> bool {
+    let header = &block.block.header;
+    let transactions = split_body(&archived.encoded.body)
+        .is_some_and(|body| transactions_root(&body.transactions) == header.transactions_root);
+    transactions
+        && block.receipts.as_ref().is_none_or(|receipts| {
+            receipts_root(receipts, header.timestamp, canyon_time) == header.receipts_root
+        })
 }
 
 /// Promote now, backfill later: logs and counts the blocks above `base` (the block the range

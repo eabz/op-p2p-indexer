@@ -13,8 +13,7 @@ use clap::{Args, Parser, Subcommand};
 use crate::load::LoadArgs;
 
 /// Downloads a chain's blocks from an external archive, verifies every block, and loads
-/// them into the local block archive the node serves from. No database is needed: ClickHouse
-/// is optional, written only with `--clickhouse-url`.
+/// them into the block archive the node serves from. No database is needed.
 ///
 /// Run `download`, then `verify`, then `load`, or `run` for all three. Every step keeps its
 /// progress in the state directory and can be stopped and started again: nothing completed
@@ -25,7 +24,7 @@ use crate::load::LoadArgs;
 /// the last block known to be committed to L1: the block of the newest dispute game. Blocks
 /// come from Envio `HyperSync`.
 #[derive(Debug, Parser)]
-#[command(name = "op-indexer-import", version)]
+#[command(name = "import", version)]
 pub(crate) struct Cli {
     /// Directory for the plan and the downloaded and verified chunks. Use the same one for
     /// every step.
@@ -44,15 +43,17 @@ pub(crate) struct Cli {
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
     /// Fetch the chunks of the range that are not in the state directory yet. Needs the API
-    /// token and nothing else; stops with a summary when the service refuses requests or the
-    /// disk is nearly full.
+    /// token; stops with a summary when the service refuses requests or the disk is nearly
+    /// full. Then lists every field the downloaded rows lack, and fetches the ones it can from
+    /// the chain's RPC endpoint (`--rpc-endpoint`).
     Download(DownloadArgs),
     /// Check every downloaded chunk offline: header hashes and parent links up to the anchor,
-    /// transactions roots and receipts roots. Senders are not checked.
+    /// transactions roots and receipts roots. Senders are checked by `load`.
     Verify(VerifyCommand),
-    /// Append the verified range to the local block archive the node serves from. Needs the
-    /// whole range accepted by `verify`, and no database: ClickHouse is written too only with
-    /// `--clickhouse-url`. The indexer must not be running.
+    /// Recover every transaction's sender from its signature, check it against the verified
+    /// chunk, and append the verified range to the block archive the node serves from. Stops at
+    /// the first sender that differs. Needs the whole range accepted by `verify`. The indexer
+    /// must not be running.
     Load(LoadArgs),
     /// `download`, `verify`, then `load`, stopping at the first step that cannot finish.
     Run(RunArgs),
@@ -104,6 +105,12 @@ pub(crate) struct DownloadArgs {
     /// that list.
     #[arg(long, env = "OP_INDEXER_IMPORT_ENDPOINT")]
     pub(crate) endpoint: Option<String>,
+    /// JSON-RPC endpoint of the chain, read-only, for what the archive service leaves out of
+    /// some rows (Unichain's EIP-7702 authorization lists); what it gives is proven by the
+    /// header hash like the rest [default: by chain, `https://mainnet.unichain.org` for
+    /// Unichain (130); none for OP Mainnet, whose rows need none so far].
+    #[arg(long, env = "OP_INDEXER_IMPORT_RPC_ENDPOINT")]
+    pub(crate) rpc_endpoint: Option<String>,
     /// `HyperSync` endpoint of the L1 chain the dispute games are on, for the lookup of the
     /// range's last block. Uses the same API token.
     #[arg(
@@ -154,8 +161,8 @@ pub(crate) struct RunArgs {
     pub(crate) load: LoadArgs,
 }
 
-/// A credential given on the command line: the archive service's API token, a database
-/// password. `Debug` never shows it.
+/// A credential given on the command line: the archive service's API token. `Debug` never
+/// shows it.
 #[derive(Clone)]
 pub(crate) struct Secret(String);
 

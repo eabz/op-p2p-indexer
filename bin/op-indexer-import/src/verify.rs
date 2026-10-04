@@ -12,30 +12,34 @@
 //! encodings; its receipts root is the root over the stored receipts. That is what a peer
 //! checks when these bytes are served to it.
 //!
-//! What is not proven: senders. No signature is checked. The sender recorded for the optional
-//! database rows is the one the service reports; a transaction signed with all zeros (an
-//! L1-to-L2 message of OP Mainnet's client before Bedrock) has none and gets the zero
-//! address. They are counted.
+//! What is not proven here: senders. No signature is checked; the sender recorded with each
+//! block is the one the service reports, and `load` recovers and checks it before archiving it.
+//! A transaction signed with all zeros (an L1-to-L2 message of OP Mainnet's client before
+//! Bedrock) has no signer and gets the zero address. They are counted.
 
 mod block;
+mod fields;
 mod lists;
 mod receipt;
 mod transaction;
 
 use std::fmt;
-use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::{fs, io};
 
 use alloy_consensus::Header;
 use alloy_primitives::B256;
 use alloy_rlp::Decodable;
+use op_indexer_chainspec::ChainSpec;
 use tokio::task::JoinSet;
 use tokio::time::{MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::chunk::{self, Link};
+pub(crate) use self::fields::{Missing, holes, missing};
+pub(crate) use self::lists::encode_access_list;
+use crate::chunk::{self, ChunkFile, Link};
 use crate::progress::{self, Rate};
 use crate::rows::RowsError;
 use crate::state::{Anchor, Chunk, LOW_SPACE_BYTES, MIN_SPACE_BYTES, Plan, State, VerifiedRange};
@@ -49,7 +53,7 @@ const LINK_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Compressed size of the chunks verified at once, whatever the number of threads; one chunk
 /// is always allowed. A chunk takes about twenty times its compressed size while it is
 /// verified (its text, then its rows), so this bounds `verify` to roughly 5 GB.
-const IN_FLIGHT_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const IN_FLIGHT_BYTES: u64 = 256 * 1024 * 1024;
 
 /// A rule a block failed.
 #[derive(Debug, thiserror::Error)]
@@ -62,6 +66,17 @@ enum Check {
     UnsupportedType { index: u64, kind: u8 },
     #[error("transaction {index} lacks the field `{field}`")]
     MissingField { index: u64, field: &'static str },
+    #[error(
+        "transaction {index} lacks the field `{field}`, which the archive service left out: run \
+         `download`, which fetches it from the chain's RPC endpoint"
+    )]
+    Unfilled { index: u64, field: &'static str },
+    #[error(
+        "the download has no transactions for this block, which every block after Bedrock has \
+         (the L1-attributes deposit): the archive service left them out; run `download`, which \
+         fetches the block from the chain's RPC endpoint"
+    )]
+    Hole,
     #[error("transaction {index}: the field `{field}` is not in the expected form: {reason}")]
     Field {
         index: u64,
@@ -79,6 +94,8 @@ enum Check {
     HeaderHash { computed: B256, reported: B256 },
     #[error("parent hash is {parent}, the block before has hash {previous}")]
     ParentLink { parent: B256, previous: B256 },
+    #[error("the header lacks `mix_hash`, which a block from Bedrock on must have")]
+    MissingMixHash,
 }
 
 /// Why a chunk was not verified.
@@ -86,6 +103,8 @@ enum Check {
 enum ChunkError {
     #[error("failed to write the verified chunk: {0}")]
     Io(io::Error),
+    #[error("failed to read the chunk's fill: {0}")]
+    Fill(io::Error),
     #[error("blocks {from}..{to}: {source}")]
     Rows {
         from: u64,
@@ -96,16 +115,33 @@ enum ChunkError {
     Block { number: u64, check: Check },
 }
 
-/// The fork activations of an OP Stack chain that change an encoding rebuilt here, in Unix
-/// seconds.
+/// The fork activations of an OP Stack chain that change an encoding rebuilt here: Bedrock by
+/// block number, the others in Unix seconds.
 #[derive(Debug, Clone, Copy)]
-struct Forks {
+pub(crate) struct Forks {
+    /// Bedrock: the first block in the current format. Before it a header's `mix_hash` is
+    /// zero, so a row without it can be rebuilt.
+    bedrock_block: u64,
     /// Regolith: the L1-attributes deposit stops being a system transaction.
     regolith: u64,
     /// Canyon: the deposit nonce and receipt version become part of the hashed receipt.
     canyon: u64,
+    /// Ecotone: the header carries the blob gas fields and the parent beacon block root.
+    ecotone: u64,
     /// Isthmus: the header carries the hash of an empty requests list.
     isthmus: u64,
+}
+
+impl Forks {
+    pub(crate) const fn new(chain: &ChainSpec) -> Self {
+        Self {
+            bedrock_block: chain.bedrock_block,
+            regolith: chain.regolith_time,
+            canyon: chain.canyon_time,
+            ecotone: chain.ecotone_time,
+            isthmus: chain.isthmus_time,
+        }
+    }
 }
 
 /// What verified chunks held.
@@ -115,6 +151,12 @@ struct Stats {
     transactions: u64,
     /// Transactions signed with all zeros.
     zero_signatures: u64,
+    /// Pre-Bedrock blocks whose row lacked `mix_hash`, rebuilt with zero and proven by the
+    /// header hash.
+    rebuilt_header_fields: u64,
+    /// Transactions with a field the service left out, taken from the chunk's fill (the
+    /// chain's RPC) and proven by the header hash.
+    rpc_filled_transactions: u64,
     /// Size of the verified chunk files written.
     disk_bytes: u64,
 }
@@ -130,6 +172,9 @@ struct Todo {
     raw_bytes: u64,
     already_verified: usize,
     not_downloaded: usize,
+    /// Verified files that were damaged (cut short, or not a chunk) and were removed, to be
+    /// verified again from their download.
+    damaged: usize,
     /// Free space on the state directory's disk, where the system tells.
     free_bytes: Option<u64>,
 }
@@ -159,11 +204,7 @@ pub(crate) async fn run(
         tokio::task::spawn_blocking(move || todo(&state, &plan, from_block)).await??
     };
     announce(&todo, threads, from_block)?;
-    let forks = Forks {
-        regolith: plan.chain.regolith_time,
-        canyon: plan.chain.canyon_time,
-        isthmus: plan.chain.isthmus_time,
-    };
+    let forks = Forks::new(plan.chain);
 
     let mut progress = Progress::new(&todo);
     let mut queue = todo.chunks.into_iter().peekable();
@@ -182,9 +223,13 @@ pub(crate) async fn run(
             })
         {
             in_flight_bytes = in_flight_bytes.saturating_add(bytes);
-            let (raw, verified) = (state.raw_path(chunk), state.verified_path(chunk));
+            let (raw, fill, verified) = (
+                state.raw_path(chunk),
+                state.fill_path(chunk),
+                state.verified_path(chunk),
+            );
             tasks.spawn_blocking(move || {
-                let result = block::verify_chunk(&forks, chunk, &raw, &verified);
+                let result = block::verify_chunk(&forks, chunk, &raw, &fill, &verified);
                 (chunk, bytes, result)
             });
         }
@@ -203,11 +248,21 @@ pub(crate) async fn run(
                     if failure.is_none() {
                         error!(%err, file = %file.display(), "chunk failed verification");
                     }
+                    // A row left without a field says itself what to run.
+                    let hint = if matches!(
+                        err,
+                        ChunkError::Block {
+                            check: Check::Unfilled { .. } | Check::Hole,
+                            ..
+                        }
+                    ) {
+                        ""
+                    } else {
+                        "; delete it, and its fill if there is one, and download again if the \
+                         data is wrong"
+                    };
                     failure.get_or_insert_with(|| {
-                        format!(
-                            "{err} (chunk {}; delete it and download again if the data is wrong)",
-                            file.display()
-                        )
+                        format!("{err} (chunk {}{hint})", file.display())
                     });
                 }
                 Some(Err(err)) => {
@@ -261,6 +316,7 @@ fn announce(todo: &Todo, threads: usize, from_block: Option<u64>) -> eyre::Resul
         raw_bytes = todo.raw_bytes,
         already_verified = todo.already_verified,
         not_downloaded = todo.not_downloaded,
+        damaged_removed = todo.damaged,
         free_bytes = todo.free_bytes,
         from_block,
         threads,
@@ -289,13 +345,29 @@ fn todo(state: &State, plan: &Plan, from_block: Option<u64>) -> io::Result<Todo>
         raw_bytes: 0,
         already_verified: 0,
         not_downloaded: 0,
+        damaged: 0,
         free_bytes: state.free_bytes()?,
     };
     let from_block = from_block.unwrap_or_default();
     for chunk in plan.chunks().filter(|chunk| chunk.to > from_block) {
-        if state.verified_path(chunk).exists() {
-            todo.already_verified = todo.already_verified.saturating_add(1);
-            continue;
+        let verified = state.verified_path(chunk);
+        match chunk::check(&verified)? {
+            ChunkFile::Present => {
+                todo.already_verified = todo.already_verified.saturating_add(1);
+                continue;
+            }
+            ChunkFile::Missing => {}
+            // Not verified: it goes, and the chunk is verified again from its download (or
+            // downloaded again, if that is gone too).
+            ChunkFile::Damaged => {
+                fs::remove_file(&verified)?;
+                warn!(
+                    file = %verified.display(),
+                    "a verified chunk is damaged (cut short, or not a chunk); removed it, to \
+                     verify it again"
+                );
+                todo.damaged = todo.damaged.saturating_add(1);
+            }
         }
         match state.raw_path(chunk).metadata() {
             Ok(file) => {
@@ -352,6 +424,14 @@ impl Progress {
             .done
             .zero_signatures
             .saturating_add(chunk.zero_signatures);
+        self.done.rebuilt_header_fields = self
+            .done
+            .rebuilt_header_fields
+            .saturating_add(chunk.rebuilt_header_fields);
+        self.done.rpc_filled_transactions = self
+            .done
+            .rpc_filled_transactions
+            .saturating_add(chunk.rpc_filled_transactions);
         self.done.disk_bytes = self.done.disk_bytes.saturating_add(chunk.disk_bytes);
     }
 
@@ -390,6 +470,8 @@ impl Progress {
             blocks = self.done.blocks,
             transactions = self.done.transactions,
             zero_signature_transactions = self.done.zero_signatures,
+            rebuilt_header_fields = self.done.rebuilt_header_fields,
+            rpc_filled_transactions = self.done.rpc_filled_transactions,
             disk_bytes = self.done.disk_bytes,
             blocks_per_sec = self.done.blocks / secs,
             secs,

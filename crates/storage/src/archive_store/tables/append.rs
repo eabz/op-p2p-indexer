@@ -2,10 +2,12 @@
 //!
 //! Does not validate what a block contains: the caller hands in bytes it has verified.
 
-use alloy_primitives::{BlockHash, Bytes};
+use alloy_primitives::{Address, BlockHash, Bytes};
 use op_indexer_primitives::BlockRef;
 
-use super::{Failure, Tables, compress_values, decode_number, end_ref, extends, record_usage};
+use super::{
+    Failure, Tables, compress_values, decode_number, encode_senders, end_ref, extends, record_usage,
+};
 use crate::{StorageError, Store, metrics};
 
 /// Most encoded bytes written in one batch by an append of many blocks (a single larger block
@@ -23,6 +25,8 @@ pub(in crate::archive_store) struct Entry {
     pub(in crate::archive_store) header: Bytes,
     pub(in crate::archive_store) body: Bytes,
     pub(in crate::archive_store) receipts: Option<Bytes>,
+    /// One per transaction, checked by the caller.
+    pub(in crate::archive_store) senders: Vec<Address>,
 }
 
 impl Entry {
@@ -34,7 +38,7 @@ impl Entry {
     /// The size of the RLP this block adds to a batch.
     fn encoded_len(&self) -> usize {
         let receipts = self.receipts.as_ref().map_or(0, |receipts| receipts.len());
-        self.header.len() + self.body.len() + receipts
+        self.header.len() + self.body.len() + receipts + self.senders.len() * super::ADDRESS_LEN
     }
 }
 
@@ -53,16 +57,16 @@ pub(in crate::archive_store) fn append_batch(
             child.extends(parent.block)?;
         }
     }
-    // Read without the lock: a writer getting in between shows as `NotContiguous` below.
+    // Read without the lock: each chunk is looked at again under it.
     let tip = end_ref(tables.headers.last_key_value())?;
     let mut rest = match tip {
         Some(tip) => above(tables, blocks, tip)?,
         None => blocks,
     };
-    let appended = rest.len();
+    let mut appended = 0_usize;
     while !rest.is_empty() {
         let (chunk, tail) = rest.split_at(chunk_len(rest));
-        append_chunk(tables, chunk)?;
+        appended = appended.saturating_add(append_chunk(tables, chunk)?);
         rest = tail;
     }
     if appended > 0 {
@@ -119,8 +123,10 @@ fn chunk_len(blocks: &[Entry]) -> usize {
         .max(1)
 }
 
-/// Writes `chunk` (consecutive, not empty) in one durable batch if it extends the tip.
-fn append_chunk(tables: &Tables, chunk: &[Entry]) -> Result<(), Failure> {
+/// Writes the blocks of `chunk` (consecutive, not empty) above the tip in one durable batch,
+/// if they extend it; blocks another writer appended since the tip was read are skipped.
+/// Returns how many were written.
+fn append_chunk(tables: &Tables, chunk: &[Entry]) -> Result<usize, Failure> {
     // Compressed before the lock is taken.
     let mut values = Vec::with_capacity(chunk.len());
     for block in chunk {
@@ -133,19 +139,25 @@ fn append_chunk(tables: &Tables, chunk: &[Entry]) -> Result<(), Failure> {
     }
 
     let _writer = tables.lock();
-    if let (Some(tip), Some(first)) = (end_ref(tables.headers.last_key_value())?, chunk.first()) {
-        first.extends(tip)?;
-    }
+    let new = match end_ref(tables.headers.last_key_value())? {
+        Some(tip) => above(tables, chunk, tip)?.len(),
+        None => chunk.len(),
+    };
+    let held = chunk.len().saturating_sub(new);
     let mut batch = tables.durable_batch();
-    for (block, (header, body, receipts)) in chunk.iter().zip(values) {
+    for (block, (header, body, receipts)) in chunk.iter().zip(values).skip(held) {
         let key = block.block.number.to_be_bytes();
         batch.insert(&tables.headers, key, header);
         batch.insert(&tables.bodies, key, body);
         if let Some(receipts) = receipts {
             batch.insert(&tables.receipts, key, receipts);
         }
+        batch.insert(&tables.senders, key, encode_senders(&block.senders));
+        if block.receipts.is_none() {
+            batch.insert(&tables.pending, key, block.block.hash.0);
+        }
         batch.insert(&tables.numbers, block.block.hash.0, key);
     }
     batch.commit()?;
-    Ok(())
+    Ok(new)
 }

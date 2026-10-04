@@ -22,6 +22,8 @@ pub use game::{Claim, ClaimError, CreatedGame, created_topic};
 pub struct ChainSpec {
     /// L2 chain id.
     pub chain_id: ChainId,
+    /// Short lowercase name, used in default paths: [`Self::default_data_dir`].
+    pub name: &'static str,
     /// Address of the sequencer key that signs gossiped unsafe blocks.
     pub unsafe_block_signer: Address,
     /// Discovery bootnodes, as `enr:` records or `enode://` URLs ([`Self::bootnodes`]).
@@ -98,6 +100,7 @@ const SUPERCHAIN_BOOTNODES: &[&str] = &[
 /// OP Mainnet (chain id 10).
 pub const OP_MAINNET: ChainSpec = ChainSpec {
     chain_id: 10,
+    name: "op",
     unsafe_block_signer: address!("0xAAAA45d9549EDA09E70937013520214382Ffc4A2"),
     bootnodes: SUPERCHAIN_BOOTNODES,
     // Sent by every OP Mainnet execution peer in its eth status (observed 2026-10-04).
@@ -144,6 +147,7 @@ const UNICHAIN_GENESIS_TIME: u64 = 1_730_748_359;
 /// 2026-10-04) unless noted. Bootnodes are the shared Superchain list.
 pub const UNICHAIN: ChainSpec = ChainSpec {
     chain_id: 130,
+    name: "unichain",
     // `unsafeBlockSigner()` of the chain's `SystemConfigProxy`
     // `0xc407398d063f942feBbcC6F80a156b47F3f1BDA6` on L1, read 2026-10-04 (the same call on OP
     // Mainnet's returns its signer above).
@@ -210,6 +214,14 @@ impl ChainSpec {
             self.jovian_time,
             self.karst_time,
         ]
+    }
+
+    /// The data directory a node uses for this chain when none is configured, and under
+    /// which the importer loads its archive by default: `data-<name>`. Two chains on one host
+    /// therefore never share a directory unless told to.
+    #[must_use]
+    pub fn default_data_dir(&self) -> String {
+        format!("data-{}", self.name)
     }
 
     /// Returns the spec for `chain_id`, if supported.

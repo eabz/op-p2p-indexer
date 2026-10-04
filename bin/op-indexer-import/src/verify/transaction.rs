@@ -6,7 +6,8 @@
 //!
 //! - Legacy, EIP-2930, EIP-1559 and EIP-7702 transactions are built from their fields and
 //!   signature; the access list and the authorization list come in the service's own binary
-//!   form (`lists`).
+//!   form (`lists`). An authorization list the service left out comes from the chunk's fill
+//!   (`fill`, fetched from the chain's RPC), on the row.
 //! - A legacy transaction signed with all zeros (an L1-to-L2 message of OP Mainnet's client
 //!   before Bedrock) is encoded with those zeros; it has no signer.
 //! - A deposit (type `0x7E`) is built from the source hash and mint the service reports. Its
@@ -14,9 +15,8 @@
 //!   L1-attributes deposit before Regolith has it ([L1 attributes deposited transaction],
 //!   [Regolith]).
 //!
-//! No signature is checked and no sender recovered: one recovery per transaction would be most
-//! of the work of `verify`, and the bytes served to peers do not contain senders. The sender
-//! recorded for the optional database rows is the one the service reports.
+//! No signature is checked and no sender recovered here: the sender recorded with each block is
+//! the one the service reports, and `load` recovers and checks it before archiving it.
 //!
 //! [L1 attributes deposited transaction]: https://specs.optimism.io/protocol/deposits.html#l1-attributes-deposited-transaction
 //! [Regolith]: https://specs.optimism.io/protocol/regolith/overview.html
@@ -121,9 +121,21 @@ impl Fields<'_> {
         )
     }
 
+    /// The authorization list: the service's, else the chunk's fill. EIP-7702 refuses an
+    /// empty list, so a row with neither is one the service left out.
     fn authorization_list(&self) -> Result<Vec<SignedAuthorization>, Check> {
+        const FIELD: &str = "authorization_list";
+        if let Some(filled) = &self.row.filled_authorization_list {
+            return Ok(filled.clone());
+        }
+        if self.row.lacks_authorization_list() {
+            return Err(Check::Unfilled {
+                index: self.index,
+                field: FIELD,
+            });
+        }
         let list = self.row.authorization_list.as_ref();
-        self.list("authorization_list", list, lists::authorization_list)
+        self.list(FIELD, list, lists::authorization_list)
     }
 
     /// Decodes a list field the service gives as the bytes of its binary column; absent or

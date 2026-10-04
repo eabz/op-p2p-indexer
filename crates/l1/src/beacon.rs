@@ -31,7 +31,7 @@ use std::net::SocketAddr;
 
 use alloy_primitives::B256;
 use libp2p::{Multiaddr, noise};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
@@ -125,16 +125,18 @@ impl LightClient {
             "beacon light client starting"
         );
 
-        // Until the bootstrap: a node that has synced nothing.
-        let (status, status_rx) = watch::channel(StatusData {
+        // Always a node that has synced nothing: a light client holds no beacon blocks to serve
+        // and SHOULD report genesis in its `Status` (light client networking, "Light clients":
+        // https://github.com/ethereum/consensus-specs/blob/master/specs/altair/light-client/p2p-interface.md#light-clients).
+        let status = StatusData {
             finalized_root: B256::ZERO,
             finalized_epoch: 0,
             head_root: spec.genesis_block_root,
             head_slot: 0,
-        });
+        };
         let (network, handle, gossip) =
-            network::new(config.listen_addr, config.bootnodes, digest, status_rx)?;
-        let client = Client::new(spec, config.checkpoint, handle, gossip, status, trusted);
+            network::new(config.listen_addr, config.bootnodes, digest, status)?;
+        let client = Client::new(spec, config.checkpoint, handle, gossip, trusted);
         // Either part ending stops the other.
         let stop = cancel.child_token();
         let (networking, result) = tokio::join!(

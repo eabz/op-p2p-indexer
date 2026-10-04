@@ -8,6 +8,7 @@ use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::Path;
 
+use alloy_eips::eip7702::SignedAuthorization;
 use alloy_primitives::{Address, B64, B256, Bytes, U64, U128, U256};
 use flate2::bufread::MultiGzDecoder;
 use serde::Deserialize;
@@ -48,7 +49,10 @@ pub(crate) struct BlockRow {
     pub(crate) gas_used: U64,
     pub(crate) timestamp: U64,
     pub(crate) extra_data: Bytes,
-    pub(crate) mix_hash: B256,
+    /// Absent from some pre-Bedrock rows the service gives (seen on OP Mainnet around block
+    /// 47,705,000); `verify` then takes zero, the value of every legacy block, and the header
+    /// hash decides.
+    pub(crate) mix_hash: Option<B256>,
     pub(crate) nonce: B64,
     pub(crate) base_fee_per_gas: Option<U64>,
     pub(crate) withdrawals_root: Option<B256>,
@@ -91,6 +95,10 @@ pub(crate) struct TransactionRow {
     pub(crate) access_list: Option<Bytes>,
     /// The EIP-7702 authorizations, as the access list.
     pub(crate) authorization_list: Option<Bytes>,
+    /// The EIP-7702 authorizations from the chunk's fill (`fill`), for a row the service sent
+    /// without them; not in the service's answer.
+    #[serde(skip)]
+    pub(crate) filled_authorization_list: Option<Vec<SignedAuthorization>>,
     /// Deposit transactions: the hash that identifies the deposit's origin.
     pub(crate) source_hash: Option<B256>,
     /// Deposit transactions: ETH minted on L2.
@@ -99,6 +107,20 @@ pub(crate) struct TransactionRow {
     pub(crate) deposit_nonce: Option<U64>,
     /// Deposit receipts: 1 from Canyon on.
     pub(crate) deposit_receipt_version: Option<U64>,
+}
+
+impl TransactionRow {
+    /// Whether this is an EIP-7702 transaction whose authorization list the service left out:
+    /// the fill has none, and the row has none, no bytes, or a list of zero entries (the
+    /// service's encoding starts with the count). EIP-7702 refuses an empty list.
+    pub(crate) fn lacks_authorization_list(&self) -> bool {
+        self.kind == Some(4)
+            && self.filled_authorization_list.is_none()
+            && self
+                .authorization_list
+                .as_ref()
+                .is_none_or(|list| list.get(..8).is_none_or(|count| count == [0_u8; 8]))
+    }
 }
 
 /// A log.
@@ -133,6 +155,35 @@ pub(crate) struct Rows {
     pub(crate) transactions: Vec<TransactionRow>,
     /// By block number, then transaction index, then log index.
     pub(crate) logs: Vec<LogRow>,
+}
+
+impl Rows {
+    /// Puts each kind of row in block order, which the lookups here and the rebuild rely on.
+    pub(crate) fn sort(&mut self) {
+        self.blocks.sort_unstable_by_key(|block| block.number);
+        self.transactions
+            .sort_unstable_by_key(|tx| (tx.block_number, tx.transaction_index));
+        self.logs
+            .sort_unstable_by_key(|log| (log.block_number, log.transaction_index, log.log_index));
+    }
+
+    /// Whether the chunk has transaction rows for block `number`.
+    pub(crate) fn has_transactions(&self, number: u64) -> bool {
+        let at = self
+            .transactions
+            .partition_point(|tx| tx.block_number < number);
+        self.transactions
+            .get(at)
+            .is_some_and(|tx| tx.block_number == number)
+    }
+
+    /// The block numbered `number`, if the chunk has it.
+    pub(crate) fn block(&self, number: u64) -> Option<&BlockRow> {
+        let at = self
+            .blocks
+            .binary_search_by_key(&number, |block| block.number);
+        at.ok().and_then(|at| self.blocks.get(at))
+    }
 }
 
 /// Why a downloaded chunk could not be read.
@@ -194,11 +245,7 @@ pub(crate) fn read(path: &Path) -> Result<Rows, RowsError> {
             }
         }
     }
-    rows.blocks.sort_unstable_by_key(|block| block.number);
-    rows.transactions
-        .sort_unstable_by_key(|tx| (tx.block_number, tx.transaction_index));
-    rows.logs
-        .sort_unstable_by_key(|log| (log.block_number, log.transaction_index, log.log_index));
+    rows.sort();
     // Answers of one chunk do not overlap, but nothing downstream should depend on that.
     rows.blocks.dedup_by_key(|block| block.number);
     rows.transactions

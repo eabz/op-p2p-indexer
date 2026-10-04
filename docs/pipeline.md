@@ -2,13 +2,13 @@
 
 The pipeline is the connection between the networks and `storage`. It takes the unsafe blocks
 the network emits, writes them to the unsafe store, and, when L1 commits them, moves them to
-the committed store and the local archive. It also attaches the receipts the execution network
+the block archive, the committed store. It also attaches the receipts the execution network
 fetches, stores the blocks a range sync fetches, and turns the dispute games the L1 side
 verifies into the safe and finalized heads. Store calls go through storage's retry helper
 (`op_indexer_storage::retry`), without a time limit.
 
-It does not depend on `p2p`: the binary hands it a channel. It is generic over the three store
-traits, so it does not know about Redis, ClickHouse or fjall.
+It does not depend on `p2p`: the binary hands it a channel. It is generic over the two store
+traits, so it does not know about Redis or fjall.
 
 ## 1. Inputs and outputs
 
@@ -21,22 +21,26 @@ traits, so it does not know about Redis, ClickHouse or fjall.
 | in | range-sync batches | `mpsc::Receiver<Vec<EncodedBlock>>` | `el`, through `Pipeline::with_range` |
 | out | unsafe head | `watch::Sender<Option<BlockRef>>` | the execution network's advertised head, through `Pipeline::with_head` |
 | out | safe block number | `watch::Sender<BlockNumber>` | `p2p` (its gap detection ignores heights at or below it) |
-| out | the three stores | `UnsafeStore`, `CommittedStore`, `ArchiveStore` | `storage` |
+| out | the two stores | `UnsafeStore`, `ArchiveStore` | `storage` |
 
 ## 2. Tasks
 
-Five tasks, each its own, so a slow ClickHouse never delays a gossip block: ingest and
+Five tasks, each its own, so a slow archive never delays a gossip block: ingest and
 promotion always run; the receipts task, the range task and the commitment task run when
 their input is given (section 4b).
 
 ```text
 p2p ─▶ [ingest]  decode ─▶ recover senders ─▶ UnsafeStore::insert
-l1  ─▶ [promote] UnsafeStore::ancestry ─▶ CommittedStore::insert ─▶ ArchiveStore::append_batch/trim
-                 ─▶ CommittedStore::set_l1_heads ─▶ UnsafeStore::prune ─▶ safe number to p2p
+l1  ─▶ [promote] UnsafeStore::ancestry ─▶ roots checked ─▶ ArchiveStore::append_batch
+                 ─▶ ArchiveStore::set_heads ─▶ UnsafeStore::prune ─▶ safe number to p2p
 ```
 
 All stop on the cancellation token after finishing the write in progress. Every store write
-is idempotent, so a write cut short is repeated on the next start.
+is idempotent, so a write cut short is repeated on the next start. Promotion, the commitment
+task and the range task follow inputs that close only when the node stops; one of them ending
+before the node starts shutting down (`Pipeline::run`'s `shutdown` token) stops the pipeline
+with `PipelineError::Ended`, naming the task, and so the node. The binary does the same for
+its own two data tasks, the L1 heads forwarder and the range sync planner.
 
 ## 3. Ingest
 
@@ -60,34 +64,38 @@ is idempotent, so a write cut short is repeated on the next start.
 
 ## 4. Promotion
 
-Runs whenever the L1 heads change. `C` is the safe head recorded in the committed store
-(`CommittedStore::l1_heads`), `S` the new safe head.
+Runs whenever the L1 heads change. `C` is the safe head recorded in the archive
+(`ArchiveStore::heads`), `S` the new safe head.
 
-1. **`S` at or below `C`.** A rollback is destructive, so it needs evidence that the block
-   at `S.number` changed: `S` at `C`'s height with another hash, or `S` below `C` where the
-   archive covers `S.number` and holds another block there (`ArchiveStore::number_of(S.hash)`
-   is not `S.number`). Then it is an **L1 reorg**: `CommittedStore::rollback_to(S)`;
-   `ArchiveStore::truncate_above(S.number)` if the archive ends at or below `C` (so at most
-   `C - S` blocks go); then continue. Otherwise (`S` is on the committed chain, or cannot be
-   checked: no archive, or outside it, with a warning) the head is behind and nothing is
-   done.
+1. **`S` at or below `C`: nothing is done.** The heads only rise: the commitment task never
+   publishes a safe head at or below the committed one (section 4b), so there is no rollback
+   and nothing is ever removed from the archive.
 2. `UnsafeStore::set_l1_heads(heads)`, so the unsafe store stops accepting blocks at or below
    `S` and fork choice respects it.
 3. `UnsafeStore::ancestry(S, C.number)`: the blocks above `C` up to `S`, oldest first. The
    first block's parent must be `C`.
-4. `CommittedStore::insert(blocks)`, then `ArchiveStore::append_batch` of the blocks if they
-   extend the archive's tip, and `ArchiveStore::trim(retention)` (skipped when the archive is
-   disabled, keeps everything, or already holds more than the window).
-5. `CommittedStore::set_l1_heads(heads)`: the marker that the range is committed. Written
-   after the data, so a crash before it repeats the range.
-6. `UnsafeStore::prune(S)`, then publish `S.number` to `p2p`.
+4. `ArchiveStore::append_batch` of the blocks, with their senders, if they extend the
+   archive's tip. Each block's transactions root, and receipts root when it has receipts, is
+   computed over exactly the bytes about to be written and compared with its header; the list
+   ends before the first block that does not match, which is not appended (error log,
+   `op_indexer_pipeline_root_mismatches_total`) and so stays the hole above the recorded safe
+   head.
+5. `ArchiveStore::set_heads(heads)`: the marker that the range is committed. Written after
+   the data, so a crash before it repeats the range. **The recorded heads never name a block
+   the archive lacks:** the safe head recorded is the newest block of `S`'s chain the archive
+   holds after step 4 (`S` when the whole range went in, else the newest block appended), and
+   the finalized head is recorded only if it is not above it. When nothing was appended but
+   the archive already holds `S` (range sync stored it, and the unsafe store may not have it),
+   `S` is recorded; otherwise the safe head stays at `C`. A part that does not extend the
+   archive ends the step: the parts above it build on it.
+6. `UnsafeStore::prune` up to the recorded safe head, then publish its number to `p2p`. Blocks
+   above it stay in the unsafe store for a later promotion (or until they expire).
 
 A change of the finalized head alone only records the heads (steps 2 and 5).
 
 **Receipts.** Blocks are promoted whether or not they have receipts: waiting would hold
 promotion on the execution network. Receipts that arrive after a block was promoted are
-attached in the archive (section 4b); the committed store keeps the row without them, and its
-insert is idempotent with a version, so the block can be inserted again with its receipts.
+attached in the archive (section 4b).
 
 **When the range cannot be read**, the pipeline promotes now and backfills later: it promotes
 the part of the range next to `S` that it can read and leaves the rest as a hole, because
@@ -104,18 +112,19 @@ hole itself; backfill belongs to the `el` crate.
   are held at a time. Past the cap, the rest is the hole, which may still be in the unsafe
   store. Hourly dispute games move the safe head by about 1,800 blocks on OP Mainnet and 3,600
   on Unichain, so one ancestry call alone would leave a hole every time.
-- The first block does not build on `C`: the range is promoted. Nothing is missing, but the
-  committed block at `C`'s height belongs to another chain (the reorg limit below).
+- The first block does not build on `C`: the range is promoted if it extends the archive.
+  Nothing is missing, but the archived block at `C`'s height belongs to another chain (the
+  reorg limit below).
 
 Each part takes at most four `ancestry` calls (`MAX_RANGE_READS`); if none succeeds, the rest
 of the range is the hole. Each hole is logged with its range and reason and counted, with only
-the blocks actually left out; a promotion repeated after a crash counts its hole again. `S` is
-recorded as the committed safe head and promotion continues from there. The blocks promoted
-after a hole do not extend the archive and are not archived until range sync fills it (below).
-Stalling until backfill exists was rejected: it would stop pruning and committing entirely.
+the blocks actually left out; a promotion repeated after a crash counts its hole again. The
+blocks above a hole do not extend the archive, so they are not archived and the recorded safe
+head stays below the hole (step 5). Range sync fills it: the binary refuses the L1 side
+without range sync, and holds the L1 heads back while the archive is far behind them; the
+next change of the heads then appends what the unsafe store still holds.
 
-**First safe head** (the committed store has recorded none): the committed store begins at
-`S`. Block `S` alone is promoted if the unsafe store has it; `S` is recorded either way and no
+**First safe head** (the archive has recorded none): the committed chain begins at `S`. Block `S` alone is promoted if the unsafe store has it; `S` is recorded either way and no
 hole is counted. Older history belongs to backfill. Heads with no safe head (only finalized
 known) are recorded and nothing else happens.
 
@@ -130,24 +139,17 @@ everything else, including the gap below a promoted range that did not connect.
   (`op_indexer_pipeline_archive_skipped_blocks_total`). Nothing is removed to make room.
   Blocks the archive already holds are skipped by `append_batch`, so a range that range sync
   or an import stored first is fine.
-- `trim` runs only while the archive holds no more than the retention window plus the blocks
-  just appended, so it removes at most as many blocks as were appended. An archive that is
-  already larger (an import: set the retention to `all`) is not trimmed, with a warning.
-- Blocks are removed only in step 1, an L1 reorg of the safe head, and only if the archive
-  ends at or below `C`: at most `C - S` blocks, the depth of the reorg. If it reaches above
-  `C`, other writers put blocks there and it is left alone, with a warning.
-- Startup removes nothing (section 5).
+- Nothing removes blocks: the archive keeps every block (no retention window), and the heads
+  only rise (step 1). Startup removes nothing either (section 5).
 
 **Known limits:**
 
 - *A safe head that jumps more than 16,384 blocks at once* (an L1 source catching up after
   downtime): only the newest 16,384 are promoted, even when the unsafe store has every block.
   The cap is a count of blocks, so it spans about 9 hours on OP Mainnet and 4.5 on Unichain.
-- *An L1 reorg where the block at `S.number` itself changed*: `rollback_to(S)` deletes the rows
-  above `S.number`, but the row at `S.number` is the old chain's block and stays. The pipeline
-  cannot replace it (the unsafe store ignores blocks at or below the safe head, and the
-  committed store has no read call to compare hashes). Backfill repairs it, like a hole of one
-  block.
+- *An L1 reorg below the committed safe head*: a safe head can only be a block a bonded
+  dispute game on L1 matched, and the heads only rise, so it is not followed: the archive
+  keeps the committed chain. The operator repairs it.
 
 ## 4b. The receipts task and the range task
 
@@ -162,15 +164,28 @@ store, or in the archive when the block has been promoted in the meantime; recei
 block neither holds are dropped and counted. A store that refuses them (wrong count or number)
 is logged and counted; any other store error stops the pipeline.
 
+**The archive never stays without receipts.** Promotion does not wait for receipts, so a few
+blocks reach the archive without them. The archive lists them (`pending_receipts`, section 9
+of `docs/storage.md`) until `set_receipts` fills them. At startup, then every 30 s, the task
+asks for the receipts of 64 of them, continuing after the last block asked for and wrapping
+round, so blocks no peer serves receipts for do not hold back the others, through the same
+channel as new blocks
+(`ReceiptsRequest` built from the archived header and its sender count, verified by `el`
+against the receipts root as usual). The answers are attached in the archive like any late
+receipts. A restart resumes from the list, which lives in the archive. The list's size is
+logged at startup and kept in `op_indexer_pipeline_archive_pending_receipts`.
+
 **Range** (`range.rs`, when a range sync is configured). The execution network hands over
 verified blocks in ascending order, in batches of consecutive blocks, as the bytes it received
 (`EncodedBlock`). For each batch the task decodes the blocks and recovers their senders on
 blocking threads (32 blocks per thread; a legacy transaction signed with all zeros gets the
-zero address), inserts them into the committed store with source `Sync`, then appends the same
-bytes to the archive with `append_batch`. It keeps no progress of its own: the archive's last
-block is where the binary starts the sync again. A batch is stored whole or the pipeline
-stops with the error (`PipelineError::RangeBlock` for a block this build cannot read,
-`PipelineError::Storage` for a store that refuses the batch), because the archive is one
+zero address), then appends the same bytes, with those senders, to the archive with
+`append_batch`. It keeps no progress of its own: the archive's last
+block is where the binary starts the sync again. Blocks the archive already holds (promotion
+appended them first) are left out; a batch that does not extend the archive is skipped with a
+warning, and the planner gives its round up. A batch that extends it is stored whole or the
+pipeline stops with the error (`PipelineError::RangeBlock` for a block this build cannot read,
+`PipelineError::Storage` for an archive that refuses the batch), because the archive is one
 contiguous range and a sync that cannot continue must not look like it is running.
 
 **Commitment** (`commit.rs`, when the L1 side is connected: `Pipeline::with_l1_games`). The
@@ -195,10 +210,10 @@ not read again: when its L1 block finalizes, minutes later, promotion has usuall
 block from the unsafe store. After a restart that memory is empty, so a finalized game at or
 below the committed safe head needs the archive to raise the finalized head.
 
-The heads only move up, across restarts too: the task starts from the committed store's
-heads (`CommittedStore::l1_heads`, read at startup) and never publishes one below them, so a
+The heads only move up, across restarts too: the task starts from the archive's heads
+(`ArchiveStore::heads`, read at startup) and never publishes one below them, so a
 restart does not hand promotion an older head. A recorded finalized head above the safe one
-(left by a rollback, which does not touch the finalized row) is not taken over: the
+(left by an earlier build's rollback) is not taken over: the
 finalized head starts unknown and the next finalized match sets it. The heads go to promotion through the binary,
 which holds them back while a range sync is still bringing the archive up to the chain.
 
@@ -207,21 +222,19 @@ gives to the execution network as the newest block the node knows.
 
 ## 5. Startup
 
-1. Read `C` from the committed store. If there is none, start both tasks.
+1. Read `C` from the archive. If there is none, start both tasks.
 2. Write the heads to the unsafe store (Redis may have been wiped by a layout change), prune it
    up to `C` (the last run may have stopped between the marker and the prune), and publish
    `C`'s number to `p2p`.
 3. Start both tasks.
 
-Nothing is deleted from the committed store or the archive at startup. Rows or archived blocks
-above `C` may come from a promotion that stopped before its marker, or from an import or a
-range sync that reached further; the two cannot be told apart, and deleting the second kind
-would discard work that takes days. What a stopped promotion leaves is harmless: the repeat
-inserts the same rows again (the insert is idempotent) and finds its blocks in the archive,
-which skips them. Only if the safe chain is another one after the restart (a crash between
-steps 4 and 5, then an L1 reorg) do rows of the stopped attempt stay and its blocks stay at
-the archive's tip, where later ranges then do not connect: backfill repairs the rows, the
-operator the archive.
+Nothing is deleted from the archive at startup. Archived blocks above `C` may come from a
+promotion that stopped before its marker, or from an import or a range sync that reached
+further; the two cannot be told apart, and deleting the second kind would discard work that
+takes days. What a stopped promotion leaves is harmless: the repeat finds its blocks in the
+archive, which skips them. Only if the safe chain is another one after the restart (a crash
+between steps 4 and 5, then an L1 reorg) do the blocks of the stopped attempt stay at the
+archive's tip, where later ranges then do not connect: the operator repairs the archive.
 
 
 The network is not held back: it starts next to this reconciliation, and the block channel
@@ -271,25 +284,25 @@ ingest lag (now minus block timestamp), channel depth.
 ## 10. Not done
 
 The unsafe store's reconciliation when the safe head contradicts it (`docs/storage.md`, the
-safe-head gap), reading data back (`query`), a metrics exporter.
+safe-head gap), a metrics exporter. Reading data back is the `stream` crate's.
 
 ## 11. Modules and API
 
 | File | Holds |
 |---|---|
-| `lib.rs` | `Pipeline<U, C, A>`: `new(...)`, the builders `with_head`, `with_l1_games`, `with_range`, and `run(self, cancel) -> Result<(), PipelineError>`. Runs startup (section 5), then the tasks; returns when they have stopped, or with the first fatal error after cancelling the others. |
+| `lib.rs` | `Pipeline<U, A>`: `new(...)`, the builders `with_head`, `with_l1_games`, `with_range`, and `run(self, shutdown, cancel) -> Result<(), PipelineError>`. Runs startup (section 5), then the tasks; returns when they have stopped, or with the first fatal error after cancelling the others. |
 | `ingest.rs` | The ingest task (section 3). |
 | `recover.rs` | Sender recovery on a blocking thread. |
 | `promote.rs` | Startup reconciliation and the promotion task (sections 4 and 5). |
 | `receipts.rs` | The receipts task and `ReceiptsChannels` (section 4b). |
-| `range.rs` | The range task: range-sync batches into the committed store and the archive (section 4b). |
+| `range.rs` | The range task: range-sync batches into the archive (section 4b). |
 | `commit.rs` | The commitment task: verified dispute games checked against our blocks, into L1 heads (section 4b). |
 | `retry.rs` | Storage's `retry` without a time limit, and `settle`, which ends a task on what it returns. |
 | `error.rs` | `PipelineError`. |
 | `metrics.rs` | Names, descriptions and recording functions (section 8), like `storage::metrics`. |
 
-`Pipeline::new` takes the unsafe store, the committed store, the archive with its retention
-(`Option`, `None` when disabled), the block receiver, the L1 heads receiver, the safe-number
+`Pipeline::new` takes the unsafe store, the archive, the chain's Canyon time (for the receipts
+roots promotion checks), the block receiver, the L1 heads receiver, the safe-number
 sender and the receipts channels (`Option`, `None` without an execution network). The
 builders add the head output (`with_head`), the dispute games and the L1 heads sender they
 feed (`with_l1_games`), and the range-sync batches (`with_range`). The stores are `Clone + Send + Sync + 'static`.

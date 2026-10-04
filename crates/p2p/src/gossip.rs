@@ -44,12 +44,13 @@ const HISTORY_LENGTH: usize = 12;
 const HISTORY_GOSSIP: usize = 3;
 /// 130 heartbeats of 0.5s.
 const SEEN_TTL: Duration = Duration::from_secs(65);
-/// Below this score a peer's RPCs are ignored (and the network disconnects it).
+/// Below this score a peer's RPCs are ignored; the network bans it only further down, below
+/// op-node's ban threshold of -100.
 ///
-/// About three rejected blocks put a peer below it (see [`peer_score_params`]). Blocks dated
-/// more than a few seconds in the future are rejected, so a local clock running behind by more
-/// than that makes every honest peer look invalid and gets them all disconnected: the host
-/// clock must be kept in sync (NTP).
+/// About three rejected blocks put a peer below it (see [`peer_score_params`]). A block the
+/// sequencer signed but dated outside the time window is ignored, not rejected: it points at
+/// our clock, so a clock that is off does not graylist honest peers. It still costs the
+/// blocks, so the host clock must be kept in sync (NTP).
 pub(crate) const GRAYLIST_THRESHOLD: f64 = -40.0;
 /// Message id domain for valid snappy payloads; invalid ones are dropped by [`Snappy`].
 const DOMAIN_VALID_SNAPPY: [u8; 4] = [1, 0, 0, 0];
@@ -148,8 +149,8 @@ pub(crate) fn behaviour(
 ///
 /// - Per-topic scoring. op-node uses none, so REJECTs cost a peer nothing there. We score only
 ///   invalid deliveries, squared and weighted by -5: one costs 5, two cost 20, and three cost 45,
-///   which is below [`GRAYLIST_THRESHOLD`], so the peer is disconnected. That tolerates a
-///   one-off.
+///   which is below [`GRAYLIST_THRESHOLD`], so its messages are ignored; five (125) put it
+///   below the ban threshold of -100. That tolerates a one-off.
 /// - The slow-peer penalty, which only rust-libp2p has; it keeps the library default.
 ///
 /// The slot is the chain's block time, as in op-node (which falls back to 2 s when it is

@@ -25,14 +25,13 @@ use std::time::Duration;
 
 use alloy_primitives::{B256, Bytes};
 use libp2p::PeerId;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 use tokio::time::{Instant, MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::BeaconError;
 use super::network::{Gossip, NetworkHandle, Request, RequestError, Response, Topic, Verdict};
-use super::rpc::StatusData;
 use super::spec::{BeaconSpec, SLOTS_PER_EPOCH, SLOTS_PER_PERIOD};
 use super::verify::{Accepted, Kind, Store, VerifyError, verify};
 use crate::TrustedL1Block;
@@ -85,8 +84,6 @@ pub(super) struct Client {
     checkpoint: B256,
     network: NetworkHandle,
     gossip: mpsc::Receiver<Gossip>,
-    /// What the network reports about this node in `Status`: follows the store.
-    status: watch::Sender<StatusData>,
     trusted: mpsc::Sender<TrustedL1Block>,
     store: Option<Store>,
     /// Peers that said they do not hold the checkpoint's bootstrap.
@@ -109,7 +106,6 @@ impl Client {
         checkpoint: B256,
         network: NetworkHandle,
         gossip: mpsc::Receiver<Gossip>,
-        status: watch::Sender<StatusData>,
         trusted: mpsc::Sender<TrustedL1Block>,
     ) -> Self {
         let now = Instant::now();
@@ -118,7 +114,6 @@ impl Client {
             checkpoint,
             network,
             gossip,
-            status,
             trusted,
             store: None,
             refused: HashSet::new(),
@@ -187,8 +182,13 @@ impl Client {
             let result = verifying.await.map_err(BeaconError::Verification)?;
             if let Some(id) = gossip {
                 // Forwarded to the mesh only if it verified and is news: on the finality
-                // topic a newer finalized block, on the optimistic topic a newer head.
+                // topic a newer finalized block, on the optimistic topic a newer head; and
+                // only once the sync messages of its slot had time to spread.
+                let spec = self.spec;
                 let news = |accepted: &Accepted| {
+                    if !spec.is_due(accepted.signature_slot) {
+                        return false;
+                    }
                     if kind == Kind::Finality {
                         accepted.finalized.is_some()
                     } else {
@@ -218,7 +218,7 @@ impl Client {
         let Some(store) = &self.store else {
             return;
         };
-        let head = store.status().head_slot;
+        let head = store.head_slot();
         if let Some((slot, since)) = self.head_since
             && slot == head
             && since.elapsed() < HEAD_STALL
@@ -357,7 +357,6 @@ impl Client {
                 "sync committees updated"
             );
         }
-        self.status.send_replace(store.status());
         self.store = Some(store);
         for block in [accepted.finalized, accepted.head].into_iter().flatten() {
             debug!(number = block.number, hash = %block.hash, finalized = block.finalized, "trusted L1 block");

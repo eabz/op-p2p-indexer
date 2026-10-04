@@ -21,6 +21,7 @@ use op_alloy_rpc_types_engine::{
     OpExecutionPayload, OpExecutionPayloadSidecar, OpExecutionPayloadV4, OpPayloadError,
     PayloadHash,
 };
+use op_indexer_chainspec::ChainSpec;
 use op_indexer_primitives::{PayloadVersion, UnsafeBlock};
 use ssz::Decode;
 
@@ -34,6 +35,10 @@ pub(crate) const VERSIONS: [PayloadVersion; 4] = [
 
 /// Blocks older than this are rejected.
 const MAX_AGE_SECS: u64 = 60;
+/// A block the sequencer signed and older than [`MAX_AGE_SECS`] is only ignored up to this
+/// age, since our clock may run ahead; older, it is a replay and rejected (never a ban). Its
+/// signature is not checked then: a replay costs the validator no signature recovery.
+const MAX_IGNORED_AGE_SECS: u64 = 2 * MAX_AGE_SECS;
 /// Blocks further in the future than this are rejected.
 const MAX_FUTURE_SECS: u64 = 5;
 
@@ -73,7 +78,13 @@ pub(crate) enum BlockError {
     #[error("payload is not valid SSZ: {0:?}")]
     InvalidPayload(ssz::DecodeError),
     #[error("block {number} is {age_secs}s old")]
-    Stale { number: BlockNumber, age_secs: u64 },
+    Stale {
+        number: BlockNumber,
+        age_secs: u64,
+        /// Whether the sequencer signed it. If so the likelier cause is a local clock running
+        /// ahead. Not checked (`false`) past [`MAX_IGNORED_AGE_SECS`]: a replay.
+        signed_by_sequencer: bool,
+    },
     #[error("block {number} is {ahead_secs}s in the future")]
     TooFarInFuture {
         number: BlockNumber,
@@ -110,6 +121,14 @@ pub(crate) enum BlockError {
         claimed: BlockHash,
         computed: BlockHash,
     },
+    /// A field the block's topic rules out ([block validation]).
+    ///
+    /// [block validation]: https://specs.optimism.io/protocol/rollup-node-p2p.html#block-validation
+    #[error("block {number} has {rule}")]
+    ForkRule {
+        number: BlockNumber,
+        rule: &'static str,
+    },
     #[error("block {number} is at a height with more than {MAX_BLOCKS_PER_HEIGHT} distinct blocks")]
     TooManyAtHeight { number: BlockNumber },
     /// The block is valid by every rule above, but holds a transaction this build cannot
@@ -129,16 +148,42 @@ impl BlockError {
         match self {
             Self::TooShort { .. }
             | Self::InvalidPayload(_)
-            | Self::Stale { .. }
-            | Self::TooFarInFuture { .. }
+            | Self::Stale {
+                signed_by_sequencer: false,
+                ..
+            }
+            | Self::TooFarInFuture {
+                signed_by_sequencer: false,
+                ..
+            }
             | Self::InvalidRecoveryId { .. }
             | Self::MalformedSignature { .. }
             | Self::WrongSigner { .. }
             | Self::InvalidBlock { .. }
             | Self::HashMismatch { .. }
+            | Self::ForkRule { .. }
             | Self::TooManyAtHeight { .. } => MessageAcceptance::Reject,
-            Self::UndecodableTransaction { .. } => MessageAcceptance::Ignore,
+            // A block the sequencer signed, outside our time window: the spec (and op-node)
+            // reject it, but it points at our clock, not the peer. op-node scores no topic, so
+            // its rejection costs a peer nothing; ours would graylist every honest peer while
+            // our clock is off. So it is ignored: dated in our future, or stale by at most
+            // `MAX_IGNORED_AGE_SECS` (older ones never get here signed, and are rejected).
+            Self::Stale {
+                signed_by_sequencer: true,
+                ..
+            }
+            | Self::TooFarInFuture {
+                signed_by_sequencer: true,
+                ..
+            }
+            | Self::UndecodableTransaction { .. } => MessageAcceptance::Ignore,
         }
+    }
+
+    /// Whether the message failed the timestamp window, which says as much about our clock as
+    /// about the peer: never a reason to ban.
+    pub(crate) const fn is_time_window(&self) -> bool {
+        matches!(self, Self::Stale { .. } | Self::TooFarInFuture { .. })
     }
 
     /// Seconds the local clock appears to lag: set when the sequencer signed a block dated too
@@ -160,13 +205,14 @@ impl BlockError {
 /// Validates decompressed block messages against the chain's sequencer key.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BlockValidator {
-    chain_id: ChainId,
-    signer: Address,
+    /// The chain's id (in the signed message), its sequencer key, and the Jovian time (from
+    /// which the header's blob gas used holds the block's data-availability footprint).
+    chain: &'static ChainSpec,
 }
 
 impl BlockValidator {
-    pub(crate) const fn new(chain_id: ChainId, signer: Address) -> Self {
-        Self { chain_id, signer }
+    pub(crate) const fn new(chain: &'static ChainSpec) -> Self {
+        Self { chain }
     }
 
     /// Cheap length check, run inline before a message is queued for full validation.
@@ -185,15 +231,16 @@ impl BlockValidator {
     ///
     /// Checks run cheapest first: length, SSZ decoding, timestamp window, the sequencer signature,
     /// then the block hash. The hash check rebuilds the header (including the transactions root),
-    /// so it only runs for messages the sequencer signed. A block dated in the future also has
-    /// its signature checked, only to report whether the sequencer signed it. `now_secs` is
+    /// so it only runs for messages the sequencer signed. A block outside the time window also
+    /// has its signature checked, only to report whether the sequencer signed it (then our
+    /// clock is the likelier fault, and the message is ignored, not rejected). `now_secs` is
     /// the current Unix time. CPU-bound: run off the async runtime.
     ///
     /// Last, the transactions are decoded, so the block is emitted ready to use.
     ///
     /// The per-height limit needs state across messages; see [`SeenBlocks`].
     pub(crate) fn validate(
-        &self,
+        self,
         version: PayloadVersion,
         message: Vec<u8>,
         now_secs: u64,
@@ -211,10 +258,21 @@ impl BlockValidator {
         let number = decoded.block_number();
         let timestamp = decoded.timestamp();
         let hash = decoded.block_hash();
+        if let Some(rule) = self.fork_rule(&decoded, timestamp) {
+            return Err(BlockError::ForkRule { number, rule });
+        }
 
         let age_secs = now_secs.saturating_sub(timestamp);
         if age_secs > MAX_AGE_SECS {
-            return Err(BlockError::Stale { number, age_secs });
+            let signed_by_sequencer = age_secs <= MAX_IGNORED_AGE_SECS
+                && self
+                    .verify_signature(number, &signature_bytes, &signed)
+                    .is_ok();
+            return Err(BlockError::Stale {
+                number,
+                age_secs,
+                signed_by_sequencer,
+            });
         }
         let ahead_secs = timestamp.saturating_sub(now_secs);
         if ahead_secs > MAX_FUTURE_SECS {
@@ -253,6 +311,29 @@ impl BlockValidator {
         })
     }
 
+    /// The topic rule `payload` breaks, if any, of those its payload type does not already
+    /// enforce ([block validation]): from V2 an empty withdrawals list, from V3 no excess blob
+    /// gas and, before Jovian (whose blob gas used is the DA footprint, `jovian/exec-engine.md`),
+    /// no blob gas used. The payload type is the topic's, so the version is read from it.
+    ///
+    /// [block validation]: https://specs.optimism.io/protocol/rollup-node-p2p.html#block-validation
+    fn fork_rule(self, payload: &OpExecutionPayload, timestamp: u64) -> Option<&'static str> {
+        if payload
+            .as_v2()
+            .is_some_and(|payload| !payload.withdrawals.is_empty())
+        {
+            return Some("a non-empty withdrawals list");
+        }
+        let v3 = payload.as_v3()?;
+        if v3.excess_blob_gas != 0 {
+            return Some("a non-zero excess blob gas");
+        }
+        if timestamp < self.chain.jovian_time && v3.blob_gas_used != 0 {
+            return Some("a non-zero blob gas used before Jovian");
+        }
+        None
+    }
+
     /// Checks that the sequencer made `signature` over `signed`.
     ///
     /// The recovery id must be 0 or 1, as the sequencer writes it. alloy would also take 27, 28
@@ -262,7 +343,7 @@ impl BlockValidator {
     /// op-node, a high `s` is accepted: rejecting it would penalize peers for relaying a message
     /// op-node forwards.
     fn verify_signature(
-        &self,
+        self,
         number: BlockNumber,
         signature: &[u8],
         signed: &[u8],
@@ -277,11 +358,11 @@ impl BlockValidator {
         }
         let signature = Signature::from_raw(signature)
             .map_err(|source| BlockError::MalformedSignature { number, source })?;
-        let message_hash = PayloadHash::from(signed).signature_message(self.chain_id);
+        let message_hash = PayloadHash::from(signed).signature_message(self.chain.chain_id);
         let recovered = signature
             .recover_address_from_prehash(&message_hash)
             .map_err(|source| BlockError::MalformedSignature { number, source })?;
-        if recovered != self.signer {
+        if recovered != self.chain.unsafe_block_signer {
             return Err(BlockError::WrongSigner {
                 number,
                 signer: recovered,

@@ -4,6 +4,7 @@
 //! <state>/plan.json                   the range, its anchor and the chunk size
 //! <state>/verified.json               written by `verify` once the whole range is accepted
 //! <state>/raw/<from>-<to>.raw         downloaded chunk: the service's answers as they travelled
+//! <state>/raw/<from>-<to>.fill.json   fields the service left out, from the chain's RPC (`fill`)
 //! <state>/verified/<from>-<to>.blk    verified chunk: consensus encodings, see `chunk`
 //! <state>/lock                        held by the one process working on the directory
 //! ```
@@ -174,7 +175,7 @@ impl State {
         lock.try_lock().map_err(|err| match err {
             TryLockError::WouldBlock => io::Error::new(
                 io::ErrorKind::ResourceBusy,
-                "another op-indexer-import process is using this state directory",
+                "another `import` process is using this state directory",
             ),
             TryLockError::Error(err) => err,
         })?;
@@ -276,6 +277,10 @@ impl State {
     ///
     /// Returns the I/O error of writing the file.
     pub(crate) fn write_verified(&self, range: &VerifiedRange) -> io::Result<()> {
+        // The record covers the verified chunks, so their renames are made durable first: one
+        // sync for the whole directory, not one per chunk (a lost rename only loses a chunk
+        // that is then verified again).
+        sync_dir(&self.verified)?;
         write_json(&self.root.join("verified.json"), range)
     }
 
@@ -285,10 +290,7 @@ impl State {
     ///
     /// Returns the I/O error of removing the file.
     pub(crate) fn clear_verified(&self) -> io::Result<()> {
-        match fs::remove_file(self.root.join("verified.json")) {
-            Err(err) if err.kind() != io::ErrorKind::NotFound => Err(err),
-            _ => Ok(()),
-        }
+        remove_if_exists(&self.root.join("verified.json"))
     }
 
     /// Free space on the directory's filesystem, in bytes; `None` where the system has no call
@@ -313,6 +315,13 @@ impl State {
     pub(crate) fn raw_path(&self, chunk: Chunk) -> PathBuf {
         self.raw
             .join(format!("{:012}-{:012}.raw", chunk.from, chunk.to))
+    }
+
+    /// File of what `download` fetched from the chain's RPC for a downloaded chunk: the
+    /// fields the service left out (see `fill`).
+    pub(crate) fn fill_path(&self, chunk: Chunk) -> PathBuf {
+        self.raw
+            .join(format!("{:012}-{:012}.fill.json", chunk.from, chunk.to))
     }
 
     /// File of the verified chunk.
@@ -343,10 +352,35 @@ pub(crate) fn write_atomic(
         let _removed = fs::remove_file(&temporary);
         return Err(err);
     }
+    // The contents are synced first, so a crash never leaves a short file under the final
+    // name; the rename itself becomes durable when the directory is synced ([`sync_dir`]).
     fs::rename(&temporary, path)
 }
 
-fn read_json<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
+/// Removes the file at `path`, if there is one. Blocking.
+///
+/// # Errors
+///
+/// Returns the I/O error, unless the file was not there.
+pub(crate) fn remove_if_exists(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Err(err) if err.kind() != io::ErrorKind::NotFound => Err(err),
+        _ => Ok(()),
+    }
+}
+
+/// Syncs the directory `path`, so the files renamed into it so far survive a power loss.
+/// Blocking.
+fn sync_dir(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+/// Reads the JSON file at `path`, if there is one. Blocking.
+///
+/// # Errors
+///
+/// Returns the I/O error, or `InvalidData` if the file does not parse.
+pub(crate) fn read_json<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
     let content = match fs::read(path) {
         Ok(content) => content,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -363,7 +397,13 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
     })
 }
 
-fn write_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
+/// Writes `value` as JSON to `path`, atomically and durably. Blocking.
+///
+/// # Errors
+///
+/// Returns the I/O error.
+pub(crate) fn write_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
     let content = serde_json::to_vec_pretty(value)?;
-    write_atomic(path, |file| file.write_all(&content))
+    write_atomic(path, |file| file.write_all(&content))?;
+    path.parent().map_or(Ok(()), sync_dir)
 }

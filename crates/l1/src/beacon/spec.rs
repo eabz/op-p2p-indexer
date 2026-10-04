@@ -70,6 +70,28 @@ impl BeaconSpec {
         secs.saturating_sub(self.genesis_time_secs) / self.seconds_per_slot
     }
 
+    /// Whether a gossiped update signed in `signature_slot` came after the sync messages of
+    /// that slot had time to spread: `get_sync_message_due_ms()` (3333 basis points of a slot)
+    /// into the slot, less `MAXIMUM_GOSSIP_CLOCK_DISPARITY` (500 ms). One that came earlier is
+    /// not forwarded ([light client gossip]).
+    ///
+    /// [light client gossip]: https://github.com/ethereum/consensus-specs/blob/master/specs/altair/light-client/p2p-interface.md#light_client_finality_update
+    pub(super) fn is_due(&self, signature_slot: u64) -> bool {
+        const SYNC_MESSAGE_DUE_BPS: u64 = 3333;
+        const MAXIMUM_GOSSIP_CLOCK_DISPARITY_MS: u64 = 500;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH);
+        let now_ms = now.map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        });
+        let slot_ms = self.seconds_per_slot.saturating_mul(1000);
+        let due = signature_slot
+            .saturating_mul(slot_ms)
+            .saturating_add(self.genesis_time_secs.saturating_mul(1000))
+            .saturating_add(SYNC_MESSAGE_DUE_BPS.saturating_mul(slot_ms) / 10_000)
+            .saturating_sub(MAXIMUM_GOSSIP_CLOCK_DISPARITY_MS);
+        now_ms >= due
+    }
+
     /// Whether a header at `slot` is of a fork whose containers `types` reads.
     pub(super) fn reads_slot(&self, slot: u64) -> bool {
         let first = self.forks.first().map_or(u64::MAX, |(epoch, _)| *epoch);

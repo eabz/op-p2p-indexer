@@ -16,6 +16,12 @@ pub struct NetworkConfig {
     pub listen_addr: SocketAddr,
     /// Discovery bootnodes.
     pub bootnodes: Vec<Bootnode>,
+    /// The public address (IP and port, the same for TCP and UDP) the node record advertises,
+    /// for a node behind NAT or in a container whose public address is known. `None` lets
+    /// discovery learn it from peers ([NAT]).
+    ///
+    /// [NAT]: https://specs.optimism.io/protocol/rollup-node-p2p.html#nat
+    pub advertised_addr: Option<SocketAddr>,
     /// Maximum established connections, inbound and outbound combined. Inbound connections may
     /// take at most half, so outbound dials always have room.
     pub max_peers: u32,

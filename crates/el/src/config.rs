@@ -23,6 +23,9 @@ pub struct ElConfig {
     /// node reachable at a known public address. `None` lets discovery learn the address from
     /// what other nodes report.
     pub advertised_addr: Option<SocketAddr>,
+    /// Sessions kept in each direction; one more is kept for an op-p2p-indexer
+    /// (`PeerConfig::max_sessions`).
+    pub max_sessions: usize,
 }
 
 impl ElConfig {

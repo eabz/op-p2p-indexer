@@ -4,8 +4,7 @@
 //! installs one every call here is a no-op, and [`describe`] must run after that. Call sites use
 //! the typed helpers below, so metric names and labels live in this file only. The stores'
 //! own metrics are in `op_indexer_storage::metrics` and are not repeated here: blocks written
-//! per store, unsafe-chain reorgs and their depth, and rollbacks of the committed store (one
-//! per L1 reorg of the safe head).
+//! per store, unsafe-chain reorgs and their depth, and blocks whose roots do not match.
 //!
 //! Labels are low-cardinality by construction: a drop reason, a hole reason or a store. Block numbers and
 //! hashes are never labels.
@@ -16,13 +15,15 @@
 //! | `op_indexer_pipeline_blocks_filled_total` | counter | | Blocks below the head that became canonical: gaps repaired. |
 //! | `op_indexer_pipeline_ingest_lag_seconds` | histogram | | Time from a block's timestamp to its insert. |
 //! | `op_indexer_pipeline_channel_depth` | gauge | | Blocks waiting in the channel from the network. |
-//! | `op_indexer_pipeline_blocks_promoted_total` | counter | | Blocks written to the committed store by promotion. |
-//! | `op_indexer_pipeline_blocks_promoted_without_receipts_total` | counter | | Of those, the blocks promoted before their receipts arrived. Receipts that come later reach the archive, not the committed store. |
+//! | `op_indexer_pipeline_blocks_promoted_total` | counter | | Blocks appended to the archive by promotion. |
+//! | `op_indexer_pipeline_blocks_promoted_without_receipts_total` | counter | | Of those, the blocks promoted before their receipts arrived. Receipts that come later are attached in the archive. |
 //! | `op_indexer_pipeline_promotion_holes_total` | counter | `reason` | Promotions that could not read their whole range from the unsafe store: `missing_ancestor`, `too_long` (the blocks may exist) or `parent_mismatch` (nothing left out, but the range is another chain than the committed safe head). |
-//! | `op_indexer_pipeline_promotion_blocks_missing_total` | counter | `reason` | Blocks those promotions left out of the committed store, for backfill. |
+//! | `op_indexer_pipeline_promotion_blocks_missing_total` | counter | `reason` | Blocks those promotions left out of the archive, for backfill. |
+//! | `op_indexer_pipeline_root_mismatches_total` | counter | | Promoted blocks not archived because their transactions or receipts do not hash to their header's roots. |
 //! | `op_indexer_pipeline_archive_skipped_blocks_total` | counter | | Promoted blocks not archived because they did not extend the archive's tip. |
 //! | `op_indexer_pipeline_safe_block_number` | gauge | | Number of the committed safe head. |
-//! | `op_indexer_pipeline_range_blocks_stored_total` | counter | | Blocks of a range sync written to the committed store and the archive. |
+//! | `op_indexer_pipeline_archive_pending_receipts` | gauge | | Archived blocks still without receipts, as last counted by the receipts task. |
+//! | `op_indexer_pipeline_range_blocks_stored_total` | counter | | Blocks of a range sync stored in the archive (counting those it already held). |
 //! | `op_indexer_pipeline_range_block_number` | gauge | | Last block of the range sync that is stored. |
 //! | `op_indexer_pipeline_l1_games_total` | counter | `outcome` | Dispute games verified on L1 and compared with our block at their height: `matched` (the block became a head), `mismatch` (the head did not advance) or `unchecked` (a block before Isthmus). |
 
@@ -42,6 +43,8 @@ const PROMOTION_HOLES: &str = "op_indexer_pipeline_promotion_holes_total";
 const PROMOTION_BLOCKS_MISSING: &str = "op_indexer_pipeline_promotion_blocks_missing_total";
 const ARCHIVE_SKIPPED_BLOCKS: &str = "op_indexer_pipeline_archive_skipped_blocks_total";
 const SAFE_BLOCK_NUMBER: &str = "op_indexer_pipeline_safe_block_number";
+const ROOT_MISMATCHES: &str = "op_indexer_pipeline_root_mismatches_total";
+const ARCHIVE_PENDING_RECEIPTS: &str = "op_indexer_pipeline_archive_pending_receipts";
 const RANGE_BLOCKS_STORED: &str = "op_indexer_pipeline_range_blocks_stored_total";
 const RANGE_BLOCK_NUMBER: &str = "op_indexer_pipeline_range_block_number";
 const L1_GAMES: &str = "op_indexer_pipeline_l1_games_total";
@@ -165,8 +168,7 @@ pub fn describe() {
     describe_counter!(
         RECEIPTS_ATTACHED,
         Unit::Count,
-        "Blocks that got their receipts, by the store that held the block; in the archive the \
-         committed store is not updated"
+        "Blocks that got their receipts, by the store that held the block"
     );
     describe_counter!(
         RECEIPTS_UNMATCHED,
@@ -201,7 +203,7 @@ pub fn describe() {
     describe_counter!(
         BLOCKS_PROMOTED,
         Unit::Count,
-        "Blocks written to the committed store by promotion"
+        "Blocks appended to the archive by promotion"
     );
     describe_counter!(
         PROMOTION_HOLES,
@@ -211,22 +213,32 @@ pub fn describe() {
     describe_counter!(
         PROMOTION_BLOCKS_MISSING,
         Unit::Count,
-        "Blocks left out of the committed store by promotion holes"
+        "Blocks left out of the archive by promotion holes"
     );
     describe_counter!(
         ARCHIVE_SKIPPED_BLOCKS,
         Unit::Count,
         "Promoted blocks not archived because they did not extend the archive"
     );
+    describe_counter!(
+        ROOT_MISMATCHES,
+        Unit::Count,
+        "Promoted blocks not archived because they do not hash to their header's roots"
+    );
     describe_gauge!(
         SAFE_BLOCK_NUMBER,
         Unit::Count,
         "Number of the committed safe head"
     );
+    describe_gauge!(
+        ARCHIVE_PENDING_RECEIPTS,
+        Unit::Count,
+        "Archived blocks still without receipts"
+    );
     describe_counter!(
         RANGE_BLOCKS_STORED,
         Unit::Count,
-        "Blocks of a range sync written to the committed store and the archive"
+        "Blocks of a range sync appended to the archive"
     );
     describe_gauge!(
         RANGE_BLOCK_NUMBER,
@@ -272,6 +284,16 @@ pub(crate) fn promotion_hole(reason: HoleReason, blocks_missing: u64) {
 /// Records promoted blocks that were not archived because they do not extend the archive.
 pub(crate) fn archive_skipped(blocks: usize) {
     counter!(ARCHIVE_SKIPPED_BLOCKS).increment(count(blocks));
+}
+
+/// Sets how many archived blocks are still without receipts.
+pub(crate) fn archive_pending_receipts(blocks: u64) {
+    gauge!(ARCHIVE_PENDING_RECEIPTS).set(gauge_value(blocks));
+}
+
+/// Records a promoted block refused because it does not hash to its header's roots.
+pub(crate) fn root_mismatch() {
+    counter!(ROOT_MISMATCHES).increment(1);
 }
 
 /// Sets the number of the committed safe head.

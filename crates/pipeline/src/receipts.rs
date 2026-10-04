@@ -2,15 +2,24 @@
 //! come back verified.
 //!
 //! The pipeline does not fetch or verify receipts; whoever holds the other ends of
-//! [`ReceiptsChannels`] does. A request is not tracked: it may never be answered, and blocks
-//! left without receipts are asked for again on the next start.
+//! [`ReceiptsChannels`] does. A request is not tracked: it may never be answered. Unsafe
+//! blocks left without receipts are asked for again on the next start; archived ones (promoted
+//! before their receipts arrived) are listed by the archive and asked for again every
+//! [`ARCHIVE_RECEIPTS_INTERVAL`] until they are filled, so the archive never stays without
+//! them.
 
 use std::ops::ControlFlow;
+use std::time::Duration;
 
-use op_indexer_primitives::{BlockRef, DecodedBlock, ReceiptsRequest, VerifiedReceipts};
+use alloy_consensus::Header;
+use alloy_primitives::BlockNumber;
+use op_indexer_primitives::{
+    ArchivedBlock, BlockRef, DecodedBlock, ReadLimits, ReceiptsRequest, VerifiedReceipts,
+};
 use op_indexer_storage::{ArchiveStore, StorageError, Store, UnsafeStore};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
+use tokio::time::{Instant, MissedTickBehavior, interval_at};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -21,6 +30,11 @@ use crate::retry::{RetryError, retry, settle};
 /// Most stored blocks checked for missing receipts at startup, newest first. The walk also
 /// ends when the request channel is full; older blocks wait for the next start.
 const STARTUP_BLOCKS: usize = 1024;
+/// How often the archived blocks without receipts are asked for: a low pace next to the
+/// requests for new blocks, which they must not crowd out.
+const ARCHIVE_RECEIPTS_INTERVAL: Duration = Duration::from_secs(30);
+/// Archived blocks without receipts asked for per round, oldest first.
+const ARCHIVE_RECEIPTS_PER_ROUND: usize = 64;
 
 /// The pipeline's ends of the two channels to the receipts fetcher.
 #[derive(Debug)]
@@ -35,7 +49,12 @@ pub struct ReceiptsChannels {
 /// Asks the fetcher for the receipts of `block`, without waiting. Returns whether the request
 /// was handed over.
 pub(crate) fn request(requests: &mpsc::Sender<ReceiptsRequest>, block: &DecodedBlock) -> bool {
-    let outcome = match requests.try_send(ReceiptsRequest::from(block)) {
+    send(requests, ReceiptsRequest::from(block))
+}
+
+/// Hands `request` to the fetcher without waiting. Returns whether it was taken.
+fn send(requests: &mpsc::Sender<ReceiptsRequest>, request: ReceiptsRequest) -> bool {
+    let outcome = match requests.try_send(request) {
         Ok(()) => RequestOutcome::Sent,
         // A full channel means the fetcher is behind; a closed one that it has stopped.
         Err(TrySendError::Full(_) | TrySendError::Closed(_)) => RequestOutcome::Dropped,
@@ -53,7 +72,7 @@ pub(crate) fn request(requests: &mpsc::Sender<ReceiptsRequest>, block: &DecodedB
 /// a refusal of one block's receipts.
 pub(crate) async fn run<U: UnsafeStore, A: ArchiveStore>(
     unsafe_store: U,
-    archive: Option<A>,
+    archive: A,
     channels: ReceiptsChannels,
     cancel: CancellationToken,
 ) -> Result<(), PipelineError> {
@@ -67,14 +86,32 @@ pub(crate) async fn run<U: UnsafeStore, A: ArchiveStore>(
     {
         return Ok(());
     }
+    // Where the next round of archived blocks starts: after the last one asked for.
+    let mut next_archived = 0;
+    let Some(pending) = request_archived(&archive, &requests, &mut next_archived, &cancel).await?
+    else {
+        return Ok(());
+    };
+    info!(pending, "archived blocks without receipts at startup");
+    let mut archived = interval_at(
+        Instant::now() + ARCHIVE_RECEIPTS_INTERVAL,
+        ARCHIVE_RECEIPTS_INTERVAL,
+    );
+    archived.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             biased;
             () = cancel.cancelled() => return Ok(()),
+            _ = archived.tick() => {
+                let round = request_archived(&archive, &requests, &mut next_archived, &cancel);
+                if round.await?.is_none() {
+                    return Ok(());
+                }
+            }
             receipts = verified.recv() => {
                 // A closed channel is the fetcher shutting down.
                 let Some(receipts) = receipts else { return Ok(()) };
-                if attach(&unsafe_store, archive.as_ref(), &receipts, &cancel).await?.is_break() {
+                if attach(&unsafe_store, &archive, &receipts, &cancel).await?.is_break() {
                     return Ok(());
                 }
             }
@@ -120,11 +157,73 @@ async fn request_missing<U: UnsafeStore>(
     Ok(ControlFlow::Continue(()))
 }
 
+/// Asks for the receipts of archived blocks without them from `next` up (wrapping round to the
+/// lowest), at most [`ARCHIVE_RECEIPTS_PER_ROUND`], stopping when the fetcher takes no more,
+/// and moves `next` past the last one asked for: blocks whose receipts no peer serves do not
+/// hold back the others. The request is built from the archived header, which the answer is
+/// verified against. Returns how many archived blocks are without receipts, or `None` when
+/// cancellation ended a read.
+async fn request_archived<A: ArchiveStore>(
+    archive: &A,
+    requests: &mpsc::Sender<ReceiptsRequest>,
+    next: &mut BlockNumber,
+    cancel: &CancellationToken,
+) -> Result<Option<u64>, PipelineError> {
+    const PENDING: &str = "archive pending_receipts";
+    const BLOCKS: &str = "archive blocks";
+    let one = ReadLimits {
+        items: 1,
+        bytes: usize::MAX,
+        lowest: 0,
+    };
+    let pending = retry(cancel, Store::Archive, PENDING, || {
+        archive.pending_receipts(*next, ARCHIVE_RECEIPTS_PER_ROUND)
+    });
+    let Some((blocks, total)) = settle(pending.await, PENDING)? else {
+        return Ok(None);
+    };
+    metrics::archive_pending_receipts(total);
+    for block in blocks {
+        *next = block.number.saturating_add(1);
+        let read = retry(cancel, Store::Archive, BLOCKS, || {
+            archive.blocks(block.number, one)
+        });
+        let Some(mut read) = settle(read.await, BLOCKS)? else {
+            return Ok(None);
+        };
+        // Gone or replaced since it was listed: nothing to ask for.
+        let Some(ArchivedBlock { encoded, senders }) = read
+            .pop()
+            .filter(|archived| archived.encoded.hash == block.hash)
+        else {
+            continue;
+        };
+        // The archive checked that these bytes hash to the block's hash when it stored them.
+        let Ok(header) = alloy_rlp::decode_exact::<Header>(&encoded.header) else {
+            warn!(number = block.number, "an archived header does not decode");
+            continue;
+        };
+        let request = ReceiptsRequest {
+            block,
+            receipts_root: header.receipts_root,
+            timestamp_secs: header.timestamp,
+            // The archive keeps one sender per transaction.
+            transaction_count: senders.len(),
+        };
+        if !send(requests, request) {
+            // Not asked for: the next round starts with it.
+            *next = block.number;
+            break;
+        }
+    }
+    Ok(Some(total))
+}
+
 /// Attaches verified receipts to their block: in the unsafe store, or in the archive if the
 /// block has been promoted. Breaks when cancellation ended a retry.
 async fn attach<U: UnsafeStore, A: ArchiveStore>(
     unsafe_store: &U,
-    archive: Option<&A>,
+    archive: &A,
     verified: &VerifiedReceipts,
     cancel: &CancellationToken,
 ) -> Result<ControlFlow<()>, PipelineError> {
@@ -140,26 +239,19 @@ async fn attach<U: UnsafeStore, A: ArchiveStore>(
         return Ok(ControlFlow::Continue(()));
     }
 
-    // Not in the unsafe store any more: promoted. The archive can take the receipts; the
-    // committed store has no call for it yet, which the archive's count stands for.
-    let held = match archive {
-        Some(archive) => {
-            let in_archive = set(
-                cancel,
-                Store::Archive,
-                "archive set_receipts",
-                block,
-                || archive.set_receipts(block, receipts),
-            );
-            let Some(held) = in_archive.await? else {
-                return Ok(ControlFlow::Break(()));
-            };
-            held
-        }
-        None => false,
+    // Not in the unsafe store any more: promoted to the archive.
+    let in_archive = set(
+        cancel,
+        Store::Archive,
+        "archive set_receipts",
+        block,
+        || archive.set_receipts(block, receipts),
+    );
+    let Some(held) = in_archive.await? else {
+        return Ok(ControlFlow::Break(()));
     };
     if !held {
-        // Pruned, expired or trimmed in the meantime.
+        // Pruned or expired in the meantime.
         debug!(number = block.number, hash = %block.hash, "dropped receipts for an unknown block");
         metrics::receipts_unmatched(UnmatchedReason::UnknownBlock);
     }

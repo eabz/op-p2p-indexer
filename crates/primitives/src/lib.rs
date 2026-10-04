@@ -86,11 +86,6 @@ pub struct DecodedBlock {
 pub enum BlockSource {
     /// Received over gossip, signed by the sequencer.
     Gossip,
-    /// Derived from batches committed to L1.
-    L1,
-    /// Imported from an external archive by `op-indexer-import` and verified against the
-    /// header chain down from a trusted block hash.
-    Import,
     /// Fetched from execution peers and verified by the header chain from a trusted block.
     Sync,
 }
@@ -102,6 +97,31 @@ pub struct BlockRef {
     pub number: BlockNumber,
     /// Block hash.
     pub hash: BlockHash,
+}
+
+impl BlockRef {
+    /// Length of [`Self::to_bytes`].
+    pub const LEN: usize = 40;
+
+    /// The block as a store keeps it: the number (8 bytes, big-endian), then the hash.
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; Self::LEN] {
+        let mut bytes = [0; Self::LEN];
+        let (number, hash) = bytes.split_at_mut(8);
+        number.copy_from_slice(&self.number.to_be_bytes());
+        hash.copy_from_slice(self.hash.as_slice());
+        bytes
+    }
+
+    /// Reads a block written by [`Self::to_bytes`]; `None` if the bytes are not one.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let (number, hash) = bytes.split_first_chunk::<8>()?;
+        Some(Self {
+            number: u64::from_be_bytes(*number),
+            hash: BlockHash::try_from(hash).ok()?,
+        })
+    }
 }
 
 /// The chain a local store holds, recorded in it when it is created so that a node of another
@@ -287,6 +307,27 @@ pub struct EncodedBlock {
     pub receipts: Option<alloy_primitives::Bytes>,
 }
 
+/// A committed block as the archive holds it: its consensus encoding and the sender of each
+/// transaction, which the encoding does not carry and recovering costs one signature each.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchivedBlock {
+    /// Hash, header, body and receipts (`None` until they are known).
+    pub encoded: EncodedBlock,
+    /// Sender of each transaction, in block order; the zero address for a legacy
+    /// transaction signed with all zeros.
+    pub senders: Vec<Address>,
+}
+
+impl From<&DecodedBlock> for ArchivedBlock {
+    /// Encodes `block` as [`EncodedBlock::from`] does, with its recovered senders.
+    fn from(block: &DecodedBlock) -> Self {
+        Self {
+            encoded: EncodedBlock::from(block),
+            senders: block.senders.clone(),
+        }
+    }
+}
+
 /// A run of blocks to read from the blocks a node holds, for answering a peer: what the eth
 /// protocol's `GetBlockHeaders`, `GetBlockBodies` and `GetReceipts` ask for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -320,13 +361,16 @@ pub enum BlockStart {
 /// cannot be converted.
 pub type ItemConvert = fn(&[u8]) -> Option<alloy_primitives::Bytes>;
 
-/// Where the answer to a [`BlockRead`] ends even if more is held.
+/// Where the answer to a read of the archive ends even if more is held.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadLimits {
     /// Most items.
     pub items: usize,
     /// The answer ends after the item that takes it to this size or beyond.
     pub bytes: usize,
+    /// Blocks numbered below this count as not held: the answer ends at the first one. `0`
+    /// for none.
+    pub lowest: BlockNumber,
 }
 
 impl From<&DecodedBlock> for EncodedBlock {

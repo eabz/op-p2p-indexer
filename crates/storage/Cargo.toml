@@ -1,6 +1,6 @@
 [package]
 name = "op-indexer-storage"
-description = "Block storage: unsafe (Redis), committed (ClickHouse) and a local archive (fjall)"
+description = "Block storage: unsafe blocks (Redis) and the committed block archive (fjall)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -15,22 +15,18 @@ alloy-eips.workspace = true
 alloy-rlp.workspace = true
 # `serde`: hashes and addresses in the JSON stored in Redis.
 alloy-primitives = { workspace = true, features = ["serde"] }
-clickhouse.workspace = true
 fastrand.workspace = true
 fjall.workspace = true
 metrics.workspace = true
 op-alloy-consensus = { workspace = true, features = ["serde"] }
 redis.workspace = true
 serde.workspace = true
-serde_bytes.workspace = true
 serde_json.workspace = true
-serde_repr.workspace = true
-sha2.workspace = true
 snap.workspace = true
 thiserror.workspace = true
 # `rt` for `spawn_blocking` (fjall is synchronous) and `sync` for the archive's fair writer
-# lock, so appends are not starved between the batches of a trim; `macros` to write a bulk
-# insert's tables at once.
+# lock, so two writers' appends take turns batch by batch; `macros` for the retry's
+# `select!` on cancellation.
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 # `CancellationToken`, which ends a retry.
 tokio-util.workspace = true
@@ -38,7 +34,3 @@ tracing.workspace = true
 
 [lints]
 workspace = true
-
-# Used only through `#[serde(with = "serde_bytes")]` attributes, which cargo-machete cannot see.
-[package.metadata.cargo-machete]
-ignored = ["serde_bytes"]

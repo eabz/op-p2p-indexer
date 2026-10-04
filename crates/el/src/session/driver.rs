@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use alloy_primitives::{B256, Bytes};
@@ -15,7 +15,7 @@ use futures_util::{SinkExt, StreamExt};
 use reth_ecies::stream::ECIESStream;
 use reth_eth_wire::P2PStream;
 use reth_eth_wire::errors::P2PStreamError;
-use reth_eth_wire_types::DisconnectReason;
+use reth_eth_wire_types::{DisconnectReason, EthVersion};
 use reth_network_peers::PeerId;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -148,6 +148,7 @@ pub(super) fn new(
         status: Arc::new(peer),
         commands: commands_tx,
         range: range_rx,
+        used: Arc::new(Mutex::new(Instant::now())),
     };
     (handle, driver)
 }
@@ -158,6 +159,9 @@ pub struct SessionHandle {
     status: Arc<PeerStatus>,
     commands: mpsc::Sender<Command>,
     range: watch::Receiver<BlockRange>,
+    /// When we last sent the peer a request, or the session opened: a session we have no use
+    /// for is released.
+    used: Arc<Mutex<Instant>>,
 }
 
 impl SessionHandle {
@@ -218,8 +222,24 @@ impl SessionHandle {
         items(&body, asked)
     }
 
+    /// Whether requesters may ask this peer: it speaks eth/69. An eth/68 peer (only met where
+    /// we serve) announces no range and sends receipts in another format; it is served, not
+    /// asked.
+    pub(crate) fn is_askable(&self) -> bool {
+        self.status.version >= EthVersion::Eth69
+    }
+
+    /// Time since we last sent the peer a request, or since the session opened.
+    pub(crate) fn idle(&self) -> Duration {
+        self.used
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .elapsed()
+    }
+
     /// Sends `request` and waits for the body of its answer (the message without its id byte).
     async fn request(&self, request: Request) -> Result<Bytes, RequestError> {
+        *self.used.lock().unwrap_or_else(PoisonError::into_inner) = Instant::now();
         let (reply_tx, reply_rx) = oneshot::channel();
         let command = Command::Request {
             request,
@@ -417,13 +437,25 @@ impl SessionDriver {
             }
         } else if message_id == wire::BLOCK_RANGE_UPDATE {
             match wire::decode_block_range(body) {
+                // "If earliest > latest, the peer should be disconnected" (devp2p
+                // `caps/eth.md`, BlockRangeUpdate).
+                Ok(update) if update.earliest > update.latest => {
+                    self.say_goodbye(DisconnectReason::ProtocolBreach).await;
+                    return Err(EndReason::Protocol(format!(
+                        "block range update from {} to {}",
+                        update.earliest, update.latest
+                    )));
+                }
                 Ok(update) => {
                     self.range.send_replace(BlockRange {
                         earliest: update.earliest,
                         latest: update.latest,
                     });
                 }
-                Err(err) => return Err(EndReason::Protocol(format!("block range update: {err}"))),
+                Err(err) => {
+                    self.say_goodbye(DisconnectReason::ProtocolBreach).await;
+                    return Err(EndReason::Protocol(format!("block range update: {err}")));
+                }
             }
         } else {
             match self.serving.request(message_id, body) {

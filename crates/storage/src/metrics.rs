@@ -1,10 +1,10 @@
-//! Metrics of the three stores, emitted through the [`metrics`] facade.
+//! Metrics of the two stores, emitted through the [`metrics`] facade.
 //!
 //! This module only records. It installs no recorder and serves no endpoint: until the binary
 //! installs one every call here is a no-op, and [`describe`] must run after that. Call sites use
 //! the typed helpers below, so metric names and labels live in this file only.
 //!
-//! Labels are low-cardinality by construction: store, operation, outcome and table. Block
+//! Labels are low-cardinality by construction: store, operation and outcome. Block
 //! numbers and hashes are never labels.
 //!
 //! | Metric | Type | Labels | Meaning |
@@ -16,10 +16,8 @@
 //! | `op_indexer_storage_reorg_depth` | histogram | | Blocks replaced by one unsafe-store reorg. |
 //! | `op_indexer_storage_receipts_attached_total` | counter | | Blocks that got receipts after they were stored in Redis. |
 //! | `op_indexer_storage_blocks_pruned_total` | counter | | Blocks removed from Redis by pruning. |
-//! | `op_indexer_storage_rows_inserted_total` | counter | `table` | Rows written to ClickHouse. |
-//! | `op_indexer_storage_rollbacks_total` | counter | | ClickHouse rollbacks to a safe head: one per L1 reorg of the safe head. |
+//! | `op_indexer_storage_root_mismatches_total` | counter | | Unsafe blocks not served because their transactions or receipts do not hash to the header's root. |
 //! | `op_indexer_storage_retries_total` | counter | `store` | Store calls repeated by `retry` after a transient error. |
-//! | `op_indexer_storage_archive_blocks_removed_total` | counter | | Blocks removed from the archive by trimming and truncating, partial runs included. |
 //! | `op_indexer_storage_archive_disk_bytes` | gauge | | Size of the archive directory, journal and blob files included. |
 //! | `op_indexer_storage_archive_fragmented_blob_bytes` | gauge | | Stale bytes in the archive's blob files, which blob garbage collection will reclaim. |
 //! | `op_indexer_storage_archive_active_compactions` | gauge | | Compactions running in the archive. |
@@ -39,10 +37,8 @@ const REORGS: &str = "op_indexer_storage_reorgs_total";
 const REORG_DEPTH: &str = "op_indexer_storage_reorg_depth";
 const RECEIPTS_ATTACHED: &str = "op_indexer_storage_receipts_attached_total";
 const BLOCKS_PRUNED: &str = "op_indexer_storage_blocks_pruned_total";
-const ROWS_INSERTED: &str = "op_indexer_storage_rows_inserted_total";
-const ROLLBACKS: &str = "op_indexer_storage_rollbacks_total";
 const RETRIES: &str = "op_indexer_storage_retries_total";
-const ARCHIVE_BLOCKS_REMOVED: &str = "op_indexer_storage_archive_blocks_removed_total";
+const ROOT_MISMATCHES: &str = "op_indexer_storage_root_mismatches_total";
 const ARCHIVE_DISK_BYTES: &str = "op_indexer_storage_archive_disk_bytes";
 const ARCHIVE_FRAGMENTED_BLOB_BYTES: &str = "op_indexer_storage_archive_fragmented_blob_bytes";
 const ARCHIVE_ACTIVE_COMPACTIONS: &str = "op_indexer_storage_archive_active_compactions";
@@ -52,9 +48,7 @@ const ARCHIVE_ACTIVE_COMPACTIONS: &str = "op_indexer_storage_archive_active_comp
 pub(crate) enum Operation {
     /// Connecting, with the ping and (Redis) the schema check.
     Connect,
-    /// Running the ClickHouse migrations.
-    Migrate,
-    /// `insert` of the unsafe or the committed store.
+    /// [`UnsafeStore::insert`](crate::UnsafeStore::insert).
     Insert,
     /// [`ArchiveStore::append_batch`](crate::ArchiveStore::append_batch).
     AppendBatch,
@@ -64,10 +58,6 @@ pub(crate) enum Operation {
     NumberOf,
     /// [`ArchiveStore::range`](crate::ArchiveStore::range).
     Range,
-    /// [`ArchiveStore::truncate_above`](crate::ArchiveStore::truncate_above).
-    TruncateAbove,
-    /// [`ArchiveStore::trim`](crate::ArchiveStore::trim).
-    Trim,
     /// `set_receipts` of the unsafe store or the archive.
     SetReceipts,
     /// [`UnsafeStore::ancestry`](crate::UnsafeStore::ancestry).
@@ -76,63 +66,61 @@ pub(crate) enum Operation {
     Prune,
     /// [`UnsafeStore::head`](crate::UnsafeStore::head).
     Head,
+    /// [`UnsafeStore::lowest`](crate::UnsafeStore::lowest).
+    Lowest,
+    /// [`UnsafeStore::canonical_number`](crate::UnsafeStore::canonical_number).
+    CanonicalNumber,
+    /// [`UnsafeStore::canonical_headers`](crate::UnsafeStore::canonical_headers).
+    CanonicalHeaders,
+    /// [`UnsafeStore::canonical_items`](crate::UnsafeStore::canonical_items).
+    CanonicalItems,
+    /// [`UnsafeStore::canonical_run`](crate::UnsafeStore::canonical_run).
+    CanonicalRun,
+    /// [`UnsafeStore::last_event_id`](crate::UnsafeStore::last_event_id).
+    LastEventId,
+    /// [`UnsafeStore::events`](crate::UnsafeStore::events).
+    Events,
     /// `block` of the unsafe store or the archive.
     Block,
     /// [`ArchiveStore::read`](crate::ArchiveStore::read).
     Read,
-    /// [`CommittedStore::rollback_to`](crate::CommittedStore::rollback_to).
-    RollbackTo,
-    /// [`CommittedStore::l1_heads`](crate::CommittedStore::l1_heads).
-    L1Heads,
-    /// `set_l1_heads` of either store.
-    SetL1Heads,
-}
-
-/// A ClickHouse block-data table, the `table` label.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum Table {
-    /// `blocks`.
+    /// [`ArchiveStore::blocks`](crate::ArchiveStore::blocks).
     Blocks,
-    /// `transactions`.
-    Transactions,
-    /// `receipts`.
-    Receipts,
-    /// `logs`.
-    Logs,
+    /// [`ArchiveStore::heads`](crate::ArchiveStore::heads).
+    Heads,
+    /// [`ArchiveStore::pending_receipts`](crate::ArchiveStore::pending_receipts).
+    PendingReceipts,
+    /// [`UnsafeStore::set_l1_heads`](crate::UnsafeStore::set_l1_heads) and
+    /// [`ArchiveStore::set_heads`](crate::ArchiveStore::set_heads).
+    SetL1Heads,
 }
 
 impl Operation {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Connect => "connect",
-            Self::Migrate => "migrate",
             Self::Insert => "insert",
             Self::Read => "read",
             Self::AppendBatch => "append_batch",
             Self::BulkAppend => "bulk_append",
             Self::NumberOf => "number_of",
             Self::Range => "range",
-            Self::TruncateAbove => "truncate_above",
-            Self::Trim => "trim",
             Self::SetReceipts => "set_receipts",
             Self::Ancestry => "ancestry",
             Self::Prune => "prune",
             Self::Head => "head",
+            Self::Lowest => "lowest",
+            Self::CanonicalNumber => "canonical_number",
+            Self::CanonicalHeaders => "canonical_headers",
+            Self::CanonicalItems => "canonical_items",
+            Self::CanonicalRun => "canonical_run",
+            Self::LastEventId => "last_event_id",
+            Self::Events => "events",
             Self::Block => "block",
-            Self::RollbackTo => "rollback_to",
-            Self::L1Heads => "l1_heads",
-            Self::SetL1Heads => "set_l1_heads",
-        }
-    }
-}
-
-impl Table {
-    const fn as_str(self) -> &'static str {
-        match self {
             Self::Blocks => "blocks",
-            Self::Transactions => "transactions",
-            Self::Receipts => "receipts",
-            Self::Logs => "logs",
+            Self::Heads => "heads",
+            Self::PendingReceipts => "pending_receipts",
+            Self::SetL1Heads => "set_l1_heads",
         }
     }
 }
@@ -164,21 +152,15 @@ pub fn describe() {
         Unit::Count,
         "Blocks removed from Redis by pruning"
     );
-    describe_counter!(ROWS_INSERTED, Unit::Count, "Rows written to ClickHouse");
+    describe_counter!(
+        ROOT_MISMATCHES,
+        Unit::Count,
+        "Unsafe blocks not served because their transactions or receipts do not hash to the header's root"
+    );
     describe_counter!(
         RETRIES,
         Unit::Count,
         "Store calls repeated after a transient error, by store"
-    );
-    describe_counter!(
-        ROLLBACKS,
-        Unit::Count,
-        "ClickHouse rollbacks to a safe head: L1 reorgs and the one at each start"
-    );
-    describe_counter!(
-        ARCHIVE_BLOCKS_REMOVED,
-        Unit::Count,
-        "Blocks removed from the archive by trimming and truncating"
     );
     describe_gauge!(
         ARCHIVE_DISK_BYTES,
@@ -240,24 +222,15 @@ pub(crate) fn blocks_pruned(blocks: usize) {
     counter!(BLOCKS_PRUNED).increment(count(blocks));
 }
 
-/// Records rows written to a ClickHouse table.
-pub(crate) fn rows_inserted(table: Table, rows: usize) {
-    counter!(ROWS_INSERTED, "table" => table.as_str()).increment(count(rows));
+/// Records a block refused because its transactions or receipts do not hash to its header's
+/// root.
+pub(crate) fn root_mismatch() {
+    counter!(ROOT_MISMATCHES).increment(1);
 }
 
 /// Records a store call repeated after a transient error.
 pub(crate) fn retried(store: Store) {
     counter!(RETRIES, "store" => store.as_str()).increment(1);
-}
-
-/// Records a ClickHouse rollback to a safe head.
-pub(crate) fn rollback() {
-    counter!(ROLLBACKS).increment(1);
-}
-
-/// Records blocks removed from the archive by `trim` or `truncate_above`.
-pub(crate) fn archive_blocks_removed(blocks: u64) {
-    counter!(ARCHIVE_BLOCKS_REMOVED).increment(blocks);
 }
 
 /// Sets the archive's size gauges, sampled from the engine after a write.

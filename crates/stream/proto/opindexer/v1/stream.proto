@@ -1,0 +1,196 @@
+// The op-p2p-indexer stream: history from the block archive, then the live chain, with each
+// block's status and reorgs. See docs/stream.md.
+//
+// Conventions: hashes are 32 bytes, addresses 20 bytes, 256-bit integers 32 bytes big-endian.
+// A message field that may be absent is optional or a message (presence is meaningful).
+//
+// A message can be up to 64 MiB (a full block, decoded): gRPC clients accept 4 MiB by default,
+// so raise the client's maximum receive size.
+
+syntax = "proto3";
+
+package opindexer.v1;
+
+service Stream {
+  // History from `start`, then the live chain. Never ends on its own.
+  rpc Subscribe(SubscribeRequest) returns (stream Event);
+  // The unsafe, safe and finalized heads.
+  rpc GetHeads(GetHeadsRequest) returns (Heads);
+  // One canonical block. NOT_FOUND if the node does not hold it, or it is a side block.
+  rpc GetBlock(GetBlockRequest) returns (Block);
+}
+
+enum Payload {
+  PAYLOAD_UNSPECIFIED = 0;
+  // Header fields, transactions with their senders, receipts and logs.
+  PAYLOAD_DECODED = 1;
+  // Header, body and receipts in their consensus encoding: the archive's bytes as stored; a
+  // block from the unsafe store (which keeps it decoded) encoded again, the same bytes.
+  PAYLOAD_RAW = 2;
+}
+
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  // Received over gossip; not yet claimed on L1.
+  STATUS_UNSAFE = 1;
+  // At or below the safe head: a bonded claim on L1 equals this chain.
+  STATUS_SAFE = 2;
+  // At or below the finalized head: that claim is in a finalized L1 block.
+  STATUS_FINALIZED = 3;
+}
+
+message SubscribeRequest {
+  oneof start {
+    // The first block sent.
+    uint64 from_number = 1;
+    // Start after the current unsafe head.
+    bool from_head = 2;
+  }
+  Payload payload = 3;
+}
+
+message GetHeadsRequest {}
+
+message GetBlockRequest {
+  oneof block {
+    // The canonical block at this height.
+    uint64 number = 1;
+    bytes hash = 2;
+  }
+  Payload payload = 3;
+}
+
+message BlockRef {
+  uint64 number = 1;
+  bytes hash = 2;
+}
+
+message Heads {
+  BlockRef unsafe_head = 1;
+  BlockRef safe_head = 2;
+  BlockRef finalized_head = 3;
+  // Whether receipts are fetched: without it, blocks never have receipts.
+  bool receipts = 4;
+}
+
+message Event {
+  oneof event {
+    Block block = 1;
+    Receipts receipts = 2;
+    Reorg reorg = 3;
+    Heads heads = 4;
+  }
+}
+
+message Block {
+  uint64 number = 1;
+  bytes hash = 2;
+  bytes parent_hash = 3;
+  // The status when the block was sent; `Heads` events move it later.
+  Status status = 4;
+  oneof payload {
+    DecodedBlock decoded = 5;
+    RawBlock raw = 6;
+  }
+}
+
+// The receipts of a block sent earlier without them, in the subscription's payload.
+message Receipts {
+  uint64 number = 1;
+  bytes hash = 2;
+  oneof payload {
+    ReceiptList decoded = 3;
+    // RLP list of the receipts in their network encoding, with blooms.
+    bytes raw = 4;
+  }
+}
+
+// The blocks from height `from` up are no longer canonical. The new canonical blocks from
+// `from` follow as `Block` events.
+message Reorg {
+  uint64 from = 1;
+  // The hashes no longer canonical, lowest first.
+  repeated bytes removed = 2;
+}
+
+message RawBlock {
+  bytes header = 1;
+  bytes body = 2;
+  // Absent until the receipts are known.
+  optional bytes receipts = 3;
+}
+
+message DecodedBlock {
+  Header header = 1;
+  repeated Transaction transactions = 2;
+  // Absent until the receipts are known.
+  ReceiptList receipts = 3;
+}
+
+message Header {
+  bytes parent_hash = 1;
+  bytes ommers_hash = 2;
+  bytes beneficiary = 3;
+  bytes state_root = 4;
+  bytes transactions_root = 5;
+  bytes receipts_root = 6;
+  bytes logs_bloom = 7;
+  bytes difficulty = 8;
+  uint64 number = 9;
+  uint64 gas_limit = 10;
+  uint64 gas_used = 11;
+  uint64 timestamp = 12;
+  bytes extra_data = 13;
+  bytes mix_hash = 14;
+  bytes nonce = 15;
+  optional uint64 base_fee_per_gas = 16;
+  optional bytes withdrawals_root = 17;
+  optional uint64 blob_gas_used = 18;
+  optional uint64 excess_blob_gas = 19;
+  optional bytes parent_beacon_block_root = 20;
+  optional bytes requests_hash = 21;
+}
+
+message Transaction {
+  bytes hash = 1;
+  // EIP-2718 type: 0 legacy, 1, 2, 4, and 126 (0x7e) for a deposit.
+  uint32 type = 2;
+  bytes sender = 3;
+  // Absent for a contract creation.
+  optional bytes to = 4;
+  bytes value = 5;
+  bytes input = 6;
+  uint64 gas_limit = 7;
+  // Absent for a deposit.
+  optional uint64 nonce = 8;
+  // Legacy and access-list transactions.
+  optional bytes gas_price = 9;
+  // Dynamic-fee and set-code transactions.
+  optional bytes max_fee_per_gas = 10;
+  optional bytes max_priority_fee_per_gas = 11;
+  // Deposits only.
+  optional bytes source_hash = 12;
+  optional bytes mint = 13;
+  optional bool is_system_transaction = 14;
+  // The transaction in its consensus encoding (EIP-2718), for any field not listed here.
+  bytes encoded = 15;
+}
+
+message ReceiptList {
+  repeated Receipt receipts = 1;
+}
+
+message Receipt {
+  bool success = 1;
+  uint64 cumulative_gas_used = 2;
+  repeated Log logs = 3;
+  // Deposits only, from Regolith and Canyon on.
+  optional uint64 deposit_nonce = 4;
+  optional uint64 deposit_receipt_version = 5;
+}
+
+message Log {
+  bytes address = 1;
+  repeated bytes topics = 2;
+  bytes data = 3;
+}

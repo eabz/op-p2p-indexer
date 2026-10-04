@@ -1,6 +1,6 @@
 //! The storage error and its classification by [`Severity`].
 //!
-//! Busy servers are recognised here, by error code, and nowhere else.
+//! A busy Redis is recognised here, by error code, and nowhere else.
 
 use std::fmt;
 use std::num::ParseIntError;
@@ -21,21 +21,6 @@ const REDIS_BUSY_CODES: [&str; 6] = [
     "CLUSTERDOWN",
     "MASTERDOWN",
 ];
-/// ClickHouse error codes of a server that is busy or briefly unavailable, from its
-/// `ErrorCodes.cpp`: 159 `TIMEOUT_EXCEEDED`, 202 `TOO_MANY_SIMULTANEOUS_QUERIES`, 209
-/// `SOCKET_TIMEOUT`, 210 `NETWORK_ERROR`, 241 `MEMORY_LIMIT_EXCEEDED` (usually the server's
-/// total memory, under merges or other queries, not our statement), 242 `TABLE_IS_READ_ONLY`
-/// and 999 `KEEPER_EXCEPTION` (a replicated or cloud service changing replicas: the store is
-/// briefly unavailable, like a lost connection), 252 `TOO_MANY_PARTS`, 319
-/// `UNKNOWN_STATUS_OF_INSERT` (the connection broke mid-insert: repeating it is safe, inserts
-/// are idempotent here).
-///
-/// A caller that retries without a time limit (the pipeline) repeats a statement that can
-/// never fit in the server's memory forever, with a warning on each attempt.
-const CLICKHOUSE_BUSY_CODES: [u32; 9] = [159, 202, 209, 210, 241, 242, 252, 319, 999];
-/// What a ClickHouse error response starts with, before the numeric code.
-const CLICKHOUSE_CODE_PREFIX: &str = "Code: ";
-
 /// How a caller should treat a [`StorageError`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -45,8 +30,8 @@ pub enum Severity {
     Transient,
     /// Nothing is wrong with the store; the caller handles the outcome.
     Expected,
-    /// Needs an operator: bad credentials, a schema or checksum mismatch, undecodable stored
-    /// data, or a block that does not fit the schema.
+    /// Needs an operator: bad credentials, a schema mismatch, undecodable stored data, or a
+    /// block that does not fit the schema.
     Fatal,
 }
 
@@ -62,14 +47,6 @@ pub enum InvalidBlockReason {
     Ommers,
     /// The body has withdrawals, which are not stored.
     Withdrawals,
-    /// The timestamp is beyond the range of the timestamp column.
-    TimestampRange,
-    /// More transactions than a transaction index can count.
-    TooManyTransactions,
-    /// More logs than a log index can count.
-    TooManyLogs,
-    /// A log has more than four topics.
-    TooManyTopics,
     /// The number is not the parent's plus one.
     ParentNumber,
     /// The number is beyond what the unsafe store can hold.
@@ -112,15 +89,6 @@ pub enum StorageError {
         /// The client's error.
         #[source]
         source: redis::RedisError,
-    },
-    /// A ClickHouse request failed.
-    #[error("clickhouse {operation} failed")]
-    ClickHouse {
-        /// The operation that was running.
-        operation: &'static str,
-        /// The client's error.
-        #[source]
-        source: clickhouse::error::Error,
     },
     /// A fjall operation on the local block archive failed.
     #[error("fjall {operation} failed")]
@@ -220,10 +188,13 @@ pub enum StorageError {
         got: BlockRef,
     },
     /// The archive directory was written with another schema version. Nothing is deleted: the
-    /// operator removes the directory, or runs the build that wrote it.
+    /// operator loads a new archive from the importer's verified chunks, or runs the build
+    /// that wrote it.
     #[error(
         "the block archive in {} has schema version {found}, this build reads version \
-         {expected}; delete the directory to start a new archive",
+         {expected}: the archive's layout changed. Move the directory away and load a new \
+         archive with `import load` from the verified chunks (no download needed), \
+         or keep running the build that wrote it",
         path.display()
     )]
     ArchiveSchema {
@@ -285,28 +256,6 @@ pub enum StorageError {
         /// EIP-2718 type of the transaction.
         tx_type: u8,
     },
-    /// An applied ClickHouse migration differs from the one embedded in this binary: the
-    /// schema changed before the first release, after this database was created.
-    #[error(
-        "migration {version} ({name}) in ClickHouse database `{database}` differs from this \
-         build's: the schema changed after the database was created. If the database holds no \
-         data yet, drop it (`DROP DATABASE {database}`) and run again, which creates it with \
-         the new schema; if it holds data you want, keep using the build that created it"
-    )]
-    MigrationChecksum {
-        /// Version of the migration.
-        version: u32,
-        /// Name of the migration.
-        name: String,
-        /// The database holding it.
-        database: String,
-    },
-    /// ClickHouse has a migration this binary does not know: the binary is older than the schema.
-    #[error("applied migration {version} is unknown to this binary")]
-    UnknownMigration {
-        /// Version of the migration.
-        version: u32,
-    },
 }
 
 impl fmt::Display for InvalidBlockReason {
@@ -316,10 +265,6 @@ impl fmt::Display for InvalidBlockReason {
             Self::ReceiptCount => "receipts are not one per transaction",
             Self::Ommers => "it has ommers",
             Self::Withdrawals => "it has withdrawals",
-            Self::TimestampRange => "its timestamp is beyond the stored range",
-            Self::TooManyTransactions => "it has too many transactions",
-            Self::TooManyLogs => "it has too many logs",
-            Self::TooManyTopics => "a log has more than four topics",
             Self::ParentNumber => "its number is not its parent's plus one",
             Self::NumberRange => "its number is beyond what the unsafe store can hold",
             Self::StoredNumber => "it is stored with another number",
@@ -347,7 +292,6 @@ impl StorageError {
     pub fn severity(&self) -> Severity {
         let transient = match self {
             Self::Redis { source, .. } => redis_is_transient(source),
-            Self::ClickHouse { source, .. } => clickhouse_is_transient(source),
             Self::Timeout { .. } => true,
             Self::MissingAncestor { .. }
             | Self::AncestryTooLong { .. }
@@ -369,9 +313,7 @@ impl StorageError {
             | Self::ArchiveChainUnreadable { .. }
             | Self::InvalidBlock { .. }
             | Self::Oversized { .. }
-            | Self::UnsupportedTransaction { .. }
-            | Self::MigrationChecksum { .. }
-            | Self::UnknownMigration { .. } => false,
+            | Self::UnsupportedTransaction { .. } => false,
         };
         if transient {
             Severity::Transient
@@ -388,21 +330,6 @@ fn redis_is_transient(err: &redis::RedisError) -> bool {
         || err
             .code()
             .is_some_and(|code| REDIS_BUSY_CODES.contains(&code))
-}
-
-fn clickhouse_is_transient(err: &clickhouse::error::Error) -> bool {
-    use clickhouse::error::Error;
-    // The server's own errors arrive as text: "Code: 202. DB::Exception: ...".
-    matches!(err, Error::Network(_) | Error::TimedOut)
-        || matches!(err, Error::BadResponse(response)
-            if clickhouse_code(response).is_some_and(|code| CLICKHOUSE_BUSY_CODES.contains(&code)))
-}
-
-/// The numeric code of a ClickHouse error response, if it has one.
-fn clickhouse_code(response: &str) -> Option<u32> {
-    let (_, after) = response.split_once(CLICKHOUSE_CODE_PREFIX)?;
-    let digits = after.split(|c: char| !c.is_ascii_digit()).next()?;
-    digits.parse().ok()
 }
 
 /// ` of block 0x…` for an error message, or nothing when the block is not known.
