@@ -90,8 +90,9 @@ const REPORTS_CAPACITY: usize = 64;
 /// How long shutdown waits for sessions to say goodbye before dropping them.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 
-/// The open sessions, as the fetcher sees them, and its way to report a peer.
-#[derive(Debug)]
+/// The open sessions, as a requester (the tip fetcher, range sync) sees them, and its way to
+/// report a peer. A clone has its own view of what changed.
+#[derive(Debug, Clone)]
 pub(crate) struct Peers {
     sessions: watch::Receiver<Arc<[SessionHandle]>>,
     reports: mpsc::Sender<Report>,
@@ -507,7 +508,8 @@ impl PeerSet {
         let cancel = cancel.clone();
         self.tasks.spawn(async move {
             Done::Ended {
-                end: driver.run(cancel).await,
+                // The driver's future is large; keep it off the task's stack frame.
+                end: Box::pin(driver.run(cancel)).await,
                 generation,
             }
         });

@@ -5,10 +5,14 @@ use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use alloy_eip2124::{ForkFilter, ForkId};
+use alloy_primitives::Bytes;
 use op_indexer_chainspec::ChainSpec;
 use op_indexer_primitives::BlockRef;
 use secp256k1::SecretKey;
+use tokio::sync::{mpsc, watch};
 use tracing::warn;
+
+use crate::serve::{Serving, SessionServing};
 
 /// Shortest time between two "this build looks behind" warnings.
 const BEHIND_WARN_INTERVAL: Duration = Duration::from_mins(10);
@@ -19,29 +23,40 @@ pub(crate) struct SessionContext {
     key: SecretKey,
     chain: &'static ChainSpec,
     listen_port: u16,
+    /// The way to the server that answers peers' requests, and the range it holds.
+    serving: Serving,
     /// The newest block the node knows, advertised in the eth status. `None` until one is set.
-    tip: Mutex<Option<BlockRef>>,
+    tip: watch::Sender<Option<BlockRef>>,
     /// When the "build looks behind" warning was last logged.
     behind_warned: Mutex<Option<Instant>>,
 }
 
 impl SessionContext {
-    pub(crate) const fn new(key: SecretKey, chain: &'static ChainSpec, listen_port: u16) -> Self {
+    pub(crate) fn new(
+        key: SecretKey,
+        chain: &'static ChainSpec,
+        listen_port: u16,
+        serving: Serving,
+    ) -> Self {
         Self {
             key,
             chain,
             listen_port,
-            tip: Mutex::new(None),
+            serving,
+            tip: watch::Sender::new(None),
             behind_warned: Mutex::new(None),
         }
     }
 
     /// Records `block` as the tip to advertise, if it is newer than the current one.
     pub(crate) fn set_tip(&self, block: BlockRef) {
-        let mut tip = self.tip.lock().unwrap_or_else(PoisonError::into_inner);
-        if tip.is_none_or(|current| block.number > current.number) {
-            *tip = Some(block);
-        }
+        self.tip.send_if_modified(|tip| {
+            let newer = tip.is_none_or(|current| block.number > current.number);
+            if newer {
+                *tip = Some(block);
+            }
+            newer
+        });
     }
 
     /// Whether a tip has been set. Sessions are only opened once it has: peers end a session
@@ -51,7 +66,7 @@ impl SessionContext {
     }
 
     pub(super) fn tip(&self) -> Option<BlockRef> {
-        *self.tip.lock().unwrap_or_else(PoisonError::into_inner)
+        *self.tip.borrow()
     }
 
     /// The node's secp256k1 key, shared by discovery and sessions so peers can dial what they
@@ -67,6 +82,12 @@ impl SessionContext {
     /// The port sessions and discovery listen on, advertised in the hello.
     pub(super) const fn listen_port(&self) -> u16 {
         self.listen_port
+    }
+
+    /// The serving side of one new session and the channel its answers arrive on. It follows
+    /// the tip, which is the end of the range the session advertises.
+    pub(super) fn session_serving(&self) -> (SessionServing, mpsc::Receiver<Bytes>) {
+        self.serving.session(self.tip.subscribe())
     }
 
     /// The fork filter at our current head: yields our fork id and validates a peer's.

@@ -44,6 +44,11 @@ services:
       # The host's public IP and port, so peers can dial back; the container only sees its
       # own bridge address.
       OP_INDEXER_EL_ADVERTISED_ADDR: ${OP_INDEXER_EL_ADVERTISED_ADDR:-}
+      # A range of blocks to fetch from execution peers (first and last number, and the
+      # trusted hash of the last one). All three or none.
+      OP_INDEXER_EL_SYNC_FROM: ${OP_INDEXER_EL_SYNC_FROM:-}
+      OP_INDEXER_EL_SYNC_TO: ${OP_INDEXER_EL_SYNC_TO:-}
+      OP_INDEXER_EL_SYNC_ANCHOR: ${OP_INDEXER_EL_SYNC_ANCHOR:-}
     ports:
       - "9222:9222/tcp"
       - "9222:9222/udp"

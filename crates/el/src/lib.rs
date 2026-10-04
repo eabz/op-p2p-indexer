@@ -1,5 +1,6 @@
 //! Execution p2p: devp2p sessions with OP Stack execution peers, to fetch what gossip does not
-//! carry. In this version: the receipts of every block, verified against the block's header.
+//! carry (the receipts of every block, verified against the block's header) and to serve the
+//! blocks this node holds to peers that ask.
 //!
 //! ```text
 //! discv5 (fork id filter) ─▶ peer set (dial, keep, redial) ─▶ session (RLPx, eth/69)
@@ -10,10 +11,10 @@
 //!   plain-data configuration and [`ElError`] what stops it.
 //! - `discovery` finds peers of our chain and fork; `session` is one connection; `wire` the
 //!   messages; `peers`, `fetch` and `verify` keep sessions, schedule requests and check answers.
+//! - `serve` answers peers' requests from a [`BlockProvider`], which the binary implements.
 //!
 //! A second p2p stack next to `op-indexer-p2p` (libp2p); the two never depend on each other.
-//! Nothing from an execution peer is trusted. This node only asks: it answers peers' requests
-//! with empty responses and serves nothing yet. See `docs/el.md`.
+//! Nothing from an execution peer is trusted. See `docs/el.md`.
 
 mod config;
 mod discovery;
@@ -21,7 +22,9 @@ mod error;
 mod fetch;
 mod metrics;
 mod peers;
+mod serve;
 mod session;
+mod sync;
 mod verify;
 mod wire;
 
@@ -36,28 +39,36 @@ use tokio_util::sync::CancellationToken;
 
 pub use config::ElConfig;
 pub use error::ElError;
+pub use serve::BlockProvider;
+pub use sync::RangeSync;
 
 use crate::discovery::Discovery;
 use crate::fetch::Fetcher;
 use crate::peers::PeerSet;
+use crate::serve::Server;
 use crate::session::SessionContext;
+use crate::sync::Syncer;
 
 /// Discovered peers waiting for the peer set. Discovery repeats what does not fit.
 const CANDIDATES_CAPACITY: usize = 256;
 /// Inbound sessions waiting for the peer set; more are refused with "too many peers".
 const ACCEPTED_CAPACITY: usize = 16;
 
-/// The execution network: discovery, sessions and the receipts fetcher.
+/// The execution network: discovery, sessions, the receipts fetcher and the server of the
+/// blocks `P` holds.
 #[derive(Debug)]
-pub struct ExecutionNetwork {
+pub struct ExecutionNetwork<P> {
     config: ElConfig,
     ctx: Arc<SessionContext>,
+    block_server: Server<P>,
     requests: mpsc::Receiver<ReceiptsRequest>,
     verified: mpsc::Sender<VerifiedReceipts>,
     served: mpsc::Sender<ExecutionPeer>,
+    /// A range of blocks to fetch from peers; `None` unless one was asked for.
+    sync: Option<RangeSync>,
 }
 
-impl ExecutionNetwork {
+impl<P: BlockProvider> ExecutionNetwork<P> {
     /// Creates the network. Does no I/O.
     ///
     /// `node_key` is the node's secp256k1 secret for the execution network. It must not be the
@@ -65,7 +76,8 @@ impl ExecutionNetwork {
     /// publish conflicting node records. Blocks to fetch receipts for arrive on `requests`;
     /// verified receipts leave on `verified`. A peer worth saving for the next start (see
     /// [`ElConfig::saved_peers`]) is reported on `served`, without waiting: once per session
-    /// we opened, at its first verified answer.
+    /// we opened, at its first verified answer. Peers' requests for headers, bodies and
+    /// receipts are answered from `provider`.
     ///
     /// # Errors
     ///
@@ -76,20 +88,33 @@ impl ExecutionNetwork {
         requests: mpsc::Receiver<ReceiptsRequest>,
         verified: mpsc::Sender<VerifiedReceipts>,
         served: mpsc::Sender<ExecutionPeer>,
+        provider: P,
     ) -> Result<Self, ElError> {
         let key = SecretKey::from_byte_array(&node_key.0).map_err(|_err| ElError::InvalidKey)?;
+        let (block_server, serving) = serve::new(provider);
         let ctx = Arc::new(SessionContext::new(
             key,
             config.chain,
             config.listen_addr.port(),
+            serving,
         ));
         Ok(Self {
             config,
             ctx,
+            block_server,
             requests,
             verified,
             served,
+            sync: None,
         })
+    }
+
+    /// Adds a range of blocks to fetch from peers and verify, next to the receipts of new
+    /// blocks. It uses the same sessions, one request at a time on each.
+    #[must_use]
+    pub fn with_sync(mut self, sync: RangeSync) -> Self {
+        self.sync = Some(sync);
+        self
     }
 
     /// Runs the network until `cancel` fires.
@@ -102,9 +127,11 @@ impl ExecutionNetwork {
         let Self {
             config,
             ctx,
+            block_server,
             requests,
             verified,
             served,
+            sync,
         } = self;
         metrics::describe();
         let bootnodes = if config.bootnodes.is_empty() {
@@ -155,6 +182,15 @@ impl ExecutionNetwork {
         {
             let stop = stop.clone();
             tasks.spawn(async move { ("peer set", peer_set.run(stop).await) });
+        }
+        {
+            let stop = stop.clone();
+            tasks.spawn(async move { ("server", block_server.run(stop).await) });
+        }
+        if let Some(sync) = sync {
+            let syncer = Syncer::new(config.chain.canyon_time, peers.clone(), sync);
+            let stop = stop.clone();
+            tasks.spawn(async move { ("range sync", syncer.run(stop).await) });
         }
         let fetcher = Fetcher::new(config.chain, Arc::clone(&ctx), peers, requests, verified);
         {

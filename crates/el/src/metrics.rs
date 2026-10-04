@@ -25,6 +25,12 @@
 //! | `op_indexer_el_queue_depth` | gauge | | Blocks waiting for receipts. |
 //! | `op_indexer_el_queue_dropped_total` | counter | | Requests dropped because the queue was full, oldest first. |
 //! | `op_indexer_el_fetch_duration_seconds` | histogram | | Time from a request's arrival to its verified receipts. |
+//! | `op_indexer_el_sync_requests_total` | counter | `outcome` | Jobs of the range sync on one session (a page of headers, or a segment of blocks): `verified`, `not_held`, `invalid`, `malformed`, `unsupported`, `timeout` or `closed`. |
+//! | `op_indexer_el_sync_blocks_total` | counter | | Blocks of the range sync verified and handed on. |
+//! | `op_indexer_el_sync_block_number` | gauge | | Last block of the range sync handed on. |
+//! | `op_indexer_el_served_requests_total` | counter | `kind`, `outcome` | Peers' requests for `headers`, `bodies` or `receipts`: `answered`, `empty` (nothing held), `rate_limited`, `busy` (too many in flight; both answered empty), `malformed` or `failed` (the provider failed). |
+//! | `op_indexer_el_served_items_total` | counter | `kind` | Headers, bodies or blocks of receipts sent to peers. |
+//! | `op_indexer_el_served_bytes_total` | counter | `kind` | Their size. |
 
 use std::time::Duration;
 
@@ -50,6 +56,12 @@ const RECEIPTS_DELIVERED: &str = "op_indexer_el_receipts_delivered_total";
 const QUEUE_DEPTH: &str = "op_indexer_el_queue_depth";
 const QUEUE_DROPPED: &str = "op_indexer_el_queue_dropped_total";
 const FETCH_DURATION: &str = "op_indexer_el_fetch_duration_seconds";
+const SYNC_REQUESTS: &str = "op_indexer_el_sync_requests_total";
+const SYNC_BLOCKS: &str = "op_indexer_el_sync_blocks_total";
+const SYNC_BLOCK_NUMBER: &str = "op_indexer_el_sync_block_number";
+const SERVED_REQUESTS: &str = "op_indexer_el_served_requests_total";
+const SERVED_ITEMS: &str = "op_indexer_el_served_items_total";
+const SERVED_BYTES: &str = "op_indexer_el_served_bytes_total";
 
 /// How a dial attempt ended, the `outcome` label of the dial counter.
 #[derive(Debug, Clone, Copy)]
@@ -186,6 +198,90 @@ impl VerificationFailure {
     }
 }
 
+/// What a peer asked for, the `kind` label of the serving metrics.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ServeKind {
+    /// `GetBlockHeaders`.
+    Headers,
+    /// `GetBlockBodies`.
+    Bodies,
+    /// `GetReceipts`.
+    Receipts,
+}
+
+impl ServeKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Headers => "headers",
+            Self::Bodies => "bodies",
+            Self::Receipts => "receipts",
+        }
+    }
+}
+
+/// How a peer's request was handled, the `outcome` label of the served-requests counter.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ServeOutcome {
+    /// Answered with at least one item.
+    Answered,
+    /// Nothing of what was asked is held.
+    Empty,
+    /// The peer is over its requests per minute; answered empty.
+    RateLimited,
+    /// Too many requests in flight, of the peer or of all peers; answered empty.
+    Busy,
+    /// The request could not be decoded.
+    Malformed,
+    /// The provider failed, or held data could not be decoded.
+    Failed,
+}
+
+impl ServeOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Answered => "answered",
+            Self::Empty => "empty",
+            Self::RateLimited => "rate_limited",
+            Self::Busy => "busy",
+            Self::Malformed => "malformed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// How a job of the range sync on one session ended, the `outcome` label of its counter.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SyncOutcome {
+    /// Everything fetched matched the trusted hashes.
+    Verified,
+    /// The peer does not hold the blocks.
+    NotHeld,
+    /// An answer failed verification.
+    Invalid,
+    /// An answer could not be decoded.
+    Malformed,
+    /// Verified data this build cannot read.
+    Unsupported,
+    /// The peer did not answer in time.
+    Timeout,
+    /// The session ended before the answer.
+    Closed,
+}
+
+impl SyncOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::NotHeld => "not_held",
+            Self::Invalid => "invalid",
+            Self::Malformed => "malformed",
+            Self::Unsupported => "unsupported",
+            Self::Timeout => "timeout",
+            Self::Closed => "closed",
+        }
+    }
+}
+
 /// Registers the description and unit of every metric with the installed recorder.
 ///
 /// A no-op without a recorder, so it runs after the binary installed one.
@@ -196,6 +292,17 @@ pub(crate) fn describe() {
         "Peers of our chain and fork found by discovery"
     );
     describe_counter!(DIALS, Unit::Count, "Dial attempts, by outcome");
+    describe_counter!(
+        SERVED_REQUESTS,
+        Unit::Count,
+        "Peers' requests for headers, bodies or receipts, by kind and outcome"
+    );
+    describe_counter!(
+        SERVED_ITEMS,
+        Unit::Count,
+        "Headers, bodies or blocks of receipts sent to peers"
+    );
+    describe_counter!(SERVED_BYTES, Unit::Bytes, "Size of the items sent to peers");
     describe_counter!(
         INBOUND_HANDSHAKES_FAILED,
         Unit::Count,
@@ -249,6 +356,21 @@ pub(crate) fn describe() {
         FETCH_DURATION,
         Unit::Seconds,
         "Time from a request's arrival to its verified receipts"
+    );
+    describe_counter!(
+        SYNC_REQUESTS,
+        Unit::Count,
+        "Jobs of the range sync on one session, by outcome"
+    );
+    describe_counter!(
+        SYNC_BLOCKS,
+        Unit::Count,
+        "Blocks of the range sync verified and handed on"
+    );
+    describe_gauge!(
+        SYNC_BLOCK_NUMBER,
+        Unit::Count,
+        "Last block of the range sync handed on"
     );
 }
 
@@ -333,4 +455,30 @@ fn count(value: usize) -> u64 {
 /// needs no cast.
 fn small(value: usize) -> f64 {
     f64::from(u32::try_from(value).unwrap_or(u32::MAX))
+}
+
+/// Records how a peer's request was handled.
+pub(crate) fn served(kind: ServeKind, outcome: ServeOutcome) {
+    counter!(SERVED_REQUESTS, "kind" => kind.as_str(), "outcome" => outcome.as_str()).increment(1);
+}
+
+/// Records the items sent in one answer and their size.
+pub(crate) fn served_items(kind: ServeKind, items: usize, bytes: usize) {
+    counter!(SERVED_ITEMS, "kind" => kind.as_str()).increment(count(items));
+    counter!(SERVED_BYTES, "kind" => kind.as_str()).increment(count(bytes));
+}
+
+/// Records how a job of the range sync ended.
+pub(crate) fn sync_request(outcome: SyncOutcome) {
+    counter!(SYNC_REQUESTS, "outcome" => outcome.as_str()).increment(1);
+}
+
+/// Records blocks of the range sync handed on, the last of them block `last`.
+pub(crate) fn sync_blocks(blocks: usize, last: u64) {
+    const HIGH_UNIT: f64 = 4_294_967_296.0;
+    counter!(SYNC_BLOCKS).increment(count(blocks));
+    // A block number as `f64` through its two 32-bit halves, exact up to 2^53.
+    let high = u32::try_from(last >> u32::BITS).unwrap_or(u32::MAX);
+    let low = u32::try_from(last & u64::from(u32::MAX)).unwrap_or(u32::MAX);
+    gauge!(SYNC_BLOCK_NUMBER).set(f64::from(high).mul_add(HIGH_UNIT, f64::from(low)));
 }

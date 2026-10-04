@@ -5,9 +5,9 @@
 //! ```
 //!
 //! The transport, the hello and the status exchange are reth's. After the handshake a
-//! [`SessionDriver`] owns the stream: it answers pings, answers the peer's requests with empty
-//! responses (this node serves nothing yet), follows the block range the peer announces, and
-//! routes responses to the requests made through a [`SessionHandle`].
+//! [`SessionDriver`] owns the stream: it answers pings, passes the peer's requests to the server
+//! (`serve`) and writes its answers, follows the block range the peer announces, and routes
+//! responses to the requests made through a [`SessionHandle`].
 //!
 //! Does not decide which peers to dial or keep, and does not verify what a peer returns: that
 //! is the peer set and the fetcher. Nothing a peer sends is trusted here beyond being framed.

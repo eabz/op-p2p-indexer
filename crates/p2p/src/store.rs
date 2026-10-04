@@ -3,12 +3,14 @@
 //! Holds the node's secp256k1 identity, so it keeps a stable peer id across restarts, a second
 //! key for its identity on the execution network, and the peers worth returning to, so a
 //! restart can reconnect without waiting for discovery: consensus peers that recently
-//! delivered valid blocks, and execution peers that served requests.
+//! delivered valid blocks, and execution peers that served requests. It also keeps the progress
+//! of a range sync, so a restart resumes it.
 //!
 //! This is a second fjall database next to the block archive's, on purpose: the archive lives
-//! in the storage crate, and p2p and storage must not depend on each other. It holds two keys
-//! and a few dozen small entries, far below every size limit fjall has, so the only setting
-//! that matters is the number of background threads.
+//! in the storage crate, and p2p and storage must not depend on each other. It holds two keys,
+//! a few dozen small entries and, during a range sync, one 32-byte hash per 256 blocks still to
+//! fetch, far below every size limit fjall has, so the only setting that matters is the number
+//! of background threads.
 
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
@@ -17,11 +19,11 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 
-use alloy_primitives::{B256, B512};
+use alloy_primitives::{B256, B512, BlockNumber};
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 use libp2p::Multiaddr;
 use libp2p::identity::{DecodingError, secp256k1};
-use op_indexer_primitives::ExecutionPeer;
+use op_indexer_primitives::{BlockRef, ExecutionPeer, SyncRange, SyncState};
 
 const NODE: &str = "node";
 const IDENTITY_KEY: &str = "secp256k1_secret";
@@ -37,6 +39,17 @@ const MAX_KNOWN_PEERS: usize = 64;
 const EXECUTION_PEERS: &str = "execution_peers";
 /// Execution peers kept; the least recently served is evicted beyond this.
 const MAX_EXECUTION_PEERS: usize = 32;
+/// Progress of a range sync: the range it belongs to, how far it is stored, and its
+/// checkpoints.
+const SYNC: &str = "sync";
+/// The range the progress belongs to: `from`, the anchor's number (both big-endian) and the
+/// anchor's hash. Progress of another range is discarded.
+const SYNC_RANGE_KEY: &[u8] = b"range";
+/// Highest stored block of the range, big-endian.
+const SYNC_STORED_KEY: &[u8] = b"stored";
+/// Prefix of a checkpoint: followed by the block number, big-endian, so they iterate in
+/// block order; the value is the block hash.
+const SYNC_CHECKPOINT_PREFIX: u8 = b'c';
 
 /// Background threads for flushes and compactions (fjall starts up to four by default); there
 /// is almost nothing for them to do.
@@ -78,7 +91,8 @@ pub struct NodeStore {
     node: Keyspace,
     peers: Keyspace,
     execution_peers: Keyspace,
-    /// Serializes the read-then-write of the keys and of both peer tables.
+    sync: Keyspace,
+    /// Serializes the read-then-write of the keys, both peer tables and the sync progress.
     write: Mutex<()>,
 }
 
@@ -115,6 +129,7 @@ impl NodeStore {
             node: db.keyspace(NODE, KeyspaceCreateOptions::default)?,
             peers: db.keyspace(PEERS, KeyspaceCreateOptions::default)?,
             execution_peers: db.keyspace(EXECUTION_PEERS, KeyspaceCreateOptions::default)?,
+            sync: db.keyspace(SYNC, KeyspaceCreateOptions::default)?,
             db,
             write: Mutex::new(()),
         })
@@ -255,6 +270,86 @@ impl NodeStore {
         Ok(())
     }
 
+    /// Returns the saved progress of the range sync `range`. Progress saved for another range
+    /// is removed first, so a changed configuration starts again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Database`] if reading or writing fails.
+    pub fn sync_state(&self, range: &SyncRange) -> Result<SyncState, StoreError> {
+        let _write = self.write.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut id = Vec::with_capacity(48);
+        id.extend_from_slice(&range.from.to_be_bytes());
+        id.extend_from_slice(&range.anchor.number.to_be_bytes());
+        id.extend_from_slice(range.anchor.hash.as_slice());
+        if self.sync.get(SYNC_RANGE_KEY)?.as_deref() != Some(id.as_slice()) {
+            let mut batch = self.durable_batch();
+            for key in self.sync.iter() {
+                batch.remove(&self.sync, key.key()?);
+            }
+            batch.insert(&self.sync, SYNC_RANGE_KEY, id);
+            batch.commit()?;
+            return Ok(SyncState::default());
+        }
+
+        let stored_to = self
+            .sync
+            .get(SYNC_STORED_KEY)?
+            .and_then(|stored| <[u8; 8]>::try_from(stored.as_ref()).ok())
+            .map(u64::from_be_bytes);
+        let mut checkpoints = Vec::new();
+        for entry in self.sync.prefix([SYNC_CHECKPOINT_PREFIX]) {
+            let (key, hash) = entry.into_inner()?;
+            // An entry of another shape was not written by this code; skip it.
+            if let Some(checkpoint) = decode_checkpoint(&key, &hash) {
+                checkpoints.push(checkpoint);
+            }
+        }
+        Ok(SyncState {
+            stored_to,
+            checkpoints,
+        })
+    }
+
+    /// Saves blocks of the range sync whose hash is verified.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Database`] if writing fails.
+    pub fn save_sync_checkpoints(&self, checkpoints: &[BlockRef]) -> Result<(), StoreError> {
+        let _write = self.write.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut batch = self.durable_batch();
+        for checkpoint in checkpoints {
+            batch.insert(
+                &self.sync,
+                checkpoint_key(checkpoint.number),
+                checkpoint.hash.as_slice(),
+            );
+        }
+        batch.commit()?;
+        Ok(())
+    }
+
+    /// Records that the range sync's blocks are stored up to `stored_to`, and removes the
+    /// checkpoints at or below it, which are no longer needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Database`] if reading or writing fails.
+    pub fn save_sync_stored(&self, stored_to: BlockNumber) -> Result<(), StoreError> {
+        let _write = self.write.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut batch = self.durable_batch();
+        batch.insert(&self.sync, SYNC_STORED_KEY, stored_to.to_be_bytes());
+        for key in self
+            .sync
+            .range(checkpoint_key(0)..=checkpoint_key(stored_to))
+        {
+            batch.remove(&self.sync, key.key()?);
+        }
+        batch.commit()?;
+        Ok(())
+    }
+
     /// Returns the stored execution peers by node id.
     fn read_execution_peers(&self) -> Result<BTreeMap<B512, ExecutionPeer>, fjall::Error> {
         let mut peers = BTreeMap::new();
@@ -285,6 +380,22 @@ impl NodeStore {
     fn durable_batch(&self) -> fjall::OwnedWriteBatch {
         self.db.batch().durability(Some(PersistMode::SyncAll))
     }
+}
+
+/// The key of the checkpoint at block `number`.
+fn checkpoint_key(number: BlockNumber) -> [u8; 9] {
+    let mut key = [SYNC_CHECKPOINT_PREFIX; 9];
+    key[1..].copy_from_slice(&number.to_be_bytes());
+    key
+}
+
+/// Decodes one checkpoint of the sync table; `None` if it has another shape.
+fn decode_checkpoint(key: &[u8], hash: &[u8]) -> Option<BlockRef> {
+    let (_prefix, number) = key.split_first()?;
+    Some(BlockRef {
+        number: u64::from_be_bytes(number.try_into().ok()?),
+        hash: B256::try_from(hash).ok()?,
+    })
 }
 
 /// Decodes one entry of the execution peers table; `None` if it has another shape.

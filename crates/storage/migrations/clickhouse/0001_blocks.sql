@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS blocks
     excess_blob_gas Nullable(UInt64) CODEC(T64, ZSTD(1)),
     parent_beacon_block_root Nullable(FixedString(32)) CODEC(NONE),
     requests_hash Nullable(FixedString(32)) CODEC(NONE),
-    source Enum8('gossip' = 0, 'l1' = 1) CODEC(ZSTD(1)),
+    source Enum8('gossip' = 0, 'l1' = 1, 'import' = 2, 'sync' = 3) CODEC(ZSTD(1)),
     has_receipts Bool CODEC(ZSTD(1)),
     version UInt64 CODEC(Delta, ZSTD(1))
 )

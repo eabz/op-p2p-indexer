@@ -57,6 +57,8 @@ pub(super) fn encode_block(block: &DecodedBlock) -> Result<EncodedBlock, Storage
         source: match block.source {
             BlockSource::Gossip => "gossip",
             BlockSource::L1 => "l1",
+            BlockSource::Import => "import",
+            BlockSource::Sync => "sync",
         },
     })
 }
@@ -97,6 +99,8 @@ pub(super) fn decode_block(
     let source = match field(fields, "source", block)? {
         "gossip" => BlockSource::Gossip,
         "l1" => BlockSource::L1,
+        "import" => BlockSource::Import,
+        "sync" => BlockSource::Sync,
         _ => return Err(invalid("block source", block, None)),
     };
 

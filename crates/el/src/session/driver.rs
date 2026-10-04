@@ -1,7 +1,8 @@
 //! A live session: the driver that owns the stream and the handle requests go through.
 //!
-//! The driver answers pings, answers the peer's requests with empty responses, follows the
-//! block range the peer announces and routes responses by request id. Does not open sessions
+//! The driver answers pings, passes the peer's requests to the server (see `serve`) and writes
+//! its answers, announces the block range this node serves, follows the one the peer announces
+//! and routes responses by request id. Does not open sessions
 //! (see `handshake`) and verifies nothing a peer returns.
 
 use std::collections::HashMap;
@@ -24,7 +25,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace};
 
 use super::handshake::PeerStatus;
-use crate::wire;
+use crate::serve::{Handled, SessionServing};
+use crate::wire::{self, Request};
 
 /// Limit for one request; receipts answered within a second in the viability test.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -102,7 +104,12 @@ impl fmt::Display for EndReason {
 }
 
 /// Builds the handle and the driver of a session whose handshake just completed on `stream`.
-pub(super) fn new(peer: PeerStatus, stream: Stream) -> (SessionHandle, SessionDriver) {
+pub(super) fn new(
+    peer: PeerStatus,
+    stream: Stream,
+    serving: SessionServing,
+    answers: mpsc::Receiver<Bytes>,
+) -> (SessionHandle, SessionDriver) {
     let (range_tx, range_rx) = watch::channel(BlockRange {
         earliest: peer.earliest.unwrap_or_default(),
         latest: peer.latest.unwrap_or_default(),
@@ -115,6 +122,8 @@ pub(super) fn new(peer: PeerStatus, stream: Stream) -> (SessionHandle, SessionDr
         range: range_tx,
         pending: HashMap::new(),
         next_request_id: 1,
+        serving,
+        answers,
         established: Instant::now(),
     };
     let handle = SessionHandle {
@@ -155,9 +164,57 @@ impl SessionHandle {
         &self,
         block: B256,
     ) -> Result<Vec<OpReceiptEnvelope>, RequestError> {
+        let body = self.request(Request::Receipts(vec![block])).await?;
+        wire::decode_receipts(&body).map_err(malformed)
+    }
+
+    /// Requests the receipts of several blocks, as [`Self::receipts`] returns them, in request
+    /// order. A peer may answer for fewer blocks than asked: the answer is then a prefix.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::receipts`].
+    pub(crate) async fn receipts_of(
+        &self,
+        blocks: Vec<B256>,
+    ) -> Result<Vec<Vec<OpReceiptEnvelope>>, RequestError> {
+        let body = self.request(Request::Receipts(blocks)).await?;
+        wire::decode_block_receipts(&body).map_err(malformed)
+    }
+
+    /// Requests up to `limit` headers going down from the block with hash `start`, inclusive.
+    /// Each is the RLP the peer sent, not decoded: the caller hashes those bytes. An empty
+    /// answer means the peer does not hold the block. Nothing is verified here.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::receipts`].
+    pub(crate) async fn headers(
+        &self,
+        start: B256,
+        limit: u64,
+    ) -> Result<Vec<Bytes>, RequestError> {
+        let body = self.request(Request::Headers { start, limit }).await?;
+        wire::decode_items(&body).map_err(malformed)
+    }
+
+    /// Requests the bodies of `blocks`, in request order. Each is the RLP the peer sent (its
+    /// transactions, ommers and optional withdrawals), not decoded. A peer may answer for fewer
+    /// blocks than asked: the answer is then a prefix. Nothing is verified here.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::receipts`].
+    pub(crate) async fn bodies(&self, blocks: Vec<B256>) -> Result<Vec<Bytes>, RequestError> {
+        let body = self.request(Request::Bodies(blocks)).await?;
+        wire::decode_items(&body).map_err(malformed)
+    }
+
+    /// Sends `request` and waits for the body of its answer (the message without its id byte).
+    async fn request(&self, request: Request) -> Result<Bytes, RequestError> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        let command = Command::Receipts {
-            block,
+        let command = Command::Request {
+            request,
             reply: reply_tx,
         };
         let answer = async {
@@ -169,10 +226,9 @@ impl SessionHandle {
                 .await
                 .map_err(|_closed| RequestError::SessionClosed)
         };
-        let body = timeout(REQUEST_TIMEOUT, answer)
+        timeout(REQUEST_TIMEOUT, answer)
             .await
-            .map_err(|_elapsed| RequestError::Timeout)??;
-        wire::decode_receipts(&body).map_err(|err| RequestError::Malformed(err.to_string()))
+            .map_err(|_elapsed| RequestError::Timeout)?
     }
 
     /// Ends the session, telling the peer why. Does nothing if it has already ended.
@@ -186,8 +242,8 @@ impl SessionHandle {
 /// What a handle asks its driver to do.
 #[derive(Debug)]
 enum Command {
-    Receipts {
-        block: B256,
+    Request {
+        request: Request,
         /// Receives the response body (the message without its id byte).
         reply: oneshot::Sender<Bytes>,
     },
@@ -201,9 +257,14 @@ pub(crate) struct SessionDriver {
     stream: Stream,
     commands: mpsc::Receiver<Command>,
     range: watch::Sender<BlockRange>,
-    /// Requests awaiting their response, by request id.
-    pending: HashMap<u64, oneshot::Sender<Bytes>>,
+    /// Requests awaiting their response, by request id, with the id of the message that
+    /// answers them.
+    pending: HashMap<u64, (u8, oneshot::Sender<Bytes>)>,
     next_request_id: u64,
+    /// The peer's requests go through it to the server.
+    serving: SessionServing,
+    /// The server's answers to the peer's requests.
+    answers: mpsc::Receiver<Bytes>,
     established: Instant,
 }
 
@@ -220,8 +281,8 @@ impl SessionDriver {
                     break EndReason::Cancelled;
                 }
                 command = self.commands.recv() => match command {
-                    Some(Command::Receipts { block, reply }) => {
-                        if let Err(reason) = self.send_request(block, reply).await {
+                    Some(Command::Request { request, reply }) => {
+                        if let Err(reason) = self.send_request(&request, reply).await {
                             break reason;
                         }
                     }
@@ -244,9 +305,20 @@ impl SessionDriver {
                     Some(Err(err)) => break end_reason(err),
                     None => break EndReason::Closed,
                 },
+                // Never closed: `serving` holds the sending side.
+                Some(answer) = self.answers.recv() => {
+                    if let Err(err) = self.stream.send(answer.0).await {
+                        break end_reason(err);
+                    }
+                }
                 // Pongs to the peer's pings wait in the stream's buffer until it is flushed.
                 _ = flush.tick() => {
-                    self.pending.retain(|_, reply| !reply.is_closed());
+                    self.pending.retain(|_, (_, reply)| !reply.is_closed());
+                    if let Some(update) = self.serving.range_update()
+                        && let Err(err) = self.stream.feed(update.0).await
+                    {
+                        break end_reason(err);
+                    }
                     if let Err(err) = self.stream.flush().await {
                         break end_reason(err);
                     }
@@ -274,20 +346,21 @@ impl SessionDriver {
 
     async fn send_request(
         &mut self,
-        block: B256,
+        request: &Request,
         reply: oneshot::Sender<Bytes>,
     ) -> Result<(), EndReason> {
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1);
-        self.pending.insert(request_id, reply);
+        self.pending
+            .insert(request_id, (request.response_id(), reply));
         self.stream
-            .send(wire::get_receipts(request_id, block).0)
+            .send(request.encode(request_id).0)
             .await
             .map_err(end_reason)
     }
 
-    /// Handles one message from the peer: a response to route, a request to answer with an
-    /// empty response, a range update, or something this node has no use for.
+    /// Handles one message from the peer: a response to route, a request to answer or pass
+    /// to the server, a range update, or something this node has no use for.
     async fn on_message(&mut self, message: &[u8]) -> Result<(), EndReason> {
         if message.len() > MAX_MESSAGE_BYTES {
             self.say_goodbye(DisconnectReason::ProtocolBreach).await;
@@ -299,8 +372,19 @@ impl SessionDriver {
         let Some((&message_id, body)) = message.split_first() else {
             return Ok(());
         };
-        if message_id == wire::RECEIPTS {
-            if let Some(reply) = wire::request_id(body).and_then(|id| self.pending.remove(&id)) {
+        if matches!(
+            message_id,
+            wire::RECEIPTS | wire::BLOCK_HEADERS | wire::BLOCK_BODIES
+        ) {
+            // An answer of another kind than the request with its id asked for is dropped,
+            // and the request times out.
+            if let Some(id) = wire::request_id(body)
+                && self
+                    .pending
+                    .get(&id)
+                    .is_some_and(|(expected, _)| *expected == message_id)
+                && let Some((_, reply)) = self.pending.remove(&id)
+            {
                 // The requester may have timed out and gone; that is not the peer's fault.
                 let _delivered = reply.send(Bytes::copy_from_slice(body));
             }
@@ -314,14 +398,22 @@ impl SessionDriver {
                 }
                 Err(err) => return Err(EndReason::Protocol(format!("block range update: {err}"))),
             }
-        } else if let Some(response) = wire::empty_response(message_id, body) {
-            self.stream.send(response.0).await.map_err(end_reason)?;
         } else {
-            // Transaction and block announcements: this node does not follow them.
-            trace!(message_id, "ignored execution peer message");
+            match self.serving.request(message_id, body) {
+                Handled::Now(response) => {
+                    self.stream.send(response.0).await.map_err(end_reason)?;
+                }
+                Handled::Later => {}
+                // Transaction and block announcements: this node does not follow them.
+                Handled::NotARequest => trace!(message_id, "ignored execution peer message"),
+            }
         }
         Ok(())
     }
+}
+
+fn malformed(err: alloy_rlp::Error) -> RequestError {
+    RequestError::Malformed(err.to_string())
 }
 
 fn end_reason(err: P2PStreamError) -> EndReason {

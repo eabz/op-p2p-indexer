@@ -185,18 +185,23 @@ async fn handshake(
     }
 
     let fork_filter = ctx.fork_filter();
-    let tip = ctx.tip();
-    let tip_number = tip.map_or(0, |tip| tip.number);
+    // The range advertised runs from the first block this node holds to the tip it knows:
+    // honest at both ends, and complete once an import has reached the tip. Until then blocks
+    // in the middle are not held and requests for them get empty answers. The end is the tip,
+    // not the last block held: peers end a session whose status does not look like a live
+    // node's (seen live). Sessions open only once a tip is known.
+    let (serving, answers) = ctx.session_serving();
+    let advertised = serving.advertised();
+    let latest = advertised.map(|range| range.latest);
     let status = UnifiedStatus {
         version: EthVersion::Eth69,
         chain: ctx.chain().chain_id.into(),
         genesis: ctx.chain().genesis_hash,
         forkid: fork_filter.current(),
-        blockhash: tip.map_or(ctx.chain().genesis_hash, |tip| tip.hash),
+        blockhash: latest.map_or(ctx.chain().genesis_hash, |latest| latest.hash),
         total_difficulty: Some(U256::ZERO),
-        // This node serves nothing yet, so the range it advertises is its tip alone.
-        earliest_block: Some(tip_number),
-        latest_block: Some(tip_number),
+        earliest_block: Some(advertised.map_or(0, |range| range.earliest)),
+        latest_block: Some(latest.map_or(0, |latest| latest.number)),
     };
     let exchange = Box::pin(
         UnauthedEthStream::new(p2p).handshake::<EthNetworkPrimitives>(status, fork_filter),
@@ -217,7 +222,7 @@ async fn handshake(
         latest: theirs.latest_block,
         head_hash: theirs.blockhash,
     };
-    Ok(driver::new(peer, eth.into_inner()))
+    Ok(driver::new(peer, eth.into_inner(), serving, answers))
 }
 
 /// Maps reth's status error, raising the "build is behind" warning where it applies.

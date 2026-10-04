@@ -29,9 +29,11 @@ mod validate;
 
 use std::fmt;
 
-use alloy_primitives::{BlockHash, BlockNumber};
+use alloy_primitives::{BlockHash, BlockNumber, Bytes};
 use op_alloy_consensus::OpReceiptEnvelope;
-use op_indexer_primitives::{ArchivedBlock, BlockRef, DecodedBlock, InsertOutcome, L1Heads};
+use op_indexer_primitives::{
+    ArchivedBlock, BlockRef, DecodedBlock, EncodedBlock, InsertOutcome, L1Heads,
+};
 
 pub use config::{ArchiveConfig, ArchiveRetention, ClickHouseConfig, RedisConfig, StorageConfig};
 pub use error::{InvalidBlockReason, ParseError, Severity, StorageError};
@@ -218,6 +220,17 @@ pub trait CommittedStore {
     -> impl Future<Output = Result<(), StorageError>> + Send;
 }
 
+/// A part of an archived block, for [`ArchiveStore::part`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockPart {
+    /// The header.
+    Header,
+    /// The body.
+    Body,
+    /// The receipts.
+    Receipts,
+}
+
 /// A local, contiguous window of recent committed blocks, kept in the encoding peers ask for.
 ///
 /// The archive holds one range of blocks, each the parent of the next. Every write is one
@@ -238,6 +251,37 @@ pub trait ArchiveStore {
     /// [`StorageError`] if the archive cannot be written.
     fn append(&self, block: &DecodedBlock)
     -> impl Future<Output = Result<(), StorageError>> + Send;
+
+    /// Appends consecutive blocks, oldest first, in their original encoding. For blocks whose
+    /// bytes the caller has verified (import, range sync); the bytes are stored unchanged.
+    ///
+    /// The archive checks what it can without decoding a body: each header hashes to its
+    /// `hash`, each block is the child of the one before it, and the first one extends the held
+    /// range unless the archive is empty. It does **not** check that the body and the receipts
+    /// belong to the header: the caller must have verified the transactions root and the
+    /// receipts root over exactly these bytes.
+    ///
+    /// Leading blocks the archive already holds, up to its tip, are skipped, so repeating a
+    /// call is harmless. An empty list is a no-op.
+    ///
+    /// The whole list is checked before anything is written. It is then written in durable
+    /// fjall batches of bounded size, each applied entirely or not at all. If a later batch
+    /// fails, the earlier ones stay: [`range`](Self::range) tells where to resume.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::InvalidBlock`] if a header does not hash to its `hash`,
+    /// [`StorageError::InvalidData`] if a header is not a header, [`StorageError::NotContiguous`]
+    /// if a block is not the child of the one before it or the list does not extend the held
+    /// range, and another [`StorageError`] if the archive cannot be written.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping the future does not stop the call: it runs to its end on a blocking thread.
+    fn append_batch(
+        &self,
+        blocks: Vec<EncodedBlock>,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
     /// Attaches receipts to an archived block. `Ok(false)` if it is not archived.
     ///
@@ -261,6 +305,18 @@ pub trait ArchiveStore {
         &self,
         number: BlockNumber,
     ) -> impl Future<Output = Result<Option<ArchivedBlock>, StorageError>> + Send;
+
+    /// Returns one part of the block at `number` as RLP, as [`block`](Self::block) gives it,
+    /// reading only that part: `None` outside the held range, and for receipts not yet set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the archive cannot be read.
+    fn part(
+        &self,
+        number: BlockNumber,
+        part: BlockPart,
+    ) -> impl Future<Output = Result<Option<Bytes>, StorageError>> + Send;
 
     /// Returns the number of the archived block with this hash.
     ///

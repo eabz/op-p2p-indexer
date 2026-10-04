@@ -155,3 +155,80 @@ the binary gets configuration and wiring (all Worker 2). Worker 3 owns the root 
 - No peer is dialed, and no inbound session accepted, until the node knows a tip to put in
   its status: peers end a session at once with a node whose status says genesis.
 - Shutdown: both networks stop first, then the pipeline.
+
+## 11. Serving (built, not yet run live)
+
+The node answers peers from its own stores, so that another node can sync from it.
+
+- `el` does not depend on `storage`. It defines the `BlockProvider` trait (`header`, `body`,
+  `receipts` by number, `number_of` a hash, the held `range`) and the binary implements it
+  over the local archive; `Option<P>` implements it too, `None` holding nothing.
+- `serve.rs`: one `Server` task reads from the provider. A session driver never waits for it:
+  it hands a request over with `try_send` and writes the answer when it arrives on the
+  session's own answer channel, so serving does not delay the tip fetcher. A peer that reads
+  a large answer slowly holds up its own session only.
+- **Bytes.** Headers and bodies go on the wire exactly as the archive holds them: the response
+  is assembled around the stored RLP, which is copied in and never decoded. With
+  `ArchiveStore::append_batch` storing the bytes the importer or range sync verified, what is
+  served is what was verified. Receipts are held with their blooms (the form up to eth/68);
+  eth/69 sends `[tx-type, status, cumulative-gas, logs]` plus the deposit nonce and version, so
+  they are decoded and encoded again without the bloom. Only the bloom is dropped (the
+  receiver rebuilds it from the logs); type, status or post-state root, gas, logs and the
+  deposit fields are carried over for every receipt type.
+- `GetBlockHeaders` (by number or hash, with count, skip and direction), `GetBlockBodies` and
+  `GetReceipts` are answered up to the first block not held. `GetPooledTransactions` is always
+  answered empty.
+- Limits (named constants in `serve.rs`):
+
+  | Limit | Value | Over it |
+  |---|---|---|
+  | Items per response | 1024 | the response ends |
+  | Bytes per response (soft) | 2 MiB | the response ends after the item that crosses it |
+  | Requests per peer per minute | 120 | empty answer |
+  | Requests of one peer being answered | 4 | empty answer |
+  | Requests of all peers waiting | 64 | empty answer |
+  | Requests read from the provider at once | 4 | the others wait in the queue |
+
+- The server reads the held range every 10 s. The status advertises `earliest` = the first
+  block held (block 0 once the legacy range is imported) and `latest` = the tip the node
+  knows, with its hash, exactly as before serving existed; a node holding nothing advertises
+  its tip alone. **The range is honest at both ends, and complete once the import has reached
+  the tip.** Until then blocks in the middle are not held, and requests for them get empty
+  answers, like every other node on this network; the same holds for the few newest blocks,
+  which are not yet committed. `latest` is the tip and not the last block held because peers
+  keep a session whose status carries the real tip and end one that does not look like a live
+  node (seen live). `BlockRangeUpdate` follows the same rule, once a minute per session.
+- Metrics: `op_indexer_el_served_requests_total{kind,outcome}`,
+  `op_indexer_el_served_items_total{kind}`, `op_indexer_el_served_bytes_total{kind}`.
+- Not shown live: serving itself (built without a live run).
+
+Owner: Worker 1 (`serve.rs`, the provider trait, the hooks in the session driver). The
+binary's provider over `ArchiveStore`: Worker 2.
+
+## 12. Range sync (being built)
+
+The node fetches a range of blocks from peers and verifies it, so that a node without
+history can get it from one that has it.
+
+- Input: a target range and a trusted anchor (a block hash at the top of the range: the
+  Bedrock block's parent for the legacy range, or a gossip-verified block).
+- Headers are fetched in pages and verified by the hash chain down from the anchor; then
+  bodies against each header's transactions root and receipts against its receipts root, with
+  the rules of the block's era: plain legacy receipts before Bedrock, the deposit nonce left
+  out of the hash before Canyon, the consensus encoding after.
+- Verified blocks go to the pipeline in ascending order, in batches, as `DecodedBlock`s; the
+  pipeline writes them to the committed store and appends them to the archive
+  (`ArchiveStore::append_batch`). Senders are recovered as for gossip blocks; a zero-signature
+  legacy transaction gets the zero address.
+- Progress is stored, so a sync resumes where it stopped. A peer that returns data failing
+  verification is dropped and banned, as for tip receipts.
+- It shares sessions with the tip fetcher and never starves it: tip requests go first.
+- Off by default: with `OP_INDEXER_EL_SYNC_FROM`, `OP_INDEXER_EL_SYNC_TO` and
+  `OP_INDEXER_EL_SYNC_ANCHOR` unset there is no sync task at all.
+
+**State (2026-10-04): parked.** Written and wired, never run, not reviewed. Before it is
+turned on: split `sync.rs`, decide who appends to the archive when promotion and a range sync
+both run (the archive is one contiguous range), run it against a node that serves.
+
+Owner: Worker 2 (`sync.rs` in `el`, the pipeline's range input, configuration and wiring),
+on Worker 3's session calls for headers and bodies.

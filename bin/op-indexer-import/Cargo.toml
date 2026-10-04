@@ -1,0 +1,34 @@
+[package]
+name = "op-indexer-import"
+description = "Command-line tool: downloads a block range from an external archive, verifies it, and loads it into the indexer's stores"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+op-indexer-primitives.workspace = true
+op-indexer-storage.workspace = true
+
+alloy-consensus.workspace = true
+alloy-eips = { workspace = true, features = ["serde"] }
+alloy-primitives = { workspace = true, features = ["serde"] }
+alloy-rlp.workspace = true
+op-alloy-consensus = { workspace = true, features = ["k256"] }
+
+bytes.workspace = true
+clap.workspace = true
+eyre.workspace = true
+fastrand.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+zstd.workspace = true
+
+[lints]
+workspace = true

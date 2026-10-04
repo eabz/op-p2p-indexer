@@ -11,30 +11,112 @@ use alloy_primitives::{B256, Bytes};
 use alloy_rlp::{Decodable, Encodable};
 use op_alloy_consensus::{OpReceipt, OpReceiptEnvelope};
 use reth_eth_wire_types::message::RequestPair;
-use reth_eth_wire_types::{BlockRangeUpdate, GetReceipts};
+use reth_eth_wire_types::{
+    BlockRangeUpdate, GetBlockBodies, GetBlockHeaders, GetReceipts, HeadersDirection,
+};
 
 /// `GetBlockHeaders`.
-const GET_BLOCK_HEADERS: u8 = 0x03;
+pub(crate) const GET_BLOCK_HEADERS: u8 = 0x03;
 /// `BlockHeaders`.
-const BLOCK_HEADERS: u8 = 0x04;
+pub(crate) const BLOCK_HEADERS: u8 = 0x04;
 /// `GetBlockBodies`.
-const GET_BLOCK_BODIES: u8 = 0x05;
+pub(crate) const GET_BLOCK_BODIES: u8 = 0x05;
 /// `BlockBodies`.
-const BLOCK_BODIES: u8 = 0x06;
+pub(crate) const BLOCK_BODIES: u8 = 0x06;
 /// `GetPooledTransactions`.
-const GET_POOLED_TRANSACTIONS: u8 = 0x09;
+pub(crate) const GET_POOLED_TRANSACTIONS: u8 = 0x09;
 /// `PooledTransactions`.
-const POOLED_TRANSACTIONS: u8 = 0x0a;
+pub(crate) const POOLED_TRANSACTIONS: u8 = 0x0a;
 /// `GetReceipts`.
-const GET_RECEIPTS: u8 = 0x0f;
+pub(crate) const GET_RECEIPTS: u8 = 0x0f;
 /// `Receipts`.
 pub(crate) const RECEIPTS: u8 = 0x10;
 /// `BlockRangeUpdate` (eth/69): the range of blocks the peer serves.
 pub(crate) const BLOCK_RANGE_UPDATE: u8 = 0x11;
 
-/// Encodes `GetReceipts` for one block.
-pub(crate) fn get_receipts(request_id: u64, block: B256) -> Bytes {
-    encode(GET_RECEIPTS, request_id, &GetReceipts(vec![block]))
+/// A request this node makes of a peer.
+#[derive(Debug)]
+pub(crate) enum Request {
+    /// `GetBlockHeaders`: up to `limit` headers going down from the block with hash `start`,
+    /// inclusive.
+    Headers {
+        /// Hash of the highest header wanted.
+        start: B256,
+        /// Most headers wanted.
+        limit: u64,
+    },
+    /// `GetBlockBodies` for these block hashes.
+    Bodies(Vec<B256>),
+    /// `GetReceipts` for these block hashes.
+    Receipts(Vec<B256>),
+}
+
+impl Request {
+    /// The id of the message that answers this request.
+    pub(crate) const fn response_id(&self) -> u8 {
+        match self {
+            Self::Headers { .. } => BLOCK_HEADERS,
+            Self::Bodies(_) => BLOCK_BODIES,
+            Self::Receipts(_) => RECEIPTS,
+        }
+    }
+
+    /// Encodes the request as a message: its id byte, then the request id and the request.
+    pub(crate) fn encode(&self, request_id: u64) -> Bytes {
+        match self {
+            Self::Headers { start, limit } => encode(
+                GET_BLOCK_HEADERS,
+                request_id,
+                &GetBlockHeaders {
+                    start_block: (*start).into(),
+                    limit: *limit,
+                    skip: 0,
+                    direction: HeadersDirection::Falling,
+                },
+            ),
+            Self::Bodies(blocks) => encode(
+                GET_BLOCK_BODIES,
+                request_id,
+                &GetBlockBodies(blocks.clone()),
+            ),
+            Self::Receipts(blocks) => {
+                encode(GET_RECEIPTS, request_id, &GetReceipts(blocks.clone()))
+            }
+        }
+    }
+}
+
+/// Cuts a `BlockHeaders` or `BlockBodies` body into its items: each header or body as the
+/// bytes the peer sent, sharing the buffer of `body`. Nothing inside an item is decoded, so a
+/// caller can hash and store exactly what was received.
+pub(crate) fn decode_items(body: &Bytes) -> alloy_rlp::Result<Vec<Bytes>> {
+    let mut buf: &[u8] = body;
+    if !alloy_rlp::Header::decode(&mut buf)?.list {
+        return Err(alloy_rlp::Error::UnexpectedString);
+    }
+    let _request_id = u64::decode(&mut buf)?;
+    let list = alloy_rlp::Header::decode(&mut buf)?;
+    if !list.list {
+        return Err(alloy_rlp::Error::UnexpectedString);
+    }
+    let mut rest = buf
+        .get(..list.payload_length)
+        .ok_or(alloy_rlp::Error::InputTooShort)?;
+    let mut items = Vec::new();
+    while !rest.is_empty() {
+        let mut after_header = rest;
+        let header = alloy_rlp::Header::decode(&mut after_header)?;
+        let length = rest
+            .len()
+            .saturating_sub(after_header.len())
+            .saturating_add(header.payload_length);
+        let (item, remaining) = rest
+            .split_at_checked(length)
+            .ok_or(alloy_rlp::Error::InputTooShort)?;
+        items.push(body.slice_ref(item));
+        rest = remaining;
+    }
+    Ok(items)
 }
 
 /// Returns the request id of a request or response body (the message without its id byte).
@@ -44,19 +126,6 @@ pub(crate) fn request_id(mut body: &[u8]) -> Option<u64> {
         return None;
     }
     u64::decode(&mut body).ok()
-}
-
-/// Builds the empty answer to a peer's request, or `None` if the message is not a request we
-/// answer. This node holds nothing to serve yet, and an empty answer is how a node says so.
-pub(crate) fn empty_response(message_id: u8, body: &[u8]) -> Option<Bytes> {
-    let response_id = match message_id {
-        GET_BLOCK_HEADERS => BLOCK_HEADERS,
-        GET_BLOCK_BODIES => BLOCK_BODIES,
-        GET_POOLED_TRANSACTIONS => POOLED_TRANSACTIONS,
-        GET_RECEIPTS => RECEIPTS,
-        _ => return None,
-    };
-    Some(encode(response_id, request_id(body)?, &Vec::<B256>::new()))
 }
 
 /// Decodes a `Receipts` body answering a request for one block: the receipts of that block,
@@ -69,13 +138,24 @@ pub(crate) fn empty_response(message_id: u8, body: &[u8]) -> Option<Bytes> {
 ///
 /// [EIP-7642]: https://eips.ethereum.org/EIPS/eip-7642
 pub(crate) fn decode_receipts(body: &[u8]) -> alloy_rlp::Result<Vec<OpReceiptEnvelope>> {
+    Ok(decode_block_receipts(body)?
+        .into_iter()
+        .next()
+        .unwrap_or_default())
+}
+
+/// Decodes a `Receipts` body answering a request for several blocks: the receipts of each
+/// block the peer answered for, in request order, as [`decode_receipts`] returns them.
+pub(crate) fn decode_block_receipts(body: &[u8]) -> alloy_rlp::Result<Vec<Vec<OpReceiptEnvelope>>> {
     let blocks = RequestPair::<Vec<Vec<OpReceipt>>>::decode(&mut &*body)?.message;
     Ok(blocks
         .into_iter()
-        .next()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|receipt| OpReceiptEnvelope::from(receipt.into_with_bloom()))
+        .map(|receipts| {
+            receipts
+                .into_iter()
+                .map(|receipt| OpReceiptEnvelope::from(receipt.into_with_bloom()))
+                .collect()
+        })
         .collect())
 }
 

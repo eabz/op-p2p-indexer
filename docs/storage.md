@@ -495,10 +495,14 @@ pub trait ArchiveStore {
     /// Appends the next block. It must extend the held range: number = last + 1 and parent
     /// hash = last hash, or the archive is empty.
     async fn append(&self, block: &DecodedBlock) -> Result<(), StorageError>;
+    /// Appends consecutive blocks, oldest first, in their original encoding, unchanged.
+    async fn append_batch(&self, blocks: Vec<EncodedBlock>) -> Result<(), StorageError>;
     /// Attaches receipts to an archived block. Ok(false) if it is not archived.
     async fn set_receipts(&self, block: BlockRef, receipts: &[OpReceiptEnvelope]) -> Result<bool, StorageError>;
     /// The encoded block at `number`, or None outside the held range.
     async fn block(&self, number: BlockNumber) -> Result<Option<ArchivedBlock>, StorageError>;
+    /// One part (header, body or receipts) of the block at `number`, reading only that part.
+    async fn part(&self, number: BlockNumber, part: BlockPart) -> Result<Option<Bytes>, StorageError>;
     /// The number of the archived block with this hash.
     async fn number_of(&self, hash: BlockHash) -> Result<Option<BlockNumber>, StorageError>;
     /// The first and last archived block, or None if empty.
@@ -519,6 +523,20 @@ pub trait ArchiveStore {
   block claims, so a wrong parent at the right height is distinguishable from a gap. The caller
   decides whether to `truncate_above` or start over.
   Appending the block already at the tip (same number and hash) is a no-op.
+- `append_batch` is for blocks whose bytes the caller verified (import, range sync):
+  `EncodedBlock { hash, header: Bytes, body: Bytes, receipts: Option<Bytes> }` (primitives).
+  **The bytes are stored unchanged**, never encoded again from a decoded value, so what is
+  served later is what was verified: a legacy transaction with an all-zero signature does not
+  survive a decode and re-encode. The archive checks keccak(header) = `hash`, reads the number
+  and parent hash from that header, and checks that each block is the child of the one before
+  and that the list extends the tip (or the archive is empty). It does not decode bodies or
+  receipts: the caller has verified the transactions root and receipts root over these bytes.
+  Receipts are in the form `op_indexer_primitives::encode_receipts` gives. Leading blocks
+  already held, up to the tip, are skipped (if the block at the tip's height has another hash,
+  that block is the `got` of `NotContiguous`). The whole list is checked before the first
+  write, then written in batches of at most 1024 blocks or 16 MiB of RLP, one turn at the
+  writer lock each; a failure leaves the earlier batches in place and `range` says where to
+  resume. `append` remains for promoted gossip blocks, which survive the round trip.
 - `set_receipts` requires one receipt per transaction and the stored number to match
   (`InvalidBlock`), as in the unsafe store. A block appended with receipts stores them at once.
 - Every write is one fjall batch across the keyspaces it touches: one journal record, applied
@@ -530,6 +548,11 @@ pub trait ArchiveStore {
   thread; the space comes back
   when fjall's background compaction runs.
 - The held range comes from the first and last keys of `headers`, never from a count.
+- Known limit: `set_receipts` decodes the stored body to count its transactions. A body
+  holding a legacy transaction with an all-zero signature (stored unchanged by `append_batch`)
+  may not decode with alloy, and `set_receipts` then fails for that block with `InvalidData`.
+  Blocks appended with `append_batch` carry their receipts, so this only matters if receipts
+  are attached to such a block afterwards.
 - Writers are serialized (a fjall batch has no conflict detection, so two appends must not
   read the same tip). The lock is granted in arrival order (tokio's mutex, taken on the
   blocking thread): with an unfair lock a removal re-took it for every batch and no append got

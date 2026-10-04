@@ -56,6 +56,8 @@ pub(crate) enum Operation {
     Insert,
     /// [`ArchiveStore::append`](crate::ArchiveStore::append).
     Append,
+    /// [`ArchiveStore::append_batch`](crate::ArchiveStore::append_batch).
+    AppendBatch,
     /// [`ArchiveStore::number_of`](crate::ArchiveStore::number_of).
     NumberOf,
     /// [`ArchiveStore::range`](crate::ArchiveStore::range).
@@ -74,6 +76,8 @@ pub(crate) enum Operation {
     Head,
     /// `block` of the unsafe store or the archive.
     Block,
+    /// [`ArchiveStore::part`](crate::ArchiveStore::part).
+    Part,
     /// [`CommittedStore::rollback_to`](crate::CommittedStore::rollback_to).
     RollbackTo,
     /// [`CommittedStore::l1_heads`](crate::CommittedStore::l1_heads).
@@ -102,6 +106,8 @@ impl Operation {
             Self::Migrate => "migrate",
             Self::Insert => "insert",
             Self::Append => "append",
+            Self::Part => "part",
+            Self::AppendBatch => "append_batch",
             Self::NumberOf => "number_of",
             Self::Range => "range",
             Self::TruncateAbove => "truncate_above",

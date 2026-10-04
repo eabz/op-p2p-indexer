@@ -106,6 +106,14 @@ fastrand = { version = "2", default-features = false, features = ["std"] }
 # Log output in the binary; `chrono` for the short UTC timestamps.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi", "chrono"] }
 
+# Importer (`bin/op-indexer-import`) only. Command line: flags with environment fallbacks and
+# generated help.
+clap = { version = "4", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context"] }
+# HTTPS client for the archive service; compressed responses keep the transfer small.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "gzip", "zstd"] }
+# Compression of the downloaded and verified chunks on disk (already in the tree).
+zstd = { version = "0.13", default-features = false }
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"

@@ -30,15 +30,17 @@ mod tables;
 use std::fmt;
 use std::path::Path;
 
-use alloy_primitives::{BlockHash, BlockNumber, keccak256};
+use alloy_consensus::Header;
+use alloy_primitives::{BlockHash, BlockNumber, Bytes, keccak256};
+use alloy_rlp::Decodable;
 use op_alloy_consensus::OpReceiptEnvelope;
-use op_indexer_primitives::{ArchivedBlock, BlockRef, DecodedBlock};
+use op_indexer_primitives::{ArchivedBlock, BlockRef, DecodedBlock, EncodedBlock, encode_receipts};
 use tracing::warn;
 
-use self::tables::{EncodedBlock, Failure, Tables};
+use self::tables::{Entry, Failure, Tables};
 use crate::metrics::{self, Operation};
 use crate::validate::{validate_block, validate_receipts};
-use crate::{ArchiveStore, InvalidBlockReason, StorageError, Store};
+use crate::{ArchiveStore, BlockPart, InvalidBlockReason, StorageError, Store};
 
 /// The block archive in one fjall database directory. Cheap to clone: clones share the open
 /// database.
@@ -122,7 +124,17 @@ impl ArchiveStore for FjallArchive {
         // The error goes into the timed call on purpose, so an invalid block is counted.
         let encoded = encode(block);
         self.blocking(Operation::Append, "append", move |tables| {
-            tables::append(tables, &encoded?)
+            tables::append_batch(tables, &[encoded?])
+        })
+        .await
+    }
+
+    /// Hashes, compresses and writes on a blocking thread. One batch holds at most 1024 blocks
+    /// or 16 MiB of RLP, and the writer lock is taken once per batch.
+    async fn append_batch(&self, blocks: Vec<EncodedBlock>) -> Result<(), StorageError> {
+        self.blocking(Operation::AppendBatch, "append_batch", move |tables| {
+            let entries: Vec<Entry> = blocks.into_iter().map(entry).collect::<Result<_, _>>()?;
+            tables::append_batch(tables, &entries)
         })
         .await
     }
@@ -146,6 +158,17 @@ impl ArchiveStore for FjallArchive {
     async fn block(&self, number: BlockNumber) -> Result<Option<ArchivedBlock>, StorageError> {
         self.blocking(Operation::Block, "block", move |tables| {
             tables::block(tables, number)
+        })
+        .await
+    }
+
+    async fn part(
+        &self,
+        number: BlockNumber,
+        part: BlockPart,
+    ) -> Result<Option<Bytes>, StorageError> {
+        self.blocking(Operation::Part, "part", move |tables| {
+            tables::part(tables, number, part)
         })
         .await
     }
@@ -178,7 +201,7 @@ impl ArchiveStore for FjallArchive {
 }
 
 /// Validates `block` and encodes it as RLP, checking that the header hashes to its hash.
-fn encode(block: &DecodedBlock) -> Result<EncodedBlock, StorageError> {
+fn encode(block: &DecodedBlock) -> Result<Entry, StorageError> {
     validate_block(block)?;
     let header = &block.block.header;
     let header_rlp = alloy_rlp::encode(header);
@@ -188,19 +211,48 @@ fn encode(block: &DecodedBlock) -> Result<EncodedBlock, StorageError> {
             reason: InvalidBlockReason::HeaderHash,
         });
     }
-    Ok(EncodedBlock {
-        number: header.number,
-        hash: block.hash,
+    Ok(Entry {
+        block: BlockRef {
+            number: header.number,
+            hash: block.hash,
+        },
         parent_hash: header.parent_hash,
-        header: header_rlp,
-        body: alloy_rlp::encode(&block.block.body),
+        header: header_rlp.into(),
+        body: alloy_rlp::encode(&block.block.body).into(),
         receipts: block.receipts.as_deref().map(encode_receipts),
     })
 }
 
-/// The RLP list of `receipts` in network encoding.
-fn encode_receipts(receipts: &[OpReceiptEnvelope]) -> Vec<u8> {
-    let mut out = Vec::new();
-    alloy_rlp::encode_list(receipts, &mut out);
-    out
+/// The archive entry of a block handed over in its original encoding: its bytes unchanged, with
+/// the number and parent hash read from the header, which must hash to the block's hash.
+fn entry(block: EncodedBlock) -> Result<Entry, StorageError> {
+    let EncodedBlock {
+        hash,
+        header,
+        body,
+        receipts,
+    } = block;
+    let decoded =
+        Header::decode(&mut header.as_ref()).map_err(|source| StorageError::InvalidData {
+            store: Store::Archive,
+            what: "header to append",
+            block: Some(hash),
+            source: Some(source.into()),
+        })?;
+    if keccak256(&header) != hash {
+        return Err(StorageError::InvalidBlock {
+            number: decoded.number,
+            reason: InvalidBlockReason::HeaderHash,
+        });
+    }
+    Ok(Entry {
+        block: BlockRef {
+            number: decoded.number,
+            hash,
+        },
+        parent_hash: decoded.parent_hash,
+        header,
+        body,
+        receipts,
+    })
 }

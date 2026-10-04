@@ -23,8 +23,14 @@ use op_indexer_primitives::{ArchivedBlock, BlockRef};
 use tokio::sync::{Mutex, MutexGuard};
 use tracing::debug;
 
-use crate::{InvalidBlockReason, ParseError, StorageError, Store, metrics};
+use crate::{BlockPart, InvalidBlockReason, ParseError, StorageError, Store, metrics};
 
+/// Most blocks written in one batch by an append of many blocks: with [`MAX_APPEND_BATCH_BYTES`]
+/// it bounds one journal record and how long other writers wait for the lock.
+const MAX_APPEND_BATCH_BLOCKS: usize = 1024;
+/// Most encoded bytes in one such batch (a single larger block still goes alone): an eighth of
+/// the journal limit, and one memtable.
+const MAX_APPEND_BATCH_BYTES: usize = 16 * 1024 * 1024;
 /// Block cache shared by the keyspaces. It holds the index and filter blocks of the trees and
 /// recently read data blocks; serving peers is not latency-critical, so it stays small and fixed
 /// (fjall's default is 32 MiB).
@@ -79,13 +85,12 @@ pub(super) struct Tables {
 
 /// A block encoded for the archive: RLP, not yet compressed.
 #[derive(Debug)]
-pub(super) struct EncodedBlock {
-    pub(super) number: BlockNumber,
-    pub(super) hash: BlockHash,
+pub(super) struct Entry {
+    pub(super) block: BlockRef,
     pub(super) parent_hash: BlockHash,
-    pub(super) header: Vec<u8>,
-    pub(super) body: Vec<u8>,
-    pub(super) receipts: Option<Vec<u8>>,
+    pub(super) header: Bytes,
+    pub(super) body: Bytes,
+    pub(super) receipts: Option<Bytes>,
 }
 
 /// Why a keyspace operation failed, before the operation's name is attached
@@ -124,6 +129,32 @@ impl Tables {
     /// every caller is on a blocking thread.
     fn lock(&self) -> MutexGuard<'_, ()> {
         self.writer.blocking_lock()
+    }
+}
+
+impl Entry {
+    /// Checks that this block is the child of `parent`.
+    fn extends(&self, parent: BlockRef) -> Result<(), StorageError> {
+        // The parent the block claims. Block 0 has none, so it never extends anything; its
+        // `got` is reported at number 0.
+        let number = self.block.number.checked_sub(1);
+        let got = BlockRef {
+            number: number.unwrap_or(0),
+            hash: self.parent_hash,
+        };
+        if number.is_none() || got != parent {
+            return Err(StorageError::NotContiguous {
+                expected: parent,
+                got,
+            });
+        }
+        Ok(())
+    }
+
+    /// The size of the RLP this block adds to a batch.
+    fn encoded_len(&self) -> usize {
+        let receipts = self.receipts.as_ref().map_or(0, |receipts| receipts.len());
+        self.header.len() + self.body.len() + receipts
     }
 }
 
@@ -201,43 +232,104 @@ pub(super) fn open(path: &Path) -> Result<(Tables, Option<Bytes>), Failure> {
     Ok((tables, emptied))
 }
 
-/// Appends `block` if it extends the held range; a no-op if it is already the tip.
-pub(super) fn append(tables: &Tables, block: &EncodedBlock) -> Result<(), Failure> {
-    let header = compress(&block.header, block.number)?;
-    let body = compress(&block.body, block.number)?;
-    let receipts = block
-        .receipts
-        .as_deref()
-        .map(|receipts| compress(receipts, block.number))
-        .transpose()?;
+/// Appends `blocks`, which must be consecutive, oldest first, and extend the held range (or the
+/// archive is empty). Leading blocks the archive holds, up to its tip, are skipped.
+///
+/// Everything is checked before the first write. The blocks are then written in chunks, one
+/// durable batch and one turn at the writer lock each, so a long list neither builds one huge
+/// journal record nor keeps other writers out for its whole length.
+pub(super) fn append_batch(tables: &Tables, blocks: &[Entry]) -> Result<(), Failure> {
+    for pair in blocks.windows(2) {
+        if let [parent, child] = pair {
+            child.extends(parent.block)?;
+        }
+    }
+    // Read without the lock: a writer getting in between shows as `NotContiguous` below.
+    let tip = end_ref(tables.headers.last_key_value())?;
+    let mut rest = match tip {
+        Some(tip) => above(blocks, tip)?,
+        None => blocks,
+    };
+    let appended = rest.len();
+    while !rest.is_empty() {
+        let (chunk, tail) = rest.split_at(chunk_len(rest));
+        append_chunk(tables, chunk)?;
+        rest = tail;
+    }
+    if appended > 0 {
+        metrics::blocks_inserted(Store::Archive, appended);
+        record_usage(tables);
+    }
+    Ok(())
+}
 
-    let writer = tables.lock();
-    if let Some(tip) = end_ref(tables.headers.last_key_value())? {
-        if tip.number == block.number && tip.hash == block.hash {
-            return Ok(());
-        }
-        // The parent the block claims. Block 0 has none, so it never extends a held range; its
-        // `got` is reported at number 0.
-        let parent = block.number.checked_sub(1);
-        let got = BlockRef {
-            number: parent.unwrap_or(0),
-            hash: block.parent_hash,
-        };
-        if parent.is_none() || got != tip {
-            return Err(StorageError::NotContiguous { expected: tip, got }.into());
-        }
+/// The blocks of `blocks` (consecutive) above `tip`: all of them if the first extends it, those
+/// after the tip if the tip is among them.
+fn above(blocks: &[Entry], tip: BlockRef) -> Result<&[Entry], StorageError> {
+    let Some(first) = blocks.first() else {
+        return Ok(blocks);
+    };
+    let held = tip
+        .number
+        .checked_sub(first.block.number)
+        .and_then(|offset| usize::try_from(offset).ok())
+        .and_then(|offset| Some((blocks.get(offset)?, blocks.get(offset.checked_add(1)?..)?)));
+    match held {
+        Some((at_tip, rest)) if at_tip.block == tip => Ok(rest),
+        Some((at_tip, _)) => Err(StorageError::NotContiguous {
+            expected: tip,
+            got: at_tip.block,
+        }),
+        None => first.extends(tip).map(|()| blocks),
     }
-    let key = block.number.to_be_bytes();
+}
+
+/// How many of `blocks` go into one batch: up to [`MAX_APPEND_BATCH_BLOCKS`], fewer when their
+/// encoded size passes [`MAX_APPEND_BATCH_BYTES`], and always at least one.
+fn chunk_len(blocks: &[Entry]) -> usize {
+    let mut bytes = 0_usize;
+    blocks
+        .iter()
+        .take(MAX_APPEND_BATCH_BLOCKS)
+        .take_while(|block| {
+            bytes = bytes.saturating_add(block.encoded_len());
+            bytes <= MAX_APPEND_BATCH_BYTES
+        })
+        .count()
+        .max(1)
+}
+
+/// Writes `chunk` (consecutive, not empty) in one durable batch if it extends the tip.
+fn append_chunk(tables: &Tables, chunk: &[Entry]) -> Result<(), Failure> {
+    // Compressed before the lock is taken.
+    let mut values = Vec::with_capacity(chunk.len());
+    for block in chunk {
+        let number = block.block.number;
+        let receipts = block.receipts.as_deref();
+        values.push((
+            compress(&block.header, number)?,
+            compress(&block.body, number)?,
+            receipts
+                .map(|receipts| compress(receipts, number))
+                .transpose()?,
+        ));
+    }
+
+    let _writer = tables.lock();
+    if let (Some(tip), Some(first)) = (end_ref(tables.headers.last_key_value())?, chunk.first()) {
+        first.extends(tip)?;
+    }
     let mut batch = tables.durable_batch();
-    batch.insert(&tables.headers, key, header);
-    batch.insert(&tables.bodies, key, body);
-    if let Some(receipts) = receipts {
-        batch.insert(&tables.receipts, key, receipts);
+    for (block, (header, body, receipts)) in chunk.iter().zip(values) {
+        let key = block.block.number.to_be_bytes();
+        batch.insert(&tables.headers, key, header);
+        batch.insert(&tables.bodies, key, body);
+        if let Some(receipts) = receipts {
+            batch.insert(&tables.receipts, key, receipts);
+        }
+        batch.insert(&tables.numbers, block.block.hash.0, key);
     }
-    batch.insert(&tables.numbers, block.hash.0, key);
     batch.commit()?;
-    drop(writer);
-    record_usage(tables);
     Ok(())
 }
 
@@ -302,6 +394,23 @@ pub(super) fn block(
         body: Bytes::from(decompress(&body, "body", Some(hash))?),
         receipts: receipts.map(Bytes::from),
     }))
+}
+
+/// One part of the archived block at `number`, decompressed; only its keyspace is read.
+pub(super) fn part(
+    tables: &Tables,
+    number: BlockNumber,
+    part: BlockPart,
+) -> Result<Option<Bytes>, Failure> {
+    let (keyspace, what) = match part {
+        BlockPart::Header => (&tables.headers, "header"),
+        BlockPart::Body => (&tables.bodies, "body"),
+        BlockPart::Receipts => (&tables.receipts, "receipts"),
+    };
+    let Some(value) = keyspace.get(number.to_be_bytes())? else {
+        return Ok(None);
+    };
+    Ok(Some(decompress(&value, what, None)?.into()))
 }
 
 /// The number of the archived block with `hash`.

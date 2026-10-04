@@ -12,12 +12,11 @@
 //! the failed conversion, which the [`InvalidBlockReason`] names.
 
 use alloy_consensus::Transaction;
-use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{Address, B256, BlockNumber, ChainId, U256};
 use clickhouse::Row;
 use clickhouse::types::UInt256;
 use op_alloy_consensus::{OpReceiptEnvelope, OpTxEnvelope};
-use op_indexer_primitives::{BlockRef, BlockSource, DecodedBlock};
+use op_indexer_primitives::{BlockRef, BlockSource, DecodedBlock, encode_transaction};
 use serde::ser::SerializeTuple;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_repr::{Deserialize_repr, Serialize_repr};
@@ -161,12 +160,14 @@ pub(super) struct StoredHead {
     hash: [u8; 32],
 }
 
-/// `blocks.source`: `Enum8('gossip' = 0, 'l1' = 1)`.
+/// `blocks.source`: `Enum8('gossip' = 0, 'l1' = 1, 'import' = 2, 'sync' = 3)`.
 #[derive(Debug, Serialize_repr)]
 #[repr(i8)]
 enum SourceColumn {
     Gossip = 0,
     L1 = 1,
+    Import = 2,
+    Sync = 3,
 }
 
 /// The block's columns repeated on each of its rows.
@@ -346,6 +347,8 @@ fn block_row(columns: &BlockColumns, block: &DecodedBlock) -> BlockRow {
         source: match block.source {
             BlockSource::Gossip => SourceColumn::Gossip,
             BlockSource::L1 => SourceColumn::L1,
+            BlockSource::Import => SourceColumn::Import,
+            BlockSource::Sync => SourceColumn::Sync,
         },
         has_receipts: block.receipts.is_some(),
         version_micros: columns.version_micros,
@@ -386,7 +389,11 @@ fn transaction_row(
         source_hash: None,
         mint: None,
         is_system_tx: None,
-        raw: tx.encoded_2718(),
+        raw: {
+            let mut raw = Vec::new();
+            encode_transaction(tx, &mut raw);
+            raw
+        },
         version_micros: block.version_micros,
     };
     match tx {

@@ -3,19 +3,22 @@
 //! Wires the components together: loads config and the node identity, checks that Redis and
 //! ClickHouse are reachable and their schemas current, opens the local block archive when it is
 //! enabled, and runs the p2p network next to the pipeline that stores the blocks it emits. When
-//! the execution network is enabled it runs too, and fetches the receipts the pipeline asks
-//! for. Shuts down cleanly on Ctrl-C or SIGTERM: the networks first, then the pipeline, which
+//! the execution network is enabled it runs too: it fetches the receipts the pipeline asks
+//! for and serves the archive's blocks to peers, and, when a range sync is configured,
+//! fetches that range from peers for the pipeline to store. Shuts down cleanly on Ctrl-C or SIGTERM: the networks first, then the pipeline, which
 //! stores what they had already delivered.
 
 mod config;
+mod provider;
 
 use std::sync::Arc;
 
+use alloy_primitives::BlockNumber;
 use eyre::WrapErr;
-use op_indexer_el::ExecutionNetwork;
+use op_indexer_el::{ElConfig, ExecutionNetwork, RangeSync};
 use op_indexer_p2p::{Network, NodeStore};
-use op_indexer_pipeline::{Pipeline, ReceiptsChannels};
-use op_indexer_primitives::{ExecutionPeer, L1Heads};
+use op_indexer_pipeline::{Pipeline, RangeChannels, ReceiptsChannels};
+use op_indexer_primitives::{BlockRef, ExecutionPeer, L1Heads, SyncRange};
 use op_indexer_storage::archive_store::FjallArchive;
 use op_indexer_storage::committed_store::ClickHouseStore;
 use op_indexer_storage::unsafe_store::RedisStore;
@@ -28,6 +31,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::time::ChronoUtc;
 
 use crate::config::Config;
+use crate::provider::ArchiveProvider;
 
 /// Unsafe blocks waiting for the pipeline. Blocks arrive every ~2s; this absorbs a store that
 /// is unreachable for several minutes before the network starts dropping them.
@@ -42,6 +46,11 @@ const VERIFIED_RECEIPTS_CAPACITY: usize = 64;
 /// Execution peers waiting to be saved. One is reported per dialed session, so a handful at a
 /// time; the execution network drops a report when this is full.
 const SERVED_PEERS_CAPACITY: usize = 32;
+/// Batches of a range sync waiting for the pipeline. A batch is up to 256 blocks, so this is
+/// kept small; the sync waits when it is full.
+const SYNC_BATCH_CAPACITY: usize = 2;
+/// Verified checkpoints of a range sync waiting to be saved; the sync waits when it is full.
+const SYNC_CHECKPOINT_CAPACITY: usize = 16;
 
 /// Directory of the node store (identity and known peers), inside the data directory.
 const NODE_DIR: &str = "node";
@@ -76,29 +85,23 @@ async fn main() -> eyre::Result<()> {
     // ignores gaps at or below it.
     let (safe_number_tx, safe_number_rx) = watch::channel(0);
 
-    // The execution network and the pipeline's ends of its two channels, when it is enabled.
-    let (execution, receipts, peer_saves) = match config.el {
-        Some(mut el) => {
-            // A key of its own: the two networks must not share a node id.
-            let key = store
-                .execution_key()
-                .wrap_err("failed to load the execution network key")?;
-            let (requests_tx, requests_rx) = mpsc::channel(RECEIPT_REQUEST_CAPACITY);
-            let (verified_tx, verified_rx) = mpsc::channel(VERIFIED_RECEIPTS_CAPACITY);
-            el.saved_peers = store
-                .execution_peers()
-                .wrap_err("failed to load the saved execution peers")?;
-            let (served_tx, served_rx) = mpsc::channel(SERVED_PEERS_CAPACITY);
-            let execution = ExecutionNetwork::new(el, key, requests_rx, verified_tx, served_tx)
-                .wrap_err("failed to create the execution network")?;
-            let peer_saves = tokio::spawn(save_execution_peers(Arc::clone(&store), served_rx));
-            let channels = ReceiptsChannels {
-                requests: requests_tx,
-                verified: verified_rx,
-            };
-            (Some(execution), Some(channels), Some(peer_saves))
-        }
-        None => (None, None, None),
+    let execution = match config.el {
+        Some(el) => Some(execution_network(
+            el,
+            config.sync,
+            &store,
+            stores.archive.as_ref().map(|(archive, _)| archive.clone()),
+        )?),
+        None => None,
+    };
+    let (execution, receipts, range, saves) = match execution {
+        Some(parts) => (
+            Some(parts.network),
+            Some(parts.receipts),
+            parts.range,
+            parts.saves,
+        ),
+        None => (None, None, None, Vec::new()),
     };
 
     let pipeline = Pipeline::new(
@@ -110,6 +113,10 @@ async fn main() -> eyre::Result<()> {
         safe_number_tx,
         receipts,
     );
+    let pipeline = match range {
+        Some(range) => pipeline.with_range(range),
+        None => pipeline,
+    };
     let network = Network::new(config.network, keypair, store, blocks_tx, safe_number_rx);
 
     // The networks stop first, on their own token, so the pipeline can still store what they
@@ -144,14 +151,14 @@ async fn main() -> eyre::Result<()> {
     networks_cancel.cancel();
     let network = join(network).await.wrap_err("network failed");
     let execution = join(execution).await.wrap_err("execution network failed");
-    // The execution network dropped its sender when it returned, so the saves end.
-    if let Some(peer_saves) = peer_saves
-        && let Err(err) = peer_saves.await
-    {
-        warn!(%err, "execution peer save task failed");
-    }
     cancel.cancel();
     let pipeline = join(pipeline).await.wrap_err("pipeline failed");
+    // Their senders are gone with the execution network and the pipeline, so they end.
+    for save in saves {
+        if let Err(err) = save.await {
+            warn!(%err, "a task saving node state failed");
+        }
+    }
     // The reason the process stopped comes first, then whatever failed while shutting down.
     stopped.and(network).and(execution).and(pipeline)
 }
@@ -181,6 +188,89 @@ where
     }
 }
 
+/// The execution network with everything that goes with it.
+struct Execution {
+    network: ExecutionNetwork<Option<ArchiveProvider>>,
+    /// The pipeline's ends of the receipts channels.
+    receipts: ReceiptsChannels,
+    /// The pipeline's ends of the range sync's channels, when a range is configured.
+    range: Option<RangeChannels>,
+    /// Tasks that save what the network reports to the node store.
+    saves: Vec<JoinHandle<()>>,
+}
+
+/// Builds the execution network from its configuration and what the node store has saved
+/// for it, with the range sync `sync` when one is configured. Peers are served from
+/// `archive`; without one the node serves nothing.
+fn execution_network(
+    mut el: ElConfig,
+    sync: Option<SyncRange>,
+    store: &Arc<NodeStore>,
+    archive: Option<FjallArchive>,
+) -> eyre::Result<Execution> {
+    // A key of its own: the two networks must not share a node id.
+    let key = store
+        .execution_key()
+        .wrap_err("failed to load the execution network key")?;
+    el.saved_peers = store
+        .execution_peers()
+        .wrap_err("failed to load the saved execution peers")?;
+    let (requests_tx, requests_rx) = mpsc::channel(RECEIPT_REQUEST_CAPACITY);
+    let (verified_tx, verified_rx) = mpsc::channel(VERIFIED_RECEIPTS_CAPACITY);
+    let (served_tx, served_rx) = mpsc::channel(SERVED_PEERS_CAPACITY);
+    let network = ExecutionNetwork::new(
+        el,
+        key,
+        requests_rx,
+        verified_tx,
+        served_tx,
+        archive.map(ArchiveProvider),
+    )
+    .wrap_err("failed to create the execution network")?;
+    let mut saves = vec![tokio::spawn(save_execution_peers(
+        Arc::clone(store),
+        served_rx,
+    ))];
+
+    let (network, range) = match sync {
+        Some(sync) => {
+            let state = store
+                .sync_state(&sync)
+                .wrap_err("failed to load the range sync's progress")?;
+            let (blocks_tx, batches) = mpsc::channel(SYNC_BATCH_CAPACITY);
+            let (checkpoints_tx, checkpoints_rx) = mpsc::channel(SYNC_CHECKPOINT_CAPACITY);
+            let (stored_tx, stored_rx) = watch::channel(None);
+            saves.push(tokio::spawn(save_sync_progress(
+                Arc::clone(store),
+                sync,
+                checkpoints_rx,
+                stored_rx,
+            )));
+            let network = network.with_sync(RangeSync {
+                range: sync,
+                state,
+                blocks: blocks_tx,
+                checkpoints: checkpoints_tx,
+            });
+            let range = RangeChannels {
+                batches,
+                stored: stored_tx,
+            };
+            (network, Some(range))
+        }
+        None => (network, None),
+    };
+    Ok(Execution {
+        network,
+        receipts: ReceiptsChannels {
+            requests: requests_tx,
+            verified: verified_rx,
+        },
+        range,
+        saves,
+    })
+}
+
 /// Saves the execution peers that served us, so the next run dials them first. Ends when the
 /// execution network drops its sender.
 async fn save_execution_peers(store: Arc<NodeStore>, mut served: mpsc::Receiver<ExecutionPeer>) {
@@ -190,6 +280,49 @@ async fn save_execution_peers(store: Arc<NodeStore>, mut served: mpsc::Receiver<
             Ok(Ok(())) => {}
             Ok(Err(err)) => warn!(%err, "failed to save execution peer"),
             Err(err) => warn!(%err, "execution peer save task failed"),
+        }
+    }
+}
+
+/// Saves the progress of the range sync `range`, so a restart resumes it: the checkpoints the
+/// execution network verifies, and how far the pipeline has stored the blocks. Ends when both
+/// have dropped their senders.
+async fn save_sync_progress(
+    store: Arc<NodeStore>,
+    range: SyncRange,
+    mut checkpoints: mpsc::Receiver<Vec<BlockRef>>,
+    mut stored: watch::Receiver<Option<BlockNumber>>,
+) {
+    let (mut fetching, mut storing) = (true, true);
+    while fetching || storing {
+        let save = tokio::select! {
+            verified = checkpoints.recv(), if fetching => {
+                let Some(verified) = verified else {
+                    fetching = false;
+                    continue;
+                };
+                let store = Arc::clone(&store);
+                tokio::task::spawn_blocking(move || store.save_sync_checkpoints(&verified))
+            }
+            changed = stored.changed(), if storing => {
+                if changed.is_err() {
+                    storing = false;
+                    continue;
+                }
+                let Some(stored_to) = *stored.borrow_and_update() else {
+                    continue;
+                };
+                if stored_to >= range.anchor.number {
+                    info!(from = range.from, to = stored_to, "range sync stored its whole range");
+                }
+                let store = Arc::clone(&store);
+                tokio::task::spawn_blocking(move || store.save_sync_stored(stored_to))
+            }
+        };
+        match save.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => warn!(%err, "failed to save range sync progress"),
+            Err(err) => warn!(%err, "range sync progress save task failed"),
         }
     }
 }
