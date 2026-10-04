@@ -17,8 +17,9 @@
 //!   reports with [`NetworkHandle::report_invalid`].
 //! - Everything is bounded: connections, the peer table, candidates, the size and the number
 //!   of chunks of a response, and the time a request may take.
-//! - Gossip messages are never forwarded: forwarding is for verified messages, and
-//!   verification is not this module's. They are handed over and reported as ignored.
+//! - A gossip message is handed to the light client and forwarded to the mesh only once the
+//!   light client reports it verified ([`NetworkHandle::report_gossip`]); one it has no room
+//!   for is not forwarded.
 //!
 //! Decodes no light-client container and verifies nothing: see `client` and `verify`. The
 //! fork digest is fixed at start: after a fork of the beacon chain the node has to restart.
@@ -45,7 +46,9 @@ use tokio::time::{Instant, MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 
-pub(super) use self::handle::{Gossip, NetworkHandle, Request, RequestError, Response, Topic};
+pub(super) use self::handle::{
+    Gossip, NetworkHandle, Request, RequestError, Response, Topic, Verdict,
+};
 
 use self::behaviour::{Asked, Behaviour, BehaviourEvent, RpcEvent};
 use self::handle::{COMMAND_CAPACITY, Command, Reply};
@@ -237,6 +240,14 @@ impl Network {
                         warn!(%peer, agent, "beacon peer sent data that does not verify");
                         self.drop_peer(peer, "its data did not verify");
                     }
+                    Some(Command::Gossip { id, peer, verdict }) => {
+                        let acceptance = match verdict {
+                            Verdict::Accept => MessageAcceptance::Accept,
+                            Verdict::Reject => MessageAcceptance::Reject,
+                            Verdict::Ignore => MessageAcceptance::Ignore,
+                        };
+                        self.judge_gossip(&id, &peer, acceptance);
+                    }
                     None => break,
                 },
                 Some(candidate) = found.recv() => {
@@ -393,7 +404,7 @@ impl Network {
                 propagation_source,
                 message_id,
                 message,
-            }) => self.on_gossip(propagation_source, &message_id, message),
+            }) => self.on_gossip(propagation_source, message_id, message),
             BehaviourEvent::Identify(_) | BehaviourEvent::Gossipsub(_) => {}
             BehaviourEvent::Limits(never) => match never {},
             BehaviourEvent::Status(event) => self.on_status(event),
@@ -569,26 +580,36 @@ impl Network {
         let _sent = pending.send(result);
     }
 
-    /// Hands a gossip message to the light client, if it has room, and tells gossipsub not
-    /// to forward it.
-    fn on_gossip(&mut self, peer: PeerId, id: &MessageId, message: gossipsub::Message) {
-        let behaviour = self.swarm.behaviour_mut();
-        let _known = behaviour.gossipsub.report_message_validation_result(
-            id,
-            &peer,
-            MessageAcceptance::Ignore,
-        );
+    /// Hands a gossip message to the light client, whose verdict decides whether it is
+    /// forwarded. Without room there, it is not.
+    fn on_gossip(&mut self, peer: PeerId, id: MessageId, message: gossipsub::Message) {
         let topic = if message.topic == self.finality_topic {
             Topic::Finality
         } else if message.topic == self.optimistic_topic {
             Topic::Optimistic
         } else {
+            self.judge_gossip(&id, &peer, MessageAcceptance::Ignore);
             return;
         };
         let data = Bytes::from(message.data);
-        if self.gossip.try_send(Gossip { peer, topic, data }).is_err() {
+        let gossip = Gossip {
+            id,
+            peer,
+            topic,
+            data,
+        };
+        if let Err(full) = self.gossip.try_send(gossip) {
             debug!(%peer, ?topic, "light-client gossip dropped: the light client is busy");
+            let id = full.into_inner().id;
+            self.judge_gossip(&id, &peer, MessageAcceptance::Ignore);
         }
+    }
+
+    /// Tells gossipsub what a message it holds back was found to be.
+    fn judge_gossip(&mut self, id: &MessageId, peer: &PeerId, acceptance: MessageAcceptance) {
+        let gossipsub = &mut self.swarm.behaviour_mut().gossipsub;
+        // Not in gossipsub's cache any more: the verdict came too late to forward it.
+        let _known = gossipsub.report_message_validation_result(id, peer, acceptance);
     }
 
     /// Counts a request the peer did not answer with data; drops the peer after a few in a

@@ -29,9 +29,9 @@ const ARCHIVE_DIR: &str = "archive";
 const ARCHIVE_RETENTION_VAR: &str = "OP_INDEXER_ARCHIVE_RETENTION_BLOCKS";
 const SYNC_VAR: &str = "OP_INDEXER_EL_SYNC";
 const L1_CHECKPOINT_VAR: &str = "OP_INDEXER_L1_CHECKPOINT";
-/// The usual beacon p2p port.
+/// Next to the usual beacon p2p port, 9000, which is also ClickHouse's native port.
 const DEFAULT_L1_BEACON_LISTEN_ADDR: SocketAddr =
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9000);
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9001);
 /// The port next to the execution network's.
 const DEFAULT_L1_LISTEN_ADDR: SocketAddr =
     SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 30304);
@@ -142,7 +142,8 @@ impl Config {
     /// - `OP_INDEXER_L1_LISTEN_ADDR`: L1 execution p2p listen socket, TCP and UDP (default
     ///   `0.0.0.0:30304`; it must differ from `OP_INDEXER_EL_LISTEN_ADDR`).
     /// - `OP_INDEXER_L1_BEACON_LISTEN_ADDR`: listen socket of the beacon light client, TCP
-    ///   and UDP (default `0.0.0.0:9000`; it must differ from the other listen addresses).
+    ///   and UDP (default `0.0.0.0:9001`; it must differ from the other listen addresses,
+    ///   and 9000 is ClickHouse's native port).
     /// - `OP_INDEXER_L1_ADVERTISED_ADDR`: public socket (IP and port, the same for TCP and
     ///   UDP) announced in the L1 node record, as `OP_INDEXER_EL_ADVERTISED_ADDR` is for the
     ///   execution network (default: unset, the address other peers observe). Worth setting

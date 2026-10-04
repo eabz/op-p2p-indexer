@@ -24,7 +24,8 @@ mod transaction;
 
 use std::fmt;
 use std::io;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy_consensus::Header;
 use alloy_primitives::B256;
@@ -38,6 +39,12 @@ use crate::chunk::{self, Link};
 use crate::progress::{self, Rate};
 use crate::rows::RowsError;
 use crate::state::{Anchor, Chunk, LOW_SPACE_BYTES, MIN_SPACE_BYTES, Plan, State, VerifiedRange};
+
+/// Threads reading chunk links per verify thread: the work is waiting for the disk to open
+/// files, not computing.
+const LINK_READERS_PER_THREAD: usize = 4;
+/// How often the linking pass looks whether its readers are done.
+const LINK_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Compressed size of the chunks verified at once, whatever the number of threads; one chunk
 /// is always allowed. A chunk takes about twenty times its compressed size while it is
@@ -227,11 +234,12 @@ pub(crate) async fn run(
     if let Some(failure) = failure {
         eyre::bail!("verification failed: {failure}");
     }
+    // A stopped run does not go on to link the range: that is the next run's work.
+    eyre::ensure!(
+        !cancel.is_cancelled(),
+        "verify was stopped before every chunk was verified: run `verify` again to continue"
+    );
     if let Some(from_block) = from_block {
-        eyre::ensure!(
-            !cancel.is_cancelled(),
-            "stopped before the chunks were verified"
-        );
         info!(
             from_block,
             "the chunks from that block on verify; the range is NOT accepted: run `verify` \
@@ -240,8 +248,8 @@ pub(crate) async fn run(
         return Ok(());
     }
 
-    let (state, plan) = (state.clone(), *plan);
-    tokio::task::spawn_blocking(move || accept(&state, &plan)).await?
+    let (state, plan, cancel) = (state.clone(), *plan, cancel.clone());
+    tokio::task::spawn_blocking(move || accept(&state, &plan, threads, &cancel)).await?
 }
 
 /// Logs what the run will do, and refuses it if the verified chunks clearly cannot fit on
@@ -415,8 +423,15 @@ impl fmt::Display for Linked {
 
 /// Links the verified chunks and checks the top against the anchor; if the whole range holds,
 /// records it as accepted, which `load` requires. Blocking.
-fn accept(state: &State, plan: &Plan) -> eyre::Result<()> {
-    let linked = link_chunks(state, plan)?;
+fn accept(
+    state: &State,
+    plan: &Plan,
+    threads: usize,
+    cancel: &CancellationToken,
+) -> eyre::Result<()> {
+    let Some(linked) = link_chunks(state, plan, threads, cancel)? else {
+        eyre::bail!("verify was stopped while linking the chunks: run `verify` again");
+    };
     let (None, true, Some(last_hash)) = (
         &linked.broken,
         linked.verified == linked.total,
@@ -444,10 +459,25 @@ fn accept(state: &State, plan: &Plan) -> eyre::Result<()> {
 }
 
 /// Checks that each verified chunk continues the one before and that the last block of the
-/// range matches the anchor. Reads two hashes per chunk. Blocking.
-fn link_chunks(state: &State, plan: &Plan) -> io::Result<Linked> {
-    let total = plan.chunks().count();
-    info!(chunks = total, "linking the verified chunks");
+/// range matches the anchor. Returns `None` if `cancel` fired before it was done. Blocking.
+///
+/// It reads the first 64 bytes of every chunk's file, on several threads: opening hundreds
+/// of thousands of files is what takes the time, and most of it is waiting for the disk. The
+/// chain itself is then checked in order, in memory.
+fn link_chunks(
+    state: &State,
+    plan: &Plan,
+    threads: usize,
+    cancel: &CancellationToken,
+) -> io::Result<Option<Linked>> {
+    let chunks: Vec<Chunk> = plan.chunks().collect();
+    let total = chunks.len();
+    let readers = threads.saturating_mul(LINK_READERS_PER_THREAD).max(1);
+    info!(chunks = total, readers, "linking the verified chunks");
+    let Some(links) = read_links(state, &chunks, readers, cancel)? else {
+        return Ok(None);
+    };
+
     let mut linked = Linked {
         verified: 0,
         total,
@@ -455,19 +485,11 @@ fn link_chunks(state: &State, plan: &Plan) -> io::Result<Linked> {
         last_hash: None,
     };
     let mut previous: Option<Link> = None;
-    let mut logged = Instant::now();
-    for (position, chunk) in plan.chunks().enumerate() {
-        if logged.elapsed() >= progress::INTERVAL {
-            info!(chunks = position, of = total, "linking");
-            logged = Instant::now();
-        }
-        let link = match chunk::read_link(&state.verified_path(chunk)) {
-            Ok(link) => link,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                previous = None;
-                continue;
-            }
-            Err(err) => return Err(err),
+    for (chunk, link) in chunks.iter().zip(links) {
+        // A chunk that is not verified yet.
+        let Some(link) = link else {
+            previous = None;
+            continue;
         };
         linked.verified = linked.verified.saturating_add(1);
         if let Some(previous) = previous
@@ -482,12 +504,71 @@ fn link_chunks(state: &State, plan: &Plan) -> io::Result<Linked> {
         if chunk.to > plan.last {
             linked.last_hash = Some(link.last_hash);
             if linked.broken.is_none() {
-                linked.broken = check_top(state, plan, chunk, link)?;
+                linked.broken = check_top(state, plan, *chunk, link)?;
             }
         }
         previous = Some(link);
     }
-    Ok(linked)
+    Ok(Some(linked))
+}
+
+/// Reads how each of `chunks` attaches to its neighbours, in the order of `chunks`, on
+/// `readers` threads; `None` for a chunk without a verified file. The outer `None` means
+/// `cancel` fired first.
+fn read_links(
+    state: &State,
+    chunks: &[Chunk],
+    readers: usize,
+    cancel: &CancellationToken,
+) -> io::Result<Option<Vec<Option<Link>>>> {
+    let done = AtomicUsize::new(0);
+    let share = chunks.len().div_ceil(readers).max(1);
+    let read = |part: &[Chunk]| -> io::Result<Vec<Option<Link>>> {
+        let mut links = Vec::with_capacity(part.len());
+        for chunk in part {
+            if cancel.is_cancelled() {
+                break;
+            }
+            links.push(match chunk::read_link(&state.verified_path(*chunk)) {
+                Ok(link) => Some(link),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+                Err(err) => return Err(err),
+            });
+            done.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(links)
+    };
+    let parts = std::thread::scope(|scope| {
+        let readers: Vec<_> = chunks
+            .chunks(share)
+            .map(|part| scope.spawn(|| read(part)))
+            .collect();
+        // This thread reports while the others read.
+        let mut logged = Instant::now();
+        while readers.iter().any(|reader| !reader.is_finished()) {
+            std::thread::park_timeout(LINK_POLL_INTERVAL);
+            if logged.elapsed() >= progress::INTERVAL {
+                info!(
+                    chunks = done.load(Ordering::Relaxed),
+                    of = chunks.len(),
+                    "linking"
+                );
+                logged = Instant::now();
+            }
+        }
+        readers
+            .into_iter()
+            .map(|reader| {
+                reader
+                    .join()
+                    .unwrap_or_else(|_panic| Err(io::Error::other("a link reader panicked")))
+            })
+            .collect::<io::Result<Vec<_>>>()
+    })?;
+    if cancel.is_cancelled() {
+        return Ok(None);
+    }
+    Ok(Some(parts.into_iter().flatten().collect()))
 }
 
 /// Checks the last block of the range, in the verified `chunk`, against the plan's anchor.

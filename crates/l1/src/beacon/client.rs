@@ -28,7 +28,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use super::BeaconError;
-use super::network::{Gossip, NetworkHandle, Request, RequestError, Topic};
+use super::network::{Gossip, NetworkHandle, Request, RequestError, Topic, Verdict};
 use super::rpc::{self, StatusData};
 use super::spec::{BeaconSpec, ForkDigest, SLOTS_PER_EPOCH, SLOTS_PER_PERIOD};
 use super::verify::{Accepted, Store, VerifyError};
@@ -128,18 +128,18 @@ impl Client {
         let mut tick = interval(TICK);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
-            let (peer, kind, payloads) = tokio::select! {
+            let (peer, kind, payloads, gossip) = tokio::select! {
                 biased;
                 () = cancel.cancelled() => return Ok(()),
                 gossip = self.gossip.recv() => {
-                    let Some(Gossip { peer, topic, data }) = gossip else {
+                    let Some(Gossip { id, peer, topic, data }) = gossip else {
                         return Ok(());
                     };
                     let kind = match topic {
                         Topic::Finality => Kind::Finality,
                         Topic::Optimistic => Kind::Optimistic,
                     };
-                    (peer, kind, vec![data])
+                    (peer, kind, vec![data], Some(id))
                 }
                 _ = tick.tick() => {
                     let Some((kind, request)) = self.due()? else {
@@ -151,13 +151,16 @@ impl Client {
                         answer = self.network.request(request) => answer,
                     };
                     match self.payloads(kind, answer) {
-                        Some((peer, payloads)) => (peer, kind, payloads),
+                        Some((peer, payloads)) => (peer, kind, payloads, None),
                         None => continue,
                     }
                 }
             };
             if self.store.is_none() && kind != Kind::Bootstrap {
                 // Gossip before the bootstrap: nothing to verify it with.
+                if let Some(id) = gossip {
+                    self.network.report_gossip(id, peer, Verdict::Ignore);
+                }
                 continue;
             }
             let (spec, checkpoint, store) = (self.spec, self.checkpoint, self.store.clone());
@@ -167,6 +170,21 @@ impl Client {
             });
             // Not cancelled: BLS over one update takes milliseconds.
             let result = verifying.await.map_err(BeaconError::Verification)?;
+            if let Some(id) = gossip {
+                // Forwarded to the mesh only if it verified and is news.
+                // News on the finality topic is a newer finalized block; on the optimistic
+                // topic, a newer head.
+                let news = |accepted: &Accepted| match kind {
+                    Kind::Finality => accepted.finalized.is_some(),
+                    Kind::Optimistic | Kind::Bootstrap | Kind::Updates => accepted.head.is_some(),
+                };
+                let verdict = match &result {
+                    Ok(verified) if news(&verified.accepted) => Verdict::Accept,
+                    Err(err) if err.is_peer_fault() => Verdict::Reject,
+                    Ok(_) | Err(_) => Verdict::Ignore,
+                };
+                self.network.report_gossip(id, peer, verdict);
+            }
             if !self.on_verified(peer, kind, result, &cancel).await {
                 return Ok(());
             }

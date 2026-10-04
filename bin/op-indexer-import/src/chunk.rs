@@ -124,14 +124,13 @@ pub(crate) fn read(path: &Path) -> io::Result<(Link, Vec<VerifiedBlock>)> {
 }
 
 fn read_link_from(file: &mut File) -> io::Result<Link> {
-    let mut hashes = [B256::ZERO; 2];
-    for hash in &mut hashes {
-        file.read_exact(hash.as_mut_slice())?;
-    }
-    let [first_parent, last_hash] = hashes;
+    // One read for both hashes.
+    let mut hashes = [0_u8; 64];
+    file.read_exact(&mut hashes)?;
+    let (first_parent, last_hash) = hashes.split_at(32);
     Ok(Link {
-        first_parent,
-        last_hash,
+        first_parent: B256::from_slice(first_parent),
+        last_hash: B256::from_slice(last_hash),
     })
 }
 

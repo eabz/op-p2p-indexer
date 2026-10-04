@@ -3,6 +3,7 @@
 
 use alloy_primitives::{B256, Bytes};
 use libp2p::PeerId;
+use libp2p::gossipsub::MessageId;
 use tokio::sync::{mpsc, oneshot};
 use tracing::debug;
 
@@ -17,7 +18,7 @@ pub(in crate::beacon) enum Request {
     /// The bootstrap of the block with this root.
     Bootstrap(B256),
     /// One update per sync-committee period, `count` of them from `start_period`; at most
-    /// [`rpc::MAX_UPDATES`] are asked for.
+    /// `rpc::MAX_UPDATES` are asked for.
     UpdatesByRange { start_period: u64, count: u64 },
     /// The newest finality update.
     FinalityUpdate,
@@ -62,7 +63,9 @@ pub(in crate::beacon) enum Topic {
 /// A gossip message, decompressed and otherwise as the peer sent it.
 #[derive(Debug)]
 pub(in crate::beacon) struct Gossip {
-    /// The peer that forwarded it, for [`NetworkHandle::report_invalid`].
+    /// What gossipsub knows the message by, for [`NetworkHandle::report_gossip`].
+    pub(in crate::beacon) id: MessageId,
+    /// The peer that forwarded it.
     pub(in crate::beacon) peer: PeerId,
     pub(in crate::beacon) topic: Topic,
     pub(in crate::beacon) data: Bytes,
@@ -71,8 +74,30 @@ pub(in crate::beacon) struct Gossip {
 /// What the swarm task is asked to do.
 #[derive(Debug)]
 pub(in crate::beacon) enum Command {
-    Request { request: Request, reply: Reply },
+    Request {
+        request: Request,
+        reply: Reply,
+    },
     Invalid(PeerId),
+    Gossip {
+        id: MessageId,
+        peer: PeerId,
+        verdict: Verdict,
+    },
+}
+
+/// What the light client found a gossip message to be ([gossip validation]).
+///
+/// [gossip validation]: https://github.com/ethereum/consensus-specs/blob/master/specs/altair/light-client/p2p-interface.md#the-gossip-domain-gossipsub
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::beacon) enum Verdict {
+    /// It verified and is newer than what was held: it is forwarded to the mesh.
+    Accept,
+    /// It does not verify, by the fault of who sent it: not forwarded, and it counts
+    /// against the peer.
+    Reject,
+    /// A duplicate, older than what is held, or not verifiable yet: not forwarded.
+    Ignore,
 }
 
 /// The light client's side of the network.
@@ -82,7 +107,7 @@ pub(in crate::beacon) struct NetworkHandle {
 }
 
 impl NetworkHandle {
-    /// Sends `request` to one peer and waits for its answer, at most [`REQUEST_TIMEOUT`].
+    /// Sends `request` to one peer and waits for its answer, at most `REQUEST_TIMEOUT`.
     ///
     /// Without a peer to ask, the request waits for one for the same time. A bootstrap is not
     /// asked of a peer that already answered one without data.
@@ -104,6 +129,14 @@ impl NetworkHandle {
             return Err(RequestError::NoPeer);
         }
         answer.await.unwrap_or(Err(RequestError::NoPeer))
+    }
+
+    /// Reports what a gossip message was found to be. Until then it is not forwarded.
+    pub(in crate::beacon) fn report_gossip(&self, id: MessageId, peer: PeerId, verdict: Verdict) {
+        let command = Command::Gossip { id, peer, verdict };
+        if self.commands.try_send(command).is_err() {
+            debug!(%peer, ?verdict, "verdict on a gossip message dropped");
+        }
     }
 
     /// Reports a peer whose data did not verify: it is disconnected and not dialed again.

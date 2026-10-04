@@ -11,7 +11,7 @@ use alloy_primitives::hex;
 use libp2p::connection_limits::{self, ConnectionLimits};
 use libp2p::gossipsub::{
     self, DataTransform, IdentTopic, MessageAuthenticity, MessageId, RawMessage, TopicHash,
-    ValidationMode,
+    ValidationMode, WhitelistSubscriptionFilter,
 };
 use libp2p::request_response::{self, ProtocolSupport};
 use libp2p::swarm::NetworkBehaviour;
@@ -40,6 +40,9 @@ const MESSAGE_DOMAIN_VALID_SNAPPY: [u8; 4] = [1, 0, 0, 0];
 /// Bytes of a message id.
 const MESSAGE_ID_LEN: usize = 20;
 
+/// Gossipsub with snappy-compressed data, tracking only the light-client topics.
+pub(super) type Gossipsub = gossipsub::Behaviour<Snappy, WhitelistSubscriptionFilter>;
+
 /// The request/response protocols a request goes out on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum Asked {
@@ -56,7 +59,7 @@ pub(super) enum Asked {
 pub(super) struct Behaviour {
     pub(super) limits: connection_limits::Behaviour,
     pub(super) identify: identify::Behaviour,
-    pub(super) gossipsub: gossipsub::Behaviour<Snappy>,
+    pub(super) gossipsub: Gossipsub,
     pub(super) status: request_response::Behaviour<Codec>,
     pub(super) ping: request_response::Behaviour<Codec>,
     pub(super) metadata_v2: request_response::Behaviour<Codec>,
@@ -69,7 +72,7 @@ pub(super) struct Behaviour {
 }
 
 impl Behaviour {
-    pub(super) fn new(key: &identity::Keypair, gossipsub: gossipsub::Behaviour<Snappy>) -> Self {
+    pub(super) fn new(key: &identity::Keypair, gossipsub: Gossipsub) -> Self {
         let protocol = |name: &'static str, support| {
             let config = request_response::Config::default().with_request_timeout(REQUEST_TIMEOUT);
             let protocols = [(StreamProtocol::new(name), support)];
@@ -157,9 +160,7 @@ fn message_id(message: &gossipsub::Message) -> MessageId {
 
 /// Builds gossipsub, subscribed to the two light-client topics of `digest`, and returns it
 /// with their hashes: the finality topic's, then the optimistic topic's.
-pub(super) fn gossip(
-    digest: ForkDigest,
-) -> Result<(gossipsub::Behaviour<Snappy>, TopicHash, TopicHash), BeaconError> {
+pub(super) fn gossip(digest: ForkDigest) -> Result<(Gossipsub, TopicHash, TopicHash), BeaconError> {
     let config = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(HEARTBEAT_INTERVAL)
         .max_transmit_size(MAX_GOSSIP_FRAME_BYTES)
@@ -170,18 +171,25 @@ pub(super) fn gossip(
         .message_id_fn(message_id)
         .build()
         .map_err(|err| BeaconError::Gossip(err.to_string()))?;
-    let mut behaviour =
-        gossipsub::Behaviour::new_with_transform(MessageAuthenticity::Anonymous, config, Snappy)
-            .map_err(|err| BeaconError::Gossip(err.to_owned()))?;
-    let mut subscribe = |name: &str| {
+    let topic = |name: &str| {
         let digest = hex::encode(digest);
-        let topic = IdentTopic::new(format!("/eth2/{digest}/{name}/ssz_snappy"));
-        behaviour
-            .subscribe(&topic)
-            .map_err(|err| BeaconError::Gossip(err.to_string()))?;
-        Ok::<_, BeaconError>(topic.hash())
+        IdentTopic::new(format!("/eth2/{digest}/{name}/ssz_snappy"))
     };
-    let finality = subscribe("light_client_finality_update")?;
-    let optimistic = subscribe("light_client_optimistic_update")?;
+    let topics = [
+        topic("light_client_finality_update"),
+        topic("light_client_optimistic_update"),
+    ];
+    let [finality, optimistic] = topics.each_ref().map(IdentTopic::hash);
+    // Peers subscribe to hundreds of topics; only ours are tracked.
+    let ours = WhitelistSubscriptionFilter([finality.clone(), optimistic.clone()].into());
+    let authenticity = MessageAuthenticity::Anonymous;
+    let mut behaviour =
+        Gossipsub::new_with_subscription_filter_and_transform(authenticity, config, ours, Snappy)
+            .map_err(|err| BeaconError::Gossip(err.to_owned()))?;
+    for topic in &topics {
+        behaviour
+            .subscribe(topic)
+            .map_err(|err| BeaconError::Gossip(err.to_string()))?;
+    }
     Ok((behaviour, finality, optimistic))
 }
