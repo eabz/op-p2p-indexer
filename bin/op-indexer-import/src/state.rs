@@ -4,6 +4,7 @@
 //! <state>/plan.json                   the range, its anchor and the chunk size
 //! <state>/verified.json               written by `verify` once the whole range is accepted
 //! <state>/raw/<from>-<to>.raw         downloaded chunk: the service's answers as they travelled
+//! <state>/raw/<from>-<to>.fill.json   fields the service left out, from the chain's RPC (`fill`)
 //! <state>/verified/<from>-<to>.blk    verified chunk: consensus encodings, see `chunk`
 //! <state>/lock                        held by the one process working on the directory
 //! ```
@@ -317,6 +318,13 @@ impl State {
     pub(crate) fn raw_path(&self, chunk: Chunk) -> PathBuf {
         self.raw
             .join(format!("{:012}-{:012}.raw", chunk.from, chunk.to))
+    }
+
+    /// File of what `download` fetched from the chain's RPC for a downloaded chunk: the
+    /// fields the service left out (see `fill`).
+    pub(crate) fn fill_path(&self, chunk: Chunk) -> PathBuf {
+        self.raw
+            .join(format!("{:012}-{:012}.fill.json", chunk.from, chunk.to))
     }
 
     /// File of the verified chunk.

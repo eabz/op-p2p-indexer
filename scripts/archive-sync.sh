@@ -49,7 +49,7 @@ target="$remote:$bucket/archive"
 marker="$remote:$bucket/archive.complete"
 # `lock` is fjall's own lock file; it is recreated on open and must not travel.
 flags=(--exclude /lock --transfers "$transfers" --checkers "$transfers" --fast-list
-  --s3-no-check-bucket --stats 10s --stats-one-line)
+  --s3-no-check-bucket --stats 10s --stats-one-line --stats-log-level NOTICE)
 
 # Refuses to touch an archive another process has open.
 ensure_closed() {

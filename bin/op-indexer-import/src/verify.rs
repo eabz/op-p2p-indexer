@@ -18,6 +18,7 @@
 //! Bedrock) has no signer and gets the zero address. They are counted.
 
 mod block;
+mod fields;
 mod lists;
 mod receipt;
 mod transaction;
@@ -30,11 +31,13 @@ use std::{fs, io};
 use alloy_consensus::Header;
 use alloy_primitives::B256;
 use alloy_rlp::Decodable;
+use op_indexer_chainspec::ChainSpec;
 use tokio::task::JoinSet;
 use tokio::time::{MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
+pub(crate) use self::fields::{Missing, missing};
 use crate::chunk::{self, ChunkFile, Link};
 use crate::progress::{self, Rate};
 use crate::rows::RowsError;
@@ -62,6 +65,11 @@ enum Check {
     UnsupportedType { index: u64, kind: u8 },
     #[error("transaction {index} lacks the field `{field}`")]
     MissingField { index: u64, field: &'static str },
+    #[error(
+        "transaction {index} lacks the field `{field}`, which the archive service left out: run \
+         `download`, which fetches it from the chain's RPC endpoint"
+    )]
+    Unfilled { index: u64, field: &'static str },
     #[error("transaction {index}: the field `{field}` is not in the expected form: {reason}")]
     Field {
         index: u64,
@@ -88,6 +96,8 @@ enum Check {
 enum ChunkError {
     #[error("failed to write the verified chunk: {0}")]
     Io(io::Error),
+    #[error("failed to read the chunk's fill: {0}")]
+    Fill(io::Error),
     #[error("blocks {from}..{to}: {source}")]
     Rows {
         from: u64,
@@ -101,7 +111,7 @@ enum ChunkError {
 /// The fork activations of an OP Stack chain that change an encoding rebuilt here: Bedrock by
 /// block number, the others in Unix seconds.
 #[derive(Debug, Clone, Copy)]
-struct Forks {
+pub(crate) struct Forks {
     /// Bedrock: the first block in the current format. Before it a header's `mix_hash` is
     /// zero, so a row without it can be rebuilt.
     bedrock_block: u64,
@@ -109,8 +119,22 @@ struct Forks {
     regolith: u64,
     /// Canyon: the deposit nonce and receipt version become part of the hashed receipt.
     canyon: u64,
+    /// Ecotone: the header carries the blob gas fields and the parent beacon block root.
+    ecotone: u64,
     /// Isthmus: the header carries the hash of an empty requests list.
     isthmus: u64,
+}
+
+impl Forks {
+    pub(crate) const fn new(chain: &ChainSpec) -> Self {
+        Self {
+            bedrock_block: chain.bedrock_block,
+            regolith: chain.regolith_time,
+            canyon: chain.canyon_time,
+            ecotone: chain.ecotone_time,
+            isthmus: chain.isthmus_time,
+        }
+    }
 }
 
 /// What verified chunks held.
@@ -123,6 +147,9 @@ struct Stats {
     /// Pre-Bedrock blocks whose row lacked `mix_hash`, rebuilt with zero and proven by the
     /// header hash.
     rebuilt_header_fields: u64,
+    /// Transactions with a field the service left out, taken from the chunk's fill (the
+    /// chain's RPC) and proven by the header hash.
+    rpc_filled_transactions: u64,
     /// Size of the verified chunk files written.
     disk_bytes: u64,
 }
@@ -170,12 +197,7 @@ pub(crate) async fn run(
         tokio::task::spawn_blocking(move || todo(&state, &plan, from_block)).await??
     };
     announce(&todo, threads, from_block)?;
-    let forks = Forks {
-        bedrock_block: plan.chain.bedrock_block,
-        regolith: plan.chain.regolith_time,
-        canyon: plan.chain.canyon_time,
-        isthmus: plan.chain.isthmus_time,
-    };
+    let forks = Forks::new(plan.chain);
 
     let mut progress = Progress::new(&todo);
     let mut queue = todo.chunks.into_iter().peekable();
@@ -385,6 +407,10 @@ impl Progress {
             .done
             .rebuilt_header_fields
             .saturating_add(chunk.rebuilt_header_fields);
+        self.done.rpc_filled_transactions = self
+            .done
+            .rpc_filled_transactions
+            .saturating_add(chunk.rpc_filled_transactions);
         self.done.disk_bytes = self.done.disk_bytes.saturating_add(chunk.disk_bytes);
     }
 
@@ -424,6 +450,7 @@ impl Progress {
             transactions = self.done.transactions,
             zero_signature_transactions = self.done.zero_signatures,
             rebuilt_header_fields = self.done.rebuilt_header_fields,
+            rpc_filled_transactions = self.done.rpc_filled_transactions,
             disk_bytes = self.done.disk_bytes,
             blocks_per_sec = self.done.blocks / secs,
             secs,

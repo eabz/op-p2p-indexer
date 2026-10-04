@@ -8,6 +8,7 @@ use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::Path;
 
+use alloy_eips::eip7702::SignedAuthorization;
 use alloy_primitives::{Address, B64, B256, Bytes, U64, U128, U256};
 use flate2::bufread::MultiGzDecoder;
 use serde::Deserialize;
@@ -94,6 +95,10 @@ pub(crate) struct TransactionRow {
     pub(crate) access_list: Option<Bytes>,
     /// The EIP-7702 authorizations, as the access list.
     pub(crate) authorization_list: Option<Bytes>,
+    /// The EIP-7702 authorizations from the chunk's fill (`fill`), for a row the service sent
+    /// without them; not in the service's answer.
+    #[serde(skip)]
+    pub(crate) filled_authorization_list: Option<Vec<SignedAuthorization>>,
     /// Deposit transactions: the hash that identifies the deposit's origin.
     pub(crate) source_hash: Option<B256>,
     /// Deposit transactions: ETH minted on L2.

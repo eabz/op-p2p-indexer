@@ -6,7 +6,8 @@
 //!
 //! - Legacy, EIP-2930, EIP-1559 and EIP-7702 transactions are built from their fields and
 //!   signature; the access list and the authorization list come in the service's own binary
-//!   form (`lists`).
+//!   form (`lists`). An authorization list the service left out comes from the chunk's fill
+//!   (`fill`, fetched from the chain's RPC), on the row.
 //! - A legacy transaction signed with all zeros (an L1-to-L2 message of OP Mainnet's client
 //!   before Bedrock) is encoded with those zeros; it has no signer.
 //! - A deposit (type `0x7E`) is built from the source hash and mint the service reports. Its
@@ -120,9 +121,25 @@ impl Fields<'_> {
         )
     }
 
+    /// The authorization list: the service's, else the chunk's fill. EIP-7702 refuses an
+    /// empty list, so a row with neither is one the service left out.
     fn authorization_list(&self) -> Result<Vec<SignedAuthorization>, Check> {
-        let list = self.row.authorization_list.as_ref();
-        self.list("authorization_list", list, lists::authorization_list)
+        const FIELD: &str = "authorization_list";
+        if let Some(filled) = &self.row.filled_authorization_list {
+            return Ok(filled.clone());
+        }
+        let list = self.list(
+            FIELD,
+            self.row.authorization_list.as_ref(),
+            lists::authorization_list,
+        )?;
+        if list.is_empty() {
+            return Err(Check::Unfilled {
+                index: self.index,
+                field: FIELD,
+            });
+        }
+        Ok(list)
     }
 
     /// Decodes a list field the service gives as the bytes of its binary column; absent or
