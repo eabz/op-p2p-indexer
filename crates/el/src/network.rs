@@ -190,14 +190,13 @@ impl PeerNetwork {
         let ctx = Arc::new(SessionContext::new(
             key,
             spec,
-            config.listen_addr.port(),
+            // Hello names the port peers reach us on, which is the advertised one when set.
+            config
+                .advertised_addr
+                .map_or(config.listen_addr.port(), |addr| addr.port()),
             serving,
             head,
         ));
-        // Saved peers are known indexers before discovery finds them again.
-        for peer in config.saved_peers.iter().filter(|peer| peer.indexer) {
-            ctx.mark_indexer(peer.id);
-        }
         let (peers, reports, published) = Peers::new();
         let network = Self {
             config,

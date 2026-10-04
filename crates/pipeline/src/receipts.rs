@@ -12,7 +12,7 @@ use std::ops::ControlFlow;
 use std::time::Duration;
 
 use alloy_consensus::Header;
-
+use alloy_primitives::BlockNumber;
 use op_indexer_primitives::{
     ArchivedBlock, BlockRef, DecodedBlock, ReadLimits, ReceiptsRequest, VerifiedReceipts,
 };
@@ -86,7 +86,10 @@ pub(crate) async fn run<U: UnsafeStore, A: ArchiveStore>(
     {
         return Ok(());
     }
-    let Some(pending) = request_archived(&archive, &requests, &cancel).await? else {
+    // Where the next round of archived blocks starts: after the last one asked for.
+    let mut next_archived = 0;
+    let Some(pending) = request_archived(&archive, &requests, &mut next_archived, &cancel).await?
+    else {
         return Ok(());
     };
     info!(pending, "archived blocks without receipts at startup");
@@ -100,7 +103,8 @@ pub(crate) async fn run<U: UnsafeStore, A: ArchiveStore>(
             biased;
             () = cancel.cancelled() => return Ok(()),
             _ = archived.tick() => {
-                if request_archived(&archive, &requests, &cancel).await?.is_none() {
+                let round = request_archived(&archive, &requests, &mut next_archived, &cancel);
+                if round.await?.is_none() {
                     return Ok(());
                 }
             }
@@ -153,13 +157,16 @@ async fn request_missing<U: UnsafeStore>(
     Ok(ControlFlow::Continue(()))
 }
 
-/// Asks for the receipts of the oldest archived blocks without them, at most
-/// [`ARCHIVE_RECEIPTS_PER_ROUND`], stopping when the fetcher takes no more. The request is
-/// built from the archived header, which the answer is verified against. Returns how many
-/// archived blocks are without receipts, or `None` when cancellation ended a read.
+/// Asks for the receipts of archived blocks without them from `next` up (wrapping round to the
+/// lowest), at most [`ARCHIVE_RECEIPTS_PER_ROUND`], stopping when the fetcher takes no more,
+/// and moves `next` past the last one asked for: blocks whose receipts no peer serves do not
+/// hold back the others. The request is built from the archived header, which the answer is
+/// verified against. Returns how many archived blocks are without receipts, or `None` when
+/// cancellation ended a read.
 async fn request_archived<A: ArchiveStore>(
     archive: &A,
     requests: &mpsc::Sender<ReceiptsRequest>,
+    next: &mut BlockNumber,
     cancel: &CancellationToken,
 ) -> Result<Option<u64>, PipelineError> {
     const PENDING: &str = "archive pending_receipts";
@@ -170,13 +177,14 @@ async fn request_archived<A: ArchiveStore>(
         lowest: 0,
     };
     let pending = retry(cancel, Store::Archive, PENDING, || {
-        archive.pending_receipts(ARCHIVE_RECEIPTS_PER_ROUND)
+        archive.pending_receipts(*next, ARCHIVE_RECEIPTS_PER_ROUND)
     });
     let Some((blocks, total)) = settle(pending.await, PENDING)? else {
         return Ok(None);
     };
     metrics::archive_pending_receipts(total);
     for block in blocks {
+        *next = block.number.saturating_add(1);
         let read = retry(cancel, Store::Archive, BLOCKS, || {
             archive.blocks(block.number, one)
         });
@@ -203,6 +211,8 @@ async fn request_archived<A: ArchiveStore>(
             transaction_count: senders.len(),
         };
         if !send(requests, request) {
+            // Not asked for: the next round starts with it.
+            *next = block.number;
             break;
         }
     }
@@ -241,7 +251,7 @@ async fn attach<U: UnsafeStore, A: ArchiveStore>(
         return Ok(ControlFlow::Break(()));
     };
     if !held {
-        // Pruned, expired or trimmed in the meantime.
+        // Pruned or expired in the meantime.
         debug!(number = block.number, hash = %block.hash, "dropped receipts for an unknown block");
         metrics::receipts_unmatched(UnmatchedReason::UnknownBlock);
     }

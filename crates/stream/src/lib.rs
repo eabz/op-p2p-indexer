@@ -18,6 +18,7 @@ mod convert;
 mod flight;
 mod follower;
 mod service;
+mod sink;
 mod source;
 mod subscription;
 
@@ -35,6 +36,17 @@ use crate::flight::Flight;
 use crate::follower::{Follower, Live};
 use crate::service::Service;
 use crate::source::Source;
+
+/// How long open connections and tasks get to end after shutdown begins.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+/// How often an idle connection is pinged, and how long the answer may take.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// The largest message the server sends: a decoded block of a full OP Stack block fits.
+/// Clients must accept messages this large (gRPC clients default to 4 MiB).
+const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+/// `GetHeads` and `GetBlock` calls served at once; one more is refused.
+const MAX_LOOKUPS: usize = 16;
 
 /// The generated protobuf messages and service of package `opindexer.v1`.
 #[expect(
@@ -106,7 +118,9 @@ where
         }
     }
 
-    /// Serves until `cancel` fires, then ends every subscription and waits for them.
+    /// Serves until `cancel` fires, then ends every subscription and Flight stream (each with
+    /// `UNAVAILABLE`) and waits for them and for open connections, at most a few seconds
+    /// each.
     ///
     /// # Errors
     ///
@@ -127,18 +141,21 @@ where
             source: source.clone(),
             live: Arc::clone(&live),
             retry_after: config.block_time,
+            receipts: config.receipts,
         };
         let tasks = TaskTracker::new();
         tasks.spawn(follower.run(cancel.child_token()));
+        let permits = |limit: usize| Arc::new(Semaphore::new(limit.min(Semaphore::MAX_PERMITS)));
         let flight = Flight {
             source: source.clone(),
-            streams: Arc::new(Semaphore::new(config.max_flights)),
+            streams: permits(config.max_flights),
             tasks: tasks.clone(),
         };
         let service = Service {
             source,
             live,
-            subscriptions: Arc::new(Semaphore::new(config.max_subscriptions)),
+            subscriptions: permits(config.max_subscriptions),
+            lookups: permits(MAX_LOOKUPS),
             tasks: tasks.clone(),
             cancel: cancel.clone(),
             receipts: config.receipts,
@@ -150,15 +167,35 @@ where
             max_flights = config.max_flights,
             "stream server listening"
         );
-        let served = tonic::transport::Server::builder()
-            .add_service(proto::stream_server::StreamServer::new(service))
-            .add_service(arrow_flight::flight_service_server::FlightServiceServer::new(flight))
-            .serve_with_shutdown(addr, cancel.cancelled())
-            .await;
-        // Subscriptions and the follower end on the same token.
+        let stream = proto::stream_server::StreamServer::new(service)
+            .max_encoding_message_size(MAX_MESSAGE_BYTES);
+        let flight = arrow_flight::flight_service_server::FlightServiceServer::new(flight);
+        let serving = tonic::transport::Server::builder()
+            // Finds connections whose peer is gone without closing them.
+            .http2_keepalive_interval(Some(KEEPALIVE_INTERVAL))
+            .http2_keepalive_timeout(Some(KEEPALIVE_TIMEOUT))
+            .add_service(stream)
+            .add_service(flight)
+            .serve_with_shutdown(addr, cancel.cancelled());
+        // A graceful stop waits for open connections, and a consumer that stops reading would
+        // hold it forever: after the grace period the server stops waiting, and connections
+        // still open end with the process.
+        let served = tokio::select! {
+            served = serving => served,
+            () = async {
+                cancel.cancelled().await;
+                tokio::time::sleep(SHUTDOWN_GRACE).await;
+            } => Ok(()),
+        };
+        // Subscriptions, Flight streams and the follower end on the same token.
         cancel.cancel();
         tasks.close();
-        tasks.wait().await;
+        if tokio::time::timeout(SHUTDOWN_GRACE, tasks.wait())
+            .await
+            .is_err()
+        {
+            tracing::warn!("stream tasks still running after the grace period; leaving them");
+        }
         served.map_err(|source| StreamError::Serve { addr, source })
     }
 }

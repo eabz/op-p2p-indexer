@@ -38,7 +38,7 @@ use std::fmt;
 
 use alloy_primitives::BlockNumber;
 use op_indexer_primitives::{BlockRef, EncodedBlock, L1Games, L1Heads, UnsafeBlock};
-use op_indexer_storage::{ArchiveRetention, ArchiveStore, UnsafeStore};
+use op_indexer_storage::{ArchiveStore, UnsafeStore};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -73,6 +73,18 @@ enum Task {
     Commit,
 }
 
+impl Task {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Ingest => "ingest",
+            Self::Promote => "promotion",
+            Self::Receipts => "receipts",
+            Self::Range => "range",
+            Self::Commit => "commit",
+        }
+    }
+}
+
 impl<U, A> Pipeline<U, A>
 where
     U: UnsafeStore + Clone + Send + Sync + 'static,
@@ -80,7 +92,8 @@ where
 {
     /// Creates a pipeline over the two stores.
     ///
-    /// - `archive` is the local block archive, the committed store, with how much it keeps.
+    /// - `archive` is the local block archive, the committed store.
+    /// - `canyon_time` is the chain's Canyon time, for the receipts roots promotion checks.
     /// - `blocks` are the gossiped blocks; the pipeline stops when the channel closes.
     /// - `l1_heads` are the safe and finalized heads; each change starts a promotion.
     /// - `safe_number` receives the number of the safe head once its blocks are committed.
@@ -88,17 +101,17 @@ where
     ///   does: then no receipts are asked for and blocks stay without them.
     pub fn new(
         unsafe_store: U,
-        archive: (A, ArchiveRetention),
+        archive: A,
+        canyon_time: u64,
         blocks: mpsc::Receiver<UnsafeBlock>,
         l1_heads: watch::Receiver<L1Heads>,
         safe_number: watch::Sender<BlockNumber>,
         receipts: Option<ReceiptsChannels>,
     ) -> Self {
-        let (archive, retention) = archive;
         let promoter = Promoter::new(
             unsafe_store.clone(),
             archive.clone(),
-            retention,
+            canyon_time,
             l1_heads,
             safe_number,
         );
@@ -144,9 +157,9 @@ where
     /// order, each batch consecutive, appended to the archive with their recovered senders.
     /// The range task ends when the channel closes.
     ///
-    /// The archive must be empty or end at the block before the first batch, and keep every
-    /// block: it holds one contiguous range, which the range task extends. A batch the archive
-    /// refuses stops the pipeline with the error.
+    /// The archive holds one contiguous range, which the range task extends: blocks it already
+    /// holds are left out, and a batch that does not extend it is skipped with a warning. A
+    /// batch that extends it but cannot be stored stops the pipeline with the error.
     #[must_use]
     pub fn with_range(mut self, batches: mpsc::Receiver<Vec<EncodedBlock>>) -> Self {
         self.range = Some(batches);
@@ -160,11 +173,19 @@ where
     /// idempotent, so one cut short is repeated on the next start. Ingest also stores the
     /// blocks already in the channel. If one task fails, the others are stopped.
     ///
+    /// `shutdown` fires when the node starts stopping, before `cancel`: from then promotion,
+    /// the commit task and the range task may end as their inputs close. Before it, one of
+    /// them ending stops the pipeline with [`PipelineError::Ended`].
+    ///
     /// # Errors
     ///
     /// Returns the first [`PipelineError`] of any task: a store failed in a way retrying
-    /// cannot fix, or a task panicked.
-    pub async fn run(mut self, cancel: CancellationToken) -> Result<(), PipelineError> {
+    /// cannot fix, a task panicked, or one ended before `shutdown`.
+    pub async fn run(
+        mut self,
+        shutdown: CancellationToken,
+        cancel: CancellationToken,
+    ) -> Result<(), PipelineError> {
         metrics::describe();
         self.promoter.reconcile(&cancel).await?;
 
@@ -211,10 +232,16 @@ where
             match joined {
                 // Ingest ends when the network does; the others have nothing left to follow.
                 Ok((Task::Ingest, Ok(()))) => stop.cancel(),
-                // Promotion ends alone only when nothing sends L1 heads any more, the receipts
-                // task when the fetcher has stopped, and the range task when its range is
-                // done or cannot be stored; ingest carries on without them.
-                Ok((Task::Promote | Task::Receipts | Task::Range | Task::Commit, Ok(()))) => {}
+                // The receipts task ends when the fetcher has stopped; ingest carries on.
+                Ok((Task::Receipts, Ok(()))) => {}
+                // Promotion, the commit and the range task follow inputs that close only when
+                // the node stops: ending earlier leaves the archive silently behind.
+                Ok((task @ (Task::Promote | Task::Range | Task::Commit), Ok(()))) => {
+                    if !shutdown.is_cancelled() && !stop.is_cancelled() {
+                        stop.cancel();
+                        first_error.get_or_insert(PipelineError::Ended(task.name()));
+                    }
+                }
                 Ok((_, Err(err))) => {
                     stop.cancel();
                     first_error.get_or_insert(err);

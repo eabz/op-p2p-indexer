@@ -74,7 +74,13 @@ pub(crate) enum BlockError {
     #[error("payload is not valid SSZ: {0:?}")]
     InvalidPayload(ssz::DecodeError),
     #[error("block {number} is {age_secs}s old")]
-    Stale { number: BlockNumber, age_secs: u64 },
+    Stale {
+        number: BlockNumber,
+        age_secs: u64,
+        /// Whether the sequencer signed it. If so the likelier cause is a local clock running
+        /// ahead (or a replay, which the seen-message cache mostly absorbs).
+        signed_by_sequencer: bool,
+    },
     #[error("block {number} is {ahead_secs}s in the future")]
     TooFarInFuture {
         number: BlockNumber,
@@ -138,8 +144,14 @@ impl BlockError {
         match self {
             Self::TooShort { .. }
             | Self::InvalidPayload(_)
-            | Self::Stale { .. }
-            | Self::TooFarInFuture { .. }
+            | Self::Stale {
+                signed_by_sequencer: false,
+                ..
+            }
+            | Self::TooFarInFuture {
+                signed_by_sequencer: false,
+                ..
+            }
             | Self::InvalidRecoveryId { .. }
             | Self::MalformedSignature { .. }
             | Self::WrongSigner { .. }
@@ -147,8 +159,26 @@ impl BlockError {
             | Self::HashMismatch { .. }
             | Self::ForkRule { .. }
             | Self::TooManyAtHeight { .. } => MessageAcceptance::Reject,
-            Self::UndecodableTransaction { .. } => MessageAcceptance::Ignore,
+            // A block the sequencer signed, outside our time window: the spec (and op-node)
+            // reject it, but it points at our clock, not the peer. op-node scores no topic, so
+            // its rejection costs a peer nothing; ours would graylist every honest peer while
+            // our clock is off. So it is ignored.
+            Self::Stale {
+                signed_by_sequencer: true,
+                ..
+            }
+            | Self::TooFarInFuture {
+                signed_by_sequencer: true,
+                ..
+            }
+            | Self::UndecodableTransaction { .. } => MessageAcceptance::Ignore,
         }
+    }
+
+    /// Whether the message failed the timestamp window, which says as much about our clock as
+    /// about the peer: never a reason to ban.
+    pub(crate) const fn is_time_window(&self) -> bool {
+        matches!(self, Self::Stale { .. } | Self::TooFarInFuture { .. })
     }
 
     /// Seconds the local clock appears to lag: set when the sequencer signed a block dated too
@@ -196,8 +226,9 @@ impl BlockValidator {
     ///
     /// Checks run cheapest first: length, SSZ decoding, timestamp window, the sequencer signature,
     /// then the block hash. The hash check rebuilds the header (including the transactions root),
-    /// so it only runs for messages the sequencer signed. A block dated in the future also has
-    /// its signature checked, only to report whether the sequencer signed it. `now_secs` is
+    /// so it only runs for messages the sequencer signed. A block outside the time window also
+    /// has its signature checked, only to report whether the sequencer signed it (then our
+    /// clock is the likelier fault, and the message is ignored, not rejected). `now_secs` is
     /// the current Unix time. CPU-bound: run off the async runtime.
     ///
     /// Last, the transactions are decoded, so the block is emitted ready to use.
@@ -228,7 +259,14 @@ impl BlockValidator {
 
         let age_secs = now_secs.saturating_sub(timestamp);
         if age_secs > MAX_AGE_SECS {
-            return Err(BlockError::Stale { number, age_secs });
+            let signed_by_sequencer = self
+                .verify_signature(number, &signature_bytes, &signed)
+                .is_ok();
+            return Err(BlockError::Stale {
+                number,
+                age_secs,
+                signed_by_sequencer,
+            });
         }
         let ahead_secs = timestamp.saturating_sub(now_secs);
         if ahead_secs > MAX_FUTURE_SECS {

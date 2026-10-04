@@ -142,15 +142,18 @@ pub(crate) async fn run(
     let missing = {
         let (state, plan) = (state.clone(), *plan);
         tokio::task::spawn_blocking(move || {
-            plan.chunks()
+            let mut missing = Vec::new();
+            for chunk in plan.chunks() {
                 // A chunk already verified needs no download, even if `raw/` was deleted.
-                .filter(|chunk| {
-                    !state.raw_path(*chunk).exists()
-                        && chunk::check(&state.verified_path(*chunk)) != ChunkFile::Present
-                })
-                .collect::<Vec<_>>()
+                if !state.raw_path(chunk).try_exists()?
+                    && chunk::check(&state.verified_path(chunk))? != ChunkFile::Present
+                {
+                    missing.push(chunk);
+                }
+            }
+            io::Result::Ok(missing)
         })
-        .await?
+        .await??
     };
     let meters = Arc::new(Meters::default());
     let mut done = Progress::new(&missing, plan.chain.bedrock_block, Arc::clone(&meters));

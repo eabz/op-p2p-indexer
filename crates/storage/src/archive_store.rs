@@ -13,19 +13,16 @@
 //! uncompressed. The message shapes are those of the devp2p eth protocol:
 //! <https://github.com/ethereum/devp2p/blob/master/caps/eth.md>.
 //!
-//! Does not decide which blocks are archived or how many are kept: the caller appends, truncates
-//! and trims.
+//! Does not decide which blocks are archived: the caller appends. Nothing removes blocks; the
+//! archive keeps every block it is given.
 //!
-//! **Space.** fjall is log-structured: [`ArchiveStore::trim`] and
-//! [`ArchiveStore::truncate_above`] write tombstones, and the
-//! space comes back later, when background compaction rewrites the trees and drops blob files
-//! nothing references. A trim with no writes after it frees nothing; the space returns as
-//! further appends trigger flushes and compactions. Appends always follow in this indexer, so
-//! there is no forced compaction. Disk use therefore runs above the live data by roughly a few
-//! blob files (64 MiB each) plus the journal (at most 128 MiB): a constant, not a multiple of
-//! the window. With a tiny window that constant dominates; at the windows this archive is for,
-//! it is a few percent. The `archive_*` gauges show disk use, stale blob bytes and running
-//! compactions after each write.
+//! **Space.** fjall is log-structured: a value written again (receipts set, a block appended
+//! twice) leaves a stale copy, and the space comes back later, when background compaction
+//! rewrites the trees and drops blob files nothing references. Disk use therefore runs above
+//! the live data by roughly a few blob files (64 MiB each) plus the journal (at most 128 MiB):
+//! a constant. In a small archive that constant dominates; in a full history it is a few
+//! percent. The `archive_*` gauges show disk use, stale blob bytes and running compactions
+//! after each write.
 
 mod tables;
 
@@ -49,8 +46,7 @@ use crate::{ArchiveStore, InvalidBlockReason, StorageError, Store};
 /// database.
 ///
 /// Every call runs on a blocking thread, so the futures never block the runtime. Dropping a
-/// future does not cancel its blocking call: an append or `set_receipts` still completes, and a
-/// `trim` or `truncate_above` keeps removing until it is done or its deadline (60 s) passes.
+/// future does not cancel its blocking call: an append or `set_receipts` still completes.
 /// Single reads and writes have no timeout: a local disk either answers or the process has
 /// bigger problems.
 ///
@@ -229,11 +225,15 @@ impl ArchiveStore for FjallArchive {
         .await
     }
 
-    async fn pending_receipts(&self, limit: usize) -> Result<(Vec<BlockRef>, u64), StorageError> {
+    async fn pending_receipts(
+        &self,
+        from: BlockNumber,
+        limit: usize,
+    ) -> Result<(Vec<BlockRef>, u64), StorageError> {
         self.blocking(
             Operation::PendingReceipts,
             "pending_receipts",
-            move |tables| tables::pending_receipts(tables, limit),
+            move |tables| tables::pending_receipts(tables, from, limit),
         )
         .await
     }
@@ -260,20 +260,6 @@ impl ArchiveStore for FjallArchive {
     async fn range(&self) -> Result<Option<(BlockRef, BlockRef)>, StorageError> {
         self.blocking(Operation::Range, "range", tables::range)
             .await
-    }
-
-    async fn truncate_above(&self, number: BlockNumber) -> Result<(), StorageError> {
-        self.blocking(Operation::TruncateAbove, "truncate_above", move |tables| {
-            tables::truncate_above(tables, number)
-        })
-        .await
-    }
-
-    async fn trim(&self, retain: u64) -> Result<u64, StorageError> {
-        self.blocking(Operation::Trim, "trim", move |tables| {
-            tables::trim(tables, retain)
-        })
-        .await
     }
 }
 

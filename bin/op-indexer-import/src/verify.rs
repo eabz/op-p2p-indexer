@@ -308,7 +308,7 @@ fn todo(state: &State, plan: &Plan, from_block: Option<u64>) -> io::Result<Todo>
     let from_block = from_block.unwrap_or_default();
     for chunk in plan.chunks().filter(|chunk| chunk.to > from_block) {
         let verified = state.verified_path(chunk);
-        match chunk::check(&verified) {
+        match chunk::check(&verified)? {
             ChunkFile::Present => {
                 todo.already_verified = todo.already_verified.saturating_add(1);
                 continue;

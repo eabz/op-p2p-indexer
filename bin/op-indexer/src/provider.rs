@@ -19,11 +19,11 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
-use alloy_primitives::{BlockHash, BlockNumber, Bytes};
+use alloy_primitives::{BlockHash, BlockNumber, Bytes, keccak256};
 use op_indexer_el::BlockProvider;
 use op_indexer_p2p::{BlockFuture, PayloadSource};
 use op_indexer_primitives::{
-    ArchivedBlock, BlockRead, BlockRef, BlockStart, EncodedBlock, ItemConvert, ReadLimits,
+    BlockRead, BlockRef, BlockStart, EncodedBlock, ItemConvert, ReadLimits,
 };
 use op_indexer_storage::archive_store::FjallArchive;
 use op_indexer_storage::unsafe_store::RedisStore;
@@ -33,6 +33,17 @@ use op_indexer_storage::{ArchiveStore, BlockPart, CanonicalItem, StorageError, U
 /// range: past this the range is advertised shorter than what is held, which promises nothing
 /// that is not.
 const MAX_RANGE_SCAN: usize = 16_384;
+
+/// One item, of any size.
+const ONE: ReadLimits = ReadLimits {
+    items: 1,
+    bytes: usize::MAX,
+    lowest: 0,
+};
+
+/// Bodies or receipts read from the unsafe store at once for one request: a few blocks' worth,
+/// so an answer the byte limit ends early reads and root-checks little more than it sends.
+const UNSAFE_ITEMS_PER_READ: usize = 16;
 
 /// The blocks this node holds, as the execution network reads them.
 #[derive(Debug, Clone)]
@@ -88,17 +99,26 @@ impl NodeProvider {
                 .await;
         }
         let tip = self.archive_tip().await?;
-        let start = match start {
-            BlockStart::Number(number) => number,
+        // With the hash asked for when the unsafe store gave its number: a reorg before the
+        // headers are read can put another block there, which is then not served.
+        let (start, unsafe_hash) = match start {
+            BlockStart::Number(number) => (number, None),
             BlockStart::Hash(hash) => match self.archive.number_of(hash).await? {
-                Some(number) => number,
+                Some(number) => (number, None),
                 None => match self.unsafe_store.canonical_number(hash).await? {
-                    Some(number) => number,
+                    Some(number) => (number, Some(hash)),
                     None => return Ok(answer.items),
                 },
             },
         };
         let in_archive = tip.is_some_and(|tip| start <= tip.number);
+        // Promoted between the two reads: the archive's block there is not checked against it.
+        if unsafe_hash.is_some() && in_archive {
+            return Ok(answer.items);
+        }
+        let starts_at_hash = |run: &[CanonicalItem]| {
+            unsafe_hash.is_none_or(|hash| run.first().is_some_and(|first| first.block.hash == hash))
+        };
         if rising {
             // The archive's part, then the unsafe store's from the block after its tip.
             let mut next = start;
@@ -123,6 +143,9 @@ impl NodeProvider {
                 .unsafe_store
                 .canonical_headers(next, answer.remaining().items, true)
                 .await?;
+            if !starts_at_hash(&run) {
+                return Ok(answer.items);
+            }
             // Linked to the archive when it starts right above its tip.
             let parent = tip.filter(|tip| next == tip.number.saturating_add(1));
             answer.push_run(run, parent.map(|tip| tip.hash), true);
@@ -141,6 +164,9 @@ impl NodeProvider {
                 .unsafe_store
                 .canonical_headers(start, count, false)
                 .await?;
+            if !starts_at_hash(&run) {
+                return Ok(answer.items);
+            }
             let last = answer.push_run(run, None, false);
             let linked = last.is_some_and(|last| {
                 last.block.number == tip.number.saturating_add(1) && last.parent_hash == tip.hash
@@ -191,22 +217,29 @@ impl NodeProvider {
             return Ok(answer.items);
         }
         let take = rest.len().min(answer.remaining().items);
-        let run = self
-            .unsafe_store
-            .canonical_items(rest.get(..take).unwrap_or_default(), part)
-            .await?;
-        // An unsafe block right above the archive's tip must name it as its parent.
-        let tip = self.archive_tip().await?;
-        let first_links = run.first().is_none_or(|first| {
-            tip.is_none_or(|tip| {
-                first.block.number != tip.number.saturating_add(1) || first.parent_hash == tip.hash
-            })
-        });
-        if first_links {
+        // A block right above the one before it (the archive's tip first) must name it as its
+        // parent.
+        let mut previous = self.archive_tip().await?;
+        // In small reads, so the byte limit ends the answer before more is read and checked.
+        for hashes in rest
+            .get(..take)
+            .unwrap_or_default()
+            .chunks(UNSAFE_ITEMS_PER_READ)
+        {
+            let run = self.unsafe_store.canonical_items(hashes, part).await?;
+            let complete = run.len() == hashes.len();
             for item in run {
-                if item.block.number < answer.limits.lowest || !answer.push(item.rlp) {
-                    break;
+                let breaks = previous.is_some_and(|previous| {
+                    item.block.number == previous.number.saturating_add(1)
+                        && item.parent_hash != previous.hash
+                });
+                if breaks || item.block.number < answer.limits.lowest || !answer.push(item.rlp) {
+                    return Ok(answer.items);
                 }
+                previous = Some(item.block);
+            }
+            if !complete || answer.is_full() {
+                break;
             }
         }
         Ok(answer.items)
@@ -318,6 +351,25 @@ impl BlockProvider for NodeProvider {
         let Some((first, tip)) = self.archive.range().await? else {
             return Ok(None);
         };
+        // Every advertised block must have its receipts (eth/69): an archived block still
+        // waiting for them, which the receipts task fills within minutes, ends the range below.
+        let (waiting, _) = self.archive.pending_receipts(first.number, 1).await?;
+        if let Some(waiting) = waiting.first().filter(|block| block.number <= tip.number) {
+            let Some(latest) = waiting.number.checked_sub(1).filter(|n| *n >= first.number) else {
+                return Ok(None);
+            };
+            let header = self.archive.read(header_at(latest), ONE, None).await?.pop();
+            return Ok(header.map(|header| {
+                let hash = keccak256(&header);
+                (
+                    first,
+                    BlockRef {
+                        number: latest,
+                        hash,
+                    },
+                )
+            }));
+        }
         let known = *self
             .range_end
             .lock()
@@ -345,22 +397,48 @@ impl BlockProvider for NodeProvider {
 }
 
 impl NodeProvider {
-    /// The canonical block at `number`: the archive's when it holds it, else the unsafe
-    /// store's canonical block there.
+    /// The canonical block at `number`, header and body only (no receipts): the archive's
+    /// when it holds it, else the unsafe store's canonical block there. Neither decompresses
+    /// receipts nor decodes senders or receipts.
     async fn canonical_block(
         &self,
         number: BlockNumber,
     ) -> Result<Option<EncodedBlock>, StorageError> {
-        let one = ReadLimits {
-            items: 1,
-            bytes: usize::MAX,
-            lowest: 0,
-        };
-        if let Some(ArchivedBlock { encoded, .. }) = self.archive.blocks(number, one).await?.pop() {
-            return Ok(Some(encoded));
+        if let Some(header) = self.archive.read(header_at(number), ONE, None).await?.pop() {
+            // The archive checked that the header hashes to the block's hash when it stored it.
+            let hash = keccak256(&header);
+            let body = self
+                .archive
+                .read(BlockRead::Bodies(vec![hash]), ONE, None)
+                .await?;
+            // A header without its body: not held.
+            return Ok(body.into_iter().next().map(|body| EncodedBlock {
+                hash,
+                header,
+                body,
+                receipts: None,
+            }));
         }
-        let block = self.unsafe_store.canonical(number).await?;
-        Ok(block.as_ref().map(EncodedBlock::from))
+        let Some(header) = self
+            .unsafe_store
+            .canonical_headers(number, 1, true)
+            .await?
+            .pop()
+        else {
+            return Ok(None);
+        };
+        let hash = header.block.hash;
+        let body = self
+            .unsafe_store
+            .canonical_items(&[hash], BlockPart::Body)
+            .await?
+            .pop();
+        Ok(body.map(|body| EncodedBlock {
+            hash,
+            header: header.rlp,
+            body: body.rlp,
+            receipts: None,
+        }))
     }
 }
 
@@ -372,5 +450,14 @@ impl PayloadSource for NodeProvider {
                 .await
                 .map_err(Into::into)
         })
+    }
+}
+
+/// The archived header at `number`, alone.
+const fn header_at(number: BlockNumber) -> BlockRead {
+    BlockRead::Headers {
+        start: BlockStart::Number(number),
+        step: 1,
+        rising: true,
     }
 }

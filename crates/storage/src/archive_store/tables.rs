@@ -12,7 +12,6 @@ mod bulk;
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use alloy_primitives::{Address, BlockHash, BlockNumber, Bytes, keccak256};
 use fjall::{
@@ -61,14 +60,6 @@ const SAFE_HEAD_KEY: &str = "safe_head";
 const FINALIZED_HEAD_KEY: &str = "finalized_head";
 /// Length of an address in `senders`.
 const ADDRESS_LEN: usize = Address::len_bytes();
-/// Most blocks removed in one batch by [`truncate_above`] and [`trim`], so one batch stays small
-/// and the writer lock is held briefly: appends go in between batches.
-const DELETE_BATCH_BLOCKS: u64 = 1024;
-/// Longest one [`truncate_above`] or [`trim`] call keeps removing, checked between batches. A
-/// call that has more to remove then fails with a timeout and is finished by calling it again.
-/// The blocking call cannot be cancelled, so this also bounds how long it outlives a dropped
-/// future or delays shutdown. The same limit as the unsafe store's multi-step operations.
-const REMOVE_DEADLINE: Duration = Duration::from_secs(60);
 
 /// The open database and its keyspaces. Cheap to clone: fjall handles are reference-counted.
 #[derive(Clone)]
@@ -94,10 +85,9 @@ pub(super) struct Tables {
     /// [`FINALIZED_HEAD_KEY`].
     meta: Keyspace,
     /// Held by every write: a batch has no conflict detection, so two appends must not both
-    /// read the same tip. tokio's mutex because it is granted in arrival order: with std's, a
-    /// removal taking the lock again for its next batch kept waiting appends out until the
-    /// whole removal was done. Not fjall's single-writer transaction database, which would
-    /// change every keyspace type.
+    /// read the same tip. tokio's mutex because it is granted in arrival order, so the batches
+    /// of a long append from one writer (promotion, range sync) and another's take turns. Not
+    /// fjall's single-writer transaction database, which would change every keyspace type.
     writer: Arc<Mutex<()>>,
 }
 
@@ -107,24 +97,8 @@ pub(super) struct Tables {
 pub(super) enum Failure {
     /// fjall failed.
     Fjall(fjall::Error),
-    /// A removal had more to do when [`REMOVE_DEADLINE`] passed.
-    Deadline,
     /// The data or the block did not allow the operation.
     Storage(StorageError),
-}
-
-/// Which end of the range a batch removes from.
-#[derive(Clone, Copy)]
-enum End {
-    Oldest,
-    Newest,
-}
-
-/// What one [`remove_batch`] did.
-struct Batch {
-    removed: u64,
-    /// More blocks were to be removed than one batch takes.
-    unfinished: bool,
 }
 
 impl Tables {
@@ -145,10 +119,6 @@ impl Failure {
     pub(super) fn into_storage_error(self, operation: &'static str) -> StorageError {
         match self {
             Self::Fjall(source) => StorageError::Fjall { operation, source },
-            Self::Deadline => StorageError::Timeout {
-                store: Store::Archive,
-                operation,
-            },
             Self::Storage(error) => error,
         }
     }
@@ -175,35 +145,37 @@ pub(super) fn open(path: &Path, chain: ChainIdentity) -> Result<Tables, Failure>
     Ok(tables)
 }
 
-/// Checks that the archive holds `chain`. An archive with no chain recorded is given one
-/// first: if it holds blocks it was written by a build before the record, so it holds
-/// [`ChainIdentity::BEFORE_RECORD`]'s; if it is empty, `chain`'s. One recording another chain
-/// is refused and left as it is.
+/// Checks that the archive holds `chain`. An archive with no chain recorded holds, if it holds
+/// blocks, [`ChainIdentity::BEFORE_RECORD`]'s (it was written by a build before the record),
+/// and if it is empty, `chain`'s; that is recorded when it is `chain`. One holding another
+/// chain is refused and left as it is, unrecorded too.
 fn check_chain(tables: &Tables, path: &Path, chain: ChainIdentity) -> Result<(), Failure> {
-    let found = if let Some(record) = tables.meta.get(CHAIN_KEY)? {
-        ChainIdentity::from_bytes(&record).ok_or_else(|| StorageError::ArchiveChainUnreadable {
-            path: path.to_owned(),
-        })?
+    let (found, recorded) = if let Some(record) = tables.meta.get(CHAIN_KEY)? {
+        let found = ChainIdentity::from_bytes(&record).ok_or_else(|| {
+            StorageError::ArchiveChainUnreadable {
+                path: path.to_owned(),
+            }
+        })?;
+        (found, true)
+    } else if tables.headers.first_key_value().is_some() {
+        (ChainIdentity::BEFORE_RECORD, false)
     } else {
-        let found = if tables.headers.first_key_value().is_some() {
-            ChainIdentity::BEFORE_RECORD
-        } else {
-            chain
-        };
+        (chain, false)
+    };
+    if found != chain {
+        return Err(StorageError::ArchiveChain {
+            path: path.to_owned(),
+            found: Box::new(found),
+            expected: Box::new(chain),
+        }
+        .into());
+    }
+    if !recorded {
         let mut batch = tables.durable_batch();
         batch.insert(&tables.meta, CHAIN_KEY, found.to_bytes());
         batch.commit()?;
-        found
-    };
-    if found == chain {
-        return Ok(());
     }
-    Err(StorageError::ArchiveChain {
-        path: path.to_owned(),
-        found: Box::new(found),
-        expected: Box::new(chain),
-    }
-    .into())
+    Ok(())
 }
 
 /// Opens the database in the directory `path`, creates the keyspaces and checks the schema
@@ -492,16 +464,21 @@ pub(super) fn blocks(
     Ok(blocks)
 }
 
-/// The archived blocks without receipts, oldest first, at most `limit`, and how many there are
-/// in all (counted over the index, which is small: imported blocks always have receipts).
+/// The archived blocks without receipts from `from` up, then from the lowest, at most `limit`,
+/// and how many there are in all (counted over the index, which is small: imported blocks
+/// always have receipts).
 pub(super) fn pending_receipts(
     tables: &Tables,
+    from: BlockNumber,
     limit: usize,
 ) -> Result<(Vec<BlockRef>, u64), Failure> {
     let snapshot = tables.db.snapshot();
     let mut blocks = Vec::new();
     let mut total: u64 = 0;
-    for guard in snapshot.iter(&tables.pending) {
+    let from = from.to_be_bytes();
+    let above = snapshot.range(&tables.pending, from..);
+    let below = snapshot.range(&tables.pending, ..from);
+    for guard in above.chain(below) {
         total = total.saturating_add(1);
         if blocks.len() < limit {
             let (key, hash) = guard.into_inner()?;
@@ -568,99 +545,6 @@ pub(super) fn range(tables: &Tables) -> Result<Option<(BlockRef, BlockRef)>, Fai
     Ok(first.zip(last))
 }
 
-/// Removes every block above `number`, newest first, in batches of [`DELETE_BATCH_BLOCKS`],
-/// for at most [`REMOVE_DEADLINE`].
-pub(super) fn truncate_above(tables: &Tables, number: BlockNumber) -> Result<(), Failure> {
-    let excess = |(_, last): (BlockNumber, BlockNumber)| last.saturating_sub(number);
-    remove(tables, End::Newest, excess).map(drop)
-}
-
-/// Removes the oldest blocks so at most `retain` remain, in batches of [`DELETE_BATCH_BLOCKS`],
-/// for at most [`REMOVE_DEADLINE`]. Returns how many were removed.
-pub(super) fn trim(tables: &Tables, retain: u64) -> Result<u64, Failure> {
-    // The range is contiguous, so its length follows from its ends.
-    let excess = |(first, last): (BlockNumber, BlockNumber)| {
-        last.saturating_sub(first)
-            .saturating_add(1)
-            .saturating_sub(retain)
-    };
-    remove(tables, End::Oldest, excess)
-}
-
-/// Removes blocks from `end`, batch by batch, until `excess(first, last)` is zero or
-/// [`REMOVE_DEADLINE`] has passed with more to remove ([`Failure::Deadline`]). Returns how many
-/// were removed; the count is also recorded as a metric, so it is not lost with an error.
-///
-/// The writer lock is taken per batch, so appends go in between batches; each batch measures
-/// the range again.
-fn remove(
-    tables: &Tables,
-    end: End,
-    excess: impl Fn((BlockNumber, BlockNumber)) -> u64,
-) -> Result<u64, Failure> {
-    let started = Instant::now();
-    let mut removed: u64 = 0;
-    let outcome = loop {
-        let batch = match remove_batch(tables, end, &excess) {
-            Ok(batch) => batch,
-            Err(failure) => break Err(failure),
-        };
-        removed = removed.saturating_add(batch.removed);
-        if !batch.unfinished {
-            break Ok(removed);
-        }
-        if started.elapsed() >= REMOVE_DEADLINE {
-            break Err(Failure::Deadline);
-        }
-    };
-    metrics::archive_blocks_removed(removed);
-    record_usage(tables);
-    outcome
-}
-
-/// Removes `excess(first, last)` blocks from `end`, at most [`DELETE_BATCH_BLOCKS`], in one
-/// durable batch under the writer lock. Removing from an end keeps the range contiguous.
-fn remove_batch(
-    tables: &Tables,
-    end: End,
-    excess: impl Fn((BlockNumber, BlockNumber)) -> u64,
-) -> Result<Batch, Failure> {
-    let _writer = tables.lock();
-    let first = end_key(tables.headers.first_key_value())?;
-    let last = end_key(tables.headers.last_key_value())?;
-    let Some(ends) = first.zip(last) else {
-        return Ok(Batch {
-            removed: 0,
-            unfinished: false,
-        });
-    };
-    let excess = excess(ends);
-    let take = usize::try_from(excess.min(DELETE_BATCH_BLOCKS)).unwrap_or(usize::MAX);
-    let iter = tables.headers.iter();
-    let doomed: Box<dyn Iterator<Item = Guard>> = match end {
-        End::Oldest => Box::new(iter.take(take)),
-        End::Newest => Box::new(iter.rev().take(take)),
-    };
-    let mut batch = tables.durable_batch();
-    let mut removed: u64 = 0;
-    for guard in doomed {
-        let (key, header) = guard.into_inner()?;
-        let hash = keccak256(decompress(&header, "header", None)?);
-        batch.remove(&tables.headers, key.clone());
-        batch.remove(&tables.bodies, key.clone());
-        batch.remove(&tables.receipts, key.clone());
-        batch.remove(&tables.senders, key.clone());
-        batch.remove(&tables.pending, key);
-        batch.remove(&tables.numbers, hash.0);
-        removed = removed.saturating_add(1);
-    }
-    batch.commit()?;
-    Ok(Batch {
-        removed,
-        unfinished: excess > removed,
-    })
-}
-
 /// Samples fjall's own counters into the archive gauges: disk use (journal, trees and blob
 /// files), blob bytes no longer referenced, and running compactions. All are cheap reads of
 /// fjall's metadata.
@@ -686,14 +570,6 @@ fn end_ref(guard: Option<Guard>) -> Result<Option<BlockRef>, Failure> {
         number: decode_number(&key)?,
         hash: keccak256(decompress(&header, "header", None)?),
     }))
-}
-
-/// The block number of the header entry `guard`, without reading its value.
-fn end_key(guard: Option<Guard>) -> Result<Option<BlockNumber>, Failure> {
-    let Some(guard) = guard else {
-        return Ok(None);
-    };
-    Ok(Some(decode_number(&guard.key()?)?))
 }
 
 /// A block number stored as a key or value: a big-endian `u64`.

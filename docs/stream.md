@@ -24,9 +24,12 @@ generated code trips, and only those.
 
 | RPC | What |
 |---|---|
-| `Subscribe(SubscribeRequest) returns (stream Event)` | From a block number, or from the head; the payload, `DECODED` or `RAW`, chosen per subscription. A number below the archive's first block is refused with `OUT_OF_RANGE`. |
+| `Subscribe(SubscribeRequest) returns (stream Event)` | From a block number, or from the head; the payload, `DECODED` or `RAW`, chosen per subscription. A number the stores do not hold and never will (below the archive's first block, or between the archive's tip and the unsafe store's lowest block) is refused with `OUT_OF_RANGE`. The archive keeps all it has; the unsafe store expires blocks nothing promoted after `UNSAFE_TTL` (24 h, e.g. with L1 off), so a subscription whose next height expired before it read it ends with `OUT_OF_RANGE` too. |
 | `GetHeads(GetHeadsRequest) returns (Heads)` | Unsafe, safe and finalized heads, and whether receipts are fetched. |
-| `GetBlock(GetBlockRequest) returns (Block)` | One block by number (canonical) or hash, in either payload. `NOT_FOUND` if not held. |
+| `GetBlock(GetBlockRequest) returns (Block)` | One canonical block, by number or hash, in either payload. `NOT_FOUND` if not held, or a side block. |
+
+A message can be up to 64 MiB (a full block, decoded; the server's limit). gRPC clients accept
+4 MiB by default: raise the client's maximum receive size.
 
 `Event` is one of:
 
@@ -34,7 +37,9 @@ generated code trips, and only those.
   and the payload:
   - `DECODED`: header fields, transactions (with sender, and each in its consensus encoding),
     receipts and their logs;
-  - `RAW`: header, body and receipts in their consensus encoding, as stored.
+  - `RAW`: header, body and receipts in their consensus encoding: the archive's bytes as
+    stored. The unsafe store keeps blocks decoded, so a block from it is encoded again, to the
+    same bytes (a legacy transaction signed with zeros keeps that signature).
 
   Receipts are a message field with presence. Absent means "not known yet", not "none".
 - `Receipts`: the receipts of a block sent earlier without them (section 3).
@@ -65,20 +70,25 @@ Per subscription, blocks come in chain order, each height once per canonical cha
   It reads the stores' state only where the events do not say enough: **at start** (the
   stream's position first, then the heads; the head is its first block), **when the stream
   trimmed events it had not read** (it keeps about the newest ten thousand: the follower reads
-  the state again and walks up from its last block), **across a gap** (heights not held stop
-  the walk until a `fill` event), and for a reorg whose ancestor it does not know (it finds the
-  newest published block still canonical).
+  the state again and walks up from its last block), **when the stream went back** (Redis
+  restarted or lost it: its last event is older than the follower's position, checked after a
+  wait that brought nothing), **across a gap** (heights not held stop the walk until a `fill`
+  event), and when a block does not build on its last one (it finds the newest published block
+  still canonical). A reorg event removes the published blocks from the first one it replaced:
+  blocks of the new chain an earlier event of the same read already published stay.
 
   It keeps the last 128 events, numbered (about two minutes of blocks at one a second), and the
   last 256 blocks it published (the deepest reorg handled without starting over from the head).
 - **Hand-over** (`subscription.rs`): a subscription reads (history, then the unsafe store),
   checking each block's parent against the last one it sent; one that does not match is a
-  reorg, found by reading which of its blocks are still canonical. Before each batch it tries to
-  join the window: right after the follower's newest publication of its last block, where the
-  follower's chain is its own, so from there every event applies as it is. Receipts published
-  before that point, for blocks it sent without them, are sent at the join. A block in the
-  window that does not build on its last one, or a window that moved past it, sends it back to
-  reading. So each height is sent once per canonical chain, in order, and no event is replayed.
+  reorg, found by reading which of its blocks are still canonical. Before each batch it sends
+  `Heads` if the follower's heads moved, and tries to join the window: when the follower's last
+  block is its own, the follower's chain is its own, so from the window's next event every event
+  applies as it is. Receipts in the window, for blocks it sent without them, are sent at the
+  join. A block in the window that does not build on its last one, or a window that moved past
+  it, sends it back to reading. So each height is sent once per canonical chain, in order, and no
+  event is applied twice: a subscription that found a reorg itself joins only once the follower
+  has seen it too.
 - Each block is prepared once (number, hash and parent read once) and each of its messages
   converted the first time a subscription asks for it, then shared: a live block is converted
   once per payload, not once per subscription. Conversion runs in `spawn_blocking`; archive
@@ -91,12 +101,20 @@ the gap is filled or the blocks reach the archive: the stream is contiguous. Thi
 ## 3. Receipts
 
 Receipts are fetched after the block arrives (the `el` crate). A block is sent as soon as it is
-canonical, with its receipts if they are attached and without them otherwise. When the unsafe
-store records them (its `receipts` event), a `Receipts` event follows for a block among the 256
-the follower published last. With the execution network disabled no receipts come;
-`Heads.receipts` says so. Receipts attached only after the block was promoted to the archive
-(the pipeline attaches late ones there) are not streamed: the archive has no events. A consumer
-can ask for the block again with `GetBlock`.
+canonical, with its receipts if they are attached and without them otherwise. Then:
+
+- The follower publishes `Receipts` for a block it published without them when the unsafe store
+  records them (its `receipts` event), or, for a block at or below the safe head, when the
+  archive has them (the pipeline attaches late ones there; the archive has no events, so after
+  each read of the event stream the follower reads the archive's list of blocks still without
+  receipts, and reads only the blocks that left it).
+- A subscription that is reading from the stores looks its blocks without receipts up again
+  every 5 s, in both stores.
+
+What a consumer can rely on: a block sent without receipts gets one `Receipts` event when they
+arrive while it is among the last 256 blocks the subscription sent, and on the same
+subscription. Past that, or after subscribing again, it asks with `GetBlock`. With the
+execution network disabled no receipts come, and `Heads.receipts` says so.
 
 ## 4. Backpressure and limits
 
@@ -107,17 +125,24 @@ can ask for the block again with `GetBlock`.
 - At most `OP_INDEXER_STREAM_MAX_SUBSCRIPTIONS` subscriptions (default 64); one more is refused
   with `RESOURCE_EXHAUSTED`.
 - History is read in batches of at most 64 blocks or 16 MiB, each sent before the next is read.
+- At most 16 `GetHeads` and `GetBlock` calls are served at once; one more is refused with
+  `RESOURCE_EXHAUSTED`.
+- HTTP/2 keepalive: the server pings a connection every 30 s and drops it if the answer takes
+  more than 10 s, so a consumer that vanished does not hold a subscription.
 - One reader of the event stream per node (the follower); it waits on a Redis connection of its
   own, so it does not hold up the pipeline's writes.
-- On shutdown every subscription ends with `UNAVAILABLE`; the server stops with the networks.
+- On shutdown every subscription and Flight stream ends with `UNAVAILABLE`. The server stops
+  with the networks, waits up to 5 s for open connections (a consumer that stops reading holds
+  one), then up to 5 s for its tasks, then gives up on them; the pipeline is stopped at the same
+  time, not after.
 
 ## 5. Configuration
 
 | Variable | Default | What |
 |---|---|---|
 | `OP_INDEXER_STREAM_LISTEN_ADDR` | `127.0.0.1:50051` | gRPC listen address: local only, since there is no authentication. The image sets `0.0.0.0:50051` inside the container. |
-| `OP_INDEXER_STREAM_MAX_SUBSCRIPTIONS` | `64` | Concurrent subscriptions. |
-| `OP_INDEXER_STREAM_MAX_FLIGHTS` | `8` | Concurrent Arrow Flight `DoGet` streams (section 6). |
+| `OP_INDEXER_STREAM_MAX_SUBSCRIPTIONS` | `64` | Concurrent subscriptions (at most `Semaphore::MAX_PERMITS`; more is lowered to it). |
+| `OP_INDEXER_STREAM_MAX_FLIGHTS` | `8` | Concurrent Arrow Flight `DoGet` streams (section 6), with the same ceiling. |
 
 docker compose: `OP_INDEXER_STREAM_PORT` (default `50051`) is the port inside and outside the
 container; `OP_INDEXER_STREAM_HOST_BIND` (default `127.0.0.1`) is the host address it is
@@ -140,7 +165,9 @@ not remove it, and would duplicate the server's wiring.
 
 - `DoGet(ticket)`: the ticket is text, `table:from:to[:cap]`, for example
   `logs:120000000:120010000:finalized`.
-  - The range `[from, to]` is inclusive.
+  - The range `[from, to]` is inclusive; `to` below `from` is `INVALID_ARGUMENT`.
+  - A range is cut to 100 000 blocks: the response's `op-indexer-range-to` header gives the
+    last block it covers; ask again from the one after it.
   - `cap` is one of:
     - `finalized`: up to the finalized head;
     - `safe`: up to the safe head;
@@ -148,8 +175,8 @@ not remove it, and would duplicate the server's wiring.
       unsafe store and may still be reorged; the `status` column says which they are.
   - `finalized` and `safe` never leave the archive.
   - A `to` above what the cap allows is lowered to it.
-  - `OUT_OF_RANGE` when `from` is below the archive's first block, or nothing is held from
-    `from` under the cap.
+  - `OUT_OF_RANGE` when the stores do not hold `from` and never will (as for `Subscribe`), or
+    the cap's head is below `from` (or not known yet).
 - `GetFlightInfo(descriptor)` and `ListFlights`: the descriptor is a path of one table (its
   whole range, from the lowest block held, cap `any`) or a ticket's text as the command. The info's endpoint carries the
   ticket for the range as it resolves now, `to` lowered. Total records and bytes are unknown
@@ -162,12 +189,15 @@ not remove it, and would duplicate the server's wiring.
 most 64 blocks or 16 MiB, senders from the archive. `blocks` reads the headers alone; the other
 tables decode each block once. Each read becomes one record batch, built off the async runtime
 while the next is read, so a large range is never held whole. A task produces the batches at
-most two ahead of the consumer; HTTP/2 flow control does the rest. On shutdown a `DoGet` ends
-with `UNAVAILABLE`.
+most one ahead of the consumer (about 50 MiB per stream at most, with the one being built and
+the one being read); HTTP/2 flow control does the rest. A consumer that does not read for 30 s
+is ended with `RESOURCE_EXHAUSTED`; one slot of the queue is held back for that error. On
+shutdown a `DoGet` ends with `UNAVAILABLE` at once, not after its next batch.
 
 A range ends early with an error in two cases:
 
-- `UNAVAILABLE`: a block is no longer held (trimmed by retention, or a gap in the unsafe chain).
+- `UNAVAILABLE`: a block is not held: a gap in the unsafe chain, or a block above the archive
+  that the unsafe store expired (`UNSAFE_TTL`) before the read reached it.
 - `ABORTED`: a block does not build on the one before it (a reorg during the read; only with
   `any`).
 

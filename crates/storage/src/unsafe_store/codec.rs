@@ -4,10 +4,14 @@
 use std::collections::HashMap;
 
 use alloy_consensus::{BlockBody, Header};
+use alloy_eips::eip2718::Encodable2718;
 use alloy_eips::eip4895::Withdrawals;
 use alloy_primitives::{Address, BlockHash, Bytes};
 use op_alloy_consensus::{OpBlock, OpReceiptEnvelope, OpTxEnvelope};
-use op_indexer_primitives::{BlockRef, BlockSource, DecodedBlock, Reorg, UnsafeEvent};
+use op_indexer_primitives::{
+    BlockRef, BlockSource, DecodedBlock, Reorg, UnsafeEvent, encode_body, receipts_root,
+    transactions_root,
+};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -127,22 +131,41 @@ pub(super) fn decode_header(hash: BlockHash, json: &str) -> Result<Header, Stora
 }
 
 /// The consensus encoding (RLP) of stored block `hash`'s body, from its header and its
-/// `transactions` field, without the senders.
+/// `transactions` field, without the senders; `None` if the transactions root over exactly
+/// these transaction encodings is not the header's.
 pub(super) fn body_rlp(
     hash: BlockHash,
     header: &Header,
     transactions: &str,
-) -> Result<Bytes, StorageError> {
-    let block = Some(hash);
-    let transactions: Vec<OpTxEnvelope> = from_json("transactions", transactions, block)?;
-    Ok(alloy_rlp::encode(body(header, transactions)).into())
+) -> Result<Option<Bytes>, StorageError> {
+    let transactions: Vec<OpTxEnvelope> = from_json("transactions", transactions, Some(hash))?;
+    let encodings: Vec<Vec<u8>> = transactions
+        .iter()
+        .map(Encodable2718::encoded_2718)
+        .collect();
+    if transactions_root(&encodings) != header.transactions_root {
+        return Ok(None);
+    }
+    Ok(Some(encode_body(
+        &encodings,
+        header.withdrawals_root.is_some(),
+    )))
 }
 
 /// The consensus encoding of stored block `hash`'s receipts, from its `receipts` field: the
-/// form [`op_indexer_primitives::encode_receipts`] gives.
-pub(super) fn receipts_rlp(hash: BlockHash, receipts: &str) -> Result<Bytes, StorageError> {
+/// form [`op_indexer_primitives::encode_receipts`] gives; `None` if their receipts root (by
+/// the rules at the block's time, `canyon_time` the chain's Canyon) is not the header's.
+pub(super) fn receipts_rlp(
+    hash: BlockHash,
+    header: &Header,
+    receipts: &str,
+    canyon_time: u64,
+) -> Result<Option<Bytes>, StorageError> {
     let receipts: Vec<OpReceiptEnvelope> = from_json("receipts", receipts, Some(hash))?;
-    Ok(op_indexer_primitives::encode_receipts(&receipts))
+    if receipts_root(&receipts, header.timestamp, canyon_time) != header.receipts_root {
+        return Ok(None);
+    }
+    Ok(Some(op_indexer_primitives::encode_receipts(&receipts)))
 }
 
 /// Decodes the events a script replied with, each a map of the fields it wrote to the stream.

@@ -20,12 +20,12 @@ use op_indexer_primitives::{BlockRef, DecodedBlock, InsertOutcome, L1Heads, Unsa
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use redis::{RedisResult, Script, ScriptInvocation};
 use tokio::time::{Instant, timeout};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use self::layout::{
     CONNECT_TIMEOUT, EVENTS_MAXLEN, Keys, MAX_ANCESTRY_BLOCKS, MAX_REORG_DEPTH, OPERATION_DEADLINE,
     PRUNE_HEIGHTS_PER_CALL, REMOVE_BLOCKS_PER_STEP, REQUEST_TIMEOUT, RETENTION_HEIGHTS_PER_INSERT,
-    SCHEMA_VERSION, UNSAFE_TTL, WIPE_SCAN_COUNT,
+    RUN_CHUNK_HEIGHTS, SCHEMA_VERSION, UNSAFE_TTL, WIPE_SCAN_COUNT,
 };
 use crate::metrics::{self, Operation};
 use crate::validate::validate_block;
@@ -50,6 +50,8 @@ static PRUNE: LazyLock<Script> = LazyLock::new(|| script(include_str!("../script
 #[derive(Debug, Clone)]
 pub struct RedisStore {
     connection: ConnectionManager,
+    /// The chain's Canyon time, for the receipts roots that reads check.
+    canyon_time: u64,
     /// For blocking reads of the event stream only.
     events: ConnectionManager,
     keys: Arc<Keys>,
@@ -85,6 +87,7 @@ impl RedisStore {
             .await?;
             let store = Self {
                 connection,
+                canyon_time: config.canyon_time,
                 events,
                 keys: Arc::new(Keys::new(chain_id)),
             };
@@ -408,6 +411,27 @@ impl UnsafeStore for RedisStore {
         .await
     }
 
+    async fn lowest(&self) -> Result<Option<BlockNumber>, StorageError> {
+        metrics::timed(Store::Unsafe, Operation::Lowest, async {
+            let mut connection = self.connection.clone();
+            let lowest: Vec<(String, f64)> = request(
+                "lowest",
+                redis::cmd("ZRANGE")
+                    .arg(self.keys.canonical())
+                    .arg(0)
+                    .arg(0)
+                    .arg("WITHSCORES")
+                    .query_async(&mut connection),
+            )
+            .await?;
+            lowest
+                .first()
+                .map(|(_hash, score)| score_number(*score))
+                .transpose()
+        })
+        .await
+    }
+
     async fn block(&self, hash: BlockHash) -> Result<Option<DecodedBlock>, StorageError> {
         metrics::timed(
             Store::Unsafe,
@@ -544,40 +568,16 @@ impl UnsafeStore for RedisStore {
             }
             let replies: Vec<redis::Value> =
                 request(READ, pipeline.query_async(&mut connection)).await?;
-            let mut replies = replies.into_iter();
-            let mut items: Vec<CanonicalItem> = Vec::with_capacity(hashes.len());
-            for hash in hashes {
-                let (Some(score), Some(fields)) = (replies.next(), replies.next()) else {
-                    break;
-                };
-                let score: Option<f64> = value(READ, score)?;
-                let fields: Vec<Option<String>> = value(READ, fields)?;
-                let (Some(score), [Some(header), Some(part_json)]) = (score, fields.as_slice())
-                else {
-                    break;
-                };
-                let number = score_number(score)?;
-                let header = codec::decode_header(*hash, header)?;
-                let follows = items
-                    .last()
-                    .filter(|previous| previous.block.number.checked_add(1) == Some(number));
-                if follows.is_some_and(|previous| previous.block.hash != header.parent_hash) {
-                    break;
-                }
-                let rlp = match part {
-                    BlockPart::Body => codec::body_rlp(*hash, &header, part_json)?,
-                    BlockPart::Receipts => codec::receipts_rlp(*hash, part_json)?,
-                };
-                items.push(CanonicalItem {
-                    block: BlockRef {
-                        number,
-                        hash: *hash,
-                    },
-                    parent_hash: header.parent_hash,
-                    rlp,
-                });
-            }
-            Ok(items)
+            // Decoding and the root checks are CPU work: off the runtime.
+            let (hashes, canyon_time) = (hashes.to_vec(), self.canyon_time);
+            tokio::task::spawn_blocking(move || {
+                canonical_parts(&hashes, replies, part, canyon_time)
+            })
+            .await
+            .map_err(|source| StorageError::BlockingTask {
+                operation: READ,
+                source,
+            })?
         })
         .await
     }
@@ -589,56 +589,66 @@ impl UnsafeStore for RedisStore {
     ) -> Result<Option<BlockRef>, StorageError> {
         metrics::timed(Store::Unsafe, Operation::CanonicalRun, async {
             const RUN: &str = "canonical_run";
-            let first = above.number.saturating_add(1);
             let mut connection = self.connection.clone();
-            let entries: Vec<(String, f64)> = request(
-                RUN,
-                redis::cmd("ZRANGEBYSCORE")
-                    .arg(self.keys.canonical())
-                    .arg(first)
-                    .arg("+inf")
-                    .arg("WITHSCORES")
-                    .arg("LIMIT")
-                    .arg(0)
-                    .arg(max)
-                    .query_async(&mut connection),
-            )
-            .await?;
-            let entries = parse_entries(entries)?;
-            let Some((child, _)) = entries.first() else {
-                return Ok(None);
-            };
-            // One round trip for the first block's parent and every block's receipts.
-            let mut pipeline = redis::pipe();
-            pipeline
-                .cmd("HGET")
-                .arg(self.keys.block(*child))
-                .arg("parent_hash");
-            for (hash, _) in &entries {
+            let (mut last, mut tip, mut left) = (None, above, max);
+            // In chunks of two round trips (the entries, then one pipeline of the first block's
+            // parent and every block's receipts flag): a run that does not continue `above`, or
+            // whose receipts lag, costs one chunk, and each chunk must continue the one before.
+            while left > 0 {
+                let count = left.min(RUN_CHUNK_HEIGHTS);
+                let first = tip.number.saturating_add(1);
+                let entries: Vec<(String, f64)> = request(
+                    RUN,
+                    redis::cmd("ZRANGEBYSCORE")
+                        .arg(self.keys.canonical())
+                        .arg(first)
+                        .arg("+inf")
+                        .arg("WITHSCORES")
+                        .arg("LIMIT")
+                        .arg(0)
+                        .arg(count)
+                        .query_async(&mut connection),
+                )
+                .await?;
+                let entries = parse_entries(entries)?;
+                let Some(&(child, _)) = entries.first() else {
+                    break;
+                };
+                let mut pipeline = redis::pipe();
                 pipeline
-                    .cmd("HEXISTS")
-                    .arg(self.keys.block(*hash))
-                    .arg("receipts");
-            }
-            let replies: Vec<redis::Value> =
-                request(RUN, pipeline.query_async(&mut connection)).await?;
-            let mut replies = replies.into_iter();
-            let parent: Option<String> = replies
-                .next()
-                .map(|reply| value(RUN, reply))
-                .transpose()?
-                .flatten();
-            if parent.as_deref().map(codec::parse_hash).transpose()? != Some(above.hash) {
-                return Ok(None);
-            }
-            let mut last = None;
-            let mut expected = first;
-            for ((hash, number), has_receipts) in entries.into_iter().zip(replies) {
-                if number != expected || !value::<bool>(RUN, has_receipts)? {
+                    .cmd("HGET")
+                    .arg(self.keys.block(child))
+                    .arg("parent_hash");
+                for (hash, _) in &entries {
+                    pipeline
+                        .cmd("HEXISTS")
+                        .arg(self.keys.block(*hash))
+                        .arg("receipts");
+                }
+                let replies: Vec<redis::Value> =
+                    request(RUN, pipeline.query_async(&mut connection)).await?;
+                let mut replies = replies.into_iter();
+                let parent: Option<String> = replies
+                    .next()
+                    .map(|reply| value(RUN, reply))
+                    .transpose()?
+                    .flatten();
+                if parent.as_deref().map(codec::parse_hash).transpose()? != Some(tip.hash) {
                     break;
                 }
-                last = Some(BlockRef { number, hash });
-                expected = expected.saturating_add(1);
+                let read = entries.len();
+                for ((hash, number), has_receipts) in entries.into_iter().zip(replies) {
+                    if number != tip.number.saturating_add(1) || !value::<bool>(RUN, has_receipts)?
+                    {
+                        return Ok(last);
+                    }
+                    tip = BlockRef { number, hash };
+                    last = Some(tip);
+                }
+                if read < count {
+                    break;
+                }
+                left = left.saturating_sub(read);
             }
             Ok(last)
         })
@@ -806,6 +816,63 @@ fn parse_entries(
         .into_iter()
         .map(|(hash, score)| Ok((codec::parse_hash(&hash)?, score_number(score)?)))
         .collect()
+}
+
+/// The items of [`UnsafeStore::canonical_items`] from its pipeline's `replies` (a canonical
+/// score and the header and part fields per hash), ending at the first block not canonical or
+/// not stored, that does not link to the one before, or whose part does not match its header's
+/// root (logged as an error and counted). Blocking: decodes and hashes every part.
+fn canonical_parts(
+    hashes: &[BlockHash],
+    replies: Vec<redis::Value>,
+    part: BlockPart,
+    canyon_time: u64,
+) -> Result<Vec<CanonicalItem>, StorageError> {
+    const READ: &str = "canonical_items";
+    let mut replies = replies.into_iter();
+    let mut items: Vec<CanonicalItem> = Vec::with_capacity(hashes.len());
+    for hash in hashes {
+        let (Some(score), Some(fields)) = (replies.next(), replies.next()) else {
+            break;
+        };
+        let score: Option<f64> = value(READ, score)?;
+        let fields: Vec<Option<String>> = value(READ, fields)?;
+        let (Some(score), [Some(header), Some(part_json)]) = (score, fields.as_slice()) else {
+            break;
+        };
+        let number = score_number(score)?;
+        let header = codec::decode_header(*hash, header)?;
+        let follows = items
+            .last()
+            .filter(|previous| previous.block.number.checked_add(1) == Some(number));
+        if follows.is_some_and(|previous| previous.block.hash != header.parent_hash) {
+            break;
+        }
+        let rlp = match part {
+            BlockPart::Body => codec::body_rlp(*hash, &header, part_json)?,
+            BlockPart::Receipts => codec::receipts_rlp(*hash, &header, part_json, canyon_time)?,
+        };
+        // Stored data that no longer matches its header is not served.
+        let Some(rlp) = rlp else {
+            error!(
+                number,
+                %hash,
+                ?part,
+                "a stored block's transactions or receipts do not match its header's root"
+            );
+            metrics::root_mismatch();
+            break;
+        };
+        items.push(CanonicalItem {
+            block: BlockRef {
+                number,
+                hash: *hash,
+            },
+            parent_hash: header.parent_hash,
+            rlp,
+        });
+    }
+    Ok(items)
 }
 
 /// One reply of a pipeline, converted; `operation` names the call in the error.

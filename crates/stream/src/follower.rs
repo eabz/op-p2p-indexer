@@ -17,7 +17,12 @@
 //!   time and stops below a height not held, until a `fill` event comes.
 //!
 //! The committed safe and finalized heads come from the archive (promotion records them
-//! there), read after every batch of events; a change is published as `Heads`.
+//! there), read after every batch of events; a change is published as `Heads`. Then the
+//! published blocks still without receipts are looked up once more: the pipeline attaches
+//! late receipts to archived blocks, which has no event.
+//!
+//! A stream that went back (Redis restarted or lost it) is a reset: its last event is older
+//! than the position, and the follower reads the state again.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -52,8 +57,12 @@ pub(crate) enum ChainEvent {
     Block(Arc<Prepared>),
     /// The receipts of a block published without them were attached.
     Receipts(Arc<Prepared>),
-    /// These blocks, lowest first, are no longer canonical.
-    Reorg(Vec<BlockRef>),
+    /// The blocks `removed`, lowest first, are no longer canonical; `last` is the last block
+    /// published that still is.
+    Reorg {
+        removed: Vec<BlockRef>,
+        last: Option<BlockRef>,
+    },
     /// The committed safe or finalized head moved; `unsafe_head` is the last block published.
     Heads {
         unsafe_head: Option<BlockRef>,
@@ -69,6 +78,8 @@ struct Window {
     next: u64,
     /// The last block published.
     last_block: Option<BlockRef>,
+    /// The heads last published.
+    heads: Option<L1Heads>,
 }
 
 impl Window {
@@ -118,23 +129,30 @@ impl Live {
         (window.next, window.last_block)
     }
 
-    /// Where a subscription whose last block is `block` continues: after the newest
-    /// publication of that block, where the follower's chain was the subscription's. With the
-    /// receipts published before it, for the subscription to pick those it lacks.
+    /// The last block and the heads published; `None` before the first heads.
+    pub(crate) fn heads(&self) -> Option<(Option<BlockRef>, L1Heads)> {
+        let window = self.window();
+        window.heads.map(|heads| (window.last_block, heads))
+    }
+
+    /// Where a subscription whose last block is `block` continues, if the follower's last
+    /// block is that one too: the follower's chain is then the subscription's, and every event
+    /// from the next one on applies to it. With the receipts in the window, for the
+    /// subscription to pick those it lacks.
     pub(crate) fn join(&self, block: BlockRef) -> Option<(u64, Vec<Arc<Prepared>>)> {
         let window = self.window();
-        let joined = window.numbered().rev().find_map(|(seq, event)| {
-            matches!(&**event, ChainEvent::Block(published) if published.at == block).then_some(seq)
-        })?;
+        if window.last_block != Some(block) {
+            return None;
+        }
         let receipts = window
-            .numbered()
-            .take_while(|(seq, _)| *seq < joined)
-            .filter_map(|(_, event)| match &**event {
+            .events
+            .iter()
+            .filter_map(|event| match &**event {
                 ChainEvent::Receipts(block) => Some(Arc::clone(block)),
-                ChainEvent::Block(_) | ChainEvent::Reorg(_) | ChainEvent::Heads { .. } => None,
+                ChainEvent::Block(_) | ChainEvent::Reorg { .. } | ChainEvent::Heads { .. } => None,
             })
             .collect();
-        Some((joined.saturating_add(1), receipts))
+        Some((window.next, receipts))
     }
 
     /// The events from number `from` on; `None` if the window no longer holds them.
@@ -155,8 +173,11 @@ impl Live {
     fn publish(&self, event: ChainEvent) {
         {
             let mut window = self.window();
-            if let ChainEvent::Block(block) = &event {
-                window.last_block = Some(block.at);
+            match &event {
+                ChainEvent::Block(block) => window.last_block = Some(block.at),
+                ChainEvent::Reorg { last, .. } => window.last_block = *last,
+                ChainEvent::Heads { heads, .. } => window.heads = Some(*heads),
+                ChainEvent::Receipts(_) => {}
             }
             window.events.push_back(Arc::new(event));
             if window.events.len() > WINDOW_EVENTS {
@@ -175,6 +196,8 @@ pub(crate) struct Follower<U, A> {
     pub(crate) live: Arc<Live>,
     /// How long to wait after a store failed before reading again.
     pub(crate) retry_after: Duration,
+    /// Whether receipts are fetched at all: without, no block is looked up for them.
+    pub(crate) receipts: bool,
 }
 
 /// What the follower remembers between events.
@@ -185,6 +208,8 @@ struct State {
     /// The newest head the events named.
     target: Option<BlockRef>,
     heads: Option<L1Heads>,
+    /// The published blocks without receipts, oldest first.
+    without_receipts: Vec<BlockRef>,
 }
 
 impl<U: UnsafeStore, A: ArchiveStore> Follower<U, A> {
@@ -224,12 +249,7 @@ impl<U: UnsafeStore, A: ArchiveStore> Follower<U, A> {
     ) -> Result<Option<EventId>, ReadError> {
         let Some(after) = after else {
             // The position first: what happens while the state is read is read again.
-            let position = self
-                .source
-                .call(Store::Unsafe, "unsafe last_event_id", || {
-                    self.source.unsafe_store.last_event_id()
-                })
-                .await?;
+            let position = self.last_event_id().await?;
             let (unsafe_head, heads) = self.source.heads().await?;
             if let Some(head) = unsafe_head {
                 state.target = Some(head);
@@ -250,6 +270,12 @@ impl<U: UnsafeStore, A: ArchiveStore> Follower<U, A> {
             warn!("the stream's follower fell behind the unsafe store's events; reading state");
             return Ok(None);
         }
+        // An empty wait may be a stream that went back: reading after a position it no longer
+        // reaches would wait forever.
+        if batch.events.is_empty() && self.last_event_id().await? < after {
+            warn!("the unsafe store's event stream was reset; the follower reads the state");
+            return Ok(None);
+        }
         let mut position = after;
         for (id, event) in batch.events {
             self.apply(state, event).await?;
@@ -262,7 +288,53 @@ impl<U: UnsafeStore, A: ArchiveStore> Follower<U, A> {
             })
             .await?;
         self.publish_heads(state, heads);
+        self.recheck_receipts(state).await?;
         Ok(Some(position))
+    }
+
+    /// Publishes the receipts the archive got for published blocks: those at or below the
+    /// safe head are archived, and the unsafe store's `receipts` events cover the others.
+    /// The archive's list of blocks still without receipts is read once; only the blocks
+    /// that left it are read.
+    async fn recheck_receipts(&self, state: &mut State) -> Result<(), ReadError> {
+        let chain = &state.chain;
+        state.without_receipts.retain(|at| chain.contains(at));
+        let Some(safe) = state.heads.and_then(|heads| heads.safe) else {
+            return Ok(());
+        };
+        let archived: Vec<BlockRef> = state
+            .without_receipts
+            .iter()
+            .filter(|at| at.number <= safe.number)
+            .copied()
+            .collect();
+        let Some(lowest) = archived.first() else {
+            return Ok(());
+        };
+        let (pending, _) = self
+            .source
+            .call(Store::Archive, "archive pending_receipts", || {
+                self.source
+                    .archive
+                    .pending_receipts(lowest.number, CHAIN_WINDOW)
+            })
+            .await?;
+        for at in archived.into_iter().filter(|at| !pending.contains(at)) {
+            if let Some(block) = self.source.archived_with_receipts(at).await? {
+                state.without_receipts.retain(|pending| *pending != at);
+                self.live.publish(ChainEvent::Receipts(Arc::new(block)));
+            }
+        }
+        Ok(())
+    }
+
+    async fn last_event_id(&self) -> Result<EventId, ReadError> {
+        Ok(self
+            .source
+            .call(Store::Unsafe, "unsafe last_event_id", || {
+                self.source.unsafe_store.last_event_id()
+            })
+            .await?)
     }
 
     async fn apply(&self, state: &mut State, event: UnsafeEvent) -> Result<(), ReadError> {
@@ -276,21 +348,23 @@ impl<U: UnsafeStore, A: ArchiveStore> Follower<U, A> {
                 None => Ok(()),
             },
             UnsafeEvent::Reorg(reorg) => {
-                let kept = reorg
-                    .common_ancestor
-                    .and_then(|ancestor| state.chain.iter().position(|block| *block == ancestor));
-                let removed = match kept {
-                    Some(index) => state.chain.drain(index.saturating_add(1)..).collect(),
-                    None => self.source.rewind(&mut state.chain).await?,
-                };
-                self.publish_reorg(removed);
+                // Only from the first block it replaced: an earlier event of the batch may
+                // have read the new chain already, and its blocks stay.
+                let first = state
+                    .chain
+                    .iter()
+                    .position(|block| reorg.replaced.contains(&block.hash));
+                if let Some(first) = first {
+                    let removed = state.chain.drain(first..).collect();
+                    self.publish_reorg(state, removed);
+                }
                 Ok(())
             }
             UnsafeEvent::Receipts(at) => {
-                if state.chain.contains(&at)
-                    && let Some(block) = self.source.block_by_hash(at.hash).await?
-                    && block.has_receipts()
+                if let Some(index) = state.without_receipts.iter().position(|block| *block == at)
+                    && let Some(block) = self.source.with_receipts(at).await?
                 {
+                    state.without_receipts.remove(index);
                     self.live.publish(ChainEvent::Receipts(Arc::new(block)));
                 }
                 Ok(())
@@ -329,7 +403,7 @@ impl<U: UnsafeStore, A: ArchiveStore> Follower<U, A> {
                     // The stores disagree for a moment (a block promoted between two reads).
                     return Ok(());
                 }
-                self.publish_reorg(removed);
+                self.publish_reorg(state, removed);
             }
         }
         Ok(())
@@ -337,10 +411,13 @@ impl<U: UnsafeStore, A: ArchiveStore> Follower<U, A> {
 
     fn publish_block(&self, state: &mut State, block: Prepared) {
         push_bounded(&mut state.chain, block.at, CHAIN_WINDOW);
+        if self.receipts && !block.has_receipts() {
+            state.without_receipts.push(block.at);
+        }
         self.live.publish(ChainEvent::Block(Arc::new(block)));
     }
 
-    fn publish_reorg(&self, removed: Vec<BlockRef>) {
+    fn publish_reorg(&self, state: &State, removed: Vec<BlockRef>) {
         let Some(first) = removed.first() else {
             return;
         };
@@ -349,7 +426,10 @@ impl<U: UnsafeStore, A: ArchiveStore> Follower<U, A> {
             depth = removed.len(),
             "reorg in the streamed chain"
         );
-        self.live.publish(ChainEvent::Reorg(removed));
+        self.live.publish(ChainEvent::Reorg {
+            removed,
+            last: state.chain.back().copied(),
+        });
     }
 
     fn publish_heads(&self, state: &mut State, heads: L1Heads) {

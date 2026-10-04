@@ -103,9 +103,11 @@ impl<U: UnsafeStore, A: ArchiveStore> Source<U, A> {
             }
             *tip = Some(from.saturating_sub(1));
         }
-        let unsafe_blocks = self.unsafe_from(from).await?;
-        if !unsafe_blocks.is_empty() {
-            return Ok(unsafe_blocks);
+        match self.unsafe_from(from).await? {
+            // Above the head: nothing is there yet.
+            None => return Ok(Vec::new()),
+            Some(unsafe_blocks) if !unsafe_blocks.is_empty() => return Ok(unsafe_blocks),
+            Some(_) => {}
         }
         // Promoted meanwhile: archived, then pruned from the unsafe store.
         let archived = self.archived(from, HISTORY_BATCH).await?;
@@ -117,13 +119,13 @@ impl<U: UnsafeStore, A: ArchiveStore> Source<U, A> {
 
     /// The unsafe store's canonical blocks from `from`, at most a batch: the block a batch
     /// above it and its ancestry, in one call each. Only the block at `from` alone when a
-    /// block in between is missing.
-    async fn unsafe_from(&self, from: BlockNumber) -> Result<Vec<Prepared>, ReadError> {
+    /// block in between is missing. `None` when `from` is above the head.
+    async fn unsafe_from(&self, from: BlockNumber) -> Result<Option<Vec<Prepared>>, ReadError> {
         let head = self
             .call(Store::Unsafe, "unsafe head", || self.unsafe_store.head())
             .await?;
         let Some(head) = head.filter(|head| head.number >= from) else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
         let span = u64::try_from(HISTORY_BATCH.items).unwrap_or(u64::MAX);
         let top_number = head.number.min(from.saturating_add(span).saturating_sub(1));
@@ -147,14 +149,15 @@ impl<U: UnsafeStore, A: ArchiveStore> Source<U, A> {
                     return blocks
                         .into_iter()
                         .map(|block| Ok(Prepared::new(StoredBlock::Decoded(Box::new(block)))?))
-                        .collect();
+                        .collect::<Result<_, _>>()
+                        .map(Some);
                 }
                 // A gap, or a reorg between the reads: one block at a time.
                 Ok(_) | Err(RetryError::Storage(_)) => {}
                 Err(RetryError::Cancelled) => return Err(ReadError::Cancelled),
             }
         }
-        Ok(self.canonical(from).await?.into_iter().collect())
+        Ok(Some(self.canonical(from).await?.into_iter().collect()))
     }
 
     /// The archive's blocks from `number`, within `limits`.
@@ -197,7 +200,8 @@ impl<U: UnsafeStore, A: ArchiveStore> Source<U, A> {
         Ok(self.archived(number, ONE_BLOCK).await?.into_iter().next())
     }
 
-    /// The block with this hash: in the unsafe store, canonical or not, or archived.
+    /// The canonical block with this hash: the unsafe store's or the archive's. A side block
+    /// is `None`.
     pub(crate) async fn block_by_hash(&self, hash: B256) -> Result<Option<Prepared>, ReadError> {
         let block = self
             .call(Store::Unsafe, "unsafe block", || {
@@ -205,7 +209,11 @@ impl<U: UnsafeStore, A: ArchiveStore> Source<U, A> {
             })
             .await?;
         if let Some(block) = block {
-            return Ok(Some(Prepared::new(StoredBlock::Decoded(Box::new(block)))?));
+            let block = Prepared::new(StoredBlock::Decoded(Box::new(block)))?;
+            if self.is_canonical(block.at).await? {
+                return Ok(Some(block));
+            }
+            return Ok(None);
         }
         let number = self
             .call(Store::Archive, "archive number_of", || {
@@ -216,6 +224,74 @@ impl<U: UnsafeStore, A: ArchiveStore> Source<U, A> {
             return Ok(None);
         };
         Ok(self.archived(number, ONE_BLOCK).await?.into_iter().next())
+    }
+
+    /// `at` (a block sent as canonical) with its receipts, if a store holds them now: the
+    /// unsafe store's block, else the archive's (the pipeline attaches late receipts there).
+    pub(crate) async fn with_receipts(&self, at: BlockRef) -> Result<Option<Prepared>, ReadError> {
+        let block = self
+            .call(Store::Unsafe, "unsafe block", || {
+                self.unsafe_store.block(at.hash)
+            })
+            .await?;
+        if let Some(block) = block.filter(|block| block.receipts.is_some()) {
+            return Ok(Some(Prepared::new(StoredBlock::Decoded(Box::new(block)))?));
+        }
+        self.archived_with_receipts(at).await
+    }
+
+    /// The archive's `at`, if it holds it with its receipts.
+    pub(crate) async fn archived_with_receipts(
+        &self,
+        at: BlockRef,
+    ) -> Result<Option<Prepared>, ReadError> {
+        Ok(self
+            .archived(at.number, ONE_BLOCK)
+            .await?
+            .into_iter()
+            .find(|block| block.at == at && block.has_receipts()))
+    }
+
+    /// Where blocks from `number` up are held, or will be: `number` itself, unless it is below
+    /// the archive's first block, or above the archive's tip and below the unsafe store's
+    /// lowest block (expired from it before being promoted). Neither store ever gets those
+    /// heights back, so a read from `number` would wait forever; this is the height held above
+    /// them. The archive's first block does not rise: it keeps all it has. With the archive's range, read on the
+    /// way.
+    pub(crate) async fn held_from(
+        &self,
+        number: BlockNumber,
+    ) -> Result<(BlockNumber, Option<(BlockRef, BlockRef)>), ReadError> {
+        // The unsafe store first: a block pruned from it was archived before, so a promotion
+        // between the two reads cannot open a false gap.
+        let lowest = self
+            .call(Store::Unsafe, "unsafe lowest", || {
+                self.unsafe_store.lowest()
+            })
+            .await?;
+        let range = self.archive_range().await?;
+        let held = match range {
+            Some((first, _)) if number < first.number => first.number,
+            Some((_, tip)) if number <= tip.number => number,
+            _ => lowest.map_or(number, |lowest| number.max(lowest)),
+        };
+        Ok((held, range))
+    }
+
+    /// `OUT_OF_RANGE` (the `Err` inside) if the stores do not hold `number` and never will
+    /// (see [`Self::held_from`]).
+    pub(crate) async fn ensure_held(
+        &self,
+        number: BlockNumber,
+    ) -> Result<Result<(), tonic::Status>, ReadError> {
+        let (held, _) = self.held_from(number).await?;
+        Ok(if held > number {
+            Err(tonic::Status::out_of_range(format!(
+                "block {number} is not held; the node holds blocks from {held} on"
+            )))
+        } else {
+            Ok(())
+        })
     }
 
     /// The unsafe head and the committed safe and finalized heads (the archive's: a block at
@@ -243,8 +319,13 @@ impl<U: UnsafeStore, A: ArchiveStore> Source<U, A> {
 
     /// Whether `block` is canonical: the unsafe store's at its height, or archived.
     async fn is_canonical(&self, block: BlockRef) -> Result<bool, ReadError> {
-        if let Some(canonical) = self.canonical(block.number).await? {
-            return Ok(canonical.at == block);
+        let number = self
+            .call(Store::Unsafe, "unsafe canonical_number", || {
+                self.unsafe_store.canonical_number(block.hash)
+            })
+            .await?;
+        if number == Some(block.number) {
+            return Ok(true);
         }
         let number = self
             .call(Store::Archive, "archive number_of", || {

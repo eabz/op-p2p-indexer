@@ -3,6 +3,9 @@
 //
 // Conventions: hashes are 32 bytes, addresses 20 bytes, 256-bit integers 32 bytes big-endian.
 // A message field that may be absent is optional or a message (presence is meaningful).
+//
+// A message can be up to 64 MiB (a full block, decoded): gRPC clients accept 4 MiB by default,
+// so raise the client's maximum receive size.
 
 syntax = "proto3";
 
@@ -13,7 +16,7 @@ service Stream {
   rpc Subscribe(SubscribeRequest) returns (stream Event);
   // The unsafe, safe and finalized heads.
   rpc GetHeads(GetHeadsRequest) returns (Heads);
-  // One block. NOT_FOUND if the node does not hold it.
+  // One canonical block. NOT_FOUND if the node does not hold it, or it is a side block.
   rpc GetBlock(GetBlockRequest) returns (Block);
 }
 
@@ -21,7 +24,8 @@ enum Payload {
   PAYLOAD_UNSPECIFIED = 0;
   // Header fields, transactions with their senders, receipts and logs.
   PAYLOAD_DECODED = 1;
-  // Header, body and receipts in their consensus encoding, as stored.
+  // Header, body and receipts in their consensus encoding: the archive's bytes as stored; a
+  // block from the unsafe store (which keeps it decoded) encoded again, the same bytes.
   PAYLOAD_RAW = 2;
 }
 

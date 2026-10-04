@@ -36,7 +36,7 @@ use op_indexer_primitives::{
     ReadLimits, UnsafeEvent,
 };
 
-pub use config::{ArchiveConfig, ArchiveRetention, RedisConfig, StorageConfig};
+pub use config::{ArchiveConfig, RedisConfig, StorageConfig};
 pub use error::{InvalidBlockReason, ParseError, Severity, StorageError};
 pub use retry::{RetryError, retry};
 
@@ -217,6 +217,14 @@ pub trait UnsafeStore {
     /// Returns [`StorageError`] if the store cannot be reached or stored data cannot be decoded.
     fn head(&self) -> impl Future<Output = Result<Option<BlockRef>, StorageError>> + Send;
 
+    /// Returns the lowest height with a canonical block, or `None` if the store is empty:
+    /// nothing below it is held.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the store cannot be reached or the height does not parse.
+    fn lowest(&self) -> impl Future<Output = Result<Option<BlockNumber>, StorageError>> + Send;
+
     /// Returns the stored block with this hash, canonical or not.
     ///
     /// # Errors
@@ -285,7 +293,10 @@ pub trait UnsafeStore {
     /// receipts yet. At most `max` heights are looked at. `None` if no block qualifies.
     ///
     /// The canonical chain is linked by parent hash wherever its heights are unbroken (fork
-    /// choice keeps it so), so the run is one chain, every block of it with its receipts.
+    /// choice keeps it so), so the run is one chain, every block of it with its receipts. It is
+    /// read in chunks of 256 heights, two round trips each, every chunk checked to continue
+    /// the one before: a run that does not continue `above`, or whose receipts lag, costs one
+    /// chunk, not `max` heights.
     ///
     /// # Errors
     ///
@@ -444,16 +455,19 @@ pub trait ArchiveStore {
     /// Returns [`StorageError`] if the archive cannot be written.
     fn set_heads(&self, heads: L1Heads) -> impl Future<Output = Result<(), StorageError>> + Send;
 
-    /// Returns the archived blocks without receipts, oldest first, at most `limit`, and how
-    /// many there are in all. Every block appended without receipts is listed, and leaves the
-    /// list when [`Self::set_receipts`] fills it: in practice the few blocks promoted before
-    /// their receipts arrived (an import always has them).
+    /// Returns the archived blocks without receipts, at most `limit`, and how many there are
+    /// in all: in block order from `from`, then from the lowest (wrapping round), so a caller
+    /// that continues after the last block it got works through all of them in turn. Every
+    /// block appended without receipts is listed, and leaves the list when
+    /// [`Self::set_receipts`] fills it: in practice the few blocks promoted before their
+    /// receipts arrived (an import always has them).
     ///
     /// # Errors
     ///
     /// Returns [`StorageError`] if the archive cannot be read.
     fn pending_receipts(
         &self,
+        from: BlockNumber,
         limit: usize,
     ) -> impl Future<Output = Result<(Vec<BlockRef>, u64), StorageError>> + Send;
 
@@ -475,36 +489,4 @@ pub trait ArchiveStore {
     fn range(
         &self,
     ) -> impl Future<Output = Result<Option<(BlockRef, BlockRef)>, StorageError>> + Send;
-
-    /// Removes every block above `number` (an L1 reorg moved the safe head back).
-    /// The recorded heads are not changed: the caller records the new ones first.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StorageError::Timeout`] if the removal exceeds its deadline, and another
-    /// [`StorageError`] if the archive cannot be written.
-    ///
-    /// # Cancel safety
-    ///
-    /// Removes in bounded batches, newest first, so the range stays contiguous. Dropping the
-    /// future does not stop the removal: it continues until it is done or reaches its deadline.
-    /// Blocks removed before the deadline stay removed; calling it again finishes the job.
-    fn truncate_above(
-        &self,
-        number: BlockNumber,
-    ) -> impl Future<Output = Result<(), StorageError>> + Send;
-
-    /// Removes the oldest blocks so at most `retain` remain. Returns how many were removed.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StorageError::Timeout`] if the removal exceeds its deadline, and another
-    /// [`StorageError`] if the archive cannot be written.
-    ///
-    /// # Cancel safety
-    ///
-    /// Removes in bounded batches, oldest first, so the range stays contiguous. Dropping the
-    /// future does not stop the removal: it continues until it is done or reaches its deadline.
-    /// Blocks removed before the deadline stay removed; calling it again finishes the job.
-    fn trim(&self, retain: u64) -> impl Future<Output = Result<u64, StorageError>> + Send;
 }

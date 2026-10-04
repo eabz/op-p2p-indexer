@@ -31,6 +31,7 @@ mod provider;
 mod session;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use alloy_primitives::{BlockNumber, Bytes};
@@ -52,6 +53,7 @@ use self::provider::HeldRange;
 pub(crate) use self::session::{Handled, Serving, SessionServing};
 use crate::ElError;
 use crate::metrics::{self, ServeKind, ServeOutcome};
+use crate::warn_limit::WarnLimit;
 use crate::wire;
 
 /// Most headers, bodies or blocks of receipts in one response: what reth and geth serve.
@@ -73,6 +75,56 @@ const MAX_CONCURRENT: usize = 4;
 const HEAD_REFRESH: Duration = Duration::from_secs(2);
 /// How often the held range is read from the provider.
 const RANGE_REFRESH: Duration = Duration::from_secs(10);
+/// Provider reads failed in a row after which requests are answered empty without reading,
+/// until a read of the held range succeeds again.
+const MAX_FAILURES: u32 = 8;
+/// Shortest time between two warnings about the same kind of failed read.
+const FAILURE_WARN_INTERVAL: Duration = Duration::from_mins(1);
+
+/// How the provider has been doing, shared by the server and the reads it spawns.
+#[derive(Debug, Default)]
+struct Health {
+    /// Reads failed in a row.
+    failures: AtomicU32,
+    /// One warning limit per kind of request.
+    warned: [WarnLimit; 3],
+    /// The warning limit for reads of the held range.
+    range_warned: WarnLimit,
+}
+
+impl Health {
+    /// Whether the provider failed [`MAX_FAILURES`] times in a row.
+    fn is_failing(&self) -> bool {
+        self.failures.load(Ordering::Relaxed) >= MAX_FAILURES
+    }
+
+    fn succeeded(&self) {
+        self.failures.store(0, Ordering::Relaxed);
+    }
+
+    /// Counts a failed read and warns about it, at most once a minute per cause (`kind`, or
+    /// `None` for the held range).
+    fn failed(&self, kind: Option<ServeKind>, err: &dyn std::fmt::Display) {
+        let failures = self
+            .failures
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        let warned = match kind {
+            Some(kind) => self.warned.get(kind as usize),
+            None => Some(&self.range_warned),
+        };
+        if let Some(held_back) = warned.and_then(|warned| warned.allow(FAILURE_WARN_INTERVAL)) {
+            let what = kind.map_or("the range of blocks held", ServeKind::as_str);
+            warn!(
+                %err,
+                held_back,
+                failures,
+                "could not read {what} to serve; after {MAX_FAILURES} failures in a row, peers \
+                 are answered empty until the provider recovers"
+            );
+        }
+    }
+}
 
 /// A peer's request on its way to the server.
 #[derive(Debug)]
@@ -99,6 +151,7 @@ pub(crate) struct Server<P> {
     range: watch::Sender<Option<HeldRange>>,
     /// Whether what is advertised has been logged once.
     logged: bool,
+    health: Arc<Health>,
 }
 
 /// Builds the server over `provider` and what sessions use to reach it. The held range is
@@ -115,6 +168,7 @@ pub(crate) fn new<P: BlockProvider>(
         requests: requests_rx,
         range: range_tx,
         logged: false,
+        health: Arc::default(),
     };
     let serving = Serving {
         requests: requests_tx,
@@ -173,17 +227,20 @@ impl<P: BlockProvider> Server<P> {
                 request = self.requests.recv(), if answering.len() < MAX_CONCURRENT => {
                     // Closed: every session and the context are gone.
                     let Some(request) = request else { return Ok(()) };
-                    answering.spawn(answer(Arc::clone(&self.provider), request).in_current_span());
+                    let (provider, health) = (Arc::clone(&self.provider), Arc::clone(&self.health));
+                    answering.spawn(answer(provider, health, request).in_current_span());
                 }
             }
         }
     }
 
-    /// Reads the held range from the provider. A failed read keeps the last one.
+    /// Reads the held range from the provider. A failed read keeps the last one: nothing new
+    /// is advertised while the provider fails.
     async fn refresh_range(&mut self) {
         let held = self.provider.range().await;
         match held {
             Ok(held) => {
+                self.health.succeeded();
                 let before = self.range.send_replace(held);
                 // The last block moves with every promotion; what is worth a line is the
                 // kind of range advertised and where it starts.
@@ -205,7 +262,7 @@ impl<P: BlockProvider> Server<P> {
                     }
                 }
             }
-            Err(err) => warn!(%err, "could not read the range of blocks to serve"),
+            Err(err) => self.health.failed(None, &err),
         }
     }
 }
@@ -229,7 +286,8 @@ const fn response_id(kind: ServeKind) -> u8 {
 }
 
 /// Answers one request from `provider` and hands the answer to its session.
-async fn answer<P: BlockProvider>(provider: Arc<P>, request: Request) {
+/// While the provider is failing, answers empty without reading.
+async fn answer<P: BlockProvider>(provider: Arc<P>, health: Arc<Health>, request: Request) {
     let Request {
         kind,
         lowest,
@@ -238,16 +296,23 @@ async fn answer<P: BlockProvider>(provider: Arc<P>, request: Request) {
         body,
         answer,
     } = request;
-    let items = gather(&*provider, kind, lowest, version, &body).await;
+    let items = if health.is_failing() {
+        Ok(Vec::new())
+    } else {
+        gather(&*provider, kind, lowest, version, &body).await
+    };
     let (items, outcome) = match items {
         Ok(items) if items.is_empty() => (items, ServeOutcome::Empty),
-        Ok(items) => (items, ServeOutcome::Answered),
+        Ok(items) => {
+            health.succeeded();
+            (items, ServeOutcome::Answered)
+        }
         Err(Fault::Malformed(err)) => {
             debug!(?kind, %err, "malformed request from an execution peer");
             (Vec::new(), ServeOutcome::Malformed)
         }
         Err(Fault::Provider(err)) => {
-            warn!(?kind, %err, "could not read blocks to serve");
+            health.failed(Some(kind), &err);
             (Vec::new(), ServeOutcome::Failed)
         }
     };

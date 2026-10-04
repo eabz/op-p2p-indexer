@@ -40,9 +40,6 @@ services:
       # A second instance of the same chain needs its own Redis database (`/1`, `/2`, ...):
       # keys are prefixed by chain id only.
       OP_INDEXER_REDIS_URL: ${OP_INDEXER_REDIS_URL:-redis://redis:6379}
-      # Blocks kept in the block archive, the committed store (the archive directory in the
-      # data volume): `all` or a block count. Empty means `all`.
-      OP_INDEXER_ARCHIVE_RETENTION_BLOCKS: ${OP_INDEXER_ARCHIVE_RETENTION_BLOCKS:-}
       # Execution p2p (devp2p), which fetches the receipts gossip does not carry. Off unless
       # OP_INDEXER_EL_ENABLED is true; the others only apply then.
       OP_INDEXER_EL_ENABLED: ${OP_INDEXER_EL_ENABLED:-}
@@ -82,8 +79,11 @@ services:
       - "${OP_INDEXER_STREAM_HOST_BIND:-127.0.0.1}:${OP_INDEXER_STREAM_PORT:-50051}:${OP_INDEXER_STREAM_PORT:-50051}/tcp"
     volumes:
       # The data directory (the image sets OP_INDEXER_DATA_DIR=/data): `node/` holds the node
-      # identity and known peers, `archive/` the local block archive.
-      - indexer-data:/data
+      # identity and known peers, `archive/` the block archive. It is a host directory named
+      # after the chain, `./data-op` by default and `./data-unichain` in unichain.env.example,
+      # the same names the node and `import load` use outside Docker. The container runs as
+      # uid 10001: create it once with `mkdir -p data-op && chown 10001:10001 data-op`.
+      - ${OP_INDEXER_HOST_DATA_DIR:-./data-op}:/data
 
   redis:
     image: redis:8-alpine
@@ -99,5 +99,4 @@ services:
       retries: 10
 
 volumes:
-  indexer-data:
   redis-data:

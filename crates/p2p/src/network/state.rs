@@ -22,7 +22,6 @@ use tracing::{debug, info, trace, warn};
 
 use super::{Behaviour, BehaviourEvent, answer};
 use crate::block::{BlockError, BlockValidator, SeenBlocks};
-use crate::gossip;
 use crate::metrics::{self, DialOutcome};
 use crate::peers::ConnectedPeers;
 use crate::sync::Server;
@@ -44,6 +43,9 @@ const CLOCK_SKEW_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// How long a peer whose score fell below the graylist threshold is banned.
 const BAN_DURATION: Duration = Duration::from_secs(3600);
+/// Score below which a peer is banned: op-node's default (`p2p.ban.threshold`). Below the
+/// graylist threshold (-40) gossipsub already ignores the peer's messages; a ban takes more.
+const BAN_THRESHOLD: f64 = -100.0;
 /// Most peers banned at once; past it a peer is only disconnected.
 const MAX_BANNED_PEERS: usize = 4096;
 
@@ -405,8 +407,9 @@ impl State {
     }
 
     /// Reports that the message `id` from `source` failed validation, as the error says to
-    /// treat it. After a rejection, bans `source` once its score falls below the graylist
-    /// threshold, where gossipsub ignores its RPCs anyway.
+    /// treat it. After a rejection, bans `source` once its score falls below
+    /// [`BAN_THRESHOLD`]; never for a block outside the time window, which may be our clock's
+    /// fault.
     fn report_failed(
         &mut self,
         swarm: &mut Swarm<Behaviour>,
@@ -420,7 +423,7 @@ impl State {
         metrics::block_rejected(err);
         report(swarm, id, &source, acceptance);
         let score = swarm.behaviour().gossipsub.peer_score(&source);
-        if rejected && score.is_some_and(|score| score < gossip::GRAYLIST_THRESHOLD) {
+        if rejected && !err.is_time_window() && score.is_some_and(|score| score < BAN_THRESHOLD) {
             self.ban(swarm, source);
         }
     }
@@ -431,7 +434,7 @@ impl State {
     ///
     /// [peer management]: https://specs.optimism.io/protocol/rollup-node-p2p.html#peer-management
     fn ban(&mut self, swarm: &mut Swarm<Behaviour>, peer: PeerId) {
-        debug!(%peer, "banning graylisted peer");
+        debug!(%peer, "banning a peer below the ban threshold");
         let now = Instant::now();
         if self.banned.len() < MAX_BANNED_PEERS {
             self.banned.insert(peer, now + BAN_DURATION);
@@ -538,6 +541,6 @@ fn report(
 }
 
 /// Current Unix time in seconds; protocol timestamps are wall-clock.
-fn unix_now_secs() -> u64 {
+pub(crate) fn unix_now_secs() -> u64 {
     UNIX_EPOCH.elapsed().map_or(0, |elapsed| elapsed.as_secs())
 }

@@ -4,8 +4,10 @@
 //! `table:from:to[:cap]`, with `cap` one of `finalized`, `safe`, `any` (the default). `DoGet`
 //! streams the table's rows for the range, one record batch per read of the stores (at most 64
 //! blocks or 16 MiB), produced by a task that reads the next batch while it builds one and
-//! stays at most two ahead of the consumer. The live chain, with reorgs, is the gRPC
-//! subscription's: Flight serves ranges.
+//! stays at most one ahead of the consumer. A range longer than [`MAX_FLIGHT_BLOCKS`] is cut
+//! to that; the response's `op-indexer-range-to` header gives the last block it covers. A
+//! consumer that does not read for 30 s is ended with `RESOURCE_EXHAUSTED`. The live chain,
+//! with reorgs, is the gRPC subscription's: Flight serves ranges.
 //!
 //! `ListFlights`, `GetFlightInfo` and `GetSchema` describe the four tables
 //! ([`tables::Table`]) and the range each ticket covers; everything else is `UNIMPLEMENTED`.
@@ -26,19 +28,25 @@ use arrow_flight::{
 };
 use arrow_ipc::writer::IpcWriteOptions;
 use op_indexer_storage::{ArchiveStore, UnsafeStore};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt as _};
 use tokio_util::task::TaskTracker;
+use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status, Streaming};
 
 use self::tables::Table;
 use crate::convert::Prepared;
+use crate::sink::Sink;
 use crate::source::{Source, read_status};
 
-/// Record batches a `DoGet` producer may hold ready ahead of the consumer.
-const BATCHES_AHEAD: usize = 2;
+/// Record batches a `DoGet` producer may hold ready ahead of the consumer: with the one being
+/// built and the one being read, about 50 MiB per stream at most.
+const BATCHES_AHEAD: usize = 1;
+/// The most blocks one `DoGet` covers; a longer range is cut, so one stream does not hold a
+/// permit for days.
+const MAX_FLIGHT_BLOCKS: u64 = 100_000;
 
 /// A response stream.
 type Responses<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
@@ -109,6 +117,9 @@ impl Query {
                 .ok_or_else(invalid)
         };
         let (from, to) = (number()?, number()?);
+        if to < from {
+            return Err(Status::invalid_argument("`to` is below `from`"));
+        }
         let cap = match parts.next() {
             None => Cap::Any,
             Some(name) => Cap::ALL
@@ -171,31 +182,25 @@ where
     A: ArchiveStore + Clone + Send + Sync + 'static,
 {
     /// The range `query` covers now: `from` the lowest block held when it names none, `to`
-    /// lowered to what its cap allows.
+    /// lowered to what its cap allows and to [`MAX_FLIGHT_BLOCKS`] blocks.
     ///
     /// # Errors
     ///
-    /// `OUT_OF_RANGE` if `from` is below the archive's first block, or nothing is held from
-    /// `from` under the cap.
+    /// `OUT_OF_RANGE` if the stores do not hold `from` and never will (see
+    /// [`Source::held_from`]), or nothing is held from `from` under the cap.
     async fn resolve(&self, query: Query) -> Result<Query, Status> {
-        let range = self
+        let asked = query.from.unwrap_or(0);
+        let (from, range) = self
             .source
-            .archive_range()
+            .held_from(asked)
             .await
             .map_err(|err| read_status(&err))?;
+        if query.from.is_some() && from > asked {
+            return Err(Status::out_of_range(format!(
+                "block {asked} is not held; the node holds blocks from {from} on"
+            )));
+        }
         let (unsafe_head, heads) = self.source.heads().await.map_err(|err| read_status(&err))?;
-        let first = range
-            .map(|(first, _)| first.number)
-            .or(unsafe_head.map(|head| head.number));
-        let from = match (query.from, first) {
-            (Some(from), Some(first)) if from < first => {
-                return Err(Status::out_of_range(format!(
-                    "the node holds blocks from {first} on"
-                )));
-            }
-            (Some(from), _) => from,
-            (None, first) => first.unwrap_or(0),
-        };
         // `None` sorts below every number: a missing head, or an empty archive, holds nothing.
         let archive_tip = range.map(|(_, tip)| tip.number);
         let reach = match query.cap {
@@ -203,15 +208,19 @@ where
             Cap::Safe => heads.safe.map(|head| head.number).min(archive_tip),
             Cap::Any => unsafe_head.map(|head| head.number).max(archive_tip),
         };
-        let to = reach
-            .map(|reach| query.to.min(reach))
-            .filter(|to| *to >= from)
-            .ok_or_else(|| {
-                Status::out_of_range(format!(
-                    "no {} block is held from {from} on",
-                    query.cap.name()
-                ))
-            })?;
+        let Some(reach) = reach.filter(|reach| *reach >= from) else {
+            return Err(Status::out_of_range(match query.cap {
+                Cap::Any => format!("the node holds no block from {from} on"),
+                cap @ (Cap::Finalized | Cap::Safe) => format!(
+                    "the {} head is below block {from}, or not known yet",
+                    cap.name()
+                ),
+            }));
+        };
+        let to = query
+            .to
+            .min(reach)
+            .min(from.saturating_add(MAX_FLIGHT_BLOCKS - 1));
         Ok(Query {
             from: Some(from),
             to,
@@ -220,8 +229,7 @@ where
     }
 
     /// The `FlightInfo` of `query`, resolved.
-    async fn info(&self, query: Query, descriptor: FlightDescriptor) -> Result<FlightInfo, Status> {
-        let query = self.resolve(query).await?;
+    fn info(query: Query, descriptor: FlightDescriptor) -> Result<FlightInfo, Status> {
         let schema = query.table.schema().map_err(Status::from)?;
         let info = FlightInfo::new()
             .try_with_schema(&schema)
@@ -234,17 +242,25 @@ where
     }
 }
 
+/// A `DoGet`'s queue of record batches.
+type Batches = Sink<RecordBatch, FlightError>;
+
 /// Reads `query` (resolved) and sends its record batches on `batches`, until it is done, the
-/// consumer leaves, or a read fails (sent as the stream's last item).
+/// consumer leaves or stops reading, a read fails, or the node shuts down; the last two end
+/// the stream with their error.
 async fn produce<U: UnsafeStore, A: ArchiveStore>(
     source: Source<U, A>,
     query: Query,
-    batches: mpsc::Sender<Result<RecordBatch, FlightError>>,
+    mut batches: Batches,
     _permit: OwnedSemaphorePermit,
 ) {
-    if let Err(err) = read_range(&source, query, &batches).await {
-        // A consumer that left is not told.
-        drop(batches.send(Err(err)).await);
+    let read = tokio::select! {
+        biased;
+        () = source.cancel.cancelled() => Err(Status::unavailable("the node is shutting down").into()),
+        read = read_range(&source, query, &mut batches) => read,
+    };
+    if let Err(err) = read {
+        batches.end(err);
     }
 }
 
@@ -254,16 +270,13 @@ type Building = JoinHandle<Result<RecordBatch, FlightError>>;
 async fn read_range<U: UnsafeStore, A: ArchiveStore>(
     source: &Source<U, A>,
     query: Query,
-    batches: &mpsc::Sender<Result<RecordBatch, FlightError>>,
+    batches: &mut Batches,
 ) -> Result<(), FlightError> {
     let (mut next, mut archive_tip) = (query.from.unwrap_or(0), None);
     let mut parent: Option<B256> = None;
     // The previous batch, built while the next one is read.
     let mut building: Option<Building> = None;
     while next <= query.to {
-        if source.cancel.is_cancelled() {
-            return Err(Status::unavailable("the node is shutting down").into());
-        }
         let heads = source
             .archive_heads()
             .await
@@ -275,7 +288,7 @@ async fn read_range<U: UnsafeStore, A: ArchiveStore>(
         blocks.retain(|block| block.at.number <= query.to);
         let Some(last) = blocks.last().map(|block| block.at) else {
             return Err(Status::unavailable(format!(
-                "block {next} is no longer held (trimmed, or a gap in the unsafe chain)"
+                "block {next} is not held (a gap in the unsafe chain, or expired from it unpromoted)"
             ))
             .into());
         };
@@ -304,15 +317,13 @@ async fn read_range<U: UnsafeStore, A: ArchiveStore>(
     Ok(())
 }
 
-/// Waits for a batch and sends it. `false` when the consumer has left.
-async fn send(
-    building: Building,
-    batches: &mpsc::Sender<Result<RecordBatch, FlightError>>,
-) -> Result<bool, FlightError> {
+/// Waits for a batch and sends it. `false` when the stream has ended (the consumer left, or
+/// was told it is too slow).
+async fn send(building: Building, batches: &mut Batches) -> Result<bool, FlightError> {
     let batch = building
         .await
         .map_err(|err| FlightError::ExternalError(Box::new(err)))??;
-    Ok(batches.send(Ok(batch)).await.is_ok())
+    Ok(batches.send(batch).await.is_ok())
 }
 
 fn unimplemented<T>() -> Result<T, Status> {
@@ -346,11 +357,17 @@ where
         &self,
         _request: Request<Criteria>,
     ) -> Result<Response<Self::ListFlightsStream>, Status> {
-        let mut infos = Vec::with_capacity(Table::ALL.len());
-        for table in Table::ALL {
-            let descriptor = FlightDescriptor::new_path(vec![table.name().to_owned()]);
-            infos.push(self.info(Query::whole(table), descriptor).await);
-        }
+        // Every table covers the same blocks: the range is resolved once.
+        let resolved = self.resolve(Query::whole(Table::Blocks)).await;
+        let infos: Vec<_> = Table::ALL
+            .into_iter()
+            .map(|table| {
+                let descriptor = FlightDescriptor::new_path(vec![table.name().to_owned()]);
+                resolved
+                    .clone()
+                    .and_then(|query| Self::info(Query { table, ..query }, descriptor))
+            })
+            .collect();
         Ok(Response::new(Box::pin(tokio_stream::iter(infos))))
     }
 
@@ -359,8 +376,8 @@ where
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
         let descriptor = request.into_inner();
-        let query = Query::try_from(&descriptor)?;
-        self.info(query, descriptor).await.map(Response::new)
+        let query = self.resolve(Query::try_from(&descriptor)?).await?;
+        Self::info(query, descriptor).map(Response::new)
     }
 
     async fn poll_flight_info(
@@ -391,14 +408,18 @@ where
             .map_err(|_full| Status::resource_exhausted("too many Flight streams at once"))?;
         let query = self.resolve(query).await?;
         let schema = query.table.schema().map_err(Status::from)?;
-        let (tx, rx) = mpsc::channel(BATCHES_AHEAD);
+        let (batches, rx) = Sink::channel(BATCHES_AHEAD);
         self.tasks
-            .spawn(produce(self.source.clone(), query, tx, permit));
+            .spawn(produce(self.source.clone(), query, batches, permit));
         let encoded = FlightDataEncoderBuilder::new()
             .with_schema(schema)
             .build(ReceiverStream::new(rx))
             .map(|data| data.map_err(Status::from));
-        Ok(Response::new(Box::pin(encoded)))
+        let mut response = Response::new(Box::pin(encoded) as Self::DoGetStream);
+        response
+            .metadata_mut()
+            .insert("op-indexer-range-to", MetadataValue::from(query.to));
+        Ok(response)
     }
 
     async fn do_put(

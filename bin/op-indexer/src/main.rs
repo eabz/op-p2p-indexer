@@ -26,10 +26,10 @@ use op_indexer_pipeline::{Pipeline, ReceiptsChannels};
 use op_indexer_primitives::{BlockRef, EncodedBlock, ExecutionPeer, L1Games, L1Heads, SyncRange};
 use op_indexer_storage::archive_store::FjallArchive;
 use op_indexer_storage::unsafe_store::RedisStore;
-use op_indexer_storage::{ArchiveRetention, ArchiveStore, StorageConfig, UnsafeStore};
+use op_indexer_storage::{ArchiveStore, StorageConfig, UnsafeStore};
 use op_indexer_stream::StreamServer;
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -129,9 +129,12 @@ async fn main() -> eyre::Result<()> {
     // With the range sync on, it closes the gaps gossip cannot: promotion extends the archive
     // from the unsafe store, which reaches only so far back, so an L1 head is held while the
     // archive is further than that below its safe block, and a sync round closes the gap.
-    let sync_archive = config.sync.then(|| stores.archive.0.clone());
+    let sync_archive = config.sync.then(|| stores.archive.clone());
     let gate_archive = sync_archive.clone();
 
+    // Tasks that follow the node until it stops, each returning its name: one ending earlier
+    // stops the node.
+    let mut followers = JoinSet::new();
     let execution = config
         .el
         .map(|el| {
@@ -143,7 +146,7 @@ async fn main() -> eyre::Result<()> {
                 committed: safe_number_rx.clone(),
                 l1: config.l1.is_some(),
             });
-            execution_network(el, sync, &store, &stores, head_rx)
+            execution_network(el, sync, &store, &stores, head_rx, &mut followers)
         })
         .transpose()?;
     let (execution, receipts, range, mut saves) = execution.map_or_else(
@@ -160,18 +163,19 @@ async fn main() -> eyre::Result<()> {
 
     // The blocks older consensus-layer nodes may ask for by number.
     let payloads: Arc<dyn PayloadSource> = Arc::new(NodeProvider::new(
-        stores.archive.0.clone(),
+        stores.archive.clone(),
         stores.unsafe_store.clone(),
     ));
     // Reads the stores the pipeline writes, and the unsafe store's events.
     let stream = StreamServer::new(
         config.stream,
         stores.unsafe_store.clone(),
-        stores.archive.0.clone(),
+        stores.archive.clone(),
     );
     let pipeline = Pipeline::new(
         stores.unsafe_store,
         stores.archive,
+        config.network.chain.canyon_time,
         blocks_rx,
         l1_heads_rx,
         safe_number_tx,
@@ -182,11 +186,9 @@ async fn main() -> eyre::Result<()> {
         Some(range) => pipeline.with_range(range),
         None => pipeline,
     };
-    saves.push(tokio::spawn(forward_l1_heads(
-        l1_source_rx,
-        l1_heads_tx,
-        gate_archive.map(|archive| (archive, safe_number_rx.clone())),
-    )));
+    let gate = gate_archive.map(|archive| (archive, safe_number_rx.clone()));
+    let forward = forward_l1_heads(l1_source_rx, l1_heads_tx, gate);
+    follow(&mut followers, "L1 heads forwarder", forward);
     // The L1 side, whose games the pipeline turns into the heads; without it nothing writes
     // them and the sender is only kept alive, so promotion sees a quiet source, not a closed
     // one.
@@ -208,7 +210,19 @@ async fn main() -> eyre::Result<()> {
         safe_number_rx,
         payloads,
     );
-    run(network, execution, l1, (pipeline, stream), saves).await
+    run(network, execution, l1, (pipeline, stream), followers, saves).await
+}
+
+/// Spawns `task` into `followers`, named for the error if it ends before the node stops.
+fn follow(
+    followers: &mut JoinSet<&'static str>,
+    name: &'static str,
+    task: impl Future<Output = ()> + Send + 'static,
+) {
+    followers.spawn(async move {
+        task.await;
+        name
+    });
 }
 
 /// The L1 side: the two components and what connects them to the rest.
@@ -283,6 +297,7 @@ async fn run(
         Pipeline<RedisStore, FjallArchive>,
         StreamServer<RedisStore, FjallArchive>,
     ),
+    mut followers: JoinSet<&'static str>,
     saves: Vec<JoinHandle<()>>,
 ) -> eyre::Result<()> {
     let cancel = CancellationToken::new();
@@ -294,7 +309,9 @@ async fn run(
     let mut l1 = l1.map(|l1| tokio::spawn(l1.run(networks_cancel.clone())));
     let mut light_client =
         light_client.map(|light_client| tokio::spawn(light_client.run(networks_cancel.clone())));
-    let mut pipeline = Some(tokio::spawn(pipeline.run(cancel.clone())));
+    let mut pipeline = Some(tokio::spawn(
+        pipeline.run(networks_cancel.clone(), cancel.clone()),
+    ));
     // Stopped with the networks: consumers are told the node is shutting down.
     let mut stream = Some(tokio::spawn(stream.run(networks_cancel.clone())));
 
@@ -325,6 +342,10 @@ async fn run(
             warn!("stream server stopped unexpectedly");
             result.wrap_err("stream server failed")
         }
+        Some(ended) = followers.join_next() => match ended {
+            Ok(task) => Err(eyre::eyre!("the {task} ended before shutdown")),
+            Err(err) => Err(err).wrap_err("a node task panicked"),
+        },
     };
 
     networks_cancel.cancel();
@@ -334,10 +355,18 @@ async fn run(
     let light_client = join(light_client)
         .await
         .wrap_err("beacon light client failed");
-    let stream = join(stream).await.wrap_err("stream server failed");
     cancel.cancel();
-    let pipeline = join(pipeline).await.wrap_err("pipeline failed");
-    // Their senders are gone with the execution network, so they end.
+    // The stream ends with the networks; it is waited for with the pipeline, so a slow stream
+    // shutdown never holds the pipeline running.
+    let (stream, pipeline) = tokio::join!(join(stream), join(pipeline));
+    let stream = stream.wrap_err("stream server failed");
+    let pipeline = pipeline.wrap_err("pipeline failed");
+    // Their inputs are gone with the networks and the pipeline, so they end.
+    while let Some(ended) = followers.join_next().await {
+        if let Err(err) = ended {
+            warn!(%err, "a node task failed");
+        }
+    }
     for save in saves {
         if let Err(err) = save.await {
             warn!(%err, "a task saving node state failed");
@@ -354,7 +383,8 @@ async fn run(
 }
 
 /// Waits for `task` to finish and clears it, so it is not awaited again. Never resolves when
-/// there is no task, which lets a disabled component sit in a `select!`.
+/// there is no task, which lets a disabled component sit in a `select!`. Components run until
+/// they are cancelled, so one that ends before shutdown is an error even when it ends cleanly.
 async fn finished<E>(task: &mut Option<JoinHandle<Result<(), E>>>) -> eyre::Result<()>
 where
     E: std::error::Error + Send + Sync + 'static,
@@ -364,7 +394,8 @@ where
     };
     let result = handle.await;
     *task = None;
-    Ok(result.wrap_err("task panicked")??)
+    result.wrap_err("task panicked")??;
+    Err(eyre::eyre!("ended before shutdown"))
 }
 
 /// Waits for `task` if it has not finished yet.
@@ -392,13 +423,14 @@ struct Execution {
 /// Builds the execution network from its settings and what the node store has saved for it.
 /// Peers are served from the archive. `head` is the
 /// newest block the node knows. With `sync`, the blocks between the archive and the chain's
-/// head are fetched from peers.
+/// head are fetched from peers, planned by a task added to `followers`.
 fn execution_network(
     el: ElSettings,
     sync: Option<SyncInputs>,
     store: &Arc<NodeStore>,
     stores: &Stores,
     head: watch::Receiver<Option<BlockRef>>,
+    followers: &mut JoinSet<&'static str>,
 ) -> eyre::Result<Execution> {
     // A key of its own: the two networks must not share a node id.
     let key = store
@@ -410,7 +442,7 @@ fn execution_network(
     let (requests_tx, requests_rx) = mpsc::channel(RECEIPT_REQUEST_CAPACITY);
     let (verified_tx, verified_rx) = mpsc::channel(VERIFIED_RECEIPTS_CAPACITY);
     let (served_tx, served_rx) = mpsc::channel(SERVED_PEERS_CAPACITY);
-    let provider = NodeProvider::new(stores.archive.0.clone(), stores.unsafe_store.clone());
+    let provider = NodeProvider::new(stores.archive.clone(), stores.unsafe_store.clone());
     let network = ExecutionNetwork::new(
         el.into_config(saved_peers),
         key,
@@ -432,7 +464,8 @@ fn execution_network(
             let (plans_tx, plans_rx) = mpsc::channel(1);
             let (blocks_tx, batches) = mpsc::channel(SYNC_BATCH_CAPACITY);
             let (checkpoints_tx, checkpoints_rx) = mpsc::channel(SYNC_CHECKPOINT_CAPACITY);
-            saves.push(tokio::spawn(plan_sync(Arc::clone(store), inputs, plans_tx)));
+            let plan = plan_sync(Arc::clone(store), inputs, plans_tx);
+            follow(followers, "range sync planner", plan);
             saves.push(tokio::spawn(save_sync_checkpoints(
                 Arc::clone(store),
                 checkpoints_rx,
@@ -825,34 +858,29 @@ async fn save_sync_checkpoints(store: Arc<NodeStore>, mut verified: mpsc::Receiv
 /// The two stores, connected and ready.
 struct Stores {
     unsafe_store: RedisStore,
-    /// The block archive, the committed store, with how much it keeps.
-    archive: (FjallArchive, ArchiveRetention),
+    /// The block archive, the committed store.
+    archive: FjallArchive,
     /// The archive's first and last block at startup; `None` when it is empty.
     archive_range: Option<(BlockRef, BlockRef)>,
 }
 
 /// Opens the block archive, checking that it holds the configured chain. Startup-only
 /// blocking I/O, like the node store.
-fn open_archive(config: &StorageConfig) -> eyre::Result<(FjallArchive, ArchiveRetention)> {
-    let store = FjallArchive::open(&config.archive.path, config.chain)
-        .wrap_err("failed to open the block archive")?;
-    Ok((store, config.archive.retention))
+fn open_archive(config: &StorageConfig) -> eyre::Result<FjallArchive> {
+    FjallArchive::open(&config.archive.path, config.chain)
+        .wrap_err("failed to open the block archive")
 }
 
 /// Reads the range of `archive` (opened by [`open_archive`]), connects to Redis and runs its
 /// schema check, and returns the stores once both are ready, so an unreachable or mismatched
 /// store stops startup.
-async fn prepare_storage(
-    config: &StorageConfig,
-    archive: (FjallArchive, ArchiveRetention),
-) -> eyre::Result<Stores> {
+async fn prepare_storage(config: &StorageConfig, archive: FjallArchive) -> eyre::Result<Stores> {
     op_indexer_storage::metrics::describe();
-    let (store, retention) = &archive;
-    let archive_range = store
+    let archive_range = archive
         .range()
         .await
         .wrap_err("failed to read the block archive")?;
-    info!(range = ?archive_range, ?retention, "block archive ready");
+    info!(range = ?archive_range, "block archive ready");
     let unsafe_store = RedisStore::connect(&config.redis, config.chain.chain_id)
         .await
         .wrap_err("failed to connect to Redis")?;

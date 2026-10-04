@@ -25,11 +25,12 @@ use crate::discovery::Candidate;
 /// Limit for opening the TCP connection.
 const TCP_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// Limit for the encrypted handshake.
-const ECIES_TIMEOUT: Duration = Duration::from_secs(10);
+/// Limit for the encrypted handshake: a round trip, so short; a connection that holds a
+/// pending inbound place without speaking frees it soon.
+const ECIES_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Limit for the hello exchange.
-const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Limit for the status exchange.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(15);

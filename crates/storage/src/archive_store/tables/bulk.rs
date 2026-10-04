@@ -7,11 +7,14 @@
 //! finished last, after the other five, and its last key is the archive's tip, so a crash
 //! leaves the archive holding a contiguous prefix.
 //!
-//! The other keyspaces may then hold blocks of the unfinished list above the tip. Reads by
-//! number stop at the tip, but a read of bodies or receipts by hash, `number_of` and
-//! `set_receipts` find them; `trim` and `truncate_above` walk `headers` and do not remove
-//! them. They are verified blocks of the chain the archive holds, and the next load writes
-//! them again, with the same values, and then the header.
+//! The other keyspaces may then hold blocks of the unfinished list above the tip. Nothing
+//! removes them: `numbers` is keyed by hash, so finding them would mean scanning it. Nothing
+//! needs to: they are verified blocks of the chain the archive holds, and the next load (or
+//! append) writes them again, with the same values, and then the header. Until then reads by
+//! number stop at the tip; a read of bodies or receipts by hash serves them (verified bytes);
+//! `number_of` gives a number above the tip, which callers take as not archived yet;
+//! `set_receipts` can fill them; and `pending_receipts` lists those without receipts, which a
+//! read by number then does not find.
 //!
 //! Does not check what a block contains: `PreparedBlock::new` checks the header's hash, the
 //! writer checks the chain.

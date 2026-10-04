@@ -8,21 +8,25 @@
 //! the payload as SSZ in snappy frames. Version 0 is the bare `ExecutionPayload` (V1, V2),
 //! version 1 the `ExecutionPayloadEnvelope` from Ecotone on (V3, V4).
 //!
-//! Requests are rate limited as op-node's are, with `governor`: 20 a second overall (bursts of
-//! 40) and 4 a second per peer (bursts of 15); a request waits for both, and is answered with
-//! result 3 when that takes more than 20 seconds. A number before the chain's Bedrock block, or past the
+//! Requests are rate limited as op-node's are, with `governor`: 4 a second per peer (bursts of
+//! 15), then 20 a second overall (bursts of 40). The peer's own limit is waited for first, so
+//! one peer cannot drain the shared budget; a request is answered with result 3 when both take
+//! more than 20 seconds, or at once when 4 of the peer's requests, or 512 in all, already wait.
+//! At most 32 answers are read and encoded at once, and an answer must be written within 10
+//! seconds, as op-node's write deadline. A number before the chain's Bedrock block, or past the
 //! block the wall clock implies, is an invalid request (result 2).
 //!
 //! [`payload_by_number`]: https://specs.optimism.io/protocol/rollup-node-p2p.html#payload_by_number
 //! [req/resp sync deprecation]: https://docs.optimism.io/notices/archive/req-resp-cl-sync-deprecation
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::io;
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use alloy_primitives::{BlockNumber, Bytes};
 use governor::clock::DefaultClock;
@@ -36,6 +40,7 @@ use op_alloy_rpc_types_engine::{OpExecutionPayload, OpExecutionPayloadEnvelope};
 use op_indexer_chainspec::ChainSpec;
 use op_indexer_primitives::{EncodedBlock, decode_block, encode_body, split_body};
 use ssz::Encode as _;
+use tokio::sync::Semaphore;
 use tokio::task::{JoinError, JoinSet};
 
 /// The canonical block at a height, or why it could not be read.
@@ -74,6 +79,12 @@ const PEER_RATE: (u32, u32) = (4, 15);
 /// Requests waiting for the limits at once; past it a request is answered with [`UNKNOWN`]
 /// at once, so a flood cannot pile up waiting tasks.
 const MAX_WAITING: usize = 512;
+/// Requests of one peer waiting at once, so one peer cannot fill [`MAX_WAITING`].
+const MAX_WAITING_PER_PEER: usize = 4;
+/// Answers read and encoded at once: each holds a block and its encoding, up to 10 MiB.
+const MAX_ENCODING: usize = 32;
+/// How long writing an answer may take, as op-node's write deadline.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Peers whose rate is remembered; past it the peers whose limit has fully recovered are
 /// forgotten.
 const MAX_RATED_PEERS: usize = 1000;
@@ -144,8 +155,13 @@ impl request_response::Codec for Codec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        io.write_all(&response).await?;
-        io.close().await
+        let write = async {
+            io.write_all(&response).await?;
+            io.close().await
+        };
+        tokio::time::timeout(WRITE_TIMEOUT, write)
+            .await
+            .unwrap_or_else(|_elapsed| Err(io::ErrorKind::TimedOut.into()))
     }
 }
 
@@ -173,8 +189,12 @@ pub(crate) struct Server {
     global: Arc<DefaultDirectRateLimiter>,
     peers: Arc<PeerLimiter>,
     /// Answers being read and encoded, each after its wait for the limits; at most
-    /// [`MAX_WAITING`].
-    answers: JoinSet<Answer>,
+    /// [`MAX_WAITING`], with the peer each is for.
+    answers: JoinSet<(PeerId, Answer)>,
+    /// Requests of each peer in [`Self::answers`].
+    waiting: HashMap<PeerId, usize>,
+    /// Permits to read and encode an answer; [`MAX_ENCODING`] of them.
+    encoding: Arc<Semaphore>,
 }
 
 impl fmt::Debug for Server {
@@ -194,43 +214,62 @@ impl Server {
             global: Arc::new(RateLimiter::direct(quota(GLOBAL_RATE))),
             peers: Arc::new(RateLimiter::hashmap(quota(PEER_RATE))),
             answers: JoinSet::new(),
+            waiting: HashMap::new(),
+            encoding: Arc::new(Semaphore::new(MAX_ENCODING)),
         }
     }
 
     /// Prepares the answer to `peer`'s request for `number`, once the rate limits allow it.
-    /// Returns the channel when too many requests are already waiting: the caller answers
-    /// [`throttled`] at once.
+    /// Returns the channel when too many requests are already waiting, in all or from `peer`:
+    /// the caller answers [`throttled`] at once.
     pub(crate) fn on_request(
         &mut self,
         peer: PeerId,
         number: BlockNumber,
         channel: ResponseChannel<Vec<u8>>,
     ) -> Option<ResponseChannel<Vec<u8>>> {
-        if self.answers.len() >= MAX_WAITING {
+        let waiting = self.waiting.get(&peer).copied().unwrap_or_default();
+        if self.answers.len() >= MAX_WAITING || waiting >= MAX_WAITING_PER_PEER {
             return Some(channel);
         }
+        self.waiting.insert(peer, waiting.saturating_add(1));
         if self.peers.len() >= MAX_RATED_PEERS {
             self.peers.retain_recent();
         }
         let (chain, source) = (self.chain, Arc::clone(&self.source));
         let (global, peers) = (Arc::clone(&self.global), Arc::clone(&self.peers));
+        let encoding = Arc::clone(&self.encoding);
         self.answers.spawn(async move {
+            // The peer's own limit first: a peer over it takes nothing from the others.
             let allowed = async {
-                global.until_ready().await;
                 peers.until_key_ready(&peer).await;
+                global.until_ready().await;
             };
             let response = match tokio::time::timeout(MAX_THROTTLE_DELAY, allowed).await {
-                Ok(()) => serve(chain, &*source, number).await,
+                Ok(()) => match encoding.acquire().await {
+                    Ok(_permit) => serve(chain, &*source, number).await,
+                    // The semaphore is never closed.
+                    Err(_closed) => throttled(),
+                },
                 Err(_elapsed) => throttled(),
             };
-            (channel, response)
+            (peer, (channel, response))
         });
         None
     }
 
     /// The next answer ready; never resolves while none is being prepared.
     pub(crate) async fn next_answer(&mut self) -> Option<Result<Answer, JoinError>> {
-        self.answers.join_next().await
+        let joined = self.answers.join_next().await?;
+        Some(joined.map(|(peer, answer)| {
+            if let Some(waiting) = self.waiting.get_mut(&peer) {
+                *waiting = waiting.saturating_sub(1);
+                if *waiting == 0 {
+                    self.waiting.remove(&peer);
+                }
+            }
+            answer
+        }))
     }
 }
 
@@ -258,9 +297,7 @@ async fn serve(chain: &ChainSpec, source: &dyn PayloadSource, number: BlockNumbe
 
 /// The block the wall clock implies: the newest that may exist.
 fn expected_tip(chain: &ChainSpec) -> BlockNumber {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs());
+    let now = crate::network::unix_now_secs();
     chain
         .bedrock_block
         .saturating_add(chain.blocks_in(now.saturating_sub(chain.bedrock_time)))

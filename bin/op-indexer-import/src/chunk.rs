@@ -82,24 +82,32 @@ pub(crate) enum ChunkFile {
     Present,
     /// No file.
     Missing,
-    /// A file that does not (cut short by a copy, say): not a verified chunk.
+    /// A file shorter than that or with another start (cut short by a copy, say): not a
+    /// verified chunk.
     Damaged,
 }
 
 /// What is at `path`, from its first 68 bytes. What decides that a chunk is verified, for
 /// `download` and `verify` alike: a damaged file is a chunk to verify again, not one to skip.
 /// Damage further in shows when the chunk is read in full. Blocking.
-pub(crate) fn check(path: &Path) -> ChunkFile {
+///
+/// # Errors
+///
+/// Returns the I/O error, naming the file, if it cannot be opened or read (other than being
+/// missing or short): that says nothing about the file, so it is not taken as damage.
+pub(crate) fn check(path: &Path) -> io::Result<ChunkFile> {
     let mut start = [0_u8; LINK_LEN + 4];
     let read = File::open(path).and_then(|mut file| file.read_exact(&mut start));
     match read {
-        Err(err) if err.kind() == io::ErrorKind::NotFound => ChunkFile::Missing,
         Ok(())
             if start.get(LINK_LEN..) == Some(&zstd::zstd_safe::MAGICNUMBER.to_le_bytes()[..]) =>
         {
-            ChunkFile::Present
+            Ok(ChunkFile::Present)
         }
-        Ok(()) | Err(_) => ChunkFile::Damaged,
+        Ok(()) => Ok(ChunkFile::Damaged),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(ChunkFile::Missing),
+        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => Ok(ChunkFile::Damaged),
+        Err(err) => Err(named(path, &err)),
     }
 }
 

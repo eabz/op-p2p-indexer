@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use alloy_primitives::B256;
 use op_indexer_storage::{ArchiveStore, UnsafeStore};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -14,8 +14,9 @@ use tonic::{Request, Response, Status};
 use crate::convert::{Payload, heads_message};
 use crate::follower::Live;
 use crate::proto;
+use crate::sink::Sink;
 use crate::source::{Source, read_status};
-use crate::subscription::{Item, Sink, Start, Subscription};
+use crate::subscription::{Item, Start, Subscription};
 
 /// Events queued per subscription before the server waits for the consumer: HTTP/2 flow
 /// control does the rest.
@@ -28,9 +29,20 @@ pub(crate) struct Service<U, A> {
     pub(crate) live: Arc<Live>,
     /// One permit per subscription.
     pub(crate) subscriptions: Arc<Semaphore>,
+    /// One permit per `GetHeads` or `GetBlock` being served.
+    pub(crate) lookups: Arc<Semaphore>,
     pub(crate) tasks: TaskTracker,
     pub(crate) cancel: CancellationToken,
     pub(crate) receipts: bool,
+}
+
+impl<U, A> Service<U, A> {
+    /// A permit for one lookup; `RESOURCE_EXHAUSTED` when all are taken.
+    fn lookup(&self) -> Result<OwnedSemaphorePermit, Status> {
+        Arc::clone(&self.lookups)
+            .try_acquire_owned()
+            .map_err(|_full| Status::resource_exhausted("too many lookups at once"))
+    }
 }
 
 #[tonic::async_trait]
@@ -56,27 +68,16 @@ where
                 ));
             }
         };
-        if let Start::Number(number) = start
-            && let Some((first, _)) = self
-                .source
-                .archive_range()
+        if let Start::Number(number) = start {
+            self.source
+                .ensure_held(number)
                 .await
-                .map_err(|err| read_status(&err))?
-            && number < first.number
-        {
-            return Err(Status::out_of_range(format!(
-                "the node holds blocks from {} on",
-                first.number
-            )));
+                .map_err(|err| read_status(&err))??;
         }
         let permit = Arc::clone(&self.subscriptions)
             .try_acquire_owned()
             .map_err(|_full| Status::resource_exhausted("too many subscriptions"))?;
-        // One slot more than the queue: the one the subscription's ending status takes.
-        let (tx, rx) = mpsc::channel(SUBSCRIPTION_QUEUE.saturating_add(1));
-        let sink = Sink::new(tx)
-            .await
-            .ok_or_else(|| Status::internal("the subscription could not start"))?;
+        let (sink, rx) = Sink::channel(SUBSCRIPTION_QUEUE);
         let subscription = Subscription::new(
             self.source.clone(),
             Arc::clone(&self.live),
@@ -94,6 +95,7 @@ where
         &self,
         _request: Request<proto::GetHeadsRequest>,
     ) -> Result<Response<proto::Heads>, Status> {
+        let _permit = self.lookup()?;
         let (unsafe_head, heads) = self.source.heads().await.map_err(|err| read_status(&err))?;
         Ok(Response::new(heads_message(
             unsafe_head,
@@ -106,6 +108,7 @@ where
         &self,
         request: Request<proto::GetBlockRequest>,
     ) -> Result<Response<proto::Block>, Status> {
+        let _permit = self.lookup()?;
         let request = request.into_inner();
         let payload = Payload::from(request.payload());
         let block = match request.block {
@@ -121,7 +124,11 @@ where
         }
         .map_err(|err| read_status(&err))?
         .ok_or_else(|| Status::not_found("the node does not hold this block"))?;
-        let (_, heads) = self.source.heads().await.map_err(|err| read_status(&err))?;
+        let heads = self
+            .source
+            .archive_heads()
+            .await
+            .map_err(|err| read_status(&err))?;
         tokio::task::spawn_blocking(move || block.message(payload, &heads))
             .await
             .map_err(|_failed| Status::internal("the node failed to convert the block"))?

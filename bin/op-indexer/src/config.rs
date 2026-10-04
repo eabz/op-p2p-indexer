@@ -11,17 +11,15 @@ use op_indexer_chainspec::{ChainSpec, OP_MAINNET};
 use op_indexer_el::{ElConfig, PeerConfig};
 use op_indexer_p2p::{Bootnode, NetworkConfig};
 use op_indexer_primitives::{ChainIdentity, ExecutionPeer};
-use op_indexer_storage::{ArchiveConfig, ArchiveRetention, RedisConfig, StorageConfig};
+use op_indexer_storage::{ArchiveConfig, RedisConfig, StorageConfig};
 use op_indexer_stream::StreamConfig;
 
 const DEFAULT_CHAIN_ID: u64 = OP_MAINNET.chain_id;
 const DEFAULT_LISTEN_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9222);
 const DEFAULT_MAX_PEERS: u32 = 30;
-const DEFAULT_DATA_DIR: &str = "data";
 const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:6379";
 /// Directory of the local block archive, inside the data directory.
 const ARCHIVE_DIR: &str = "archive";
-const ARCHIVE_RETENTION_VAR: &str = "OP_INDEXER_ARCHIVE_RETENTION_BLOCKS";
 const SYNC_VAR: &str = "OP_INDEXER_EL_SYNC";
 const L1_ENABLED_VAR: &str = "OP_INDEXER_L1_ENABLED";
 const L1_CHECKPOINT_VAR: &str = "OP_INDEXER_L1_CHECKPOINT";
@@ -31,8 +29,6 @@ const DEFAULT_L1_BEACON_LISTEN_ADDR: SocketAddr =
 /// The port next to the execution network's.
 const DEFAULT_L1_LISTEN_ADDR: SocketAddr =
     SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 30304);
-/// Value of [`ARCHIVE_RETENTION_VAR`] that keeps every block.
-const ARCHIVE_RETENTION_ALL: &str = "all";
 /// Local only: the stream has no authentication. Clear of the p2p (9222), execution (30303),
 /// L1 (30304, 9001) and Redis (6379) ports.
 const DEFAULT_STREAM_LISTEN_ADDR: SocketAddr =
@@ -109,11 +105,9 @@ impl Config {
     ///   the consensus-layer node record advertises (default: unset, the address
     ///   peers observe). Set it behind NAT or in a container, with the port forwarded.
     /// - `OP_INDEXER_MAX_PEERS`: maximum connections, inbound and outbound (default 30).
-    /// - `OP_INDEXER_DATA_DIR`: node state directory (default `data`).
+    /// - `OP_INDEXER_DATA_DIR`: node state directory (default `data-<chain>`: `data-op` or
+    ///   `data-unichain`, so two chains on one host never share one by default).
     /// - `OP_INDEXER_REDIS_URL`: unsafe store (default `redis://127.0.0.1:6379`).
-    /// - `OP_INDEXER_ARCHIVE_RETENTION_BLOCKS`: blocks kept in the block archive, the
-    ///   committed store, in the `archive` directory inside the data directory: `all` to keep
-    ///   every block (default), or a block count to keep a window of the newest.
     /// - `OP_INDEXER_EL_ENABLED`: `true` to join the execution p2p network (devp2p) and fetch
     ///   the receipts gossip does not carry (default `false`: blocks stay without receipts).
     ///   The variables below only apply when it is enabled.
@@ -134,11 +128,11 @@ impl Config {
     ///   verified against. With the L1 side a round runs while the archive is 1,024 blocks or
     ///   more below the safe head (the unsafe store's read limit) and is anchored on the safe
     ///   head; without it, while the archive is that far below the gossiped head, anchored on
-    ///   the sequencer-signed block 64 below it (a deeper unsafe reorg would need the archive
-    ///   rebuilt). Promotion extends the archive otherwise. A restart continues after the
-    ///   archive's last block. Needs the execution network and an archive that keeps every
-    ///   block (`OP_INDEXER_ARCHIVE_RETENTION_BLOCKS=all`, the default). Required with the L1
-    ///   side.
+    ///   the sequencer-signed block 64 below it. Without the L1 side the archive then holds
+    ///   blocks L1 has not committed (the stream marks them unsafe), and an unsafe reorg deeper
+    ///   than 64 blocks leaves it on a dead branch, which only rebuilding the archive repairs.
+    ///   Promotion extends the archive otherwise. A restart continues after the archive's last
+    ///   block. Needs the execution network. Required with the L1 side.
     /// - `OP_INDEXER_L1_ENABLED`: `true` to follow Ethereum L1 for what it commits to
     ///   (default `false`: no safe or finalized head, nothing is promoted). The node then
     ///   runs a beacon light client, which follows Ethereum's finality from the checkpoint,
@@ -177,10 +171,10 @@ impl Config {
             None => chain.bootnodes().map(parse_bootnode).collect(),
         }?;
 
-        let data_dir = PathBuf::from(var_or("OP_INDEXER_DATA_DIR", DEFAULT_DATA_DIR));
+        let data_dir =
+            PathBuf::from(var("OP_INDEXER_DATA_DIR").unwrap_or_else(|| chain.default_data_dir()));
         let archive = ArchiveConfig {
             path: data_dir.join(ARCHIVE_DIR),
-            retention: archive_retention()?,
         };
 
         let el = el_settings(chain)?;
@@ -188,12 +182,6 @@ impl Config {
         ensure!(
             !sync || el.is_some(),
             "{SYNC_VAR} needs the execution network: set OP_INDEXER_EL_ENABLED=true"
-        );
-        // The synced range is the archive's: it must not be trimmed.
-        ensure!(
-            !sync || archive.retention == ArchiveRetention::All,
-            "{SYNC_VAR} needs an archive that keeps every block: set \
-             {ARCHIVE_RETENTION_VAR}={ARCHIVE_RETENTION_ALL} (the default)"
         );
         let l1 = l1_settings()?;
         // Promotion records only what the archive holds; with the L1 side, range sync is what
@@ -229,6 +217,7 @@ impl Config {
             storage: StorageConfig {
                 redis: RedisConfig {
                     url: var_or("OP_INDEXER_REDIS_URL", DEFAULT_REDIS_URL),
+                    canyon_time: chain.canyon_time,
                 },
                 archive,
                 chain: ChainIdentity {
@@ -295,25 +284,6 @@ fn l1_settings() -> eyre::Result<Option<L1Settings>> {
 
 fn var(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.is_empty())
-}
-
-/// Reads the archive retention: `all` (the default) or a block count of at least 1. The
-/// archive is the committed store, so it cannot be disabled.
-fn archive_retention() -> eyre::Result<ArchiveRetention> {
-    let Some(value) = var(ARCHIVE_RETENTION_VAR) else {
-        return Ok(ArchiveRetention::All);
-    };
-    if value.eq_ignore_ascii_case(ARCHIVE_RETENTION_ALL) {
-        return Ok(ArchiveRetention::All);
-    }
-    let blocks: u64 = value
-        .parse()
-        .ok()
-        .filter(|blocks| *blocks > 0)
-        .ok_or_else(|| {
-            eyre!("{ARCHIVE_RETENTION_VAR} is invalid: {value} (expected `all` or a block count)")
-        })?;
-    Ok(ArchiveRetention::Blocks(blocks))
 }
 
 fn var_or(name: &str, default: &str) -> String {

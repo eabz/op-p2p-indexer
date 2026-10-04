@@ -452,7 +452,10 @@ impl SessionDriver {
                         latest: update.latest,
                     });
                 }
-                Err(err) => return Err(EndReason::Protocol(format!("block range update: {err}"))),
+                Err(err) => {
+                    self.say_goodbye(DisconnectReason::ProtocolBreach).await;
+                    return Err(EndReason::Protocol(format!("block range update: {err}")));
+                }
             }
         } else {
             match self.serving.request(message_id, body) {

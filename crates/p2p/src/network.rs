@@ -28,6 +28,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use self::state::State;
+pub(crate) use self::state::unix_now_secs;
 use crate::block::BlockValidator;
 use crate::discovery::{Discovery, DiscoveryError};
 use crate::gossip::{self, GossipError};

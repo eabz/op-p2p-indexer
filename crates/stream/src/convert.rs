@@ -18,6 +18,7 @@ use op_indexer_primitives::{
     ArchivedBlock, BlockRef, BlockSource, DecodedBlock, EncodedBlock, L1Heads, decode_block,
     encode_receipts, encode_transaction, split_body,
 };
+use op_indexer_storage::InvalidBlockReason;
 
 use crate::proto;
 
@@ -149,22 +150,41 @@ impl Prepared {
     }
 
     /// The block decoded, with its senders: the unsafe store's as it is, the archive's decoded
-    /// (its senders as the archive recorded them). CPU work for an archived block.
+    /// (its senders as the archive recorded them). CPU work for an archived block. Checked to
+    /// have one sender, and one receipt if any, per transaction, so they pair up by position.
     pub(crate) fn decoded(&self) -> Result<Cow<'_, DecodedBlock>, ConvertError> {
-        match &self.block {
-            StoredBlock::Decoded(block) => Ok(Cow::Borrowed(block)),
+        let block = match &self.block {
+            StoredBlock::Decoded(block) => Cow::Borrowed(&**block),
             StoredBlock::Archived(archived) => {
                 let (block, receipts) = decode_block(&archived.encoded)
                     .map_err(|err| ConvertError::new(self.at.hash, &err))?;
-                Ok(Cow::Owned(DecodedBlock {
+                Cow::Owned(DecodedBlock {
                     block,
                     hash: archived.encoded.hash,
                     senders: archived.senders.clone(),
                     receipts,
                     source: BlockSource::Sync,
-                }))
+                })
             }
+        };
+        let transactions = block.block.body.transactions.len();
+        if block.senders.len() != transactions {
+            return Err(ConvertError::new(
+                self.at.hash,
+                &InvalidBlockReason::SenderCount,
+            ));
         }
+        if block
+            .receipts
+            .as_ref()
+            .is_some_and(|receipts| receipts.len() != transactions)
+        {
+            return Err(ConvertError::new(
+                self.at.hash,
+                &InvalidBlockReason::ReceiptCount,
+            ));
+        }
+        Ok(block)
     }
 
     fn convert(&self, payload: Payload) -> Result<proto::Block, ConvertError> {
@@ -269,6 +289,7 @@ fn raw(encoded: &EncodedBlock) -> proto::block::Payload {
     })
 }
 
+/// `block` as `decoded()` checked it: one sender per transaction.
 fn decoded(block: &DecodedBlock) -> proto::block::Payload {
     let transactions = block
         .block

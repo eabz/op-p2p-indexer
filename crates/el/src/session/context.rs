@@ -3,7 +3,7 @@
 
 use std::collections::HashSet;
 use std::sync::{Mutex, PoisonError};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
 
 use alloy_eip2124::{ForkFilter, ForkId};
 use alloy_primitives::{BlockNumber, Bytes};
@@ -16,11 +16,12 @@ use tracing::warn;
 
 use crate::network::NetworkSpec;
 use crate::serve::{Serving, SessionServing};
+use crate::warn_limit::WarnLimit;
 
 /// Shortest time between two "this build looks behind" warnings.
 const BEHIND_WARN_INTERVAL: Duration = Duration::from_mins(10);
-/// Most peers remembered as indexers; the set starts over when full. Indexers are few: the
-/// cap only bounds what a flood of node records can make us hold.
+/// Most peers remembered as indexers; when full, new ones are not added, so a flood of node
+/// records cannot push out the indexers already known. Indexers are few.
 const MAX_INDEXERS: usize = 4096;
 
 /// What every session of this node shares: its key, its chain and the head it follows.
@@ -34,9 +35,9 @@ pub(crate) struct SessionContext {
     /// The newest block the node knows, which the binary provides. `None` until it knows one.
     tip: watch::Receiver<Option<BlockRef>>,
     /// When the "build looks behind" warning was last logged.
-    behind_warned: Mutex<Option<Instant>>,
-    /// Peers whose node record says they are op-p2p-indexers, from discovery and the saved
-    /// peers. At most [`MAX_INDEXERS`].
+    behind_warned: WarnLimit,
+    /// Peers whose node record says they are op-p2p-indexers, as discovery saw them in
+    /// this run (a saved flag is not trusted). At most [`MAX_INDEXERS`].
     indexers: Mutex<HashSet<PeerId>>,
 }
 
@@ -54,7 +55,7 @@ impl SessionContext {
             listen_port,
             serving,
             tip,
-            behind_warned: Mutex::new(None),
+            behind_warned: WarnLimit::default(),
             indexers: Mutex::new(HashSet::new()),
         }
     }
@@ -119,10 +120,9 @@ impl SessionContext {
             return;
         }
         let mut indexers = self.indexers.lock().unwrap_or_else(PoisonError::into_inner);
-        if indexers.len() >= MAX_INDEXERS {
-            indexers.clear();
+        if indexers.len() < MAX_INDEXERS {
+            indexers.insert(peer);
         }
-        indexers.insert(peer);
     }
 
     /// Whether `peer` is known to be an op-p2p-indexer.
@@ -141,13 +141,7 @@ impl SessionContext {
     /// Warns, at most once per [`BEHIND_WARN_INTERVAL`], that peers are on a fork this build
     /// does not know: the fork activations in `chainspec` need updating.
     pub(crate) fn warn_build_behind(&self, remote: ForkId, seen_in: &'static str) {
-        let now = Instant::now();
-        let mut warned = self
-            .behind_warned
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if warned.is_none_or(|at| now.duration_since(at) >= BEHIND_WARN_INTERVAL) {
-            *warned = Some(now);
+        if self.behind_warned.allow(BEHIND_WARN_INTERVAL).is_some() {
             warn!(
                 remote_fork_hash = ?remote.hash,
                 remote_fork_next = remote.next,

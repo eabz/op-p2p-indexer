@@ -69,15 +69,12 @@ const APPEND_BYTES: u64 = 1024 * 1024 * 1024;
 /// Settings of `load`: it checks the senders and fills the block archive the node serves from.
 #[derive(Debug, Clone, Args)]
 pub(crate) struct LoadArgs {
-    /// Directory of the indexer's block archive: `archive` inside its data directory. The
-    /// indexer must not be running on it. It must be empty or hold the start of this range,
-    /// and the indexer must then keep every block (`OP_INDEXER_ARCHIVE_RETENTION_BLOCKS=all`).
-    #[arg(
-        long,
-        env = "OP_INDEXER_IMPORT_ARCHIVE_DIR",
-        default_value = "data/archive"
-    )]
-    pub(crate) archive_dir: PathBuf,
+    /// Directory of the indexer's block archive: `archive` inside its data directory
+    /// (default `data-<chain>/archive`, the node's default for the plan's chain: `data-op` or
+    /// `data-unichain`). The indexer must not be running on it. It must be empty or hold the
+    /// start of this range.
+    #[arg(long, env = "OP_INDEXER_IMPORT_ARCHIVE_DIR")]
+    pub(crate) archive_dir: Option<PathBuf>,
 }
 
 /// Loads the verified range of `plan` into the archive, to the end of the range.
@@ -112,22 +109,26 @@ pub(crate) async fn run(
         chain_id: plan.chain.chain_id,
         genesis_hash: plan.chain.genesis_hash,
     };
-    let archive = FjallArchive::open(&args.archive_dir, identity).map_err(|err| {
+    let archive_dir = args
+        .archive_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(plan.chain.default_data_dir()).join("archive"));
+    let archive = FjallArchive::open(&archive_dir, identity).map_err(|err| {
         if err.is_archive_locked() {
             eyre!(
                 "the block archive in {} is open in another process: stop the indexer, or the \
                  other import, that is using it and run `load` again",
-                args.archive_dir.display()
+                archive_dir.display()
             )
         } else {
             eyre::Report::new(err).wrap_err("failed to open the block archive")
         }
     })?;
 
-    let held_to = archive_tip(&archive, &args.archive_dir, state, plan).await?;
+    let held_to = archive_tip(&archive, &archive_dir, state, plan).await?;
     let stopped_at = fill_archive(&archive, held_to, state, plan, cancel).await?;
     if stopped_at.is_none() {
-        check_top(&archive, &args.archive_dir, plan, accepted.last_hash).await?;
+        check_top(&archive, &archive_dir, plan, accepted.last_hash).await?;
     }
     match stopped_at {
         None => Ok(()),
@@ -264,8 +265,10 @@ impl Collected {
 /// from `next` on ([`check_senders`]) and prepares those blocks for the archive. Blocking:
 /// decompression, one signature recovery per transaction, a hash and compression per block.
 fn prepare(path: &Path, chunk: Chunk, next: u64, file_bytes: u64) -> eyre::Result<Collected> {
-    let held =
-        usize::try_from(next.saturating_sub(chunk.from)).wrap_err("a chunk has too many blocks")?;
+    // `next` is the same for every chunk of the run: it falls inside the first one only.
+    let first = next.max(chunk.from);
+    let held = usize::try_from(first.saturating_sub(chunk.from))
+        .wrap_err("a chunk has too many blocks")?;
     let mut collected = Collected {
         amount: Amount {
             file_bytes,
@@ -273,7 +276,7 @@ fn prepare(path: &Path, chunk: Chunk, next: u64, file_bytes: u64) -> eyre::Resul
         },
         ..Collected::default()
     };
-    for (number, block) in (next..).zip(read(path, chunk)?.into_iter().skip(held)) {
+    for (number, block) in (first..).zip(read(path, chunk)?.into_iter().skip(held)) {
         // Checks one sender per transaction, which `check_senders` relies on.
         let prepared = PreparedBlock::new(&block)
             .wrap_err_with(|| format!("{} does not hold archivable blocks", path.display()))?;

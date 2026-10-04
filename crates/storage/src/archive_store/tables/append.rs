@@ -57,16 +57,16 @@ pub(in crate::archive_store) fn append_batch(
             child.extends(parent.block)?;
         }
     }
-    // Read without the lock: a writer getting in between shows as `NotContiguous` below.
+    // Read without the lock: each chunk is looked at again under it.
     let tip = end_ref(tables.headers.last_key_value())?;
     let mut rest = match tip {
         Some(tip) => above(tables, blocks, tip)?,
         None => blocks,
     };
-    let appended = rest.len();
+    let mut appended = 0_usize;
     while !rest.is_empty() {
         let (chunk, tail) = rest.split_at(chunk_len(rest));
-        append_chunk(tables, chunk)?;
+        appended = appended.saturating_add(append_chunk(tables, chunk)?);
         rest = tail;
     }
     if appended > 0 {
@@ -123,8 +123,10 @@ fn chunk_len(blocks: &[Entry]) -> usize {
         .max(1)
 }
 
-/// Writes `chunk` (consecutive, not empty) in one durable batch if it extends the tip.
-fn append_chunk(tables: &Tables, chunk: &[Entry]) -> Result<(), Failure> {
+/// Writes the blocks of `chunk` (consecutive, not empty) above the tip in one durable batch,
+/// if they extend it; blocks another writer appended since the tip was read are skipped.
+/// Returns how many were written.
+fn append_chunk(tables: &Tables, chunk: &[Entry]) -> Result<usize, Failure> {
     // Compressed before the lock is taken.
     let mut values = Vec::with_capacity(chunk.len());
     for block in chunk {
@@ -137,11 +139,13 @@ fn append_chunk(tables: &Tables, chunk: &[Entry]) -> Result<(), Failure> {
     }
 
     let _writer = tables.lock();
-    if let (Some(tip), Some(first)) = (end_ref(tables.headers.last_key_value())?, chunk.first()) {
-        first.extends(tip)?;
-    }
+    let new = match end_ref(tables.headers.last_key_value())? {
+        Some(tip) => above(tables, chunk, tip)?.len(),
+        None => chunk.len(),
+    };
+    let held = chunk.len().saturating_sub(new);
     let mut batch = tables.durable_batch();
-    for (block, (header, body, receipts)) in chunk.iter().zip(values) {
+    for (block, (header, body, receipts)) in chunk.iter().zip(values).skip(held) {
         let key = block.block.number.to_be_bytes();
         batch.insert(&tables.headers, key, header);
         batch.insert(&tables.bodies, key, body);
@@ -155,5 +159,5 @@ fn append_chunk(tables: &Tables, chunk: &[Entry]) -> Result<(), Failure> {
         batch.insert(&tables.numbers, block.block.hash.0, key);
     }
     batch.commit()?;
-    Ok(())
+    Ok(new)
 }

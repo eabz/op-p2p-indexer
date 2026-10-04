@@ -22,22 +22,11 @@ pub struct StorageConfig {
     pub chain: ChainIdentity,
 }
 
-/// Where the local block archive is, and how much it keeps.
+/// Where the local block archive is. It keeps every block it is given.
 #[derive(Debug, Clone)]
 pub struct ArchiveConfig {
     /// The archive's directory.
     pub path: PathBuf,
-    /// How much the archive keeps.
-    pub retention: ArchiveRetention,
-}
-
-/// How much of the chain the local block archive keeps.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ArchiveRetention {
-    /// The newest blocks, this many; the caller trims the archive to it after appending.
-    Blocks(u64),
-    /// Every block; the archive is never trimmed.
-    All,
 }
 
 /// Where the unsafe store is.
@@ -45,12 +34,16 @@ pub enum ArchiveRetention {
 pub struct RedisConfig {
     /// `redis://[user:password@]host:port[/db]`.
     pub url: String,
+    /// The chain's Canyon time, in Unix seconds: from it a deposit receipt's nonce and version
+    /// are part of the receipts root, which reads check before serving receipts.
+    pub canyon_time: u64,
 }
 
 impl fmt::Debug for RedisConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RedisConfig")
             .field("url", &redact_url(&self.url))
+            .field("canyon_time", &self.canyon_time)
             .finish()
     }
 }

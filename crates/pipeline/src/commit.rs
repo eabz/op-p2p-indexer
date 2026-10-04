@@ -21,8 +21,8 @@
 //!
 //! **Heads only move up, across runs too.** The heads start at what the archive recorded and are
 //! never published below it: after a restart the L1 side finds older games first, and promoting on
-//! them would undo committed work. A recorded finalized head above the safe one (left by a
-//! rollback) is not taken over: the finalized head starts unknown.
+//! them would undo committed work. A recorded finalized head above the safe one (left by an
+//! earlier build's rollback) is not taken over: the finalized head starts unknown.
 //!
 //! **A game that matched is remembered** (the whole game and our block's hash) while it is
 //! recent, and not read again: when its L1 block finalizes, minutes after it raised the safe
@@ -105,9 +105,10 @@ pub(crate) async fn run<U: UnsafeStore, A: ArchiveStore>(
     committed: L1Heads,
     cancel: CancellationToken,
 ) -> Result<(), PipelineError> {
-    // Never below what is committed: promotion would take a lower head for an L1 reorg. This
+    // Never below what is committed: promotion ignores a lower head. This
     // task is the only writer of `heads`, so what it published last is `held`. A finalized
-    // head above the safe one is what a rollback left: not a block of the safe chain.
+    // head above the safe one is what an earlier build's rollback left: not a block of the safe
+    // chain.
     let mut held = committed;
     held.finalized = held.finalized.filter(|finalized| {
         held.safe

@@ -212,7 +212,6 @@ from block 0 and the running indexer continues it at the tip once the two meet.
   again resumes. On a stop (Ctrl-C), no new chunk is read; the chunks being read are
   appended, and `load` reports where it stopped. Checked by killing the
   load at random points (`kill -9`) and reading every block back.
-- The archive's retention must be `all` on a node that serves history.
 - Serving itself (answering header, body and receipt requests, advertising the held range)
   and the syncing side (a node fetching a range from peers and verifying it) are `el` work:
   `docs/el.md` sections 11 and 12.
@@ -236,7 +235,7 @@ machine: `cargo build --release -p op-indexer-import` produces one file to copy.
   (`OP_INDEXER_IMPORT_ARCHIVE_DIR`).
 - **The importer fills the block archive the node serves from, and needs no database.**
   `load` appends the verified bytes and senders to the archive directory (`--archive-dir`,
-  default `data/archive`) and contacts nothing else. Redis is never needed.
+  default `data-<chain>/archive`: `data-op/archive` or `data-unichain/archive`, where the node looks by default) and contacts nothing else. Redis is never needed.
 - `load` needs the range accepted by `verify` (`verified.json`) and refuses anything else.
   What the archive holds is asked of the archive: `load` continues after its last block, and
   refuses an archive that does not start at the range's first block or holds another chain.
@@ -265,7 +264,7 @@ import verify
 ```
 
 ```bash
-import load --archive-dir data/archive
+import load
 ```
 
 `import --help` and `<command> --help` list every flag, its environment variable
@@ -409,7 +408,7 @@ import --state-dir unichain-state verify
 ```
 
 ```bash
-import --state-dir unichain-state load --archive-dir data/archive
+import --state-dir unichain-state load
 ```
 
 What differs from OP Mainnet:

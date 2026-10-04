@@ -37,9 +37,9 @@ before proposing a design, and record new decisions there.
 ## Storage
 
 - **Redis**: the unsafe store. Blocks received over gossip and not yet committed to L1, with fork choice.
-- **fjall** (`archive/` in the data dir): the committed store. Every committed block by default (a
-  window is optional), in its consensus encoding, with its transaction senders and the committed
-  L1 heads. It is what the node serves to peers and streams to consumers. Embedded; needs no service.
+- **fjall** (`archive/` in the data dir): the committed store. Every committed block (the whole
+  history: there is no retention window), in its consensus encoding, with its transaction senders
+  and the committed L1 heads. It is what the node serves to peers and streams to consumers. Embedded; needs no service.
 
 There is no ClickHouse any more. `docker compose up -d redis` starts Redis locally; `docker compose
 up --build` also runs the indexer image. The binary needs Redis to start: it opens the archive,

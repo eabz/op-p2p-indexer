@@ -28,6 +28,7 @@ mod serve;
 mod session;
 mod sync;
 mod verify;
+mod warn_limit;
 mod wire;
 
 use alloy_primitives::B256;
