@@ -86,7 +86,8 @@ pub(crate) struct DownloadArgs {
     #[arg(long, env = "OP_INDEXER_IMPORT_ANCHOR_HASH", requires = "last_block")]
     pub(crate) anchor_hash: Option<B256>,
     /// Import only the blocks before Bedrock: the range ends at the chain's last legacy
-    /// block, checked against its known hash. Needs no lookup on L1.
+    /// block, checked against its known hash. Needs no lookup on L1. Refused for a chain that
+    /// began with Bedrock (Unichain).
     #[arg(long, env = "OP_INDEXER_IMPORT_LEGACY_ONLY")]
     pub(crate) legacy_only: bool,
     /// Blocks per chunk: one file on disk, and one request when the service answers it in
@@ -97,13 +98,12 @@ pub(crate) struct DownloadArgs {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     pub(crate) chunk_blocks: Option<u64>,
-    /// `HyperSync` endpoint of the chain.
-    #[arg(
-        long,
-        env = "OP_INDEXER_IMPORT_ENDPOINT",
-        default_value = "https://optimism.hypersync.xyz"
-    )]
-    pub(crate) endpoint: String,
+    /// `HyperSync` endpoint of the chain [default: by chain, `https://optimism.hypersync.xyz`
+    /// for OP Mainnet (10) and `https://unichain.hypersync.xyz` for Unichain (130), the host
+    /// the service's naming gives, not yet reached from here]. Needed for a chain not in
+    /// that list.
+    #[arg(long, env = "OP_INDEXER_IMPORT_ENDPOINT")]
+    pub(crate) endpoint: Option<String>,
     /// `HyperSync` endpoint of the L1 chain the dispute games are on, for the lookup of the
     /// range's last block. Uses the same API token.
     #[arg(

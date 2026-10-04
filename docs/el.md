@@ -4,8 +4,8 @@ Status: **built**, off by default (`OP_INDEXER_EL_ENABLED`). Receipts at the tip
 live; serving (section 11) and range sync (section 12) have not. Peer access is the open
 risk (section 1).
 
-The `el` crate connects to OP Mainnet execution peers over devp2p and fetches what gossip does
-not carry: receipts for every block, and headers and bodies for blocks missed on gossip. All of
+The `el` crate connects to the configured chain's execution peers (OP Mainnet or Unichain,
+`op-indexer-chainspec`) over devp2p and fetches what gossip does not carry: receipts for every block, and headers and bodies for blocks missed on gossip. All of
 it is verified against data we already trust before it is handed on. It is a second p2p stack
 next to `p2p` (libp2p); the two never depend on each other.
 
@@ -64,8 +64,9 @@ bodies of a range come from the same stack: range sync, section 12.
 
 ## 3. Parts
 
-1. **Discovery**: discv5 in the global DHT, filtered by OP Mainnet's fork id in the node
-   record (`eth` and `opel` keys), seeded with the execution bootnodes.
+1. **Discovery**: discv5 in the global DHT, filtered by the chain's fork id in the node
+   record (`eth` and `opel` keys), seeded with the execution bootnodes (one Superchain list
+   for every chain).
 2. **Session**: RLPx (ECIES handshake, framing), the p2p hello, the eth status exchange.
 3. **Peer set**: a small number of peers kept connected, with redial and backoff, preferring
    peers at the tip; "too many peers" is retried politely, not hammered.
@@ -84,9 +85,17 @@ chain from one). A peer that returns data that fails verification is dropped and
 
 ## 5. Fork activations
 
-The fork id is derived from the list of OP Mainnet fork activations. That list is
-configuration this project keeps current (in `chainspec`), not something taken from a crate
-alone. The node should also notice when most peers reject its fork id or announce a `next`
+The fork id is derived from the chain's genesis hash, its block forks and the time forks
+after its genesis time ([EIP-2124](https://eips.ethereum.org/EIPS/eip-2124): a fork at block 0
+or at or before the genesis time is part of the genesis). The activations are configuration
+this project keeps current (in `chainspec`), not something taken from a crate alone.
+
+| Chain | Fork hash | Status |
+|---|---|---|
+| OP Mainnet (10) | `c29239af` | observed from peers (2026-10-04) |
+| Unichain (130) | `1faa456e` | computed (2026-10-04: genesis `0x3425…befe`; Holocene, Isthmus, Jovian, Karst); not yet confirmed by a peer: a 4-minute run found no Unichain peer, execution or gossip, while the same setup found OP Mainnet peers in 50 s |
+
+The node should also notice when most peers reject its fork id or announce a `next`
 fork it does not know, and say so loudly: that is the sign the build is behind.
 
 ## 6. Being a polite peer

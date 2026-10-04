@@ -221,6 +221,9 @@ machine: `cargo build --release -p op-indexer-import` produces one file to copy.
 - `load` needs the range accepted by `verify` (`verified.json`) and refuses anything else.
   What the archive holds is asked of the archive: `load` continues after its last block, and
   refuses an archive that does not start at the range's first block or holds another chain.
+  The archive also records the chain it is for (chain id and genesis hash) on first open: one
+  recorded for another chain is refused before anything is read or appended, and one with no
+  record (new, or written by an earlier build) takes the plan's chain.
   ClickHouse records each chunk it holds in its own table (`imported_ranges`, written after
   the chunk's rows), and `load` loads the chunks it has no record of, so it can be loaded on a
   later run from the same verified chunks without touching the archive. The record lives in
@@ -355,10 +358,52 @@ the hash of an empty requests list, which has no column in HyperSync).
 
 ## 10. Any chain
 
-The chain is chosen with `--chain <id>` on the first `download`; its parameters (fork times,
-the Bedrock block and its time, the hash of the last legacy block, the block time, the
-dispute-game factory) come from `op-indexer-chainspec`, which today knows OP Mainnet. The
-HyperSync endpoints of the chain and of its L1 are flags (`--endpoint`, `--l1-endpoint`).
+The chain is chosen with `--chain <id>` on the first `download` and recorded in `plan.json`;
+a later run with another `--chain` is refused, and one without it continues the recorded
+chain. Its parameters (fork times, the Bedrock block and its time, the hash of the last
+legacy block if it has a legacy chain, the block time, the dispute-game factory) come from
+`op-indexer-chainspec`, which knows OP Mainnet (10) and Unichain (130). The HyperSync
+endpoint is the importer's concern, not the chain specification's: a table in the importer
+gives `https://optimism.hypersync.xyz` for 10 and `https://unichain.hypersync.xyz` for 130,
+`--endpoint` overrides it, and a chain without an entry needs `--endpoint`. The L1 endpoint
+(`--l1-endpoint`, default Ethereum's) is where the dispute games are looked up.
+
+### Unichain (chain 130)
+
+```bash
+op-indexer-import --state-dir unichain-state download --chain 130 --api-token <TOKEN>
+```
+
+```bash
+op-indexer-import --state-dir unichain-state verify
+```
+
+```bash
+op-indexer-import --state-dir unichain-state load --archive-dir data/archive
+```
+
+What differs from OP Mainnet:
+
+- **No legacy chain.** Unichain began with Bedrock at its genesis (block 0, time
+  1730748359): every chunk is a post-Bedrock chunk, a tenth of `--chunk-blocks` (100 blocks
+  by default), and `--legacy-only` is refused. Block 0's parent hash is zero and its header
+  already has the fields of every fork through Granite, which are all active at genesis; the
+  transaction and receipt rules are chosen by each block's timestamp as for OP Mainnet.
+- **One-second blocks**, so about 60 million blocks today and about 600,000 chunks at the
+  default size, about as many as OP Mainnet's: the linking pass, `verified.json` and memory
+  are sized by chunk, not by block, and stay as they are. Unichain blocks are small, so
+  `--chunk-blocks 10000` (1,000 blocks per chunk) means fewer requests and files; it is
+  recorded in the plan and cannot change later.
+- **The endpoint** is `https://unichain.hypersync.xyz`, the host the service's naming gives.
+  It has not been reached from here; if it is wrong, give the right one with `--endpoint`.
+- **The top anchor** is the newest dispute game of Unichain's own factory
+  (`0x2F12d621a16e2d3285929C9996f478508951dFe4` on Ethereum): super games (type 9), whose
+  claim is read for chain 130, with the timestamp turned into a block at one block a second
+  from genesis.
+
+**Not run:** nothing of this has been run against Unichain: no download, no `verify` of a
+Unichain block, no game lookup on its factory. The code paths are those OP Mainnet's
+post-Bedrock range has run through in full.
 
 ## 11. Where the import stops, and the top anchor
 

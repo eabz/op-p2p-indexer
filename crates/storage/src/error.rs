@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use alloy_primitives::hex::FromHexError;
 use alloy_primitives::{BlockHash, BlockNumber};
-use op_indexer_primitives::BlockRef;
+use op_indexer_primitives::{BlockRef, ChainIdentity};
 
 use crate::Store;
 
@@ -234,6 +234,32 @@ pub enum StorageError {
         /// The version this build writes.
         expected: u64,
     },
+    /// The archive directory holds another chain's blocks. Nothing is deleted: the operator
+    /// points the node at that chain's data directory, or removes this one.
+    #[error(
+        "the block archive in {} holds {found}, but this node runs {expected}; use a data \
+         directory of chain {}, or delete this one",
+        path.display(),
+        expected.chain_id
+    )]
+    ArchiveChain {
+        /// The archive directory.
+        path: PathBuf,
+        /// The chain recorded in the archive. Boxed, as is `expected`, to keep the error small.
+        found: Box<ChainIdentity>,
+        /// The chain this node runs.
+        expected: Box<ChainIdentity>,
+    },
+    /// The archive's chain record does not decode. Nothing is deleted.
+    #[error(
+        "the chain record of the block archive in {} is unreadable; the directory is left as \
+         it is",
+        path.display()
+    )]
+    ArchiveChainUnreadable {
+        /// The archive directory.
+        path: PathBuf,
+    },
     /// A block to store does not fit the schema.
     #[error("block {number} cannot be stored: {reason}")]
     InvalidBlock {
@@ -339,6 +365,8 @@ impl StorageError {
             | Self::MissingField { .. }
             | Self::InvalidData { .. }
             | Self::ArchiveSchema { .. }
+            | Self::ArchiveChain { .. }
+            | Self::ArchiveChainUnreadable { .. }
             | Self::InvalidBlock { .. }
             | Self::Oversized { .. }
             | Self::UnsupportedTransaction { .. }

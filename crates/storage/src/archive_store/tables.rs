@@ -19,7 +19,9 @@ use fjall::{
     CompressionType, Database, Guard, Keyspace, KeyspaceCreateOptions, KvSeparationOptions,
     PersistMode, Readable,
 };
-use op_indexer_primitives::{BlockRead, BlockRef, BlockStart, ItemConvert, ReadLimits, split_body};
+use op_indexer_primitives::{
+    BlockRead, BlockRef, BlockStart, ChainIdentity, ItemConvert, ReadLimits, split_body,
+};
 use tokio::sync::{Mutex, MutexGuard};
 use tracing::debug;
 
@@ -47,6 +49,8 @@ const WORKER_THREADS: usize = 2;
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 /// Layout version of the keyspaces. An archive written with another version is refused on open.
 const SCHEMA_VERSION: u64 = 1;
+/// Name of the entry in `meta` recording the archive's chain ([`ChainIdentity::to_bytes`]).
+const CHAIN_KEY: &str = "chain";
 /// Most blocks removed in one batch by [`truncate_above`] and [`trim`], so one batch stays small
 /// and the writer lock is held briefly: appends go in between batches.
 const DELETE_BATCH_BLOCKS: u64 = 1024;
@@ -69,7 +73,7 @@ pub(super) struct Tables {
     receipts: Keyspace,
     /// Block hash -> block number.
     numbers: Keyspace,
-    /// Name -> value; holds [`SCHEMA_VERSION_KEY`].
+    /// Name -> value; holds [`SCHEMA_VERSION_KEY`] and [`CHAIN_KEY`].
     meta: Keyspace,
     /// Held by every write: a batch has no conflict detection, so two appends must not both
     /// read the same tip. tokio's mutex because it is granted in arrival order: with std's, a
@@ -145,9 +149,48 @@ impl From<StorageError> for Failure {
 }
 
 /// Opens the database in the directory `path`, creates the keyspaces and checks the schema
-/// version. A new archive gets this build's version; one of another version is refused and
-/// left as it is.
-pub(super) fn open(path: &Path) -> Result<Tables, Failure> {
+/// version and the chain. A new archive gets this build's version; one of another version is
+/// refused and left as it is. Then see [`check_chain`].
+pub(super) fn open(path: &Path, chain: ChainIdentity) -> Result<Tables, Failure> {
+    let tables = open_schema(path)?;
+    check_chain(&tables, path, chain)?;
+    Ok(tables)
+}
+
+/// Checks that the archive holds `chain`. An archive with no chain recorded is given one
+/// first: if it holds blocks it was written by a build before the record, so it holds
+/// [`ChainIdentity::BEFORE_RECORD`]'s; if it is empty, `chain`'s. One recording another chain
+/// is refused and left as it is.
+fn check_chain(tables: &Tables, path: &Path, chain: ChainIdentity) -> Result<(), Failure> {
+    let found = if let Some(record) = tables.meta.get(CHAIN_KEY)? {
+        ChainIdentity::from_bytes(&record).ok_or_else(|| StorageError::ArchiveChainUnreadable {
+            path: path.to_owned(),
+        })?
+    } else {
+        let found = if tables.headers.first_key_value().is_some() {
+            ChainIdentity::BEFORE_RECORD
+        } else {
+            chain
+        };
+        let mut batch = tables.durable_batch();
+        batch.insert(&tables.meta, CHAIN_KEY, found.to_bytes());
+        batch.commit()?;
+        found
+    };
+    if found == chain {
+        return Ok(());
+    }
+    Err(StorageError::ArchiveChain {
+        path: path.to_owned(),
+        found: Box::new(found),
+        expected: Box::new(chain),
+    }
+    .into())
+}
+
+/// Opens the database in the directory `path`, creates the keyspaces and checks the schema
+/// version.
+fn open_schema(path: &Path) -> Result<Tables, Failure> {
     let db = Database::builder(path)
         .cache_size(CACHE_SIZE_BYTES)
         .max_journaling_size(MAX_JOURNAL_BYTES)

@@ -5,7 +5,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
-use alloy_primitives::ChainId;
+use op_indexer_primitives::ChainIdentity;
 
 /// Shown by `Debug` in place of credentials.
 const REDACTED: &str = "<redacted>";
@@ -19,8 +19,9 @@ pub struct StorageConfig {
     pub clickhouse: ClickHouseConfig,
     /// Local block archive; `None` disables it, so nothing is opened or written.
     pub archive: Option<ArchiveConfig>,
-    /// Chain whose blocks are stored; part of every Redis key and ClickHouse row.
-    pub chain_id: ChainId,
+    /// Chain whose blocks are stored. Its id is part of every Redis key and ClickHouse row; the
+    /// archive records all of it and refuses another chain's directory.
+    pub chain: ChainIdentity,
 }
 
 /// Where the local block archive is, and how much it keeps.

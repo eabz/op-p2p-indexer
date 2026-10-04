@@ -39,8 +39,9 @@ use tracing_subscriber::fmt::time::ChronoUtc;
 use crate::config::{Config, ElSettings, L1Settings};
 use crate::provider::ArchiveProvider;
 
-/// Unsafe blocks waiting for the pipeline. Blocks arrive every ~2s; this absorbs a store that
-/// is unreachable for several minutes before the network starts dropping them.
+/// Unsafe blocks waiting for the pipeline. Blocks arrive every 2 s on OP Mainnet and every
+/// second on Unichain; this absorbs a store that is unreachable for about 8 or 4 minutes
+/// before the network starts dropping them.
 const BLOCK_CHANNEL_CAPACITY: usize = 256;
 
 /// Requests for receipts waiting for the execution network. Its own queue is bounded too, so
@@ -101,9 +102,13 @@ async fn main() -> eyre::Result<()> {
 
     // Startup-only blocking I/O, before any task runs.
     std::fs::create_dir_all(&config.data_dir).wrap_err("failed to create data dir")?;
-    let stores = prepare_storage(&config.storage).await?;
-    let store =
-        NodeStore::open(config.data_dir.join(NODE_DIR)).wrap_err("failed to open node store")?;
+    // The local stores first, so a data directory of another chain fails before any
+    // connection; the archive before the node store, so a refused archive leaves the node
+    // store without a record.
+    let archive = open_archive(&config.storage)?;
+    let store = NodeStore::open(config.data_dir.join(NODE_DIR), config.storage.chain)
+        .wrap_err("failed to open node store")?;
+    let stores = prepare_storage(&config.storage, archive).await?;
     let keypair = store.identity().wrap_err("failed to load node identity")?;
     let store = Arc::new(store);
 
@@ -238,11 +243,7 @@ fn l1_side(
             checkpoint: settings.checkpoint,
             listen_addr: settings.beacon_listen_addr,
             // Beacon nodes share the discovery network of the chain's bootnodes.
-            bootnodes: chain
-                .bootnodes
-                .iter()
-                .map(|bootnode| (*bootnode).to_owned())
-                .collect(),
+            bootnodes: chain.bootnodes().map(str::to_owned).collect(),
         },
         trusted_tx,
     );
@@ -811,15 +812,43 @@ struct Stores {
     archive_range: Option<(BlockRef, BlockRef)>,
 }
 
-/// Connects to both stores, runs the Redis schema check and the ClickHouse migrations, opens
-/// the local block archive when it is enabled, and returns the stores once all are ready, so
-/// an unreachable or mismatched store stops startup.
-async fn prepare_storage(config: &StorageConfig) -> eyre::Result<Stores> {
+/// Opens the local block archive when it is enabled, checking that it holds the configured
+/// chain. Startup-only blocking I/O, like the node store.
+fn open_archive(config: &StorageConfig) -> eyre::Result<Option<(FjallArchive, ArchiveRetention)>> {
+    config
+        .archive
+        .as_ref()
+        .map(|archive| {
+            let store = FjallArchive::open(&archive.path, config.chain)
+                .wrap_err("failed to open the block archive")?;
+            Ok((store, archive.retention))
+        })
+        .transpose()
+}
+
+/// Connects to both stores, runs the Redis schema check and the ClickHouse migrations, reads
+/// the range of `archive` (opened by [`open_archive`]), and returns the stores once all are
+/// ready, so an unreachable or mismatched store stops startup.
+async fn prepare_storage(
+    config: &StorageConfig,
+    archive: Option<(FjallArchive, ArchiveRetention)>,
+) -> eyre::Result<Stores> {
     op_indexer_storage::metrics::describe();
-    let unsafe_store = RedisStore::connect(&config.redis, config.chain_id)
+    let archive_range = match &archive {
+        Some((store, retention)) => {
+            let range = store
+                .range()
+                .await
+                .wrap_err("failed to read the block archive")?;
+            info!(?range, ?retention, "block archive ready");
+            range
+        }
+        None => None,
+    };
+    let unsafe_store = RedisStore::connect(&config.redis, config.chain.chain_id)
         .await
         .wrap_err("failed to connect to Redis")?;
-    let committed = ClickHouseStore::new(&config.clickhouse, config.chain_id);
+    let committed = ClickHouseStore::new(&config.clickhouse, config.chain.chain_id);
     committed
         .ping()
         .await
@@ -829,26 +858,10 @@ async fn prepare_storage(config: &StorageConfig) -> eyre::Result<Stores> {
         .await
         .wrap_err("failed to migrate ClickHouse")?;
     info!(?config, "storage ready");
-
-    let archive = match &config.archive {
-        Some(archive) => {
-            // Startup-only blocking I/O, like the node store.
-            let store =
-                FjallArchive::open(&archive.path).wrap_err("failed to open the block archive")?;
-            let range = store
-                .range()
-                .await
-                .wrap_err("failed to read the block archive")?;
-            info!(?range, retention = ?archive.retention, "block archive ready");
-            Some((store, archive.retention, range))
-        }
-        None => None,
-    };
-    let archive_range = archive.as_ref().and_then(|(_, _, range)| *range);
     Ok(Stores {
         unsafe_store,
         committed,
-        archive: archive.map(|(store, retention, _)| (store, retention)),
+        archive,
         archive_range,
     })
 }

@@ -16,7 +16,7 @@ before proposing a design, and record new decisions there.
 | `bin/op-indexer` | `op-indexer` | Thin binary: config, tracing, wiring, shutdown | chainspec, p2p, el, l1, storage, pipeline, primitives |
 | `bin/op-indexer-import` | `op-indexer-import` | Command-line importer, a separate process: downloads a block range from an external archive (Envio HyperSync), verifies it, loads it into the block archive (and optionally ClickHouse) | chainspec, primitives, storage |
 | `crates/primitives` | `op-indexer-primitives` | Shared domain types (alloy and op-alloy only) | none |
-| `crates/chainspec` | `op-indexer-chainspec` | Static chain parameters (chain id, sequencer signer, bootnodes) | none |
+| `crates/chainspec` | `op-indexer-chainspec` | Every per-chain value, for each supported chain (OP Mainnet, Unichain): chain id, sequencer signer, bootnodes, genesis, fork blocks and times, block time, dispute game factory. The one exception is the importer's HyperSync endpoint, which stays in the importer | none |
 | `crates/p2p` | `op-indexer-p2p` | discv5 discovery, gossipsub block gossip (scoring, connection limits), unsafe-block validation, fjall node state (identity, saved peers and sync progress, for `el` and `l1` too) | primitives, chainspec |
 | `crates/storage` | `op-indexer-storage` | Unsafe store (Redis, fork choice) / committed store (ClickHouse, migrations) / local block archive (fjall), their traits and metrics; the retry policy | primitives |
 | `crates/pipeline` | `op-indexer-pipeline` | Unsafe blocks → unsafe store; promote safe/finalized → committed store and archive | primitives, storage |

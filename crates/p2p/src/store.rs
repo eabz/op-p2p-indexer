@@ -4,7 +4,8 @@
 //! key for its identity on the execution network, and the peers worth returning to, so a
 //! restart can reconnect without waiting for discovery: consensus peers that recently
 //! delivered valid blocks, and execution peers that served requests. It also keeps the progress
-//! of a range sync, so a restart resumes it.
+//! of a range sync, so a restart resumes it. It records the chain it was made for, so a node of
+//! another chain refuses it instead of dialing that chain's peers.
 //!
 //! This is a second fjall database next to the block archive's, on purpose: the archive lives
 //! in the storage crate, and p2p and storage must not depend on each other. It holds two keys,
@@ -16,14 +17,14 @@ use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
 use alloy_primitives::{B256, B512, BlockNumber};
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 use libp2p::Multiaddr;
 use libp2p::identity::{DecodingError, secp256k1};
-use op_indexer_primitives::{BlockRef, ExecutionPeer};
+use op_indexer_primitives::{BlockRef, ChainIdentity, ExecutionPeer};
 
 const NODE: &str = "node";
 const IDENTITY_KEY: &str = "secp256k1_secret";
@@ -31,6 +32,8 @@ const IDENTITY_KEY: &str = "secp256k1_secret";
 const EXECUTION_KEY: &str = "execution_secp256k1_secret";
 /// Secret of the node's identity on L1's execution network; a third key.
 const L1_KEY: &str = "l1_secp256k1_secret";
+/// The chain the store's peers and sync progress belong to ([`ChainIdentity::to_bytes`]).
+const CHAIN_KEY: &str = "chain";
 /// Known good peers: multiaddr bytes -> last time (Unix seconds, big-endian) they delivered a
 /// valid block.
 const PEERS: &str = "known_peers";
@@ -78,6 +81,31 @@ pub enum StoreError {
         /// Length of the stored value.
         len: usize,
     },
+    /// The store was made by a node of another chain: its saved peers and sync progress are
+    /// that chain's. Nothing is deleted.
+    #[error(
+        "the node store in {} belongs to {found}, but this node runs {expected}; use a data \
+         directory of chain {}, or delete this one",
+        path.display(),
+        expected.chain_id
+    )]
+    WrongChain {
+        /// The store directory.
+        path: PathBuf,
+        /// The chain recorded in the store.
+        found: ChainIdentity,
+        /// The chain this node runs.
+        expected: ChainIdentity,
+    },
+    /// The store's chain record does not decode. Nothing is deleted.
+    #[error(
+        "the chain record of the node store in {} is unreadable; the directory is left as it is",
+        path.display()
+    )]
+    UnreadableChain {
+        /// The store directory.
+        path: PathBuf,
+    },
 }
 
 /// Node state backed by a fjall database, which is a directory.
@@ -106,15 +134,20 @@ impl fmt::Debug for NodeStore {
 }
 
 impl NodeStore {
-    /// Opens the store in the directory `path`, creating it and its keyspaces if they do not
-    /// exist.
+    /// Opens the store of `chain` in the directory `path`, creating it and its keyspaces if
+    /// they do not exist.
+    ///
+    /// The store records its chain when it is created; see `check_chain` for one made before
+    /// the record.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError::CreateDir`] if the directory cannot be created,
-    /// [`StoreError::Permissions`] if its permissions cannot be restricted, and
+    /// [`StoreError::Permissions`] if its permissions cannot be restricted,
+    /// [`StoreError::WrongChain`] if it belongs to another chain,
+    /// [`StoreError::UnreadableChain`] if its chain record does not decode, and
     /// [`StoreError::Database`] if the database in it cannot be opened.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+    pub fn open(path: impl AsRef<Path>, chain: ChainIdentity) -> Result<Self, StoreError> {
         let path = path.as_ref();
         // Restricted before fjall writes anything into it.
         std::fs::create_dir_all(path).map_err(StoreError::CreateDir)?;
@@ -127,7 +160,7 @@ impl NodeStore {
         let db = Database::builder(path)
             .worker_threads(WORKER_THREADS)
             .open()?;
-        Ok(Self {
+        let store = Self {
             node: db.keyspace(NODE, KeyspaceCreateOptions::default)?,
             peers: db.keyspace(PEERS, KeyspaceCreateOptions::default)?,
             execution_peers: db.keyspace(EXECUTION_PEERS, KeyspaceCreateOptions::default)?,
@@ -135,6 +168,47 @@ impl NodeStore {
             sync: db.keyspace(SYNC, KeyspaceCreateOptions::default)?,
             db,
             write: Mutex::new(()),
+        };
+        store.check_chain(path, chain)?;
+        Ok(store)
+    }
+
+    /// Checks that the store belongs to `chain`. A store with no chain recorded is given one
+    /// first: if it holds anything (an identity, saved peers, sync progress) it was made by a
+    /// build before the record, so it is [`ChainIdentity::BEFORE_RECORD`]'s; if it is empty,
+    /// `chain`'s.
+    fn check_chain(&self, path: &Path, chain: ChainIdentity) -> Result<(), StoreError> {
+        let found = if let Some(record) = self.node.get(CHAIN_KEY)? {
+            ChainIdentity::from_bytes(&record).ok_or_else(|| StoreError::UnreadableChain {
+                path: path.to_owned(),
+            })?
+        } else {
+            let holds_data = [
+                &self.node,
+                &self.peers,
+                &self.execution_peers,
+                &self.l1_peers,
+                &self.sync,
+            ]
+            .iter()
+            .any(|keyspace| keyspace.first_key_value().is_some());
+            let found = if holds_data {
+                ChainIdentity::BEFORE_RECORD
+            } else {
+                chain
+            };
+            let mut batch = self.durable_batch();
+            batch.insert(&self.node, CHAIN_KEY, found.to_bytes());
+            batch.commit()?;
+            found
+        };
+        if found == chain {
+            return Ok(());
+        }
+        Err(StoreError::WrongChain {
+            path: path.to_owned(),
+            found,
+            expected: chain,
         })
     }
 

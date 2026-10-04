@@ -55,11 +55,10 @@ pub(crate) const GRAYLIST_THRESHOLD: f64 = -40.0;
 const DOMAIN_VALID_SNAPPY: [u8; 4] = [1, 0, 0, 0];
 /// Bytes of the SHA-256 digest kept as the message id.
 const MESSAGE_ID_LEN: usize = 20;
-/// Score decay interval, one block. op-node uses the chain's block time and falls back to 2s;
-/// we assume 2s, the block time of the chains in `op-indexer-chainspec`.
-const SCORE_SLOT: Duration = Duration::from_secs(2);
-/// op-node's "epoch": 6 slots.
-const SCORE_EPOCH: Duration = SCORE_SLOT.saturating_mul(6);
+/// Slots in op-node's scoring "epoch".
+const SLOTS_PER_EPOCH: u32 = 6;
+/// Time over which the invalid-delivery penalty halves: about 2.3 minutes, 69 slots of 2 s.
+const INVALID_DELIVERY_HALF_LIFE: Duration = Duration::from_secs(138);
 
 /// Errors setting up gossipsub.
 #[derive(Debug, thiserror::Error)]
@@ -88,6 +87,7 @@ pub enum GossipError {
 
 /// Builds the gossipsub behaviour, subscribed to every block topic of `chain_id`, and returns it
 /// with the payload version each topic carries. Every received message must then be validated.
+/// `block_time` is the chain's, the slot that peer scores decay by.
 ///
 /// # Errors
 ///
@@ -95,6 +95,7 @@ pub enum GossipError {
 /// a block topic cannot be subscribed to.
 pub(crate) fn behaviour(
     chain_id: ChainId,
+    block_time: Duration,
 ) -> Result<(Behaviour, HashMap<TopicHash, PayloadVersion>), GossipError> {
     let config = gossipsub::ConfigBuilder::default()
         .mesh_n(MESH_TARGET)
@@ -131,7 +132,10 @@ pub(crate) fn behaviour(
     }
 
     behaviour
-        .with_peer_score(peer_score_params(topics.keys()), peer_score_thresholds())
+        .with_peer_score(
+            peer_score_params(topics.keys(), block_time),
+            peer_score_thresholds(),
+        )
         .map_err(GossipError::Score)?;
     Ok((behaviour, topics))
 }
@@ -148,8 +152,16 @@ pub(crate) fn behaviour(
 ///   one-off.
 /// - The slow-peer penalty, which only rust-libp2p has; it keeps the library default.
 ///
+/// The slot is the chain's block time, as in op-node (which falls back to 2 s when it is
+/// unset).
+///
 /// [`op-node/p2p/peer_params.go`]: https://github.com/ethereum-optimism/optimism/blob/c8e4ba855d79ca56463909ef5a2c5830a1189401/op-node/p2p/peer_params.go
-fn peer_score_params<'a>(topics: impl Iterator<Item = &'a TopicHash>) -> PeerScoreParams {
+fn peer_score_params<'a>(
+    topics: impl Iterator<Item = &'a TopicHash>,
+    block_time: Duration,
+) -> PeerScoreParams {
+    let slot = block_time;
+    let epoch = slot.saturating_mul(SLOTS_PER_EPOCH);
     let topic_params = TopicScoreParams {
         topic_weight: 1.0,
         time_in_mesh_weight: 0.0,
@@ -157,27 +169,27 @@ fn peer_score_params<'a>(topics: impl Iterator<Item = &'a TopicHash>) -> PeerSco
         mesh_message_deliveries_weight: 0.0,
         mesh_failure_penalty_weight: 0.0,
         invalid_message_deliveries_weight: -5.0,
-        // Roughly halves every 2-3 minutes at one decay per slot.
-        invalid_message_deliveries_decay: 0.99,
+        // 0.99 per slot at 2 s blocks.
+        invalid_message_deliveries_decay: gossipsub::score_parameter_decay_with_base(
+            INVALID_DELIVERY_HALF_LIFE,
+            slot,
+            0.5,
+        ),
         ..TopicScoreParams::default()
     };
     PeerScoreParams {
         topics: topics
             .map(|topic| (topic.clone(), topic_params.clone()))
             .collect(),
-        decay_interval: SCORE_SLOT,
+        decay_interval: slot,
         decay_to_zero: 0.01,
         app_specific_weight: 1.0,
         ip_colocation_factor_weight: -35.0,
         ip_colocation_factor_threshold: 10.0,
         behaviour_penalty_weight: -16.0,
         behaviour_penalty_threshold: 6.0,
-        behaviour_penalty_decay: gossipsub::score_parameter_decay_with_base(
-            SCORE_EPOCH * 10,
-            SCORE_SLOT,
-            0.01,
-        ),
-        retain_score: SCORE_EPOCH * 100,
+        behaviour_penalty_decay: gossipsub::score_parameter_decay_with_base(epoch * 10, slot, 0.01),
+        retain_score: epoch * 100,
         ..PeerScoreParams::default()
     }
 }

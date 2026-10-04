@@ -113,8 +113,13 @@ async fn plan(args: &DownloadArgs, state: &State) -> eyre::Result<Plan> {
     let chain = ChainSpec::by_chain_id(chain_id)
         .ok_or_else(|| eyre::eyre!("chain {chain_id} is not known to this build"))?;
     let (last, anchor) = if args.legacy_only {
-        let last = chain.bedrock_block.saturating_sub(1);
-        (last, Anchor::Hash(chain.last_legacy_hash))
+        let hash = chain.last_legacy_hash.ok_or_else(|| {
+            eyre::eyre!(
+                "--legacy-only: chain {} began with Bedrock and has no legacy blocks",
+                chain.chain_id
+            )
+        })?;
+        (chain.bedrock_block.saturating_sub(1), Anchor::Hash(hash))
     } else if let (Some(last), Some(hash)) = (args.last_block, args.anchor_hash) {
         (last, Anchor::Hash(hash))
     } else {
@@ -157,10 +162,12 @@ async fn plan(args: &DownloadArgs, state: &State) -> eyre::Result<Plan> {
 /// Refuses a range flag that disagrees with the recorded plan: files already written were
 /// cut by that plan.
 fn check_flags(args: &DownloadArgs, plan: &Plan) -> eyre::Result<()> {
-    let legacy = (
-        plan.chain.bedrock_block.saturating_sub(1),
-        Anchor::Hash(plan.chain.last_legacy_hash),
-    );
+    let legacy = plan.chain.last_legacy_hash.map(|hash| {
+        (
+            plan.chain.bedrock_block.saturating_sub(1),
+            Anchor::Hash(hash),
+        )
+    });
     let disagreements = [
         (
             "--chain",
@@ -181,7 +188,7 @@ fn check_flags(args: &DownloadArgs, plan: &Plan) -> eyre::Result<()> {
         ),
         (
             "--legacy-only",
-            args.legacy_only && (plan.last, plan.anchor) != legacy,
+            args.legacy_only && Some((plan.last, plan.anchor)) != legacy,
         ),
         (
             "--chunk-blocks",
@@ -210,8 +217,22 @@ async fn download(
     state: &State,
     cancel: &CancellationToken,
 ) -> eyre::Result<Plan> {
+    // Known before the plan is made, which may already use the service: the recorded plan's
+    // chain (a later run need not name it again), else the one asked for.
+    let recorded = state.read_plan()?.map(|plan| plan.chain.chain_id);
+    let chain_id = recorded.or(args.chain).unwrap_or(OP_MAINNET.chain_id);
+    let endpoint = match &args.endpoint {
+        Some(endpoint) => endpoint.clone(),
+        None => source::default_endpoint(chain_id)
+            .ok_or_else(|| {
+                eyre::eyre!(
+                    "no HyperSync endpoint is known for chain {chain_id}: give it with --endpoint"
+                )
+            })?
+            .to_owned(),
+    };
     let plan = plan(args, state).await?;
-    let source = HyperSync::new(&args.endpoint, &args.api_token)?;
+    let source = HyperSync::new(&endpoint, &args.api_token)?;
     let requests = usize::try_from(args.requests).wrap_err("--requests is too large")?;
     download::ensure_open_files(args.requests)?;
     download::run(&source, state, &plan, requests, cancel).await?;

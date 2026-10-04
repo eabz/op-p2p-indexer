@@ -64,11 +64,7 @@ impl NetworkSpec {
     #[must_use]
     pub fn op_stack(chain: &ChainSpec, bootnodes: Vec<String>) -> Self {
         let bootnodes = if bootnodes.is_empty() {
-            chain
-                .bootnodes
-                .iter()
-                .map(|node| (*node).to_owned())
-                .collect()
+            chain.bootnodes().map(str::to_owned).collect()
         } else {
             bootnodes
         };
@@ -76,8 +72,7 @@ impl NetworkSpec {
             label: "op",
             network_id: chain.chain_id,
             genesis_hash: chain.genesis_hash,
-            // OP Mainnet's genesis timestamp is 0; its time forks are all later.
-            genesis_time: 0,
+            genesis_time: chain.genesis_time,
             fork_blocks: chain.fork_blocks.to_vec(),
             fork_times: chain.fork_times().to_vec(),
             bootnodes,

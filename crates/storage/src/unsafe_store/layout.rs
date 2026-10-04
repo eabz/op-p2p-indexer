@@ -23,14 +23,12 @@ pub(super) const WIPE_SCAN_COUNT: u32 = 1000;
 /// Version of this key layout, stored in `…:schema_version`. Bump it on any change to the keys
 /// or to the shape of their values: a store written with another version is wiped on connect.
 pub(super) const SCHEMA_VERSION: &str = "1";
-/// Lifetime of block-scoped keys, a backstop for when nothing prunes them.
+/// Lifetime of block-scoped keys, a backstop for when nothing prunes them. Also the horizon of
+/// the heights kept below the head: `insert` drops heights whose keys have expired.
 pub(super) const UNSAFE_TTL: Duration = Duration::from_hours(24);
 /// Most parent links fork choice follows to connect a block to the canonical chain.
 pub(super) const MAX_REORG_DEPTH: u32 = 256;
-/// Heights kept below the head when nothing prunes: 24 hours of 2 second blocks, the same
-/// horizon as [`UNSAFE_TTL`].
-pub(super) const UNSAFE_RETENTION_BLOCKS: u32 = 43_200;
-/// Heights past the retention horizon that one insert removes. More than one, so the store
+/// Expired heights that one insert removes. More than one, so the store
 /// catches up after falling behind.
 pub(super) const RETENTION_HEIGHTS_PER_INSERT: u32 = 16;
 /// Heights one prune script call removes; a longer prune takes several calls, so that no

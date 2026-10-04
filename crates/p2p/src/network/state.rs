@@ -33,8 +33,9 @@ const DIAL_BACKOFF: Duration = Duration::from_secs(120);
 const MAX_DIAL_BACKOFF_ENTRIES: usize = 1024;
 /// How long an evicted peer is not dialed again; discovery keeps reporting it.
 const EVICTED_PEER_BACKOFF: Duration = Duration::from_secs(600);
-/// Blocks arrive every ~2s and duplicates are dropped by gossipsub before validation, so a few
-/// in flight is normal; beyond this, messages are ignored rather than queued without bound.
+/// Blocks arrive every 1 or 2 s, depending on the chain, and duplicates are dropped by
+/// gossipsub before validation, so a few in flight is normal; beyond this, messages are
+/// ignored rather than queued without bound.
 const MAX_PENDING_VALIDATIONS: usize = 32;
 /// Minimum time between warnings that the local clock looks slow.
 const CLOCK_SKEW_WARN_INTERVAL: Duration = Duration::from_secs(60);

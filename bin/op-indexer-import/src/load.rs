@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 use alloy_primitives::B256;
 use clap::Args;
 use eyre::{WrapErr, ensure, eyre};
-use op_indexer_primitives::{BlockSource, DecodedBlock, EncodedBlock, decode_block};
+use op_indexer_primitives::{BlockSource, ChainIdentity, DecodedBlock, EncodedBlock, decode_block};
 use op_indexer_storage::archive_store::{FjallArchive, PreparedBlock};
 use op_indexer_storage::committed_store::{BulkRows, ClickHouseStore};
 use op_indexer_storage::{
@@ -160,7 +160,11 @@ pub(crate) async fn run(
         None => None,
     };
     // Startup-only blocking I/O, before any chunk is read.
-    let archive = FjallArchive::open(&args.archive_dir).map_err(|err| {
+    let identity = ChainIdentity {
+        chain_id: plan.chain.chain_id,
+        genesis_hash: plan.chain.genesis_hash,
+    };
+    let archive = FjallArchive::open(&args.archive_dir, identity).map_err(|err| {
         if err.is_archive_locked() {
             eyre!(
                 "the block archive in {} is open in another process: stop the indexer, or the \
