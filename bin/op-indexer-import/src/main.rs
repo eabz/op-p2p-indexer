@@ -5,8 +5,9 @@
 //! ```
 //!
 //! - `download` ([`mod@download`]) decides the range, records it, fetches it in chunks from
-//!   the archive service ([`source`]) and keeps each answer as received. It does nothing else, so a limited request window is spent
-//!   on the transfer only.
+//!   the archive service ([`source`]) and keeps each answer as received, so a limited request
+//!   window is spent on the transfer only. It then checks the downloaded rows for fields the
+//!   service left out and fetches the ones it can from the chain's RPC ([`mod@fill`], [`rpc`]).
 //! - `verify` ([`mod@verify`]) rebuilds every block's consensus encoding from the downloaded rows
 //!   and checks it: header hash, parent links up to a trusted anchor, transactions root and
 //!   receipts root (senders are checked later, by `load`). What passes is written as the exact
@@ -22,10 +23,12 @@
 mod chunk;
 mod cli;
 mod download;
+mod fill;
 mod game;
 mod load;
 mod progress;
 mod rows;
+mod rpc;
 mod source;
 mod state;
 mod verify;
@@ -39,6 +42,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::time::ChronoUtc;
 
 use crate::cli::{Cli, Command, DownloadArgs, VerifyArgs};
+use crate::rpc::Rpc;
 use crate::source::HyperSync;
 use crate::state::{Anchor, Plan, State};
 
@@ -237,6 +241,13 @@ async fn download(
     let requests = usize::try_from(args.requests).wrap_err("--requests is too large")?;
     download::ensure_open_files(args.requests)?;
     download::run(&source, state, &plan, requests, cancel).await?;
+    // What the service left out of the rows, from the chain's RPC.
+    let rpc_endpoint = args
+        .rpc_endpoint
+        .as_deref()
+        .or_else(|| rpc::default_endpoint(plan.chain.chain_id));
+    let rpc = rpc_endpoint.map(Rpc::new).transpose()?;
+    fill::run(state, &plan, rpc.as_ref(), threads(None), cancel).await?;
     Ok(plan)
 }
 
@@ -247,12 +258,22 @@ async fn verify(
     plan: &Plan,
     cancel: &CancellationToken,
 ) -> eyre::Result<()> {
-    let threads = args
-        .verify_threads
+    verify::run(
+        state,
+        plan,
+        threads(args.verify_threads),
+        from_block,
+        cancel,
+    )
+    .await
+}
+
+/// Threads for the CPU-bound work: `asked`, else one per CPU.
+fn threads(asked: Option<usize>) -> usize {
+    asked
         .or_else(|| std::thread::available_parallelism().ok().map(usize::from))
         .unwrap_or(1)
-        .max(1);
-    verify::run(state, plan, threads, from_block, cancel).await
+        .max(1)
 }
 
 /// Cancels `cancel` on Ctrl-C or, on Unix, SIGTERM, so the running step stops between chunks.

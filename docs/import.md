@@ -19,6 +19,10 @@ and loads the verified bytes into the local block archive. It keeps what it down
 It is a separate binary: the indexer never links it and never talks to an external service.
 The HTTP client and the compression crates belong to this package only.
 
+**Sources.** Envio HyperSync for the blocks, and, only for what HyperSync leaves out of some
+rows, the chain's JSON-RPC endpoint, read-only (section 3.1a). Neither is trusted: every block
+is rebuilt and proven by its header hash and the parent links up to the anchor.
+
 ## 1. What was measured (2026-10-04, 1,009 blocks)
 
 - HyperSync has the whole range from block 0, with every header field. Each rebuilt header
@@ -80,6 +84,50 @@ again; a completed chunk is never redone.
   era (before the Bedrock block, and from it on, where blocks are ten to thirty times larger)
   times the blocks left in it, over the speed on the wire. It is absent until an era with
   blocks left has been sampled, and within the second era it still grows as blocks do.
+
+### 3.1a Fields the service leaves out, from the chain's RPC
+
+On Unichain HyperSync sends EIP-7702 transactions (type 4) without their
+`authorization_list`; every other field is there. Found at block 16,068,511: its type-4
+transaction rebuilt with an empty list hashes the header to another value. OP Mainnet's rows
+carry the list (its whole chain verified). The list is not optional (EIP-7702 refuses an
+empty one), so such a row cannot be rebuilt from the download alone.
+
+- **Checked after every download.** Once the chunks are on disk, `download` reads every chunk
+  not verified yet (one per core at a time) and lists every field its rows lack that the
+  rebuild needs, or fills with a default the header hash must then prove: header fields of
+  the block's forks (`mix_hash` and `base_fee_per_gas` from Bedrock, `withdrawals_root` from
+  Canyon, the blob gas fields and the parent beacon block root from Ecotone), the fields of
+  each transaction type, a receipt's status, and a deposit receipt's nonce and version from
+  Canyon. Each is logged once, at warn, with its count and its first block: one pass shows
+  them all, where `verify` would stop at the first. Progress is logged every 10 seconds
+  (chunks per second, time left). The pass costs about what reading the rows costs `verify`
+  (decompress and parse, no hashing, nothing written); it runs again on every `download`
+  over the chunks still not verified, and skips the verified ones.
+- **Fetched** for the authorization lists only: one `eth_getBlockByNumber` with full
+  transactions per block that needs it (Unichain's public endpoint does not allow
+  `eth_getTransactionByBlockNumberAndIndex`), four requests at a time, each retried up to six
+  times with capped, jittered backoff on a busy endpoint (429, 408, 5xx) or a broken
+  connection. A refused call, a block the endpoint does not have, or a block hash that is not
+  the downloaded one (an endpoint of another chain) fails at once, naming the endpoint.
+- **Kept apart.** What is fetched goes to the chunk's fill, `raw/<from>-<to>.fill.json`,
+  written atomically; the downloaded chunk stays as received. `verify` stays offline: it puts
+  the fill into the rows before rebuilding. A type-4 row with no list and no fill fails
+  `verify` with a message to run `download`, not the generic hash mismatch.
+- **Trust unchanged.** The list goes into the rebuilt transaction; the transactions root, so
+  the header hash, proves it. A wrong fill fails `verify` like a wrong row (checked: one
+  changed signature byte gives a header hash mismatch).
+- **Endpoint**: `--rpc-endpoint` (`OP_INDEXER_IMPORT_RPC_ENDPOINT`), by default
+  `https://mainnet.unichain.org` for Unichain and none for OP Mainnet, whose rows need none so
+  far; without one, `download` stops with a message when a list is missing.
+- **Counted**: `authorization_lists_to_fetch` and `rpc_filled_transactions` in `download`'s
+  summary, `rpc_filled_transactions` in `verify`'s.
+
+Checked on 2026-10-04, offline but for the endpoint: a chunk of block 16,068,511 built from
+the endpoint's block and receipts in HyperSync's row format, without `authorization_list`.
+`verify` failed with the message to run `download`; `download` fetched the list and wrote the
+fill; `verify` then rebuilt the header to the block's hash 0xb8a5…c3e6 and accepted the range.
+A second `download` fetched nothing. Not checked against HyperSync's own Unichain answers.
 
 ### 3.2 `verify`
 
@@ -340,6 +388,7 @@ On the real service:
 <state>/plan.json                 the chain, the range, its anchor and the chunk size
 <state>/verified.json             the range `verify` accepted; `load` requires it
 <state>/raw/<from>-<to>.raw       downloaded chunk: the service's answers as they travelled
+<state>/raw/<from>-<to>.fill.json fields the service left out, from the chain's RPC (3.1a)
 <state>/verified/<from>-<to>.blk  verified chunk: the consensus encodings that passed
 <state>/lock                      held by the one process working on the directory
 ```
@@ -425,14 +474,17 @@ What differs from OP Mainnet:
   recorded in the plan and cannot change later.
 - **The endpoint** is `https://unichain.hypersync.xyz`, the host the service's naming gives.
   It has not been reached from here; if it is wrong, give the right one with `--endpoint`.
+- **EIP-7702 authorization lists** are missing from HyperSync's rows; `download` fetches them
+  from `https://mainnet.unichain.org` (section 3.1a). A state directory downloaded before
+  this needs one more `download`, which downloads nothing and fills what is missing.
 - **The top anchor** is the newest dispute game of Unichain's own factory
   (`0x2F12d621a16e2d3285929C9996f478508951dFe4` on Ethereum): super games (type 9), whose
   claim is read for chain 130, with the timestamp turned into a block at one block a second
   from genesis.
 
-**Not run:** nothing of this has been run against Unichain: no download, no `verify` of a
-Unichain block, no game lookup on its factory. The code paths are those OP Mainnet's
-post-Bedrock range has run through in full.
+**Run so far** (by the user, reported 2026-10-04): a download of 604,009 chunks, and a
+`verify` that stopped at block 16,068,511 on the missing authorization list (section 3.1a).
+The fill, the rest of `verify` and `load` have not run on Unichain yet.
 
 ## 11. Where the import stops, and the top anchor
 

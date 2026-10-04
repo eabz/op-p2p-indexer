@@ -27,26 +27,31 @@ use tracing::info;
 use super::receipt::BloomHashes;
 use super::{Check, ChunkError, Forks, Stats, receipt, transaction};
 use crate::chunk::{self, Link, VerifiedBlock};
+use crate::fill;
 use crate::rows::{self, BlockRow, LogRow, TransactionRow};
 use crate::state::Chunk;
 
-/// Verifies the downloaded chunk at `raw` and writes it to `verified`. Blocking, CPU-bound.
+/// Verifies the downloaded chunk at `raw`, with what its fill at `fill` holds, and writes it
+/// to `verified`. Blocking, CPU-bound.
 pub(super) fn verify_chunk(
     forks: &Forks,
     chunk: Chunk,
-    raw: &Path,
+    (raw, fill): (&Path, &Path),
     verified: &Path,
 ) -> Result<Stats, ChunkError> {
-    let rows = rows::read(raw).map_err(|source| ChunkError::Rows {
+    let mut rows = rows::read(raw).map_err(|source| ChunkError::Rows {
         from: chunk.from,
         to: chunk.to,
         source,
     })?;
+    let mut stats = Stats::default();
+    if let Some(fill) = fill::read(fill).map_err(ChunkError::Fill)? {
+        stats.rpc_filled_transactions = fill::apply(&mut rows, fill);
+    }
     let mut block_rows = rows.blocks.iter().peekable();
     let mut transactions = rows.transactions.as_slice();
     let mut logs = rows.logs.as_slice();
 
-    let mut stats = Stats::default();
     let mut hashes = BloomHashes::default();
     let mut blocks = Vec::new();
     let mut link: Option<Link> = None;

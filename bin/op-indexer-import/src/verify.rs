@@ -216,9 +216,10 @@ pub(crate) async fn run(
             })
         {
             in_flight_bytes = in_flight_bytes.saturating_add(bytes);
-            let (raw, verified) = (state.raw_path(chunk), state.verified_path(chunk));
+            let (raw, fill) = (state.raw_path(chunk), state.fill_path(chunk));
+            let verified = state.verified_path(chunk);
             tasks.spawn_blocking(move || {
-                let result = block::verify_chunk(&forks, chunk, &raw, &verified);
+                let result = block::verify_chunk(&forks, chunk, (&raw, &fill), &verified);
                 (chunk, bytes, result)
             });
         }
@@ -237,11 +238,19 @@ pub(crate) async fn run(
                     if failure.is_none() {
                         error!(%err, file = %file.display(), "chunk failed verification");
                     }
+                    // A row left without a field says itself what to run.
+                    let unfilled =
+                        matches!(err, ChunkError::Block { check: Check::Unfilled { .. }, .. });
                     failure.get_or_insert_with(|| {
-                        format!(
-                            "{err} (chunk {}; delete it and download again if the data is wrong)",
-                            file.display()
-                        )
+                        if unfilled {
+                            format!("{err} (chunk {})", file.display())
+                        } else {
+                            format!(
+                                "{err} (chunk {}; delete it, and its fill if there is one, and \
+                                 download again if the data is wrong)",
+                                file.display()
+                            )
+                        }
                     });
                 }
                 Some(Err(err)) => {

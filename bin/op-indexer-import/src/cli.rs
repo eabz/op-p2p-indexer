@@ -43,8 +43,9 @@ pub(crate) struct Cli {
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
     /// Fetch the chunks of the range that are not in the state directory yet. Needs the API
-    /// token and nothing else; stops with a summary when the service refuses requests or the
-    /// disk is nearly full.
+    /// token; stops with a summary when the service refuses requests or the disk is nearly
+    /// full. Then lists every field the downloaded rows lack, and fetches the ones it can from
+    /// the chain's RPC endpoint (`--rpc-endpoint`).
     Download(DownloadArgs),
     /// Check every downloaded chunk offline: header hashes and parent links up to the anchor,
     /// transactions roots and receipts roots. Senders are checked by `load`.
@@ -104,6 +105,12 @@ pub(crate) struct DownloadArgs {
     /// that list.
     #[arg(long, env = "OP_INDEXER_IMPORT_ENDPOINT")]
     pub(crate) endpoint: Option<String>,
+    /// JSON-RPC endpoint of the chain, read-only, for what the archive service leaves out of
+    /// some rows (Unichain's EIP-7702 authorization lists); what it gives is proven by the
+    /// header hash like the rest [default: by chain, `https://mainnet.unichain.org` for
+    /// Unichain (130); none for OP Mainnet, whose rows need none so far].
+    #[arg(long, env = "OP_INDEXER_IMPORT_RPC_ENDPOINT")]
+    pub(crate) rpc_endpoint: Option<String>,
     /// `HyperSync` endpoint of the L1 chain the dispute games are on, for the lookup of the
     /// range's last block. Uses the same API token.
     #[arg(
