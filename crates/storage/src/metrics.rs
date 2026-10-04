@@ -17,7 +17,7 @@
 //! | `op_indexer_storage_receipts_attached_total` | counter | | Blocks that got receipts after they were stored in Redis. |
 //! | `op_indexer_storage_blocks_pruned_total` | counter | | Blocks removed from Redis by pruning. |
 //! | `op_indexer_storage_rows_inserted_total` | counter | `table` | Rows written to ClickHouse. |
-//! | `op_indexer_storage_rollbacks_total` | counter | | ClickHouse rollbacks to an earlier safe head. |
+//! | `op_indexer_storage_rollbacks_total` | counter | | ClickHouse rollbacks to a safe head: L1 reorgs, and one at each start that clears what a stopped promotion left. |
 //! | `op_indexer_storage_archive_blocks_removed_total` | counter | | Blocks removed from the archive by trimming and truncating, partial runs included. |
 //! | `op_indexer_storage_archive_disk_bytes` | gauge | | Size of the archive directory, journal and blob files included. |
 //! | `op_indexer_storage_archive_fragmented_blob_bytes` | gauge | | Stale bytes in the archive's blob files, which blob garbage collection will reclaim. |
@@ -160,7 +160,7 @@ pub fn describe() {
     describe_counter!(
         ROLLBACKS,
         Unit::Count,
-        "ClickHouse rollbacks to an earlier safe head"
+        "ClickHouse rollbacks to a safe head: L1 reorgs and the one at each start"
     );
     describe_counter!(
         ARCHIVE_BLOCKS_REMOVED,
@@ -232,7 +232,7 @@ pub(crate) fn rows_inserted(table: Table, rows: usize) {
     counter!(ROWS_INSERTED, "table" => table.as_str()).increment(count(rows));
 }
 
-/// Records a ClickHouse rollback to an earlier safe head.
+/// Records a ClickHouse rollback to a safe head.
 pub(crate) fn rollback() {
     counter!(ROLLBACKS).increment(1);
 }

@@ -193,8 +193,8 @@ pub(crate) fn peer_evicted() {
 /// `now_secs` (Unix seconds).
 pub(crate) fn block_accepted(block: &UnsafeBlock, now_secs: u64) {
     counter!(BLOCKS_ACCEPTED, "version" => version(block.version)).increment(1);
-    gauge!(LATEST_BLOCK_NUMBER).set(gauge_value(block.number));
-    gauge!(LATEST_BLOCK_LAG).set(gauge_value(now_secs.saturating_sub(block.timestamp)));
+    gauge!(LATEST_BLOCK_NUMBER).set(gauge_value(block.number()));
+    gauge!(LATEST_BLOCK_LAG).set(gauge_value(now_secs.saturating_sub(block.timestamp_secs())));
 }
 
 /// Records a valid block that was already seen.
@@ -299,6 +299,7 @@ fn reason(err: &BlockError) -> &'static str {
         BlockError::InvalidBlock { .. } => "invalid_block",
         BlockError::HashMismatch { .. } => "hash_mismatch",
         BlockError::TooManyAtHeight { .. } => "too_many_at_height",
+        BlockError::UndecodableTransaction { .. } => "undecodable_transaction",
     }
 }
 

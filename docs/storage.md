@@ -35,8 +35,9 @@ Use alloy and op-alloy types; do not redefine blocks, transactions or receipts.
 | `ArchivedBlock { header: Bytes, body: Bytes, receipts: Option<Bytes> }` | An archived block as RLP, ready for the wire (section 9.2). |
 | `InsertOutcome { stored: bool, events: Vec<UnsafeEvent> }` | Result of an unsafe-store insert. `stored` is `false` for a block that was already stored or is at or below the safe head; `events` is then empty. |
 
-The existing `UnsafeBlock` and `PayloadVersion` stay as they are; turning an `UnsafeBlock` into
-an `DecodedBlock` is the pipeline's job.
+`UnsafeBlock` (a gossiped block, decoded and hash-checked by `p2p`, senders not yet recovered)
+and `PayloadVersion` are not storage's concern; turning an `UnsafeBlock` into a `DecodedBlock`
+is the pipeline's job.
 
 ## 2. Store traits and errors (`crates/storage`)
 

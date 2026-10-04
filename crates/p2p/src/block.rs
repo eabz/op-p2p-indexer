@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 
+use alloy_eips::eip2718::{Decodable2718, Eip2718Error};
 use alloy_primitives::{Address, B256, BlockHash, BlockNumber, ChainId, Signature, SignatureError};
 use alloy_rpc_types_engine::{
     CancunPayloadFields, ExecutionPayloadV1, ExecutionPayloadV2, ExecutionPayloadV3,
@@ -15,6 +16,7 @@ use alloy_rpc_types_engine::{
 };
 use bytes::Bytes;
 use libp2p::gossipsub::MessageAcceptance;
+use op_alloy_consensus::OpTxEnvelope;
 use op_alloy_rpc_types_engine::{
     OpExecutionPayload, OpExecutionPayloadSidecar, OpExecutionPayloadV4, OpPayloadError,
     PayloadHash,
@@ -61,8 +63,9 @@ pub(crate) fn topic(chain_id: ChainId, version: PayloadVersion) -> String {
 /// Why a block message failed validation.
 ///
 /// [`Self::acceptance`] says how gossipsub should treat the message. The spec makes every
-/// failure a `REJECT`, which penalizes the peer that forwarded it; the one case where the peer
-/// is probably not at fault is reported by [`Self::local_clock_lag_secs`].
+/// validation failure a `REJECT`, which penalizes the peer that forwarded it; the one case
+/// where the peer is probably not at fault is reported by [`Self::local_clock_lag_secs`].
+/// [`Self::UndecodableTransaction`] is not a spec rule: the message is ignored, not rejected.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum BlockError {
     #[error("message is {len} bytes, shorter than the minimum {min}")]
@@ -109,6 +112,14 @@ pub(crate) enum BlockError {
     },
     #[error("block {number} is at a height with more than {MAX_BLOCKS_PER_HEIGHT} distinct blocks")]
     TooManyAtHeight { number: BlockNumber },
+    /// The block is valid by every rule above, but holds a transaction this build cannot
+    /// decode (a transaction type newer than it). Our limitation, not a peer fault.
+    #[error("block {number} has a transaction this build cannot decode")]
+    UndecodableTransaction {
+        number: BlockNumber,
+        #[source]
+        source: Eip2718Error,
+    },
 }
 
 impl BlockError {
@@ -126,6 +137,7 @@ impl BlockError {
             | Self::InvalidBlock { .. }
             | Self::HashMismatch { .. }
             | Self::TooManyAtHeight { .. } => MessageAcceptance::Reject,
+            Self::UndecodableTransaction { .. } => MessageAcceptance::Ignore,
         }
     }
 
@@ -177,6 +189,8 @@ impl BlockValidator {
     /// its signature checked, only to report whether the sequencer signed it. `now_secs` is
     /// the current Unix time. CPU-bound: run off the async runtime.
     ///
+    /// Last, the transactions are decoded, so the block is emitted ready to use.
+    ///
     /// The per-height limit needs state across messages; see [`SeenBlocks`].
     pub(crate) fn validate(
         &self,
@@ -197,7 +211,6 @@ impl BlockValidator {
         let number = decoded.block_number();
         let timestamp = decoded.timestamp();
         let hash = decoded.block_hash();
-        let parent_hash = decoded.parent_hash();
 
         let age_secs = now_secs.saturating_sub(timestamp);
         if age_secs > MAX_AGE_SECS {
@@ -206,7 +219,7 @@ impl BlockValidator {
         let ahead_secs = timestamp.saturating_sub(now_secs);
         if ahead_secs > MAX_FUTURE_SECS {
             let signed_by_sequencer = self
-                .sequencer_signature(number, &signature_bytes, &signed)
+                .verify_signature(number, &signature_bytes, &signed)
                 .is_ok();
             return Err(BlockError::TooFarInFuture {
                 number,
@@ -214,13 +227,12 @@ impl BlockValidator {
                 signed_by_sequencer,
             });
         }
-        let signature = self.sequencer_signature(number, &signature_bytes, &signed)?;
+        self.verify_signature(number, &signature_bytes, &signed)?;
 
-        let computed = decoded
+        let block = decoded
             .into_block_with_sidecar_raw(&sidecar(version, parent_beacon_block_root))
-            .map_err(|source| BlockError::InvalidBlock { number, source })?
-            .header
-            .hash_slow();
+            .map_err(|source| BlockError::InvalidBlock { number, source })?;
+        let computed = block.header.hash_slow();
         if computed != hash {
             return Err(BlockError::HashMismatch {
                 number,
@@ -229,19 +241,19 @@ impl BlockValidator {
             });
         }
 
+        // Decoded last, once the block is known to be the sequencer's: the consumer gets the
+        // block it would otherwise have to decode again.
+        let block = block
+            .try_map_transactions(|transaction| OpTxEnvelope::decode_2718_exact(&transaction))
+            .map_err(|source| BlockError::UndecodableTransaction { number, source })?;
         Ok(UnsafeBlock {
             version,
-            number,
             hash,
-            parent_hash,
-            timestamp,
-            parent_beacon_block_root,
-            signature,
-            payload,
+            block,
         })
     }
 
-    /// Returns the message's signature if the sequencer made it over `signed`.
+    /// Checks that the sequencer made `signature` over `signed`.
     ///
     /// The recovery id must be 0 or 1, as the sequencer writes it. alloy would also take 27, 28
     /// and EIP-155 values, giving one signature hundreds of encodings, each a distinct gossip
@@ -249,12 +261,12 @@ impl BlockValidator {
     /// 2 and 3 as a different public key, which the sequencer's signatures never recover to. Like
     /// op-node, a high `s` is accepted: rejecting it would penalize peers for relaying a message
     /// op-node forwards.
-    fn sequencer_signature(
+    fn verify_signature(
         &self,
         number: BlockNumber,
         signature: &[u8],
         signed: &[u8],
-    ) -> Result<Signature, BlockError> {
+    ) -> Result<(), BlockError> {
         if let Some(&recovery_id) = signature.last()
             && recovery_id > 1
         {
@@ -275,7 +287,7 @@ impl BlockValidator {
                 signer: recovered,
             });
         }
-        Ok(signature)
+        Ok(())
     }
 }
 
