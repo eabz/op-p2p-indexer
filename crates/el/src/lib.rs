@@ -92,7 +92,7 @@ impl<P: BlockProvider> ExecutionNetwork<P> {
         served: mpsc::Sender<ExecutionPeer>,
         provider: P,
     ) -> Result<Self, ElError> {
-        let (block_server, serving) = serve::new(provider);
+        let (block_server, serving) = serve::new(provider, head.clone());
         let spec = NetworkSpec::op_stack(config.chain, config.bootnodes.clone());
         let label = spec.label;
         let peer_config = PeerConfig {

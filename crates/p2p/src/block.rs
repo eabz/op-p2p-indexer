@@ -21,6 +21,7 @@ use op_alloy_rpc_types_engine::{
     OpExecutionPayload, OpExecutionPayloadSidecar, OpExecutionPayloadV4, OpPayloadError,
     PayloadHash,
 };
+use op_indexer_chainspec::ChainSpec;
 use op_indexer_primitives::{PayloadVersion, UnsafeBlock};
 use ssz::Decode;
 
@@ -110,6 +111,14 @@ pub(crate) enum BlockError {
         claimed: BlockHash,
         computed: BlockHash,
     },
+    /// A field the block's topic rules out ([block validation]).
+    ///
+    /// [block validation]: https://specs.optimism.io/protocol/rollup-node-p2p.html#block-validation
+    #[error("block {number} has {rule}")]
+    ForkRule {
+        number: BlockNumber,
+        rule: &'static str,
+    },
     #[error("block {number} is at a height with more than {MAX_BLOCKS_PER_HEIGHT} distinct blocks")]
     TooManyAtHeight { number: BlockNumber },
     /// The block is valid by every rule above, but holds a transaction this build cannot
@@ -136,6 +145,7 @@ impl BlockError {
             | Self::WrongSigner { .. }
             | Self::InvalidBlock { .. }
             | Self::HashMismatch { .. }
+            | Self::ForkRule { .. }
             | Self::TooManyAtHeight { .. } => MessageAcceptance::Reject,
             Self::UndecodableTransaction { .. } => MessageAcceptance::Ignore,
         }
@@ -160,13 +170,14 @@ impl BlockError {
 /// Validates decompressed block messages against the chain's sequencer key.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BlockValidator {
-    chain_id: ChainId,
-    signer: Address,
+    /// The chain's id (in the signed message), its sequencer key, and the Jovian time (from
+    /// which the header's blob gas used holds the block's data-availability footprint).
+    chain: &'static ChainSpec,
 }
 
 impl BlockValidator {
-    pub(crate) const fn new(chain_id: ChainId, signer: Address) -> Self {
-        Self { chain_id, signer }
+    pub(crate) const fn new(chain: &'static ChainSpec) -> Self {
+        Self { chain }
     }
 
     /// Cheap length check, run inline before a message is queued for full validation.
@@ -193,7 +204,7 @@ impl BlockValidator {
     ///
     /// The per-height limit needs state across messages; see [`SeenBlocks`].
     pub(crate) fn validate(
-        &self,
+        self,
         version: PayloadVersion,
         message: Vec<u8>,
         now_secs: u64,
@@ -211,6 +222,9 @@ impl BlockValidator {
         let number = decoded.block_number();
         let timestamp = decoded.timestamp();
         let hash = decoded.block_hash();
+        if let Some(rule) = self.fork_rule(&decoded, timestamp) {
+            return Err(BlockError::ForkRule { number, rule });
+        }
 
         let age_secs = now_secs.saturating_sub(timestamp);
         if age_secs > MAX_AGE_SECS {
@@ -253,6 +267,29 @@ impl BlockValidator {
         })
     }
 
+    /// The topic rule `payload` breaks, if any, of those its payload type does not already
+    /// enforce ([block validation]): from V2 an empty withdrawals list, from V3 no excess blob
+    /// gas and, before Jovian (whose blob gas used is the DA footprint, `jovian/exec-engine.md`),
+    /// no blob gas used. The payload type is the topic's, so the version is read from it.
+    ///
+    /// [block validation]: https://specs.optimism.io/protocol/rollup-node-p2p.html#block-validation
+    fn fork_rule(self, payload: &OpExecutionPayload, timestamp: u64) -> Option<&'static str> {
+        if payload
+            .as_v2()
+            .is_some_and(|payload| !payload.withdrawals.is_empty())
+        {
+            return Some("a non-empty withdrawals list");
+        }
+        let v3 = payload.as_v3()?;
+        if v3.excess_blob_gas != 0 {
+            return Some("a non-zero excess blob gas");
+        }
+        if timestamp < self.chain.jovian_time && v3.blob_gas_used != 0 {
+            return Some("a non-zero blob gas used before Jovian");
+        }
+        None
+    }
+
     /// Checks that the sequencer made `signature` over `signed`.
     ///
     /// The recovery id must be 0 or 1, as the sequencer writes it. alloy would also take 27, 28
@@ -262,7 +299,7 @@ impl BlockValidator {
     /// op-node, a high `s` is accepted: rejecting it would penalize peers for relaying a message
     /// op-node forwards.
     fn verify_signature(
-        &self,
+        self,
         number: BlockNumber,
         signature: &[u8],
         signed: &[u8],
@@ -277,11 +314,11 @@ impl BlockValidator {
         }
         let signature = Signature::from_raw(signature)
             .map_err(|source| BlockError::MalformedSignature { number, source })?;
-        let message_hash = PayloadHash::from(signed).signature_message(self.chain_id);
+        let message_hash = PayloadHash::from(signed).signature_message(self.chain.chain_id);
         let recovered = signature
             .recover_address_from_prehash(&message_hash)
             .map_err(|source| BlockError::MalformedSignature { number, source })?;
-        if recovered != self.signer {
+        if recovered != self.chain.unsafe_block_signer {
             return Err(BlockError::WrongSigner {
                 number,
                 signer: recovered,

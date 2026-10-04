@@ -193,7 +193,7 @@ pub enum StorageError {
     #[error(
         "the block archive in {} has schema version {found}, this build reads version \
          {expected}: the archive's layout changed. Move the directory away and load a new \
-         archive with `op-indexer-import load` from the verified chunks (no download needed), \
+         archive with `import load` from the verified chunks (no download needed), \
          or keep running the build that wrote it",
         path.display()
     )]

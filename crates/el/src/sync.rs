@@ -438,7 +438,8 @@ impl Syncer {
     /// with each other; other peers are left alone for those.
     fn serves(&self, session: &SessionHandle, first: BlockNumber, last: BlockNumber) -> bool {
         let range = session.range();
-        range.earliest <= first
+        session.is_askable()
+            && range.earliest <= first
             && last <= range.latest
             && (first >= self.indexers_only_below || session.status().indexer)
     }

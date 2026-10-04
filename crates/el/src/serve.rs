@@ -36,10 +36,10 @@ use std::time::Duration;
 use alloy_primitives::{BlockNumber, Bytes};
 use alloy_rlp::{Decodable, Encodable, Header};
 use op_alloy_consensus::{OpReceipt, OpReceiptEnvelope};
-use op_indexer_primitives::{BlockRead, BlockStart, ItemConvert, ReadLimits};
+use op_indexer_primitives::{BlockRead, BlockRef, BlockStart, ItemConvert, ReadLimits};
 use reth_eth_wire_types::message::RequestPair;
 use reth_eth_wire_types::{
-    BlockHashOrNumber, GetBlockBodies, GetBlockHeaders, GetReceipts, HeadersDirection,
+    BlockHashOrNumber, EthVersion, GetBlockBodies, GetBlockHeaders, GetReceipts, HeadersDirection,
 };
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
@@ -69,6 +69,8 @@ const MAX_QUEUED: usize = 64;
 /// provider; this keeps serving to a few of them whatever the number of peers.
 const MAX_CONCURRENT: usize = 4;
 
+/// Shortest time between two reads of the held range when the head moves: a block or two.
+const HEAD_REFRESH: Duration = Duration::from_secs(2);
 /// How often the held range is read from the provider.
 const RANGE_REFRESH: Duration = Duration::from_secs(10);
 
@@ -78,6 +80,8 @@ struct Request {
     kind: ServeKind,
     /// Blocks below this are not served to the peer: answered as not held.
     lowest: BlockNumber,
+    /// The session's eth version, whose receipts format the answer uses.
+    version: EthVersion,
     id: u64,
     /// The request without its message id byte.
     body: Bytes,
@@ -89,6 +93,8 @@ struct Request {
 #[derive(Debug)]
 pub(crate) struct Server<P> {
     provider: Arc<P>,
+    /// The newest block the node knows: the held range is read again when it moves.
+    head: watch::Receiver<Option<BlockRef>>,
     requests: mpsc::Receiver<Request>,
     range: watch::Sender<Option<HeldRange>>,
     /// Whether what is advertised has been logged once.
@@ -96,12 +102,16 @@ pub(crate) struct Server<P> {
 }
 
 /// Builds the server over `provider` and what sessions use to reach it. The held range is
-/// unknown (nothing held) until the server runs.
-pub(crate) fn new<P: BlockProvider>(provider: P) -> (Server<P>, Serving) {
+/// unknown (nothing held) until the server runs, and is read again whenever `head` moves.
+pub(crate) fn new<P: BlockProvider>(
+    provider: P,
+    head: watch::Receiver<Option<BlockRef>>,
+) -> (Server<P>, Serving) {
     let (requests_tx, requests_rx) = mpsc::channel(MAX_QUEUED);
     let (range_tx, range_rx) = watch::channel(None);
     let server = Server {
         provider: Arc::new(provider),
+        head,
         requests: requests_rx,
         range: range_tx,
         logged: false,
@@ -109,6 +119,7 @@ pub(crate) fn new<P: BlockProvider>(provider: P) -> (Server<P>, Serving) {
     let serving = Serving {
         requests: requests_tx,
         range: range_rx,
+        enabled: true,
     };
     (server, serving)
 }
@@ -120,7 +131,11 @@ pub(crate) fn disabled() -> Serving {
     // keeps its initial "nothing held".
     let (requests, _) = mpsc::channel(1);
     let (_, range) = watch::channel(None);
-    Serving { requests, range }
+    Serving {
+        requests,
+        range,
+        enabled: false,
+    }
 }
 
 impl<P: BlockProvider> Server<P> {
@@ -134,6 +149,7 @@ impl<P: BlockProvider> Server<P> {
         let mut refresh = interval(RANGE_REFRESH);
         refresh.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut answering = JoinSet::new();
+        let mut last_read = tokio::time::Instant::now();
         loop {
             tokio::select! {
                 biased;
@@ -143,7 +159,17 @@ impl<P: BlockProvider> Server<P> {
                         return Err(ElError::Task { task: "serve request", source });
                     }
                 }
-                _ = refresh.tick() => self.refresh_range().await,
+                _ = refresh.tick() => {
+                    self.refresh_range().await;
+                    last_read = tokio::time::Instant::now();
+                }
+                // The held range ends at the head: it is read again as the head moves, at
+                // most once per `HEAD_REFRESH`. A closed head means the binary is stopping;
+                // the periodic refresh carries on.
+                Ok(()) = self.head.changed(), if last_read.elapsed() >= HEAD_REFRESH => {
+                    self.refresh_range().await;
+                    last_read = tokio::time::Instant::now();
+                }
                 request = self.requests.recv(), if answering.len() < MAX_CONCURRENT => {
                     // Closed: every session and the context are gone.
                     let Some(request) = request else { return Ok(()) };
@@ -207,11 +233,12 @@ async fn answer<P: BlockProvider>(provider: Arc<P>, request: Request) {
     let Request {
         kind,
         lowest,
+        version,
         id,
         body,
         answer,
     } = request;
-    let items = gather(&*provider, kind, lowest, &body).await;
+    let items = gather(&*provider, kind, lowest, version, &body).await;
     let (items, outcome) = match items {
         Ok(items) if items.is_empty() => (items, ServeOutcome::Empty),
         Ok(items) => (items, ServeOutcome::Answered),
@@ -240,6 +267,7 @@ async fn gather<P: BlockProvider>(
     provider: &P,
     kind: ServeKind,
     lowest: BlockNumber,
+    version: EthVersion,
     mut body: &[u8],
 ) -> Result<Vec<Bytes>, Fault<P::Error>> {
     let mut limits = ReadLimits {
@@ -274,7 +302,9 @@ async fn gather<P: BlockProvider>(
         ServeKind::Receipts => {
             let request = RequestPair::<GetReceipts>::decode(&mut body);
             let hashes = request.map_err(Fault::Malformed)?.message.0;
-            (BlockRead::Receipts(hashes), Some(without_blooms))
+            // Held with their blooms, as eth/68 sends them; eth/69 drops the bloom.
+            let convert = (version >= EthVersion::Eth69).then_some(without_blooms as ItemConvert);
+            (BlockRead::Receipts(hashes), convert)
         }
     };
     provider

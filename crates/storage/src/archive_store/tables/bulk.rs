@@ -1,10 +1,10 @@
 //! The importer's bulk load: blocks prepared off the writer, written straight into new tables
 //! and blob files with fjall's ingestion, bypassing the journal and the memtables.
 //!
-//! Each keyspace takes its part of a list in one ingestion, all five at once on their own
-//! threads. An ingestion is registered atomically, and durably, by its `finish`: its tables and
+//! Each keyspace takes its part of a list in one ingestion, all at once on their own
+//! threads (`pending_receipts` only when some block of the list has no receipts). An ingestion is registered atomically, and durably, by its `finish`: its tables and
 //! blob files are synced before the keyspace's version that lists them is. `headers` is
-//! finished last, after the other four, and its last key is the archive's tip, so a crash
+//! finished last, after the other five, and its last key is the archive's tip, so a crash
 //! leaves the archive holding a contiguous prefix.
 //!
 //! The other keyspaces may then hold blocks of the unfinished list above the tip. Reads by
@@ -106,25 +106,39 @@ pub(in crate::archive_store) fn bulk_append(
             }
             Ok::<_, Failure>(())
         });
-        let others = [
+        let mut others = vec![
             scope.spawn(|| ingest(&tables.bodies, by_number(|block| Some(&block.body)))),
             scope.spawn(|| ingest(&tables.receipts, by_number(|block| block.receipts.as_ref()))),
             scope.spawn(|| ingest(&tables.senders, by_number(|block| Some(&block.senders)))),
-            scope.spawn(|| {
-                // Hash order. Hashes are distinct (keccak), but a duplicate must not reach the
-                // ingestion, which requires strictly ascending keys.
-                let mut numbers: Vec<([u8; 32], [u8; 8])> = blocks
-                    .iter()
-                    .map(|block| (block.block.hash.0, block.block.number.to_be_bytes()))
-                    .collect();
-                numbers.sort_unstable();
-                numbers.dedup_by_key(|(hash, _)| *hash);
-                let entries = numbers
-                    .into_iter()
-                    .map(|(hash, number)| (UserKey::from(hash), UserValue::from(number)));
-                ingest(&tables.numbers, Box::new(entries))
-            }),
         ];
+        // Blocks without receipts go into the index; an import has none, so there is usually
+        // nothing to ingest there.
+        if blocks.iter().any(|block| block.receipts.is_none()) {
+            others.push(scope.spawn(|| {
+                let entries = blocks
+                    .iter()
+                    .filter(|block| block.receipts.is_none())
+                    .map(|block| {
+                        let key = UserKey::from(block.block.number.to_be_bytes());
+                        (key, UserValue::from(block.block.hash.0))
+                    });
+                ingest(&tables.pending, Box::new(entries))
+            }));
+        }
+        others.push(scope.spawn(|| {
+            // Hash order. Hashes are distinct (keccak), but a duplicate must not reach the
+            // ingestion, which requires strictly ascending keys.
+            let mut numbers: Vec<([u8; 32], [u8; 8])> = blocks
+                .iter()
+                .map(|block| (block.block.hash.0, block.block.number.to_be_bytes()))
+                .collect();
+            numbers.sort_unstable();
+            numbers.dedup_by_key(|(hash, _)| *hash);
+            let entries = numbers
+                .into_iter()
+                .map(|(hash, number)| (UserKey::from(hash), UserValue::from(number)));
+            ingest(&tables.numbers, Box::new(entries))
+        }));
         let mut result = Ok(());
         for ingestion in others {
             let joined = ingestion

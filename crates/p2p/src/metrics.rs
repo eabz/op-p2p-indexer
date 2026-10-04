@@ -298,6 +298,7 @@ fn reason(err: &BlockError) -> &'static str {
         BlockError::WrongSigner { .. } => "wrong_signer",
         BlockError::InvalidBlock { .. } => "invalid_block",
         BlockError::HashMismatch { .. } => "hash_mismatch",
+        BlockError::ForkRule { .. } => "fork_rule",
         BlockError::TooManyAtHeight { .. } => "too_many_at_height",
         BlockError::UndecodableTransaction { .. } => "undecodable_transaction",
     }

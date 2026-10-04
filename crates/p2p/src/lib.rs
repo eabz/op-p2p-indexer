@@ -24,6 +24,7 @@ mod metrics;
 mod network;
 mod peers;
 mod store;
+mod sync;
 
 pub use bootnode::{Bootnode, BootnodeError};
 pub use config::NetworkConfig;
@@ -31,3 +32,4 @@ pub use discovery::DiscoveryError;
 pub use gossip::GossipError;
 pub use network::{Network, NetworkError};
 pub use store::{NodeStore, StoreError};
+pub use sync::{BlockFuture, PayloadSource};

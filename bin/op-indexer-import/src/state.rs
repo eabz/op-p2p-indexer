@@ -174,7 +174,7 @@ impl State {
         lock.try_lock().map_err(|err| match err {
             TryLockError::WouldBlock => io::Error::new(
                 io::ErrorKind::ResourceBusy,
-                "another op-indexer-import process is using this state directory",
+                "another `import` process is using this state directory",
             ),
             TryLockError::Error(err) => err,
         })?;
@@ -276,6 +276,10 @@ impl State {
     ///
     /// Returns the I/O error of writing the file.
     pub(crate) fn write_verified(&self, range: &VerifiedRange) -> io::Result<()> {
+        // The record covers the verified chunks, so their renames are made durable first: one
+        // sync for the whole directory, not one per chunk (a lost rename only loses a chunk
+        // that is then verified again).
+        sync_dir(&self.verified)?;
         write_json(&self.root.join("verified.json"), range)
     }
 
@@ -343,7 +347,15 @@ pub(crate) fn write_atomic(
         let _removed = fs::remove_file(&temporary);
         return Err(err);
     }
+    // The contents are synced first, so a crash never leaves a short file under the final
+    // name; the rename itself becomes durable when the directory is synced ([`sync_dir`]).
     fs::rename(&temporary, path)
+}
+
+/// Syncs the directory `path`, so the files renamed into it so far survive a power loss.
+/// Blocking.
+fn sync_dir(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
 }
 
 fn read_json<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
@@ -365,5 +377,6 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
 
 fn write_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
     let content = serde_json::to_vec_pretty(value)?;
-    write_atomic(path, |file| file.write_all(&content))
+    write_atomic(path, |file| file.write_all(&content))?;
+    path.parent().map_or(Ok(()), sync_dir)
 }

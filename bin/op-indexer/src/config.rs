@@ -105,6 +105,9 @@ impl Config {
     /// - `OP_INDEXER_LISTEN_ADDR`: p2p listen socket, TCP and UDP (default `0.0.0.0:9222`).
     /// - `OP_INDEXER_BOOTNODES`: comma-separated `enr:` records or `enode://` URLs (default: the
     ///   chain's bootnodes).
+    /// - `OP_INDEXER_ADVERTISED_ADDR`: public socket (IP and port, the same for TCP and UDP)
+    ///   the consensus-layer node record advertises (default: unset, the address
+    ///   peers observe). Set it behind NAT or in a container, with the port forwarded.
     /// - `OP_INDEXER_MAX_PEERS`: maximum connections, inbound and outbound (default 30).
     /// - `OP_INDEXER_DATA_DIR`: node state directory (default `data`).
     /// - `OP_INDEXER_REDIS_URL`: unsafe store (default `redis://127.0.0.1:6379`).
@@ -220,6 +223,7 @@ impl Config {
                 chain,
                 listen_addr: parse_var("OP_INDEXER_LISTEN_ADDR")?.unwrap_or(DEFAULT_LISTEN_ADDR),
                 bootnodes,
+                advertised_addr: parse_var("OP_INDEXER_ADVERTISED_ADDR")?,
                 max_peers: parse_var("OP_INDEXER_MAX_PEERS")?.unwrap_or(DEFAULT_MAX_PEERS),
             },
             storage: StorageConfig {

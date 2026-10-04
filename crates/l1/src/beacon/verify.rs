@@ -40,8 +40,7 @@ use blst::min_pk::{PublicKey, Signature};
 use ssz::Decode;
 use tree_hash::TreeHash;
 
-use super::rpc::StatusData;
-use super::spec::{BeaconSpec, SLOTS_PER_EPOCH, SLOTS_PER_PERIOD, hash_pair};
+use super::spec::{BeaconSpec, SLOTS_PER_PERIOD, hash_pair};
 use super::types::{
     LightClientBootstrap, LightClientFinalityUpdate, LightClientHeader,
     LightClientOptimisticUpdate, LightClientUpdate, SyncAggregate, SyncCommittee,
@@ -149,12 +148,8 @@ impl Committee {
 pub(super) struct Store {
     /// Slot of the finalized header.
     finalized_slot: u64,
-    /// Root of the finalized header: the block root peers are told we have finalized.
-    finalized_root: B256,
     /// Slot of the newest header accepted as head.
     head_slot: u64,
-    /// Root of that header.
-    head_root: B256,
     /// The committee of the finalized header's period.
     current: Arc<Committee>,
     /// The committee of the period after, once an update proved it.
@@ -168,6 +163,8 @@ pub(super) struct Accepted {
     pub(super) finalized: Option<TrustedL1Block>,
     /// The execution block of a newer head.
     pub(super) head: Option<TrustedL1Block>,
+    /// The slot the update was signed in (0 for a bootstrap).
+    pub(super) signature_slot: u64,
 }
 
 /// An update of any of the three kinds, as it is verified.
@@ -260,8 +257,11 @@ pub(super) fn verify(
         match store.apply(spec, &Update::decode(kind, ssz.as_ref())?, now_slot) {
             Ok(step) => {
                 applied = true;
-                accepted.finalized = step.finalized.or(accepted.finalized);
-                accepted.head = step.head.or(accepted.head);
+                accepted = Accepted {
+                    finalized: step.finalized.or(accepted.finalized),
+                    head: step.head.or(accepted.head),
+                    ..step
+                };
             }
             // An update of a period already passed: the next one may still be news.
             Err(VerifyError::Stale) => stale = true,
@@ -302,15 +302,13 @@ impl Store {
         )?;
         let store = Self {
             finalized_slot: header.beacon.slot,
-            finalized_root: root,
             head_slot: header.beacon.slot,
-            head_root: root,
             current: Arc::new(Committee::new(&bootstrap.current_sync_committee)?),
             next: None,
         };
         let accepted = Accepted {
             finalized: Some(trusted(header, true)),
-            head: None,
+            ..Accepted::default()
         };
         Ok((store, accepted))
     }
@@ -331,15 +329,9 @@ impl Store {
         self.next.is_some()
     }
 
-    /// The finalized header's root and epoch, and the head's root and slot: what a `Status`
-    /// message reports.
-    pub(super) const fn status(&self) -> StatusData {
-        StatusData {
-            finalized_root: self.finalized_root,
-            finalized_epoch: self.finalized_slot / SLOTS_PER_EPOCH,
-            head_root: self.head_root,
-            head_slot: self.head_slot,
-        }
+    /// The slot of the newest header accepted as head.
+    pub(super) const fn head_slot(&self) -> u64 {
+        self.head_slot
     }
 
     /// The committee that signs in `period`, if known.
@@ -411,21 +403,16 @@ impl Store {
         }
 
         check_header(spec, &update.attested)?;
-        let finalized_root = match &update.finalized {
-            Some((header, branch)) => {
-                check_header(spec, header)?;
-                let root = header.beacon.tree_hash_root();
-                check_branch(
-                    "finalized header",
-                    root,
-                    branch,
-                    FINALIZED_ROOT_GINDEX,
-                    attested.state_root,
-                )?;
-                Some(root)
-            }
-            None => None,
-        };
+        if let Some((header, branch)) = &update.finalized {
+            check_header(spec, header)?;
+            check_branch(
+                "finalized header",
+                header.beacon.tree_hash_root(),
+                branch,
+                FINALIZED_ROOT_GINDEX,
+                attested.state_root,
+            )?;
+        }
         if let Some((next, branch)) = &update.next_committee {
             check_branch(
                 "next sync committee",
@@ -451,15 +438,17 @@ impl Store {
             _ => None,
         };
 
-        let mut accepted = Accepted::default();
-        if finalizes && let (Some((header, _)), Some(root)) = (&update.finalized, finalized_root) {
+        let mut accepted = Accepted {
+            signature_slot: update.signature_slot,
+            ..Accepted::default()
+        };
+        if finalizes && let Some((header, _)) = &update.finalized {
             // The finalized header enters the next period: its committee, known because it
             // signed this update (signature period ≥ finalized period), becomes the current.
             if rotates && let Some(next) = self.next.take() {
                 self.current = next;
             }
             self.finalized_slot = header.beacon.slot;
-            self.finalized_root = root;
             accepted.finalized = Some(trusted(header, true));
         }
         // The next committee an update proves is the one after its attested header's period;
@@ -472,7 +461,6 @@ impl Store {
         }
         if attested.slot > self.head_slot {
             self.head_slot = attested.slot;
-            self.head_root = attested_root;
             accepted.head = Some(trusted(&update.attested, false));
         }
         Ok(accepted)

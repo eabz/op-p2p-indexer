@@ -24,7 +24,7 @@ use crate::load::LoadArgs;
 /// the last block known to be committed to L1: the block of the newest dispute game. Blocks
 /// come from Envio `HyperSync`.
 #[derive(Debug, Parser)]
-#[command(name = "op-indexer-import", version)]
+#[command(name = "import", version)]
 pub(crate) struct Cli {
     /// Directory for the plan and the downloaded and verified chunks. Use the same one for
     /// every step.

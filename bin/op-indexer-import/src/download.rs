@@ -27,6 +27,7 @@ use tokio::time::{MissedTickBehavior, interval, sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::chunk::{self, ChunkFile};
 use crate::progress::{self, Rate};
 use crate::source::{Encoding, HyperSync, Meters, SourceError};
 use crate::state::{Chunk, LOW_SPACE_BYTES, MIN_SPACE_BYTES, Plan, State, write_atomic};
@@ -144,7 +145,8 @@ pub(crate) async fn run(
             plan.chunks()
                 // A chunk already verified needs no download, even if `raw/` was deleted.
                 .filter(|chunk| {
-                    !state.raw_path(*chunk).exists() && !state.verified_path(*chunk).exists()
+                    !state.raw_path(*chunk).exists()
+                        && chunk::check(&state.verified_path(*chunk)) != ChunkFile::Present
                 })
                 .collect::<Vec<_>>()
         })

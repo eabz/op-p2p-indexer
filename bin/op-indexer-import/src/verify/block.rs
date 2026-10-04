@@ -22,6 +22,8 @@ use op_indexer_primitives::{
     EncodedBlock, encode_body, encode_receipts, receipts_root, transactions_root,
 };
 
+use tracing::info;
+
 use super::receipt::BloomHashes;
 use super::{Check, ChunkError, Forks, Stats, receipt, transaction};
 use crate::chunk::{self, Link, VerifiedBlock};
@@ -60,9 +62,15 @@ pub(super) fn verify_chunk(
         let block_transactions = take_while(&mut transactions, |tx| tx.block_number == number);
         let block_logs = take_while(&mut logs, |log| log.block_number == number);
 
-        let (block, zero_signatures) =
-            verify_block(forks, row, block_transactions, block_logs, &mut hashes)
-                .map_err(failed)?;
+        let block = verify_block(
+            forks,
+            row,
+            block_transactions,
+            block_logs,
+            &mut hashes,
+            &mut stats,
+        )
+        .map_err(failed)?;
         if let Some(link) = &link
             && link.last_hash != row.parent_hash
         {
@@ -79,8 +87,15 @@ pub(super) fn verify_chunk(
         stats.transactions = stats
             .transactions
             .saturating_add(u64::try_from(block.senders.len()).unwrap_or(u64::MAX));
-        stats.zero_signatures = stats.zero_signatures.saturating_add(zero_signatures);
         blocks.push(block);
+    }
+    if stats.rebuilt_header_fields > 0 {
+        info!(
+            from = chunk.from,
+            to = chunk.to,
+            rebuilt_header_fields = stats.rebuilt_header_fields,
+            "blocks without `mix_hash` rebuilt with zero, proven by their hash"
+        );
     }
     if let Some(link) = link {
         chunk::write(verified, link, &blocks)?;
@@ -90,20 +105,31 @@ pub(super) fn verify_chunk(
 }
 
 /// Rebuilds one block from its rows and checks it against the reported block hash. Returns
-/// the verified encodings and the number of transactions signed with all zeros.
+/// the verified encodings, and counts in `stats` the transactions signed with all zeros and
+/// a header whose missing `mix_hash` was taken as zero (before Bedrock only).
 fn verify_block(
     forks: &Forks,
     row: &BlockRow,
     transactions: &[TransactionRow],
     mut logs: &[LogRow],
     hashes: &mut BloomHashes,
-) -> Result<(VerifiedBlock, u64), Check> {
+    stats: &mut Stats,
+) -> Result<VerifiedBlock, Check> {
     let timestamp: u64 = row.timestamp.to();
+    // Every legacy header has a zero `mix_hash`; the header hash below proves the guess. From
+    // Bedrock on it is the L1 block's randomness and cannot be rebuilt.
+    let (mix_hash, rebuilt) = match row.mix_hash {
+        Some(mix_hash) => (mix_hash, false),
+        None if row.number < forks.bedrock_block => (B256::ZERO, true),
+        None => return Err(Check::MissingMixHash),
+    };
+    stats.rebuilt_header_fields = stats
+        .rebuilt_header_fields
+        .saturating_add(u64::from(rebuilt));
     let mut encodings = Vec::with_capacity(transactions.len());
     let mut senders = Vec::with_capacity(transactions.len());
     let mut receipts = Vec::with_capacity(transactions.len());
     let mut logs_bloom = Bloom::ZERO;
-    let mut zero_signatures = 0_u64;
     for (index, tx) in (0_u64..).zip(transactions) {
         if tx.transaction_index != index {
             return Err(Check::TransactionIndex {
@@ -114,7 +140,9 @@ fn verify_block(
         let mut encoding = Vec::new();
         let (sender, zero_signature) =
             transaction::encode(index, tx, timestamp < forks.regolith, &mut encoding)?;
-        zero_signatures = zero_signatures.saturating_add(u64::from(zero_signature));
+        stats.zero_signatures = stats
+            .zero_signatures
+            .saturating_add(u64::from(zero_signature));
         encodings.push(encoding);
         senders.push(sender);
 
@@ -131,7 +159,14 @@ fn verify_block(
     }
     let transactions_root = transactions_root(&encodings);
     let receipts_root = receipts_root(&receipts, timestamp, forks.canyon);
-    let header = encode_header(forks, row, transactions_root, receipts_root, logs_bloom);
+    let header = encode_header(
+        forks,
+        row,
+        transactions_root,
+        receipts_root,
+        logs_bloom,
+        mix_hash,
+    );
     let computed = keccak256(&header);
     if computed != row.hash {
         return Err(Check::HeaderHash {
@@ -149,17 +184,19 @@ fn verify_block(
         },
         senders,
     };
-    Ok((block, zero_signatures))
+    Ok(block)
 }
 
 /// Encodes the header of `row` with the roots and the bloom computed from the block's
-/// transactions, receipts and logs.
+/// transactions, receipts and logs, and `mix_hash` (the row's, or zero for a legacy row
+/// without it).
 fn encode_header(
     forks: &Forks,
     row: &BlockRow,
     transactions_root: B256,
     receipts_root: B256,
     logs_bloom: Bloom,
+    mix_hash: B256,
 ) -> Vec<u8> {
     let timestamp: u64 = row.timestamp.to();
     alloy_rlp::encode(Header {
@@ -176,7 +213,7 @@ fn encode_header(
         gas_used: row.gas_used.to(),
         timestamp,
         extra_data: row.extra_data.clone(),
-        mix_hash: row.mix_hash,
+        mix_hash,
         nonce: row.nonce,
         base_fee_per_gas: row.base_fee_per_gas.map(|fee| fee.to()),
         withdrawals_root: row.withdrawals_root,

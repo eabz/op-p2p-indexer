@@ -15,7 +15,7 @@ use futures_util::{SinkExt, StreamExt};
 use reth_ecies::stream::ECIESStream;
 use reth_eth_wire::P2PStream;
 use reth_eth_wire::errors::P2PStreamError;
-use reth_eth_wire_types::DisconnectReason;
+use reth_eth_wire_types::{DisconnectReason, EthVersion};
 use reth_network_peers::PeerId;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -220,6 +220,13 @@ impl SessionHandle {
         let asked = blocks.len();
         let body = self.request(Request::Bodies(blocks)).await?;
         items(&body, asked)
+    }
+
+    /// Whether requesters may ask this peer: it speaks eth/69. An eth/68 peer (only met where
+    /// we serve) announces no range and sends receipts in another format; it is served, not
+    /// asked.
+    pub(crate) fn is_askable(&self) -> bool {
+        self.status.version >= EthVersion::Eth69
     }
 
     /// Time since we last sent the peer a request, or since the session opened.
@@ -430,6 +437,15 @@ impl SessionDriver {
             }
         } else if message_id == wire::BLOCK_RANGE_UPDATE {
             match wire::decode_block_range(body) {
+                // "If earliest > latest, the peer should be disconnected" (devp2p
+                // `caps/eth.md`, BlockRangeUpdate).
+                Ok(update) if update.earliest > update.latest => {
+                    self.say_goodbye(DisconnectReason::ProtocolBreach).await;
+                    return Err(EndReason::Protocol(format!(
+                        "block range update from {} to {}",
+                        update.earliest, update.latest
+                    )));
+                }
                 Ok(update) => {
                     self.range.send_replace(BlockRange {
                         earliest: update.earliest,

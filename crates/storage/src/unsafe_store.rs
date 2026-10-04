@@ -29,7 +29,10 @@ use self::layout::{
 };
 use crate::metrics::{self, Operation};
 use crate::validate::validate_block;
-use crate::{EventId, Events, InvalidBlockReason, RedisConfig, StorageError, Store, UnsafeStore};
+use crate::{
+    BlockPart, CanonicalItem, EventId, Events, InvalidBlockReason, RedisConfig, StorageError,
+    Store, UnsafeStore,
+};
 
 /// Entries of the event stream as `XRANGE` and `XREAD` return them: id and fields.
 type StreamEntries = Vec<(String, HashMap<String, String>)>;
@@ -213,6 +216,29 @@ impl RedisStore {
         }
     }
 
+    /// The hash of the canonical block at height `number`: the canonical chain is a sorted
+    /// set scored by number, with at most one hash per height.
+    async fn canonical_at(
+        &self,
+        operation: &'static str,
+        number: BlockNumber,
+    ) -> Result<Option<BlockHash>, StorageError> {
+        let mut connection = self.connection.clone();
+        let hashes: Vec<String> = request(
+            operation,
+            redis::cmd("ZRANGEBYSCORE")
+                .arg(self.keys.canonical())
+                .arg(number)
+                .arg(number)
+                .query_async(&mut connection),
+        )
+        .await?;
+        hashes
+            .first()
+            .map(|hash| codec::parse_hash(hash))
+            .transpose()
+    }
+
     async fn stored_block(
         &self,
         operation: &'static str,
@@ -393,22 +419,228 @@ impl UnsafeStore for RedisStore {
 
     async fn canonical(&self, number: BlockNumber) -> Result<Option<DecodedBlock>, StorageError> {
         metrics::timed(Store::Unsafe, Operation::Block, async {
+            let Some(hash) = self.canonical_at("canonical", number).await? else {
+                return Ok(None);
+            };
+            self.stored_block("canonical", hash).await
+        })
+        .await
+    }
+
+    async fn canonical_number(&self, hash: BlockHash) -> Result<Option<BlockNumber>, StorageError> {
+        metrics::timed(Store::Unsafe, Operation::CanonicalNumber, async {
             let mut connection = self.connection.clone();
-            // The canonical chain is a sorted set scored by number: at most one hash per height.
-            let hashes: Vec<String> = request(
-                "canonical",
-                redis::cmd("ZRANGEBYSCORE")
+            let score: Option<f64> = request(
+                "canonical_number",
+                redis::cmd("ZSCORE")
                     .arg(self.keys.canonical())
-                    .arg(number)
-                    .arg(number)
+                    .arg(hash.to_string())
                     .query_async(&mut connection),
             )
             .await?;
-            let Some(hash) = hashes.first() else {
+            score.map(score_number).transpose()
+        })
+        .await
+    }
+
+    async fn canonical_headers(
+        &self,
+        from: BlockNumber,
+        count: usize,
+        rising: bool,
+    ) -> Result<Vec<CanonicalItem>, StorageError> {
+        metrics::timed(Store::Unsafe, Operation::CanonicalHeaders, async {
+            const READ: &str = "canonical_headers";
+            if count == 0 {
+                return Ok(Vec::new());
+            }
+            let mut connection = self.connection.clone();
+            let (command, end) = if rising {
+                ("ZRANGEBYSCORE", "+inf")
+            } else {
+                ("ZREVRANGEBYSCORE", "-inf")
+            };
+            let entries: Vec<(String, f64)> = request(
+                READ,
+                redis::cmd(command)
+                    .arg(self.keys.canonical())
+                    .arg(from)
+                    .arg(end)
+                    .arg("WITHSCORES")
+                    .arg("LIMIT")
+                    .arg(0)
+                    .arg(count)
+                    .query_async(&mut connection),
+            )
+            .await?;
+            let entries = parse_entries(entries)?;
+            let mut pipeline = redis::pipe();
+            for (hash, _) in &entries {
+                pipeline
+                    .cmd("HGET")
+                    .arg(self.keys.block(*hash))
+                    .arg("header");
+            }
+            let headers: Vec<Option<String>> =
+                request(READ, pipeline.query_async(&mut connection)).await?;
+            let mut items: Vec<CanonicalItem> = Vec::with_capacity(entries.len());
+            let mut expected = Some(from);
+            for ((hash, number), header) in entries.into_iter().zip(headers) {
+                let Some(header) = header.filter(|_| Some(number) == expected) else {
+                    break;
+                };
+                let header = codec::decode_header(hash, &header)?;
+                let links = items.last().is_none_or(|previous| {
+                    if rising {
+                        header.parent_hash == previous.block.hash
+                    } else {
+                        previous.parent_hash == hash
+                    }
+                });
+                if header.number != number || !links {
+                    break;
+                }
+                items.push(CanonicalItem {
+                    block: BlockRef { number, hash },
+                    parent_hash: header.parent_hash,
+                    rlp: alloy_rlp::encode(&header).into(),
+                });
+                expected = if rising {
+                    number.checked_add(1)
+                } else {
+                    number.checked_sub(1)
+                };
+            }
+            Ok(items)
+        })
+        .await
+    }
+
+    async fn canonical_items(
+        &self,
+        hashes: &[BlockHash],
+        part: BlockPart,
+    ) -> Result<Vec<CanonicalItem>, StorageError> {
+        metrics::timed(Store::Unsafe, Operation::CanonicalItems, async {
+            const READ: &str = "canonical_items";
+            if hashes.is_empty() {
+                return Ok(Vec::new());
+            }
+            let field = match part {
+                BlockPart::Body => "transactions",
+                BlockPart::Receipts => "receipts",
+            };
+            let mut connection = self.connection.clone();
+            let mut pipeline = redis::pipe();
+            for hash in hashes {
+                pipeline
+                    .cmd("ZSCORE")
+                    .arg(self.keys.canonical())
+                    .arg(hash.to_string())
+                    .cmd("HMGET")
+                    .arg(self.keys.block(*hash))
+                    .arg("header")
+                    .arg(field);
+            }
+            let replies: Vec<redis::Value> =
+                request(READ, pipeline.query_async(&mut connection)).await?;
+            let mut replies = replies.into_iter();
+            let mut items: Vec<CanonicalItem> = Vec::with_capacity(hashes.len());
+            for hash in hashes {
+                let (Some(score), Some(fields)) = (replies.next(), replies.next()) else {
+                    break;
+                };
+                let score: Option<f64> = value(READ, score)?;
+                let fields: Vec<Option<String>> = value(READ, fields)?;
+                let (Some(score), [Some(header), Some(part_json)]) = (score, fields.as_slice())
+                else {
+                    break;
+                };
+                let number = score_number(score)?;
+                let header = codec::decode_header(*hash, header)?;
+                let follows = items
+                    .last()
+                    .filter(|previous| previous.block.number.checked_add(1) == Some(number));
+                if follows.is_some_and(|previous| previous.block.hash != header.parent_hash) {
+                    break;
+                }
+                let rlp = match part {
+                    BlockPart::Body => codec::body_rlp(*hash, &header, part_json)?,
+                    BlockPart::Receipts => codec::receipts_rlp(*hash, part_json)?,
+                };
+                items.push(CanonicalItem {
+                    block: BlockRef {
+                        number,
+                        hash: *hash,
+                    },
+                    parent_hash: header.parent_hash,
+                    rlp,
+                });
+            }
+            Ok(items)
+        })
+        .await
+    }
+
+    async fn canonical_run(
+        &self,
+        above: BlockRef,
+        max: usize,
+    ) -> Result<Option<BlockRef>, StorageError> {
+        metrics::timed(Store::Unsafe, Operation::CanonicalRun, async {
+            const RUN: &str = "canonical_run";
+            let first = above.number.saturating_add(1);
+            let mut connection = self.connection.clone();
+            let entries: Vec<(String, f64)> = request(
+                RUN,
+                redis::cmd("ZRANGEBYSCORE")
+                    .arg(self.keys.canonical())
+                    .arg(first)
+                    .arg("+inf")
+                    .arg("WITHSCORES")
+                    .arg("LIMIT")
+                    .arg(0)
+                    .arg(max)
+                    .query_async(&mut connection),
+            )
+            .await?;
+            let entries = parse_entries(entries)?;
+            let Some((child, _)) = entries.first() else {
                 return Ok(None);
             };
-            self.stored_block("canonical", codec::parse_hash(hash)?)
-                .await
+            // One round trip for the first block's parent and every block's receipts.
+            let mut pipeline = redis::pipe();
+            pipeline
+                .cmd("HGET")
+                .arg(self.keys.block(*child))
+                .arg("parent_hash");
+            for (hash, _) in &entries {
+                pipeline
+                    .cmd("HEXISTS")
+                    .arg(self.keys.block(*hash))
+                    .arg("receipts");
+            }
+            let replies: Vec<redis::Value> =
+                request(RUN, pipeline.query_async(&mut connection)).await?;
+            let mut replies = replies.into_iter();
+            let parent: Option<String> = replies
+                .next()
+                .map(|reply| value(RUN, reply))
+                .transpose()?
+                .flatten();
+            if parent.as_deref().map(codec::parse_hash).transpose()? != Some(above.hash) {
+                return Ok(None);
+            }
+            let mut last = None;
+            let mut expected = first;
+            for ((hash, number), has_receipts) in entries.into_iter().zip(replies) {
+                if number != expected || !value::<bool>(RUN, has_receipts)? {
+                    break;
+                }
+                last = Some(BlockRef { number, hash });
+                expected = expected.saturating_add(1);
+            }
+            Ok(last)
         })
         .await
     }
@@ -564,6 +796,49 @@ fn script(body: &str) -> Script {
         UNSAFE_TTL.as_secs(),
     );
     Script::new(&[&constants, include_str!("../scripts/lib.lua"), body].concat())
+}
+
+/// Entries of the canonical sorted set with their scores, as hashes and block numbers.
+fn parse_entries(
+    entries: Vec<(String, f64)>,
+) -> Result<Vec<(BlockHash, BlockNumber)>, StorageError> {
+    entries
+        .into_iter()
+        .map(|(hash, score)| Ok((codec::parse_hash(&hash)?, score_number(score)?)))
+        .collect()
+}
+
+/// One reply of a pipeline, converted; `operation` names the call in the error.
+fn value<T: redis::FromRedisValue>(
+    operation: &'static str,
+    reply: redis::Value,
+) -> Result<T, StorageError> {
+    redis::from_redis_value(reply).map_err(|source| StorageError::Redis {
+        operation,
+        source: source.into(),
+    })
+}
+
+/// A block number from a sorted-set score; scores are block numbers, exact up to 2^53.
+fn score_number(score: f64) -> Result<BlockNumber, StorageError> {
+    // Exact for every integer up to 2^53, the highest height the store accepts.
+    const MAX: f64 = 9_007_199_254_740_992.0;
+    if !(0.0..=MAX).contains(&score) || score.fract() != 0.0 {
+        return Err(StorageError::InvalidData {
+            store: Store::Unsafe,
+            what: "canonical height",
+            block: None,
+            source: None,
+        });
+    }
+    format!("{score:.0}")
+        .parse()
+        .map_err(|err| StorageError::InvalidData {
+            store: Store::Unsafe,
+            what: "canonical height",
+            block: None,
+            source: Some(crate::ParseError::from(err)),
+        })
 }
 
 /// A stream entry id as Redis writes it, `millis-seq`.

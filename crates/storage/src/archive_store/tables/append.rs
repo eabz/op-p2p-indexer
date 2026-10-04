@@ -149,6 +149,9 @@ fn append_chunk(tables: &Tables, chunk: &[Entry]) -> Result<(), Failure> {
             batch.insert(&tables.receipts, key, receipts);
         }
         batch.insert(&tables.senders, key, encode_senders(&block.senders));
+        if block.receipts.is_none() {
+            batch.insert(&tables.pending, key, block.block.hash.0);
+        }
         batch.insert(&tables.numbers, block.block.hash.0, key);
     }
     batch.commit()?;

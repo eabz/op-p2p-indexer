@@ -80,28 +80,39 @@ pub(crate) struct Discovery {
 }
 
 impl Discovery {
-    /// Creates a discovery node on `listen` (UDP), with the same secp256k1 key as the libp2p identity.
+    /// Creates a discovery node on `listen` (UDP), with the same secp256k1 key as the libp2p
+    /// identity. With `advertised`, the record carries that address and port, and is not
+    /// rewritten from what peers report.
     pub(crate) fn new(
         keypair: &secp256k1::Keypair,
         listen: SocketAddr,
+        advertised: Option<SocketAddr>,
         chain_id: ChainId,
     ) -> Result<Self, DiscoveryError> {
         let key = enr::k256::ecdsa::SigningKey::from_slice(&keypair.secret().to_bytes())
             .map(CombinedKey::from)
             .map_err(DiscoveryError::Key)?;
 
-        // UDP (discovery) and TCP (libp2p) share the port, as in op-node. Our IP is learned from
-        // peers (discv5 updates the ENR from PONG votes).
+        // UDP (discovery) and TCP (libp2p) share the port, as in op-node. Without an advertised
+        // address our IP is learned from peers (discv5 updates the ENR from PONG votes).
         let mut builder = Enr::builder();
-        if listen.is_ipv6() {
-            builder.udp6(listen.port()).tcp6(listen.port());
+        let public = advertised.unwrap_or(listen);
+        if public.is_ipv6() {
+            builder.udp6(public.port()).tcp6(public.port());
         } else {
-            builder.udp4(listen.port()).tcp4(listen.port());
+            builder.udp4(public.port()).tcp4(public.port());
+        }
+        if let Some(advertised) = advertised {
+            builder.ip(advertised.ip());
         }
         builder.add_value(OPSTACK_ENR_KEY, &opstack_entry(chain_id));
         let enr = builder.build(&key).map_err(DiscoveryError::Enr)?;
 
-        let config = ConfigBuilder::new(ListenConfig::from(listen)).build();
+        let mut config = ConfigBuilder::new(ListenConfig::from(listen));
+        if advertised.is_some() {
+            config.disable_enr_update();
+        }
+        let config = config.build();
         let discv5 = Discv5::new(enr, key, config).map_err(DiscoveryError::Create)?;
         Ok(Self {
             discv5,

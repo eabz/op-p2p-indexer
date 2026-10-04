@@ -227,6 +227,21 @@ again at a pruned height would be stored and could be filled back in.
 `set_l1_heads`: a `None` head means "unknown" and leaves the stored key untouched, as in the
 archive's `set_heads`. Deleting `safe_head` would silently switch off step 2.
 
+Reads for serving execution peers, each at most two round trips (the canonical entries, then
+one pipeline), decoding only the field asked for:
+
+- `canonical_number(hash)`: the block's height if it is canonical (`ZSCORE` on the canonical
+  set, whose members are the hashes).
+- `canonical_headers(from, count, rising)`: consecutive canonical headers as RLP, ending at
+  the first gap, missing block or broken parent link (a reorg between the two round trips).
+- `canonical_items(hashes, Body | Receipts)`: the bodies or receipts of the leading hashes
+  that are canonical and stored (receipts attached), as RLP; consecutive ones must link.
+- `canonical_run(above, max)`: the last block of the unbroken canonical run above `above`
+  (whose first block names `above` as its parent) whose blocks all have receipts, looking at
+  most `max` heights (one pipelined `HGET` and `HEXISTS` per block): what serving advertises.
+  The binary's provider continues it from the last end found while that is still canonical,
+  so a new head costs a scan of the new blocks only.
+
 `ancestry(head, stop_at)` returns the complete range or an error, never a partial one:
 `MissingAncestor` if a parent on the way down to `stop_at + 1` is not stored (pruned, expired,
 or never received), and `AncestryTooLong` if the range exceeds `MAX_ANCESTRY_BLOCKS`, checked
@@ -270,7 +285,7 @@ not read; drop it when convenient.
 The archive's layout has a version in `meta` (`schema_version`, section 9.1). An archive of
 another version is refused on open and left as it is; there is no migration in place. Version
 2 added the `senders` keyspace and the heads in `meta`; an archive of version 1 is loaded again
-from the importer's verified chunks (`op-indexer-import load`, no download needed) into a new
+from the importer's verified chunks (`import load`, no download needed) into a new
 directory.
 
 ### 5.2 Redis
@@ -377,7 +392,9 @@ blocks removed from the archive, and the archive's disk gauges.
 **Why.** The archive is the committed store: every block committed to L1 (or a window of the
 newest), kept in the encoding peers ask for, with each transaction's sender, and the committed
 L1 heads. Promotion (pipeline) appends to it and records the heads, the importer and range
-sync fill it, serving (`el`) and the stream (`stream`) read it.
+sync fill it, serving (`el`) and the stream (`stream`) read it. Serving also reads the
+canonical unsafe blocks above the archive's tip from the unsafe store (`docs/el.md`
+section 11), with the unsafe store's `canonical_*` reads (section 3.2).
 
 **Engine.** fjall (3.x): a log-structured store, pure Rust, published on crates.io, with no
 native code and nothing our `cargo deny` rejects. It is a directory, `archive/` in the data
@@ -425,6 +442,7 @@ so key order is block order. Values are RLP, snappy-compressed (`snap`).
 | `receipts` | number | RLP list of the receipts in network encoding, with bloom (one `Receipts` entry up to eth/68; a caller serving eth/69 re-encodes without the bloom); absent until set |
 | `numbers` | block hash (32 bytes) | number |
 | `senders` | number | the sender of each transaction, 20 bytes each, in block order, uncompressed |
+| `pending_receipts` | number | block hash, for each archived block without receipts: written in the same batch as the block, removed in the same batch as its receipts (`set_receipts`), and with the block by `trim` / `truncate_above`. Added after version 2 without a new version: a version-2 archive gains it empty on open, which is right for an import (every imported block has receipts) |
 | `meta` | name | `schema_version` (2); `chain`, the chain the archive holds: its id (8 bytes, big-endian), then its genesis hash (32 bytes); `safe_head` and `finalized_head`, the committed heads: number (8 bytes, big-endian) then hash, absent until promotion records one |
 
 `bodies` and `receipts` use fjall's key-value separation, which keeps large values out of the
@@ -448,6 +466,8 @@ pub trait ArchiveStore {
     async fn blocks(&self, from: BlockNumber, limits: ReadLimits) -> Result<Vec<ArchivedBlock>, StorageError>;
     /// The committed L1 heads; `set_heads` records them, a `None` head leaving the recorded one.
     async fn heads(&self) -> Result<L1Heads, StorageError>;
+    /// The archived blocks without receipts, oldest first, at most `limit`, and how many in all.
+    async fn pending_receipts(&self, limit: usize) -> Result<(Vec<BlockRef>, u64), StorageError>;
     async fn set_heads(&self, heads: L1Heads) -> Result<(), StorageError>;
     /// The number of the archived block with this hash.
     async fn number_of(&self, hash: BlockHash) -> Result<Option<BlockNumber>, StorageError>;
@@ -561,7 +581,7 @@ pub trait ArchiveStore {
   a blocking thread, so the trait is async like the other two.
 - On open: a directory holding an archive of another `schema_version` (or blocks and no
   version) is refused with `StorageError::ArchiveSchema`, naming the directory and both
-  versions and telling the operator to load a new archive with `op-indexer-import load` from
+  versions and telling the operator to load a new archive with `import load` from
   the verified chunks. Nothing is deleted: an archive can hold an import of the whole chain,
   so removing it is the operator's decision.
 - On open, the chain: `open` takes the node's `ChainIdentity` (chain id and genesis hash). An

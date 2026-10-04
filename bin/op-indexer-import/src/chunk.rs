@@ -24,6 +24,8 @@ use crate::state::write_atomic;
 
 /// Compression level of the verified chunks: zstd's default.
 const COMPRESSION_LEVEL: i32 = 3;
+/// Bytes of the two leading hashes.
+const LINK_LEN: usize = 64;
 
 /// A verified block, as the archive takes it: header, body and receipts as verified (the
 /// receipts are always present), and the sender of each transaction as the service reported
@@ -73,26 +75,66 @@ pub(crate) fn write(path: &Path, link: Link, blocks: &[VerifiedBlock]) -> io::Re
     })
 }
 
+/// What is at a verified chunk's path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChunkFile {
+    /// A file that starts like a verified chunk: the two hashes, then a zstd frame.
+    Present,
+    /// No file.
+    Missing,
+    /// A file that does not (cut short by a copy, say): not a verified chunk.
+    Damaged,
+}
+
+/// What is at `path`, from its first 68 bytes. What decides that a chunk is verified, for
+/// `download` and `verify` alike: a damaged file is a chunk to verify again, not one to skip.
+/// Damage further in shows when the chunk is read in full. Blocking.
+pub(crate) fn check(path: &Path) -> ChunkFile {
+    let mut start = [0_u8; LINK_LEN + 4];
+    let read = File::open(path).and_then(|mut file| file.read_exact(&mut start));
+    match read {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => ChunkFile::Missing,
+        Ok(())
+            if start.get(LINK_LEN..) == Some(&zstd::zstd_safe::MAGICNUMBER.to_le_bytes()[..]) =>
+        {
+            ChunkFile::Present
+        }
+        Ok(()) | Err(_) => ChunkFile::Damaged,
+    }
+}
+
 /// Reads only how the chunk at `path` attaches to its neighbours. Blocking.
 ///
 /// # Errors
 ///
-/// Returns the I/O error; `UnexpectedEof` if the file is too short.
+/// Returns the I/O error, naming the file; `InvalidData` if the file is shorter than the
+/// hashes.
 pub(crate) fn read_link(path: &Path) -> io::Result<Link> {
-    read_link_from(&mut File::open(path)?)
+    let mut file = File::open(path).map_err(|err| named(path, &err))?;
+    read_link_from(path, &mut file)
 }
 
 /// Reads the verified chunk at `path`. Blocking.
 ///
 /// # Errors
 ///
-/// Returns the I/O error; `UnexpectedEof` or `InvalidData` if the file is damaged.
+/// Returns the I/O error, naming the file; `InvalidData` if the file is damaged.
 pub(crate) fn read(path: &Path) -> io::Result<(Link, Vec<VerifiedBlock>)> {
-    let mut file = File::open(path)?;
-    let link = read_link_from(&mut file)?;
+    let mut file = File::open(path).map_err(|err| named(path, &err))?;
+    let link = read_link_from(path, &mut file)?;
     // One buffer for the chunk: every value below is a slice of it, not a copy.
-    let data = Bytes::from(zstd::stream::decode_all(file)?);
-    let mut rest: &[u8] = &data;
+    let data = Bytes::from(
+        zstd::stream::decode_all(file)
+            .map_err(|err| damaged(path, &format!("its blocks do not decompress ({err})")))?,
+    );
+    let blocks =
+        parse(&data).map_err(|err| damaged(path, &format!("its blocks do not parse ({err})")))?;
+    Ok((link, blocks))
+}
+
+/// The blocks of a chunk's decompressed data.
+fn parse(data: &Bytes) -> io::Result<Vec<VerifiedBlock>> {
+    let mut rest: &[u8] = data;
     let mut blocks = Vec::new();
     while !rest.is_empty() {
         let hash = B256::from_slice(take(&mut rest, 32)?);
@@ -118,18 +160,47 @@ pub(crate) fn read(path: &Path) -> io::Result<(Link, Vec<VerifiedBlock>)> {
             senders,
         });
     }
-    Ok((link, blocks))
+    Ok(blocks)
 }
 
-fn read_link_from(file: &mut File) -> io::Result<Link> {
+fn read_link_from(path: &Path, file: &mut File) -> io::Result<Link> {
     // One read for both hashes.
-    let mut hashes = [0_u8; 64];
-    file.read_exact(&mut hashes)?;
+    let mut hashes = [0_u8; LINK_LEN];
+    file.read_exact(&mut hashes).map_err(|err| {
+        if err.kind() == io::ErrorKind::UnexpectedEof {
+            let len = file.metadata().map_or(0, |file| file.len());
+            damaged(
+                path,
+                &format!("{len} bytes, shorter than its {LINK_LEN}-byte header"),
+            )
+        } else {
+            named(path, &err)
+        }
+    })?;
     let (first_parent, last_hash) = hashes.split_at(32);
     Ok(Link {
         first_parent: B256::from_slice(first_parent),
         last_hash: B256::from_slice(last_hash),
     })
+}
+
+/// `err`, with the verified chunk it happened on.
+fn named(path: &Path, err: &io::Error) -> io::Error {
+    io::Error::new(
+        err.kind(),
+        format!("verified chunk {}: {err}", path.display()),
+    )
+}
+
+/// A verified chunk that does not hold what it should: `what` says how.
+fn damaged(path: &Path, what: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "verified chunk {} is damaged: {what}; delete it and run `verify` (and `download` if its raw chunk is gone)",
+            path.display()
+        ),
+    )
 }
 
 fn length(len: usize) -> io::Result<[u8; 4]> {

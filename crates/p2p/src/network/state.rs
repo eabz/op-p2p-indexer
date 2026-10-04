@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use alloy_primitives::BlockNumber;
 use libp2p::gossipsub::{self, MessageAcceptance, MessageId, TopicHash};
 use libp2p::multiaddr::Protocol;
+use libp2p::request_response;
 use libp2p::swarm::SwarmEvent;
 use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
 use libp2p::{Multiaddr, PeerId, Swarm};
@@ -19,11 +20,12 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tracing::{debug, info, trace, warn};
 
-use super::{Behaviour, BehaviourEvent};
+use super::{Behaviour, BehaviourEvent, answer};
 use crate::block::{BlockError, BlockValidator, SeenBlocks};
 use crate::gossip;
 use crate::metrics::{self, DialOutcome};
 use crate::peers::ConnectedPeers;
+use crate::sync::Server;
 use crate::{NodeStore, StoreError};
 
 /// Minimum time between dials to the same peer, so unreachable peers aren't re-dialed every lookup.
@@ -39,6 +41,11 @@ const EVICTED_PEER_BACKOFF: Duration = Duration::from_secs(600);
 const MAX_PENDING_VALIDATIONS: usize = 32;
 /// Minimum time between warnings that the local clock looks slow.
 const CLOCK_SKEW_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How long a peer whose score fell below the graylist threshold is banned.
+const BAN_DURATION: Duration = Duration::from_secs(3600);
+/// Most peers banned at once; past it a peer is only disconnected.
+const MAX_BANNED_PEERS: usize = 4096;
 
 /// Mutable state of the running node, separate from the swarm so handlers can borrow both.
 pub(super) struct State {
@@ -78,6 +85,10 @@ pub(super) struct State {
     /// Highest L2 block committed to L1. Missing blocks at or below it are not a gap. Until an L1
     /// source feeds it, it stays 0 and every in-process gap counts as unsafe.
     safe_head: watch::Receiver<BlockNumber>,
+    /// The `payload_by_number` server.
+    pub(super) server: Server,
+    /// Banned peers and when their ban ends.
+    banned: HashMap<PeerId, Instant>,
 }
 
 /// Result of validating one message on a blocking thread.
@@ -95,6 +106,7 @@ impl State {
         store: Arc<NodeStore>,
         peer_count: watch::Sender<usize>,
         safe_head: watch::Receiver<BlockNumber>,
+        server: Server,
     ) -> Self {
         Self {
             topics,
@@ -116,6 +128,8 @@ impl State {
             peer_count,
             highest: None,
             safe_head,
+            server,
+            banned: HashMap::new(),
         }
     }
 
@@ -138,7 +152,7 @@ impl State {
                     return;
                 };
                 if let Err(err) = BlockValidator::precheck(version, &message.data) {
-                    report_failed(swarm, &message_id, propagation_source, &err);
+                    self.report_failed(swarm, &message_id, propagation_source, &err);
                     return;
                 }
                 if self.validations.len() >= MAX_PENDING_VALIDATIONS {
@@ -203,6 +217,18 @@ impl State {
                 metrics::dial(DialOutcome::Failed);
                 self.dial_queued_known_peers(swarm);
             }
+            SwarmEvent::Behaviour(BehaviourEvent::Payloads(request_response::Event::Message {
+                peer,
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
+                ..
+            })) => {
+                if let Some(channel) = self.server.on_request(peer, request, channel) {
+                    answer(swarm, channel, crate::sync::throttled());
+                }
+            }
             SwarmEvent::NewListenAddr { address, .. } => info!(addr = %address, "listening"),
             other => trace!(event = ?other, "swarm event"),
         }
@@ -258,7 +284,7 @@ impl State {
                 if let BlockError::UndecodableTransaction { number, .. } = err {
                     self.warn_undecodable(number);
                 }
-                report_failed(swarm, &id, source, &err);
+                self.report_failed(swarm, &id, source, &err);
             }
         }
     }
@@ -378,10 +404,62 @@ impl State {
             .map(|(peer, _)| peer)
     }
 
+    /// Reports that the message `id` from `source` failed validation, as the error says to
+    /// treat it. After a rejection, bans `source` once its score falls below the graylist
+    /// threshold, where gossipsub ignores its RPCs anyway.
+    fn report_failed(
+        &mut self,
+        swarm: &mut Swarm<Behaviour>,
+        id: &MessageId,
+        source: PeerId,
+        err: &BlockError,
+    ) {
+        let acceptance = err.acceptance();
+        let rejected = matches!(acceptance, MessageAcceptance::Reject);
+        debug!(peer = %source, %err, rejected, "block message failed validation");
+        metrics::block_rejected(err);
+        report(swarm, id, &source, acceptance);
+        let score = swarm.behaviour().gossipsub.peer_score(&source);
+        if rejected && score.is_some_and(|score| score < gossip::GRAYLIST_THRESHOLD) {
+            self.ban(swarm, source);
+        }
+    }
+
+    /// Bans `peer` for [`BAN_DURATION`]: its connections close, it may not connect again and
+    /// is not dialed until then ([peer management]: "Peers may be banned if their performance
+    /// score is too low"). Past [`MAX_BANNED_PEERS`] the peer is only disconnected.
+    ///
+    /// [peer management]: https://specs.optimism.io/protocol/rollup-node-p2p.html#peer-management
+    fn ban(&mut self, swarm: &mut Swarm<Behaviour>, peer: PeerId) {
+        debug!(%peer, "banning graylisted peer");
+        let now = Instant::now();
+        if self.banned.len() < MAX_BANNED_PEERS {
+            self.banned.insert(peer, now + BAN_DURATION);
+            swarm.behaviour_mut().bans.block_peer(peer);
+        }
+        self.back_off(peer, now + BAN_DURATION, now);
+        // `Err` only means the peer was already disconnected, which is what we want.
+        let _disconnected = swarm.disconnect_peer_id(peer);
+    }
+
+    /// Lifts the bans that have run out.
+    fn lift_bans(&mut self, swarm: &mut Swarm<Behaviour>, now: Instant) {
+        let bans = &mut swarm.behaviour_mut().bans;
+        self.banned.retain(|peer, until| {
+            let banned = *until > now;
+            if !banned {
+                bans.unblock_peer(*peer);
+            }
+            banned
+        });
+    }
+
     /// Disconnects peers that hold a slot without subscribing to our block topics (see
     /// [`ConnectedPeers::idle`]) and keeps them out of dialing for [`EVICTED_PEER_BACKOFF`].
+    /// Lifts the bans that have run out, too.
     pub(super) fn evict_idle_peers(&mut self, swarm: &mut Swarm<Behaviour>) {
         let now = Instant::now();
+        self.lift_bans(swarm, now);
         let subscribed: HashSet<PeerId> = self.subscribed_peers(swarm).copied().collect();
         for peer in self.peers.idle(now, |peer| subscribed.contains(peer)) {
             debug!(%peer, "disconnecting peer not subscribed to block topics");
@@ -444,23 +522,6 @@ impl State {
             self.next_dial.retain(|_, next| *next > now);
         }
         self.next_dial.len() < MAX_DIAL_BACKOFF_ENTRIES
-    }
-}
-
-/// Reports that the message `id` from `source` failed validation, as the error says to treat
-/// it. After a rejection, disconnects `source` once its score falls below the graylist
-/// threshold, where gossipsub ignores its RPCs anyway, freeing its connection slot.
-fn report_failed(swarm: &mut Swarm<Behaviour>, id: &MessageId, source: PeerId, err: &BlockError) {
-    let acceptance = err.acceptance();
-    let rejected = matches!(acceptance, MessageAcceptance::Reject);
-    debug!(peer = %source, %err, rejected, "block message failed validation");
-    metrics::block_rejected(err);
-    report(swarm, id, &source, acceptance);
-    let score = swarm.behaviour().gossipsub.peer_score(&source);
-    if rejected && score.is_some_and(|score| score < gossip::GRAYLIST_THRESHOLD) {
-        debug!(peer = %source, ?score, "disconnecting graylisted peer");
-        // `Err` only means the peer was already disconnected, which is what we want.
-        let _disconnected = swarm.disconnect_peer_id(source);
     }
 }
 

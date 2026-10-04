@@ -41,7 +41,7 @@ use libp2p::request_response::{self, OutboundFailure, OutboundRequestId};
 use libp2p::swarm::SwarmEvent;
 use libp2p::swarm::dial_opts::DialOpts;
 use libp2p::{Multiaddr, PeerId, Swarm, SwarmBuilder, identify, identity, noise, tcp, yamux};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::time::{Instant, MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
@@ -85,7 +85,8 @@ pub(super) struct Network {
     bootnodes: Vec<String>,
     digest: ForkDigest,
     swarm: Swarm<Behaviour>,
-    status: watch::Receiver<StatusData>,
+    /// The SSZ of the `Status` this node reports.
+    status: Vec<u8>,
     commands: mpsc::Receiver<Command>,
     gossip: mpsc::Sender<Gossip>,
     finality_topic: TopicHash,
@@ -112,8 +113,7 @@ impl std::fmt::Debug for Network {
 /// listener; [`Network::run`] binds discovery's UDP socket.
 ///
 /// The node gets a new identity at each start. `digest` is the fork digest peers must be on;
-/// `status` is what the node reports about itself in `Status`, and follows the light client's
-/// store.
+/// `status` is what the node reports about itself in `Status` for the whole run.
 ///
 /// # Errors
 ///
@@ -124,7 +124,7 @@ pub(super) fn new(
     listen_addr: SocketAddr,
     bootnodes: Vec<String>,
     digest: ForkDigest,
-    status: watch::Receiver<StatusData>,
+    status: StatusData,
 ) -> Result<(Network, NetworkHandle, mpsc::Receiver<Gossip>), BeaconError> {
     let (gossipsub, finality_topic, optimistic_topic) = behaviour::gossip(digest)?;
     let mut swarm = SwarmBuilder::with_existing_identity(identity::Keypair::generate_secp256k1())
@@ -150,7 +150,7 @@ pub(super) fn new(
         bootnodes,
         digest,
         swarm,
-        status,
+        status: rpc::status(digest, status),
         commands,
         gossip,
         finality_topic,
@@ -416,9 +416,9 @@ impl Network {
         }
     }
 
-    /// The SSZ of the `Status` this node reports now.
+    /// The SSZ of the `Status` this node reports.
     fn status_ssz(&self) -> Vec<u8> {
-        rpc::status(self.digest, *self.status.borrow())
+        self.status.clone()
     }
 
     /// Answers a peer's request on one of the protocols that are only served.

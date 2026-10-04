@@ -271,6 +271,9 @@ impl Fetcher {
         let now = Instant::now();
         let canyon_time = self.chain.canyon_time;
         for session in sessions {
+            if !session.is_askable() {
+                continue;
+            }
             let peer = session.status().peer_id;
             let state = self.peer_states.entry(peer).or_insert(PeerState {
                 pacing: Pacing::new(now),

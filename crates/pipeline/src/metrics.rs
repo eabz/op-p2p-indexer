@@ -21,6 +21,7 @@
 //! | `op_indexer_pipeline_promotion_blocks_missing_total` | counter | `reason` | Blocks those promotions left out of the archive, for backfill. |
 //! | `op_indexer_pipeline_archive_skipped_blocks_total` | counter | | Promoted blocks not archived because they did not extend the archive's tip. |
 //! | `op_indexer_pipeline_safe_block_number` | gauge | | Number of the committed safe head. |
+//! | `op_indexer_pipeline_archive_pending_receipts` | gauge | | Archived blocks still without receipts, as last counted by the receipts task. |
 //! | `op_indexer_pipeline_range_blocks_stored_total` | counter | | Blocks of a range sync appended to the archive. |
 //! | `op_indexer_pipeline_range_block_number` | gauge | | Last block of the range sync that is stored. |
 //! | `op_indexer_pipeline_l1_games_total` | counter | `outcome` | Dispute games verified on L1 and compared with our block at their height: `matched` (the block became a head), `mismatch` (the head did not advance) or `unchecked` (a block before Isthmus). |
@@ -41,6 +42,7 @@ const PROMOTION_HOLES: &str = "op_indexer_pipeline_promotion_holes_total";
 const PROMOTION_BLOCKS_MISSING: &str = "op_indexer_pipeline_promotion_blocks_missing_total";
 const ARCHIVE_SKIPPED_BLOCKS: &str = "op_indexer_pipeline_archive_skipped_blocks_total";
 const SAFE_BLOCK_NUMBER: &str = "op_indexer_pipeline_safe_block_number";
+const ARCHIVE_PENDING_RECEIPTS: &str = "op_indexer_pipeline_archive_pending_receipts";
 const RANGE_BLOCKS_STORED: &str = "op_indexer_pipeline_range_blocks_stored_total";
 const RANGE_BLOCK_NUMBER: &str = "op_indexer_pipeline_range_block_number";
 const L1_GAMES: &str = "op_indexer_pipeline_l1_games_total";
@@ -221,6 +223,11 @@ pub fn describe() {
         Unit::Count,
         "Number of the committed safe head"
     );
+    describe_gauge!(
+        ARCHIVE_PENDING_RECEIPTS,
+        Unit::Count,
+        "Archived blocks still without receipts"
+    );
     describe_counter!(
         RANGE_BLOCKS_STORED,
         Unit::Count,
@@ -270,6 +277,11 @@ pub(crate) fn promotion_hole(reason: HoleReason, blocks_missing: u64) {
 /// Records promoted blocks that were not archived because they do not extend the archive.
 pub(crate) fn archive_skipped(blocks: usize) {
     counter!(ARCHIVE_SKIPPED_BLOCKS).increment(count(blocks));
+}
+
+/// Sets how many archived blocks are still without receipts.
+pub(crate) fn archive_pending_receipts(blocks: u64) {
+    gauge!(ARCHIVE_PENDING_RECEIPTS).set(gauge_value(blocks));
 }
 
 /// Sets the number of the committed safe head.

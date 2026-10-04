@@ -30,6 +30,9 @@ services:
       # Every listen port is the same inside the container and on the host, so the node
       # records advertise the port peers can reach. Shift them all for a second instance.
       OP_INDEXER_LISTEN_ADDR: 0.0.0.0:${OP_INDEXER_P2P_PORT:-9222}
+      # The host's public IP and port, so consensus-layer peers can dial back; the container
+      # only sees its own bridge address.
+      OP_INDEXER_ADVERTISED_ADDR: ${OP_INDEXER_ADVERTISED_ADDR:-}
       OP_INDEXER_BOOTNODES: ${OP_INDEXER_BOOTNODES:-}
       OP_INDEXER_MAX_PEERS: ${OP_INDEXER_MAX_PEERS:-}
       # Storage: at startup the binary opens the block archive, connects to Redis and checks

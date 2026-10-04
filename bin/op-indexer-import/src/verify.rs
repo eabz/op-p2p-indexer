@@ -23,9 +23,9 @@ mod receipt;
 mod transaction;
 
 use std::fmt;
-use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::{fs, io};
 
 use alloy_consensus::Header;
 use alloy_primitives::B256;
@@ -35,7 +35,7 @@ use tokio::time::{MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::chunk::{self, Link};
+use crate::chunk::{self, ChunkFile, Link};
 use crate::progress::{self, Rate};
 use crate::rows::RowsError;
 use crate::state::{Anchor, Chunk, LOW_SPACE_BYTES, MIN_SPACE_BYTES, Plan, State, VerifiedRange};
@@ -79,6 +79,8 @@ enum Check {
     HeaderHash { computed: B256, reported: B256 },
     #[error("parent hash is {parent}, the block before has hash {previous}")]
     ParentLink { parent: B256, previous: B256 },
+    #[error("the header lacks `mix_hash`, which a block from Bedrock on must have")]
+    MissingMixHash,
 }
 
 /// Why a chunk was not verified.
@@ -96,10 +98,13 @@ enum ChunkError {
     Block { number: u64, check: Check },
 }
 
-/// The fork activations of an OP Stack chain that change an encoding rebuilt here, in Unix
-/// seconds.
+/// The fork activations of an OP Stack chain that change an encoding rebuilt here: Bedrock by
+/// block number, the others in Unix seconds.
 #[derive(Debug, Clone, Copy)]
 struct Forks {
+    /// Bedrock: the first block in the current format. Before it a header's `mix_hash` is
+    /// zero, so a row without it can be rebuilt.
+    bedrock_block: u64,
     /// Regolith: the L1-attributes deposit stops being a system transaction.
     regolith: u64,
     /// Canyon: the deposit nonce and receipt version become part of the hashed receipt.
@@ -115,6 +120,9 @@ struct Stats {
     transactions: u64,
     /// Transactions signed with all zeros.
     zero_signatures: u64,
+    /// Pre-Bedrock blocks whose row lacked `mix_hash`, rebuilt with zero and proven by the
+    /// header hash.
+    rebuilt_header_fields: u64,
     /// Size of the verified chunk files written.
     disk_bytes: u64,
 }
@@ -130,6 +138,9 @@ struct Todo {
     raw_bytes: u64,
     already_verified: usize,
     not_downloaded: usize,
+    /// Verified files that were damaged (cut short, or not a chunk) and were removed, to be
+    /// verified again from their download.
+    damaged: usize,
     /// Free space on the state directory's disk, where the system tells.
     free_bytes: Option<u64>,
 }
@@ -160,6 +171,7 @@ pub(crate) async fn run(
     };
     announce(&todo, threads, from_block)?;
     let forks = Forks {
+        bedrock_block: plan.chain.bedrock_block,
         regolith: plan.chain.regolith_time,
         canyon: plan.chain.canyon_time,
         isthmus: plan.chain.isthmus_time,
@@ -261,6 +273,7 @@ fn announce(todo: &Todo, threads: usize, from_block: Option<u64>) -> eyre::Resul
         raw_bytes = todo.raw_bytes,
         already_verified = todo.already_verified,
         not_downloaded = todo.not_downloaded,
+        damaged_removed = todo.damaged,
         free_bytes = todo.free_bytes,
         from_block,
         threads,
@@ -289,13 +302,29 @@ fn todo(state: &State, plan: &Plan, from_block: Option<u64>) -> io::Result<Todo>
         raw_bytes: 0,
         already_verified: 0,
         not_downloaded: 0,
+        damaged: 0,
         free_bytes: state.free_bytes()?,
     };
     let from_block = from_block.unwrap_or_default();
     for chunk in plan.chunks().filter(|chunk| chunk.to > from_block) {
-        if state.verified_path(chunk).exists() {
-            todo.already_verified = todo.already_verified.saturating_add(1);
-            continue;
+        let verified = state.verified_path(chunk);
+        match chunk::check(&verified) {
+            ChunkFile::Present => {
+                todo.already_verified = todo.already_verified.saturating_add(1);
+                continue;
+            }
+            ChunkFile::Missing => {}
+            // Not verified: it goes, and the chunk is verified again from its download (or
+            // downloaded again, if that is gone too).
+            ChunkFile::Damaged => {
+                fs::remove_file(&verified)?;
+                warn!(
+                    file = %verified.display(),
+                    "a verified chunk is damaged (cut short, or not a chunk); removed it, to \
+                     verify it again"
+                );
+                todo.damaged = todo.damaged.saturating_add(1);
+            }
         }
         match state.raw_path(chunk).metadata() {
             Ok(file) => {
@@ -352,6 +381,10 @@ impl Progress {
             .done
             .zero_signatures
             .saturating_add(chunk.zero_signatures);
+        self.done.rebuilt_header_fields = self
+            .done
+            .rebuilt_header_fields
+            .saturating_add(chunk.rebuilt_header_fields);
         self.done.disk_bytes = self.done.disk_bytes.saturating_add(chunk.disk_bytes);
     }
 
@@ -390,6 +423,7 @@ impl Progress {
             blocks = self.done.blocks,
             transactions = self.done.transactions,
             zero_signature_transactions = self.done.zero_signatures,
+            rebuilt_header_fields = self.done.rebuilt_header_fields,
             disk_bytes = self.done.disk_bytes,
             blocks_per_sec = self.done.blocks / secs,
             secs,

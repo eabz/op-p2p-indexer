@@ -46,7 +46,8 @@ Rules observed:
 - *eth/69 receipts* (EIP-7642): no bloom on the wire; it is rebuilt from the logs. Deposit
   receipts carry the deposit nonce and version after the logs when present.
 - *Open:* an erigon peer on eth/68 returned receipts whose root did not match for 3 of 5
-  blocks; not diagnosed. The crate speaks eth/69 only, so it does not meet this case.
+  blocks; not diagnosed. The crate asks only eth/69 peers for blocks (it serves eth/68 peers
+  but never asks them), so it does not meet this case.
 
 ## 2. Inputs and outputs
 
@@ -147,7 +148,7 @@ not delay ingest; a small storage call (parent hash plus has-receipts) would rem
 | `lib.rs`, `config.rs`, `error.rs` | `ExecutionNetwork::new(...)` / `run(cancel)`, plain-data config, the crate's error |
 | `network.rs` | `NetworkSpec` (network id, genesis, fork schedule, bootnodes, record keys) and `PeerNetwork`: discovery, sessions and the peer set for one devp2p network, reused by `l1` for Ethereum L1 |
 | `discovery.rs` | discv5 in the global DHT, filtered by the current fork id (`opel` and `eth` keys) |
-| `session.rs`, `session/{context,driver,handshake,listener}.rs` | One RLPx session, dialed or accepted: ECIES, hello, eth/69 status (a peer that speaks only eth/68 is refused at hello), ping/pong, disconnect reasons; requests as async calls; peers' requests passed to the server |
+| `session.rs`, `session/{context,driver,handshake,listener}.rs` | One RLPx session, dialed or accepted: ECIES, hello, eth/69 or eth/68 status (the highest both speak; an eth/68 peer is served, never asked), ping/pong, disconnect reasons; requests as async calls; peers' requests passed to the server |
 | `wire.rs` | The message types used and OP's eth/69 receipt decoding, including the bloom rebuilt from the logs |
 | `peers.rs`, `peers/schedule.rs` | The peer set: who to dial and when, polite retry and backoff, how many sessions to keep in each direction, banning peers that fail verification |
 | `pacing.rs` | Request pacing per session |
@@ -159,7 +160,8 @@ not delay ingest; a small storage call (parent hash plus has-receipts) would rem
 
 Elsewhere: `chainspec` holds the genesis hash, the fork activations and the fork id;
 `primitives` the channel types; the pipeline has a receipts task and sends requests; the
-binary has the configuration, the provider over the archive and the wiring.
+binary has the configuration, the provider over the archive and the unsafe store, and the
+wiring.
 
 ## 10. Configuration and identity
 
@@ -186,9 +188,33 @@ binary has the configuration, the provider over the archive and the wiring.
 
 The node answers peers from its own stores, so that another node can sync from it.
 
-- `el` does not depend on `storage`. It defines the `BlockProvider` trait (`header`, `body`,
-  `receipts` by number, `number_of` a hash, the held `range`) and the binary implements it
-  over the local archive; `Option<P>` implements it too, `None` holding nothing.
+- `el` does not depend on `storage`. It defines the `BlockProvider` trait (`read` a run of
+  headers, bodies or receipts within `ReadLimits`, and the held `range`), and the binary
+  implements it (`NodeProvider`, `bin/op-indexer/src/provider.rs`):
+  - Committed blocks come from the archive. The canonical unsafe blocks above its tip come
+    from the unsafe store (Redis), because peers syncing the tip need those most: op-node
+    relies on execution-layer sync to fill unsafe gaps.
+  - **One chain per answer.** A run that crosses the archive's tip, or continues in the
+    unsafe store, is checked by parent hash as it is read, and ends at the first block that
+    does not link, so a reorg during a read never puts a block of the old branch after one
+    of the new.
+  - **Orphans and missing receipts are not held.** A block asked for by hash is served from
+    the unsafe store only while it is canonical; its receipts only once they are attached.
+  - **Steps.** Headers every `step > 1` blocks cannot be linked, so they come from the
+    archive only.
+  - **Bytes.** Unsafe blocks are encoded from the stored gossip block, which gives the
+    original bytes (signed transactions survive decoding).
+  - **Range.** `range()` is the archive's first block up to the end of the unbroken run of
+    canonical unsafe blocks above its tip that have their receipts
+    (`UnsafeStore::canonical_run`, continued from the last end found while it is still
+    canonical, at most 16,384 new heights looked at). eth/69 promises bodies and receipts
+    for every block of the advertised range, so a block without receipts ends it, even
+    though its header and body are served. In the archive part, a block promoted before its
+    receipts arrived is listed in the archive's `pending_receipts` until the pipeline fetches
+    them (`docs/pipeline.md` section 4b): until then a peer asking for its receipts briefly
+    gets an answer that ends before it, and the node fills it within minutes.
+  - **Cost.** The unsafe part of an answer is two Redis round trips, whatever its length,
+    and decodes only the header, the transactions or the receipts asked for.
 - `serve.rs`: one `Server` task reads from the provider. A session driver never waits for it:
   it hands a request over with `try_send` and writes the answer when it arrives on the
   session's own answer channel, so serving does not delay the tip fetcher. A peer that reads
@@ -196,8 +222,8 @@ The node answers peers from its own stores, so that another node can sync from i
 - **Bytes.** Headers and bodies go on the wire exactly as the archive holds them: the response
   is assembled around the stored RLP, which is copied in and never decoded. With
   `ArchiveStore::append_batch` storing the bytes the importer or range sync verified, what is
-  served is what was verified. Receipts are held with their blooms (the form up to eth/68);
-  eth/69 sends `[tx-type, status, cumulative-gas, logs]` plus the deposit nonce and version, so
+  served is what was verified. Receipts are held with their blooms (the form up to eth/68),
+  and eth/68 sessions get them as held; eth/69 sends `[tx-type, status, cumulative-gas, logs]` plus the deposit nonce and version, so
   they are decoded and encoded again without the bloom. Only the bloom is dropped (the
   receiver rebuilds it from the logs); type, status or post-state root, gas, logs and the
   deposit fields are carried over for every receipt type.
@@ -215,7 +241,9 @@ The node answers peers from its own stores, so that another node can sync from i
   | Requests of all peers waiting | 64 | empty answer |
   | Requests read from the provider at once | 4 | the others wait in the queue |
 
-- **What is advertised** (status and `BlockRangeUpdate`, at most once a minute per session):
+- **What is advertised** (status and `BlockRangeUpdate`, at most once every two minutes per
+  eth/69 session, as devp2p `caps/eth.md` recommends; the range is read again whenever the
+  head moves):
   only blocks this node serves, or its tip alone. The server reads the held range every 10 s.
   - Blocks are held: the held range as it is, `earliest` = its first block (block 0 once the
     legacy range is imported), `latest` = its last block with its hash, however far that is
@@ -226,6 +254,10 @@ The node answers peers from its own stores, so that another node can sync from i
     days behind is not confirmed live:** whether peers keep sessions with such a node, and
     still answer its requests for the tip's receipts, is unmeasured.
   - Nothing is held: the tip alone, `earliest` = `latest` = the tip.
+  - The provider (the binary's) also serves the canonical unsafe blocks above the archive,
+    linked to it by parent hash, so `latest` is the newest of those whose receipts are held:
+    op-node relies on execution-layer sync to fill unsafe gaps, so the recent chain is what
+    helps peers most.
   What is advertised is logged at info at startup and when its kind or its first block
   changes.
   The tip is an input: the binary provides the newest block the node knows (gossip, or the

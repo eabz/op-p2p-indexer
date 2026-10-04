@@ -21,7 +21,7 @@ use eyre::WrapErr;
 use op_indexer_chainspec::ChainSpec;
 use op_indexer_el::{ExecutionNetwork, RangeSync, RoundEnd, SyncPlan};
 use op_indexer_l1::{BeaconConfig, L1Config, L1Network, LightClient};
-use op_indexer_p2p::{Network, NodeStore, StoreError};
+use op_indexer_p2p::{Network, NodeStore, PayloadSource, StoreError};
 use op_indexer_pipeline::{Pipeline, ReceiptsChannels};
 use op_indexer_primitives::{BlockRef, EncodedBlock, ExecutionPeer, L1Games, L1Heads, SyncRange};
 use op_indexer_storage::archive_store::FjallArchive;
@@ -36,7 +36,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::time::ChronoUtc;
 
 use crate::config::{Config, ElSettings, L1Settings};
-use crate::provider::ArchiveProvider;
+use crate::provider::NodeProvider;
 
 /// Unsafe blocks waiting for the pipeline. Blocks arrive every 2 s on OP Mainnet and every
 /// second on Unichain; this absorbs a store that is unreachable for about 8 or 4 minutes
@@ -158,6 +158,11 @@ async fn main() -> eyre::Result<()> {
         },
     );
 
+    // The blocks older consensus-layer nodes may ask for by number.
+    let payloads: Arc<dyn PayloadSource> = Arc::new(NodeProvider::new(
+        stores.archive.0.clone(),
+        stores.unsafe_store.clone(),
+    ));
     // Reads the stores the pipeline writes, and the unsafe store's events.
     let stream = StreamServer::new(
         config.stream,
@@ -195,7 +200,14 @@ async fn main() -> eyre::Result<()> {
         }
         None => (None, pipeline, Some(l1_source_tx)),
     };
-    let network = Network::new(config.network, keypair, store, blocks_tx, safe_number_rx);
+    let network = Network::new(
+        config.network,
+        keypair,
+        store,
+        blocks_tx,
+        safe_number_rx,
+        payloads,
+    );
     run(network, execution, l1, (pipeline, stream), saves).await
 }
 
@@ -265,7 +277,7 @@ fn l1_side(
 /// delivered.
 async fn run(
     network: Network,
-    execution: Option<ExecutionNetwork<ArchiveProvider>>,
+    execution: Option<ExecutionNetwork<NodeProvider>>,
     l1: Option<(L1Network, LightClient)>,
     (pipeline, stream): (
         Pipeline<RedisStore, FjallArchive>,
@@ -368,7 +380,7 @@ where
 
 /// The execution network with everything that goes with it.
 struct Execution {
-    network: ExecutionNetwork<ArchiveProvider>,
+    network: ExecutionNetwork<NodeProvider>,
     /// The pipeline's ends of the receipts channels.
     receipts: ReceiptsChannels,
     /// The batches of the range sync, for the pipeline, when a range is configured.
@@ -398,7 +410,7 @@ fn execution_network(
     let (requests_tx, requests_rx) = mpsc::channel(RECEIPT_REQUEST_CAPACITY);
     let (verified_tx, verified_rx) = mpsc::channel(VERIFIED_RECEIPTS_CAPACITY);
     let (served_tx, served_rx) = mpsc::channel(SERVED_PEERS_CAPACITY);
-    let provider = ArchiveProvider(stores.archive.0.clone());
+    let provider = NodeProvider::new(stores.archive.0.clone(), stores.unsafe_store.clone());
     let network = ExecutionNetwork::new(
         el.into_config(saved_peers),
         key,

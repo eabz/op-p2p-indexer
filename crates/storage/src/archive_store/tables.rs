@@ -37,8 +37,8 @@ const CACHE_SIZE_BYTES: u64 = 64 * 1024 * 1024;
 /// Most journal kept on disk before memtables are flushed to make room. It also bounds how much
 /// is replayed on open after a crash (fjall's default is 512 MiB, its minimum 64 MiB).
 const MAX_JOURNAL_BYTES: u64 = 128 * 1024 * 1024;
-/// Memtable of one keyspace before it is flushed. With six keyspaces this bounds the active
-/// memtables to 96 MiB; fjall 3.1's database-wide cap (`max_write_buffer_size`) is deprecated
+/// Memtable of one keyspace before it is flushed. With seven keyspaces this bounds the active
+/// memtables to 112 MiB; fjall 3.1's database-wide cap (`max_write_buffer_size`) is deprecated
 /// and not enforced, so this and [`MAX_JOURNAL_BYTES`] are the bounds. Live appends add about
 /// 20 KB a block, so a memtable fills in under an hour; a smaller one only means more, smaller
 /// flushes (fjall's default is 64 MiB per keyspace).
@@ -49,7 +49,9 @@ const WORKER_THREADS: usize = 2;
 /// Name of the schema version entry in `meta`.
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 /// Layout version of the keyspaces. An archive written with another version is refused on open.
-/// Version 2 added `senders` and the heads in `meta`.
+/// Version 2 added `senders` and the heads in `meta`. `pending_receipts` came later without a
+/// new version: an archive of version 2 gains it empty on open, which is right for an import
+/// (every imported block has its receipts).
 const SCHEMA_VERSION: u64 = 2;
 /// Name of the entry in `meta` recording the archive's chain ([`ChainIdentity::to_bytes`]).
 const CHAIN_KEY: &str = "chain";
@@ -84,6 +86,10 @@ pub(super) struct Tables {
     /// Block number -> the sender of each transaction, 20 bytes each, in block order,
     /// uncompressed (addresses do not compress).
     senders: Keyspace,
+    /// Block number -> block hash, for every archived block without receipts: written with
+    /// the block, removed when its receipts are set, so the few blocks promoted before their
+    /// receipts arrived can be found and filled.
+    pending: Keyspace,
     /// Name -> value; holds [`SCHEMA_VERSION_KEY`], [`CHAIN_KEY`], [`SAFE_HEAD_KEY`] and
     /// [`FINALIZED_HEAD_KEY`].
     meta: Keyspace,
@@ -221,6 +227,7 @@ fn open_schema(path: &Path) -> Result<Tables, Failure> {
         receipts: db.keyspace("receipts", separated)?,
         numbers: db.keyspace("numbers", inline)?,
         senders: db.keyspace("senders", inline)?,
+        pending: db.keyspace("pending_receipts", inline)?,
         meta: db.keyspace("meta", inline)?,
         db,
         writer: Arc::default(),
@@ -288,6 +295,7 @@ pub(super) fn set_receipts(
     }
     let mut batch = tables.durable_batch();
     batch.insert(&tables.receipts, key, receipts);
+    batch.remove(&tables.pending, key);
     batch.commit()?;
     Ok(true)
 }
@@ -484,6 +492,29 @@ pub(super) fn blocks(
     Ok(blocks)
 }
 
+/// The archived blocks without receipts, oldest first, at most `limit`, and how many there are
+/// in all (counted over the index, which is small: imported blocks always have receipts).
+pub(super) fn pending_receipts(
+    tables: &Tables,
+    limit: usize,
+) -> Result<(Vec<BlockRef>, u64), Failure> {
+    let snapshot = tables.db.snapshot();
+    let mut blocks = Vec::new();
+    let mut total: u64 = 0;
+    for guard in snapshot.iter(&tables.pending) {
+        total = total.saturating_add(1);
+        if blocks.len() < limit {
+            let (key, hash) = guard.into_inner()?;
+            blocks.push(BlockRef {
+                number: decode_number(&key)?,
+                hash: BlockHash::try_from(&*hash)
+                    .map_err(|_wrong_length| invalid("pending receipts hash", None))?,
+            });
+        }
+    }
+    Ok((blocks, total))
+}
+
 /// The committed heads recorded by [`set_heads`].
 pub(super) fn heads(tables: &Tables) -> Result<L1Heads, Failure> {
     let snapshot = tables.db.snapshot();
@@ -618,7 +649,8 @@ fn remove_batch(
         batch.remove(&tables.headers, key.clone());
         batch.remove(&tables.bodies, key.clone());
         batch.remove(&tables.receipts, key.clone());
-        batch.remove(&tables.senders, key);
+        batch.remove(&tables.senders, key.clone());
+        batch.remove(&tables.pending, key);
         batch.remove(&tables.numbers, hash.0);
         removed = removed.saturating_add(1);
     }

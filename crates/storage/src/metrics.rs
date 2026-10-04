@@ -70,6 +70,14 @@ pub(crate) enum Operation {
     Prune,
     /// [`UnsafeStore::head`](crate::UnsafeStore::head).
     Head,
+    /// [`UnsafeStore::canonical_number`](crate::UnsafeStore::canonical_number).
+    CanonicalNumber,
+    /// [`UnsafeStore::canonical_headers`](crate::UnsafeStore::canonical_headers).
+    CanonicalHeaders,
+    /// [`UnsafeStore::canonical_items`](crate::UnsafeStore::canonical_items).
+    CanonicalItems,
+    /// [`UnsafeStore::canonical_run`](crate::UnsafeStore::canonical_run).
+    CanonicalRun,
     /// [`UnsafeStore::last_event_id`](crate::UnsafeStore::last_event_id).
     LastEventId,
     /// [`UnsafeStore::events`](crate::UnsafeStore::events).
@@ -82,6 +90,8 @@ pub(crate) enum Operation {
     Blocks,
     /// [`ArchiveStore::heads`](crate::ArchiveStore::heads).
     Heads,
+    /// [`ArchiveStore::pending_receipts`](crate::ArchiveStore::pending_receipts).
+    PendingReceipts,
     /// [`UnsafeStore::set_l1_heads`](crate::UnsafeStore::set_l1_heads) and
     /// [`ArchiveStore::set_heads`](crate::ArchiveStore::set_heads).
     SetL1Heads,
@@ -103,11 +113,16 @@ impl Operation {
             Self::Ancestry => "ancestry",
             Self::Prune => "prune",
             Self::Head => "head",
+            Self::CanonicalNumber => "canonical_number",
+            Self::CanonicalHeaders => "canonical_headers",
+            Self::CanonicalItems => "canonical_items",
+            Self::CanonicalRun => "canonical_run",
             Self::LastEventId => "last_event_id",
             Self::Events => "events",
             Self::Block => "block",
             Self::Blocks => "blocks",
             Self::Heads => "heads",
+            Self::PendingReceipts => "pending_receipts",
             Self::SetL1Heads => "set_l1_heads",
         }
     }

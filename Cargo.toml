@@ -121,6 +121,9 @@ tonic-prost-build = { version = "0.14", default-features = false }
 protox = "0.9"
 # `ReceiverStream`: a subscription's queue as the response stream.
 tokio-stream = { version = "0.1", default-features = false }
+# Rate limits of the consensus layer's `payload_by_number` server (GCRA, as op-node's):
+# `std` only, no dashmap, quanta or jitter.
+governor = { version = "0.10", default-features = false, features = ["std"] }
 # Arrow Flight for bulk history as columnar record batches: the Apache crate (same tonic and
 # prost as the stream), no default features; arrow-array and arrow-schema to build the batches.
 arrow-flight = { version = "60", default-features = false }

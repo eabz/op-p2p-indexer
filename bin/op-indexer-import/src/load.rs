@@ -522,8 +522,8 @@ async fn check_top(
 
 /// Reads the verified chunk at `path`: the blocks of `chunk`, in block order. Blocking.
 fn read(path: &Path, chunk: Chunk) -> eyre::Result<Vec<VerifiedBlock>> {
-    let (_link, blocks) = chunk::read(path)
-        .wrap_err_with(|| format!("failed to read verified chunk {}", path.display()))?;
+    // Its errors name the file.
+    let (_link, blocks) = chunk::read(path)?;
     ensure!(
         u64::try_from(blocks.len()).ok() == Some(chunk.blocks()),
         "{} holds {} blocks, not the {} of its chunk",

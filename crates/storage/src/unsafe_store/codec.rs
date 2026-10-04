@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use alloy_consensus::{BlockBody, Header};
 use alloy_eips::eip4895::Withdrawals;
-use alloy_primitives::{Address, BlockHash};
+use alloy_primitives::{Address, BlockHash, Bytes};
 use op_alloy_consensus::{OpBlock, OpReceiptEnvelope, OpTxEnvelope};
 use op_indexer_primitives::{BlockRef, BlockSource, DecodedBlock, Reorg, UnsafeEvent};
 use serde::Deserialize;
@@ -100,13 +100,7 @@ pub(super) fn decode_block(
         _ => return Err(invalid("block source", block, None)),
     };
 
-    // Only the header and the transactions are stored. OP Stack blocks have no ommers, and
-    // their withdrawals list is empty from the fork that added the withdrawals root.
-    let body = BlockBody {
-        transactions,
-        ommers: Vec::new(),
-        withdrawals: header.withdrawals_root.map(|_| Withdrawals::default()),
-    };
+    let body = body(&header, transactions);
     Ok(DecodedBlock {
         block: OpBlock::new(header, body),
         hash,
@@ -114,6 +108,41 @@ pub(super) fn decode_block(
         receipts,
         source,
     })
+}
+
+/// A block's body from its header and transactions. Only the header and the transactions are
+/// stored: OP Stack blocks have no ommers, and their withdrawals list is empty from the fork
+/// that added the withdrawals root.
+fn body(header: &Header, transactions: Vec<OpTxEnvelope>) -> BlockBody<OpTxEnvelope> {
+    BlockBody {
+        transactions,
+        ommers: Vec::new(),
+        withdrawals: header.withdrawals_root.map(|_| Withdrawals::default()),
+    }
+}
+
+/// The header of stored block `hash`, from its `header` field.
+pub(super) fn decode_header(hash: BlockHash, json: &str) -> Result<Header, StorageError> {
+    from_json("header", json, Some(hash))
+}
+
+/// The consensus encoding (RLP) of stored block `hash`'s body, from its header and its
+/// `transactions` field, without the senders.
+pub(super) fn body_rlp(
+    hash: BlockHash,
+    header: &Header,
+    transactions: &str,
+) -> Result<Bytes, StorageError> {
+    let block = Some(hash);
+    let transactions: Vec<OpTxEnvelope> = from_json("transactions", transactions, block)?;
+    Ok(alloy_rlp::encode(body(header, transactions)).into())
+}
+
+/// The consensus encoding of stored block `hash`'s receipts, from its `receipts` field: the
+/// form [`op_indexer_primitives::encode_receipts`] gives.
+pub(super) fn receipts_rlp(hash: BlockHash, receipts: &str) -> Result<Bytes, StorageError> {
+    let receipts: Vec<OpReceiptEnvelope> = from_json("receipts", receipts, Some(hash))?;
+    Ok(op_indexer_primitives::encode_receipts(&receipts))
 }
 
 /// Decodes the events a script replied with, each a map of the fields it wrote to the stream.

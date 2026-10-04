@@ -97,6 +97,15 @@ the anchor (section 11). The bytes that passed are written as verified chunks.
   parent up to the anchor; its transactions root is the root over the stored transaction
   encodings; its receipts root is the root over the stored receipts. That is what a peer
   checks when the bytes are served to it.
+- **Header fields `verify` rebuilds.** The transactions root, the receipts root and the logs
+  bloom are never downloaded: `verify` computes them from the transactions, receipts and logs,
+  and the header hash proves them (they are not compared with anything the service says).
+  `mix_hash` is downloaded, but the service leaves it out of some pre-Bedrock rows (seen on
+  OP Mainnet in chunks around block 47,705,000, 47,740,000 and 47,745,000). Before Bedrock
+  every header has a zero `mix_hash`, so a row without it is rebuilt with zero, and the
+  header hash decides: a wrong guess is refused, never accepted. The blocks rebuilt this way
+  are logged per chunk and counted in the summary (`rebuilt_header_fields`). From Bedrock on
+  a row without `mix_hash` is refused ("the header lacks `mix_hash`").
 - **Senders are proven by `load`, not by `verify`.** `verify` checks no signature: the sender
   it records in each verified chunk is the `from` HyperSync reports. `load` then proves it
   before anything is archived (user decision, 2026-10-04): for every signed transaction it
@@ -244,22 +253,22 @@ Build on any machine with the Rust toolchain and copy the one file:
 cargo build --release -p op-indexer-import
 ```
 
-The file is `target/release/op-indexer-import`. On the machine that runs it, with the defaults
+The file is `target/release/import` (the package is `op-indexer-import`). On the machine that runs it, with the defaults
 (OP Mainnet, from block 0 to the last block committed to L1, state in `./import-state`):
 
 ```bash
-op-indexer-import download --api-token <TOKEN> --requests 64
+import download --api-token <TOKEN> --requests 64
 ```
 
 ```bash
-op-indexer-import verify
+import verify
 ```
 
 ```bash
-op-indexer-import load --archive-dir data/archive
+import load --archive-dir data/archive
 ```
 
-`op-indexer-import --help` and `<command> --help` list every flag, its environment variable
+`import --help` and `<command> --help` list every flag, its environment variable
 and its default. Only `--state-dir` is shared by the steps: the range is decided by the first
 `download` and read from `plan.json` afterwards.
 
@@ -273,11 +282,23 @@ and its default. Only `--state-dir` is shared by the steps: the range is decided
 - **Stopping and restarting**: Ctrl-C or SIGTERM stops a step within a fraction of a second
   and exits with status 1 and a summary; `run` does not start the next step. Run the same
   command again: it continues with exactly the chunks that are missing. A killed process
-  (SIGKILL, power loss) is as safe: a chunk file is written under a `.tmp` name and renamed,
-  so a file with a final name is always complete, and leftover `.tmp` files are removed at
-  the next start.
+  (SIGKILL, power loss) is as safe: a chunk file is written under a `.tmp` name, synced and
+  renamed, so a file with a final name is always complete, and leftover `.tmp` files are
+  removed at the next start. A rename lost to a power loss only loses that chunk, which the
+  next run does again; `verified/` is synced once before `verified.json` is written, and the
+  JSON files' directory after each of them.
+- **A damaged verified chunk is not a verified one.** A file copied or downloaded short
+  (seen on a server filled from a snapshot: three files under the 64-byte header) would
+  otherwise block linking and be skipped by `download`. One check decides for both: a
+  verified file counts only if it starts with the two hashes and then a zstd frame's magic
+  number (68 bytes read). `verify` removes a file that fails it, with a warning per file and a
+  `damaged_removed` count in its start line, and verifies the chunk again from `raw/`. If
+  `raw/` no longer has it, it counts as not downloaded, and `download` fetches just those
+  chunks. Damage past the first bytes shows when a chunk is read in full (linking a game
+  anchor, or `load`): every such error names the file and says what is wrong and what to
+  run.
 - **One process per state directory**: the directory is locked while a process runs; a second
-  one exits with "another op-indexer-import process is using this state directory". The lock
+  one exits with "another `import` process is using this state directory". The lock
   is released by the system when the process ends, however it ends.
 - **Resuming**: when the request window closes, `download` stops with a summary of how many
   chunks are missing. Reset the window and run the same command again: only missing chunks are
@@ -330,8 +351,11 @@ On the real service:
   written were cut by it, which is why it cannot change.
 - A directory written by a build with another layout is refused: it either has chunks and no
   `plan.json`, or a `plan.json` with another version. Delete it and download again.
-- A file exists only when it is complete: it is written under a `.tmp` name and renamed, and
-  leftover `.tmp` files are removed at the next start.
+- A file exists only when it is complete: it is written under a `.tmp` name, synced and
+  renamed; leftover `.tmp` files are removed at the next start.
+  How the three short files on the new server came about is not known: this code syncs the
+  data before the rename, so a crash cannot leave a short file under the final name; the copy
+  of the snapshot is the likelier cause.
 
 ## 8. Not built
 
@@ -377,15 +401,15 @@ gives `https://optimism.hypersync.xyz` for 10 and `https://unichain.hypersync.xy
 ### Unichain (chain 130)
 
 ```bash
-op-indexer-import --state-dir unichain-state download --chain 130 --api-token <TOKEN>
+import --state-dir unichain-state download --chain 130 --api-token <TOKEN>
 ```
 
 ```bash
-op-indexer-import --state-dir unichain-state verify
+import --state-dir unichain-state verify
 ```
 
 ```bash
-op-indexer-import --state-dir unichain-state load --archive-dir data/archive
+import --state-dir unichain-state load --archive-dir data/archive
 ```
 
 What differs from OP Mainnet:

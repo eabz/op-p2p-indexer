@@ -423,6 +423,7 @@ impl PeerSet {
             addr = %status.addr,
             client = %status.client,
             direction = ?status.direction,
+            eth = %status.version,
             latest = ?status.latest,
             "execution session opened"
         );

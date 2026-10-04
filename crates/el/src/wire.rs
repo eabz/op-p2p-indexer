@@ -2,7 +2,8 @@
 //!
 //! reth's typed eth stream is built for Ethereum's types, so OP messages are encoded and
 //! decoded here on the raw stream: a message is its id byte followed by RLP. Request and
-//! response structures are reth's; receipts are decoded by op-alloy. Only eth/69 is spoken.
+//! response structures are reth's; receipts are decoded by op-alloy. Requests and their answers are eth/69's; what is served is answered in
+//! the session's version (eth/69 or eth/68), see `serve`.
 //!
 //! Does not open connections or track requests; see `session`.
 

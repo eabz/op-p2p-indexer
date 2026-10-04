@@ -48,7 +48,10 @@ pub(crate) struct BlockRow {
     pub(crate) gas_used: U64,
     pub(crate) timestamp: U64,
     pub(crate) extra_data: Bytes,
-    pub(crate) mix_hash: B256,
+    /// Absent from some pre-Bedrock rows the service gives (seen on OP Mainnet around block
+    /// 47,705,000); `verify` then takes zero, the value of every legacy block, and the header
+    /// hash decides.
+    pub(crate) mix_hash: Option<B256>,
     pub(crate) nonce: B64,
     pub(crate) base_fee_per_gas: Option<U64>,
     pub(crate) withdrawals_root: Option<B256>,

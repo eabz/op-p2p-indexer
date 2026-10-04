@@ -167,6 +167,15 @@ store, or in the archive when the block has been promoted in the meantime; recei
 block neither holds are dropped and counted. A store that refuses them (wrong count or number)
 is logged and counted; any other store error stops the pipeline.
 
+**The archive never stays without receipts.** Promotion does not wait for receipts, so a few
+blocks reach the archive without them. The archive lists them (`pending_receipts`, section 9
+of `docs/storage.md`) until `set_receipts` fills them. At startup, then every 30 s, the task
+asks for the receipts of the oldest 64 of them, through the same channel as new blocks
+(`ReceiptsRequest` built from the archived header and its sender count, verified by `el`
+against the receipts root as usual). The answers are attached in the archive like any late
+receipts. A restart resumes from the list, which lives in the archive. The list's size is
+logged at startup and kept in `op_indexer_pipeline_archive_pending_receipts`.
+
 **Range** (`range.rs`, when a range sync is configured). The execution network hands over
 verified blocks in ascending order, in batches of consecutive blocks, as the bytes it received
 (`EncodedBlock`). For each batch the task decodes the blocks and recovers their senders on

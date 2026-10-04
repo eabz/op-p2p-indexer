@@ -8,6 +8,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use alloy_eip2124::{ForkFilter, ForkId};
 use alloy_primitives::{BlockNumber, Bytes};
 use op_indexer_primitives::BlockRef;
+use reth_eth_wire_types::EthVersion;
 use reth_network_peers::PeerId;
 use secp256k1::SecretKey;
 use tokio::sync::{mpsc, watch};
@@ -87,9 +88,19 @@ impl SessionContext {
     /// The serving side of one new session with a peer that is an indexer or not, and the
     /// channel its answers arrive on. It follows the tip, which is the end of the range the
     /// session advertises.
-    pub(super) fn session_serving(&self, indexer: bool) -> (SessionServing, mpsc::Receiver<Bytes>) {
+    pub(super) fn session_serving(
+        &self,
+        indexer: bool,
+        version: EthVersion,
+    ) -> (SessionServing, mpsc::Receiver<Bytes>) {
         self.serving
-            .session(self.tip.clone(), self.lowest_for(indexer))
+            .session(self.tip.clone(), self.lowest_for(indexer), version)
+    }
+
+    /// Whether this node serves blocks on this network: eth/68 is offered only then, for
+    /// peers that cannot speak eth/69 to sync from us; we ask only eth/69 peers.
+    pub(crate) const fn serves(&self) -> bool {
+        self.serving.is_enabled()
     }
 
     /// The lowest block shared with a peer: every block for an indexer, from the network's

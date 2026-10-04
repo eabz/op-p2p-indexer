@@ -229,6 +229,15 @@ impl ArchiveStore for FjallArchive {
         .await
     }
 
+    async fn pending_receipts(&self, limit: usize) -> Result<(Vec<BlockRef>, u64), StorageError> {
+        self.blocking(
+            Operation::PendingReceipts,
+            "pending_receipts",
+            move |tables| tables::pending_receipts(tables, limit),
+        )
+        .await
+    }
+
     async fn heads(&self) -> Result<L1Heads, StorageError> {
         self.blocking(Operation::Heads, "heads", tables::heads)
             .await

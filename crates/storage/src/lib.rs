@@ -101,6 +101,27 @@ impl FromStr for EventId {
     }
 }
 
+/// A part of a canonical unsafe block in its consensus encoding, with the block it belongs to
+/// and that block's parent, so a reader can check that a run links.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalItem {
+    /// The block.
+    pub block: BlockRef,
+    /// Its parent's hash.
+    pub parent_hash: BlockHash,
+    /// The header, the body or the receipts (an RLP list of network encodings with bloom).
+    pub rlp: Bytes,
+}
+
+/// Which part of a block [`UnsafeStore::canonical_items`] reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BlockPart {
+    /// The body: transactions, no ommers, and withdrawals when the header has their root.
+    Body,
+    /// The receipts.
+    Receipts,
+}
+
 /// What [`UnsafeStore::events`] read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Events {
@@ -216,6 +237,64 @@ pub trait UnsafeStore {
         &self,
         number: BlockNumber,
     ) -> impl Future<Output = Result<Option<DecodedBlock>, StorageError>> + Send;
+
+    /// Returns the height of the block with `hash` if it is canonical, without reading it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the store cannot be reached or the height does not parse.
+    fn canonical_number(
+        &self,
+        hash: BlockHash,
+    ) -> impl Future<Output = Result<Option<BlockNumber>, StorageError>> + Send;
+
+    /// Returns up to `count` consecutive canonical headers from height `from`, rising or
+    /// falling, each in its consensus encoding (RLP). The run ends at the first height with no
+    /// canonical block, a block no longer stored, or a block that does not link by parent hash
+    /// to the one before (a reorg between the store's two reads). Two round trips.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the store cannot be reached or stored data cannot be
+    /// decoded.
+    fn canonical_headers(
+        &self,
+        from: BlockNumber,
+        count: usize,
+        rising: bool,
+    ) -> impl Future<Output = Result<Vec<CanonicalItem>, StorageError>> + Send;
+
+    /// Returns the bodies or receipts of the leading blocks of `hashes` that are canonical and
+    /// stored (with their receipts, for [`BlockPart::Receipts`]), each in its consensus
+    /// encoding, in order. The run ends at the first that is not, or that follows the one
+    /// before by height without naming it as its parent. Two round trips at most.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the store cannot be reached or stored data cannot be
+    /// decoded.
+    fn canonical_items(
+        &self,
+        hashes: &[BlockHash],
+        part: BlockPart,
+    ) -> impl Future<Output = Result<Vec<CanonicalItem>, StorageError>> + Send;
+
+    /// Returns the last block of the unbroken canonical run that continues `above` and has its
+    /// receipts: the canonical block at `above.number + 1` must name `above` as its parent, and
+    /// the run ends before the first height with no canonical block or whose block has no
+    /// receipts yet. At most `max` heights are looked at. `None` if no block qualifies.
+    ///
+    /// The canonical chain is linked by parent hash wherever its heights are unbroken (fork
+    /// choice keeps it so), so the run is one chain, every block of it with its receipts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the store cannot be reached or stored data does not parse.
+    fn canonical_run(
+        &self,
+        above: BlockRef,
+        max: usize,
+    ) -> impl Future<Output = Result<Option<BlockRef>, StorageError>> + Send;
 
     /// Records the L1 safe and finalized heads.
     ///
@@ -364,6 +443,19 @@ pub trait ArchiveStore {
     ///
     /// Returns [`StorageError`] if the archive cannot be written.
     fn set_heads(&self, heads: L1Heads) -> impl Future<Output = Result<(), StorageError>> + Send;
+
+    /// Returns the archived blocks without receipts, oldest first, at most `limit`, and how
+    /// many there are in all. Every block appended without receipts is listed, and leaves the
+    /// list when [`Self::set_receipts`] fills it: in practice the few blocks promoted before
+    /// their receipts arrived (an import always has them).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the archive cannot be read.
+    fn pending_receipts(
+        &self,
+        limit: usize,
+    ) -> impl Future<Output = Result<(Vec<BlockRef>, u64), StorageError>> + Send;
 
     /// Returns the number of the archived block with this hash.
     ///
