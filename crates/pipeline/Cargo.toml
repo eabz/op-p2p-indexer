@@ -10,5 +10,17 @@ publish.workspace = true
 op-indexer-primitives.workspace = true
 op-indexer-storage.workspace = true
 
+alloy-consensus.workspace = true
+alloy-primitives.workspace = true
+fastrand.workspace = true
+metrics.workspace = true
+# `k256` implements sender recovery for `OpTxEnvelope`.
+op-alloy-consensus = { workspace = true, features = ["k256"] }
+thiserror.workspace = true
+# `rt` for `spawn_blocking` and the task set: sender recovery is CPU work.
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+tokio-util.workspace = true
+tracing.workspace = true
+
 [lints]
 workspace = true

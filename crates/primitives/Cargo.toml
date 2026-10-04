@@ -8,7 +8,6 @@ publish.workspace = true
 
 [dependencies]
 alloy-primitives.workspace = true
-bytes.workspace = true
 op-alloy-consensus.workspace = true
 
 [lints]

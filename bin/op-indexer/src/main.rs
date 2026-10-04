@@ -2,7 +2,9 @@
 //!
 //! Wires the components together: loads config and the node identity, checks that Redis and
 //! ClickHouse are reachable and their schemas current, opens the local block archive when it is
-//! enabled, runs the p2p network, and consumes the unsafe blocks it emits. Shuts down cleanly on Ctrl-C or SIGTERM.
+//! enabled, and runs the p2p network next to the pipeline that stores the blocks it emits.
+//! Shuts down cleanly on Ctrl-C or SIGTERM: the network first, then the pipeline, which stores
+//! what the network had already delivered.
 
 mod config;
 
@@ -10,10 +12,12 @@ use std::sync::Arc;
 
 use eyre::WrapErr;
 use op_indexer_p2p::{Network, NodeStore};
+use op_indexer_pipeline::Pipeline;
+use op_indexer_primitives::L1Heads;
 use op_indexer_storage::archive_store::FjallArchive;
 use op_indexer_storage::committed_store::ClickHouseStore;
 use op_indexer_storage::unsafe_store::RedisStore;
-use op_indexer_storage::{ArchiveStore, StorageConfig};
+use op_indexer_storage::{ArchiveRetention, ArchiveStore, StorageConfig};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -22,7 +26,8 @@ use tracing_subscriber::fmt::time::ChronoUtc;
 
 use crate::config::Config;
 
-/// Unsafe blocks waiting for the consumer. Blocks arrive every ~2s; this absorbs long stalls.
+/// Unsafe blocks waiting for the pipeline. Blocks arrive every ~2s; this absorbs a store that
+/// is unreachable for several minutes before the network starts dropping them.
 const BLOCK_CHANNEL_CAPACITY: usize = 256;
 
 /// Directory of the node store (identity and known peers), inside the data directory.
@@ -44,55 +49,82 @@ async fn main() -> eyre::Result<()> {
 
     // Startup-only blocking I/O, before any task runs.
     std::fs::create_dir_all(&config.data_dir).wrap_err("failed to create data dir")?;
-    prepare_storage(&config.storage).await?;
+    let stores = prepare_storage(&config.storage).await?;
     let store =
         NodeStore::open(config.data_dir.join(NODE_DIR)).wrap_err("failed to open node store")?;
     let keypair = store.identity().wrap_err("failed to load node identity")?;
 
-    let (blocks_tx, mut blocks_rx) = mpsc::channel(BLOCK_CHANNEL_CAPACITY);
-    let cancel = CancellationToken::new();
-    // L2 safe head: nothing feeds it yet, so every gap counts as unsafe.
-    // TODO: drive it from the L1 crate once it exists (docs/roadmap.md).
-    let (_safe_head_tx, safe_head_rx) = watch::channel(0);
+    let (blocks_tx, blocks_rx) = mpsc::channel(BLOCK_CHANNEL_CAPACITY);
+    // Nothing produces the L1 heads until the L1 crate exists (docs/roadmap.md); the sender is
+    // kept so the pipeline sees a quiet source, not a closed one.
+    let (_l1_heads_tx, l1_heads_rx) = watch::channel(L1Heads::default());
+    // The pipeline publishes the safe block number once its blocks are committed; the network
+    // ignores gaps at or below it.
+    let (safe_number_tx, safe_number_rx) = watch::channel(0);
+
+    let pipeline = Pipeline::new(
+        stores.unsafe_store,
+        stores.committed,
+        stores.archive,
+        blocks_rx,
+        l1_heads_rx,
+        safe_number_tx,
+    );
     let network = Network::new(
         config.network,
         keypair,
         Arc::new(store),
         blocks_tx,
-        safe_head_rx,
+        safe_number_rx,
     );
-    let mut network = tokio::spawn(network.run(cancel.child_token()));
 
-    // Created once, so a signal arriving while other branches run is not missed.
-    let shutdown = shutdown_signal();
-    tokio::pin!(shutdown);
-    loop {
-        tokio::select! {
-            biased;
-            signal = &mut shutdown => {
-                info!(signal = signal?, "shutting down");
-                cancel.cancel();
-                network.await.wrap_err("network task panicked")??;
-                return Ok(());
-            }
-            result = &mut network => {
-                result.wrap_err("network task panicked")??;
-                warn!("network stopped unexpectedly");
-                return Ok(());
-            }
-            // TODO: hand blocks to the pipeline (unsafe store) once it exists.
-            Some(_block) = blocks_rx.recv() => {}
+    // The network stops first, on its own token, so the pipeline can still store what it
+    // delivered; cancelling `cancel` stops both.
+    let cancel = CancellationToken::new();
+    let network_cancel = cancel.child_token();
+    let mut network = tokio::spawn(network.run(network_cancel.clone()));
+    let mut pipeline = tokio::spawn(pipeline.run(cancel.clone()));
+
+    // Either component stopping ends the process; the other is stopped and waited for.
+    tokio::select! {
+        signal = shutdown_signal() => info!(signal = signal?, "shutting down"),
+        result = &mut network => {
+            warn!("network stopped unexpectedly");
+            cancel.cancel();
+            let stopped = result.wrap_err("network task panicked")?.wrap_err("network failed");
+            pipeline.await.wrap_err("pipeline task panicked")??;
+            return stopped;
+        }
+        result = &mut pipeline => {
+            warn!("pipeline stopped unexpectedly");
+            cancel.cancel();
+            let stopped = result.wrap_err("pipeline task panicked")?.wrap_err("pipeline failed");
+            network.await.wrap_err("network task panicked")??;
+            return stopped;
         }
     }
+
+    network_cancel.cancel();
+    network.await.wrap_err("network task panicked")??;
+    cancel.cancel();
+    pipeline.await.wrap_err("pipeline task panicked")??;
+    Ok(())
+}
+
+/// The three stores, connected and ready.
+struct Stores {
+    unsafe_store: RedisStore,
+    committed: ClickHouseStore,
+    /// The local block archive with how much it keeps; `None` when it is disabled.
+    archive: Option<(FjallArchive, ArchiveRetention)>,
 }
 
 /// Connects to both stores, runs the Redis schema check and the ClickHouse migrations, opens
-/// the local block archive when it is enabled, and returns once all are ready, so an
-/// unreachable or mismatched store stops startup.
-// TODO: keep the stores and hand them to the pipeline once it exists; nothing writes blocks yet.
-async fn prepare_storage(config: &StorageConfig) -> eyre::Result<()> {
+/// the local block archive when it is enabled, and returns the stores once all are ready, so
+/// an unreachable or mismatched store stops startup.
+async fn prepare_storage(config: &StorageConfig) -> eyre::Result<Stores> {
     op_indexer_storage::metrics::describe();
-    RedisStore::connect(&config.redis, config.chain_id)
+    let unsafe_store = RedisStore::connect(&config.redis, config.chain_id)
         .await
         .wrap_err("failed to connect to Redis")?;
     let committed = ClickHouseStore::new(&config.clickhouse, config.chain_id);
@@ -106,17 +138,25 @@ async fn prepare_storage(config: &StorageConfig) -> eyre::Result<()> {
         .wrap_err("failed to migrate ClickHouse")?;
     info!(?config, "storage ready");
 
-    if let Some(archive) = &config.archive {
-        // Startup-only blocking I/O, like the node store.
-        let store =
-            FjallArchive::open(&archive.path).wrap_err("failed to open the block archive")?;
-        let range = store
-            .range()
-            .await
-            .wrap_err("failed to read the block archive")?;
-        info!(?range, retention = ?archive.retention, "block archive ready");
-    }
-    Ok(())
+    let archive = match &config.archive {
+        Some(archive) => {
+            // Startup-only blocking I/O, like the node store.
+            let store =
+                FjallArchive::open(&archive.path).wrap_err("failed to open the block archive")?;
+            let range = store
+                .range()
+                .await
+                .wrap_err("failed to read the block archive")?;
+            info!(?range, retention = ?archive.retention, "block archive ready");
+            Some((store, archive.retention))
+        }
+        None => None,
+    };
+    Ok(Stores {
+        unsafe_store,
+        committed,
+        archive,
+    })
 }
 
 /// Resolves with the signal's name on Ctrl-C (SIGINT) or, on Unix, SIGTERM, which `docker stop`

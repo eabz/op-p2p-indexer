@@ -82,6 +82,8 @@ thiserror = "2"
 tracing = "0.1"
 # Metrics facade (as in reth): recording is a no-op until the binary installs a recorder.
 metrics = { version = "0.24", default-features = false }
+# Jitter for the pipeline's retry backoff (already in the tree through fjall).
+fastrand = { version = "2", default-features = false, features = ["std"] }
 # Log output in the binary; `chrono` for the short UTC timestamps.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi", "chrono"] }
 

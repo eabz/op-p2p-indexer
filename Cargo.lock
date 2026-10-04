@@ -162,6 +162,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "borsh",
+ "k256 0.13.4",
  "serde",
  "thiserror 2.0.21",
 ]
@@ -4213,6 +4214,8 @@ dependencies = [
  "eyre",
  "op-indexer-chainspec",
  "op-indexer-p2p",
+ "op-indexer-pipeline",
+ "op-indexer-primitives",
  "op-indexer-storage",
  "tokio",
  "tokio-util",
@@ -4231,6 +4234,7 @@ dependencies = [
 name = "op-indexer-p2p"
 version = "0.1.0"
 dependencies = [
+ "alloy-eips",
  "alloy-primitives",
  "alloy-rpc-types-engine",
  "bytes",
@@ -4240,6 +4244,7 @@ dependencies = [
  "fjall",
  "libp2p",
  "metrics",
+ "op-alloy-consensus",
  "op-alloy-rpc-types-engine",
  "op-indexer-chainspec",
  "op-indexer-primitives",
@@ -4256,8 +4261,17 @@ dependencies = [
 name = "op-indexer-pipeline"
 version = "0.1.0"
 dependencies = [
+ "alloy-consensus",
+ "alloy-primitives",
+ "fastrand",
+ "metrics",
+ "op-alloy-consensus",
  "op-indexer-primitives",
  "op-indexer-storage",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -4265,7 +4279,6 @@ name = "op-indexer-primitives"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
- "bytes",
  "op-alloy-consensus",
 ]
 

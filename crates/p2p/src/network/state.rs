@@ -55,6 +55,8 @@ pub(super) struct State {
     ignored_overload: u64,
     /// Accepted blocks dropped because the consumer channel was full.
     dropped_blocks: u64,
+    /// Blocks skipped because this build could not decode one of their transactions.
+    undecodable_blocks: u64,
     /// Set when the block consumer dropped its receiver; the node then shuts down.
     consumer_closed: bool,
     /// Known good peers from the node store still to dial, most recently seen first; drained as
@@ -103,6 +105,7 @@ impl State {
             next_dial: HashMap::new(),
             ignored_overload: 0,
             dropped_blocks: 0,
+            undecodable_blocks: 0,
             consumer_closed: false,
             known_peers: VecDeque::new(),
             clock_skew_warned: None,
@@ -134,7 +137,7 @@ impl State {
                     return;
                 };
                 if let Err(err) = BlockValidator::precheck(version, &message.data) {
-                    reject(swarm, &message_id, propagation_source, &err);
+                    report_failed(swarm, &message_id, propagation_source, &err);
                     return;
                 }
                 if self.validations.len() >= MAX_PENDING_VALIDATIONS {
@@ -212,7 +215,7 @@ impl State {
         metrics::validations_pending(self.validations.len());
         // A valid block is still rejected past the per-height limit; one already seen is `None`.
         let result = result.and_then(|block| {
-            let is_new = self.seen.observe(block.number, block.hash)?;
+            let is_new = self.seen.observe(block.number(), block.hash)?;
             Ok(is_new.then_some(block))
         });
         match result {
@@ -223,10 +226,10 @@ impl State {
             }
             Ok(Some(block)) => {
                 report(swarm, &id, &source, MessageAcceptance::Accept);
-                debug!(number = block.number, hash = %block.hash, version = ?block.version, "received unsafe block");
+                debug!(number = block.number(), hash = %block.hash, version = ?block.version, "received unsafe block");
                 metrics::block_accepted(&block, unix_now_secs());
-                self.check_gap(block.number);
-                self.remember(source, block.timestamp);
+                self.check_gap(block.number());
+                self.remember(source, block.timestamp_secs());
                 match self.blocks.try_send(block) {
                     Ok(()) => {}
                     Err(TrySendError::Full(block)) => {
@@ -235,7 +238,7 @@ impl State {
                         // Logged at 1, 2, 4, 8, ... drops, like the validation backlog warning.
                         if self.dropped_blocks.is_power_of_two() {
                             warn!(
-                                number = block.number,
+                                number = block.number(),
                                 hash = %block.hash,
                                 dropped_total = self.dropped_blocks,
                                 "block consumer is not keeping up, dropped block"
@@ -245,12 +248,16 @@ impl State {
                     Err(TrySendError::Closed(_)) => self.consumer_closed = true,
                 }
             }
-            // Every block validation failure is a REJECT in the spec.
+            // The error says how to treat the message: a REJECT for every spec rule, an
+            // IGNORE when the fault is ours.
             Err(err) => {
                 if let Some(ahead_secs) = err.local_clock_lag_secs() {
                     self.warn_clock_skew(ahead_secs);
                 }
-                reject(swarm, &id, source, &err);
+                if let BlockError::UndecodableTransaction { number, .. } = err {
+                    self.warn_undecodable(number);
+                }
+                report_failed(swarm, &id, source, &err);
             }
         }
     }
@@ -279,6 +286,20 @@ impl State {
             "missed unsafe blocks"
         );
         metrics::gap_detected(missed);
+    }
+
+    /// Warns that a sequencer-signed block holds a transaction this build cannot decode, which
+    /// means the chain has upgraded past it and every block from now on may be skipped. Logged
+    /// at 1, 2, 4, 8, ... blocks, like the other repeated warnings.
+    fn warn_undecodable(&mut self, number: BlockNumber) {
+        self.undecodable_blocks += 1;
+        if self.undecodable_blocks.is_power_of_two() {
+            warn!(
+                number,
+                skipped_total = self.undecodable_blocks,
+                "skipped block with a transaction this build cannot decode, upgrade the indexer"
+            );
+        }
     }
 
     /// Warns, at most once per [`CLOCK_SKEW_WARN_INTERVAL`], that the local clock looks slow: the
@@ -425,14 +446,14 @@ impl State {
     }
 }
 
-/// Reports `id` from `source` as failing validation with `err`. A rejected peer whose score
-/// falls below the graylist threshold, where gossipsub ignores its RPCs anyway, is disconnected
-/// to free its connection slot.
-fn reject(swarm: &mut Swarm<Behaviour>, id: &MessageId, source: PeerId, err: &BlockError) {
-    debug!(peer = %source, %err, "rejected block message");
-    metrics::block_rejected(err);
+/// Reports that the message `id` from `source` failed validation, as the error says to treat
+/// it. After a rejection, disconnects `source` once its score falls below the graylist
+/// threshold, where gossipsub ignores its RPCs anyway, freeing its connection slot.
+fn report_failed(swarm: &mut Swarm<Behaviour>, id: &MessageId, source: PeerId, err: &BlockError) {
     let acceptance = err.acceptance();
     let rejected = matches!(acceptance, MessageAcceptance::Reject);
+    debug!(peer = %source, %err, rejected, "block message failed validation");
+    metrics::block_rejected(err);
     report(swarm, id, &source, acceptance);
     let score = swarm.behaviour().gossipsub.peer_score(&source);
     if rejected && score.is_some_and(|score| score < gossip::GRAYLIST_THRESHOLD) {

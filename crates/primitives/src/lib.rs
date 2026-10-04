@@ -1,15 +1,13 @@
 //! Domain types shared by every op-p2p-indexer crate.
 //!
-//! Depends only on alloy and op-alloy types and `bytes`, never on networking or storage crates.
+//! Depends only on alloy and op-alloy types, never on networking or storage crates.
 //! Blocks, transactions and receipts are the alloy / op-alloy consensus types; nothing here
 //! redefines them.
 
-use alloy_primitives::{Address, B256, BlockHash, BlockNumber, Signature};
-use bytes::Bytes;
+use alloy_primitives::{Address, BlockHash, BlockNumber};
 use op_alloy_consensus::{OpBlock, OpReceiptEnvelope};
 
-/// Execution payload version of a gossiped block, which determines how [`UnsafeBlock::payload`]
-/// is SSZ-decoded.
+/// Execution payload version a block was gossiped as, which is also the fork it belongs to.
 ///
 /// See <https://specs.optimism.io/protocol/rollup-node-p2p.html#topic-validation>.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -26,26 +24,28 @@ pub enum PayloadVersion {
 
 /// An L2 block received over gossip and signed by the sequencer, not yet derived from L1.
 ///
-/// The fields needed for indexing are extracted; the full payload is kept as raw SSZ in
-/// [`Self::payload`] so nothing is lost.
+/// The network has checked the sequencer's signature and that the header hashes to
+/// [`Self::hash`], and has decoded the transactions; their senders are not recovered yet.
 #[derive(Debug, Clone)]
 pub struct UnsafeBlock {
-    /// Payload version, which determines the SSZ layout of [`Self::payload`].
+    /// Payload version the block was gossiped as.
     pub version: PayloadVersion,
-    /// L2 block number.
-    pub number: BlockNumber,
-    /// L2 block hash, verified against the header rebuilt from the payload.
+    /// Hash of the block header.
     pub hash: BlockHash,
-    /// Hash of the parent L2 block.
-    pub parent_hash: BlockHash,
-    /// Block timestamp, in seconds since the Unix epoch.
-    pub timestamp: u64,
-    /// Parent beacon block root (L1 origin), present from [`PayloadVersion::V3`].
-    pub parent_beacon_block_root: Option<B256>,
-    /// Sequencer signature over the payload.
-    pub signature: Signature,
-    /// SSZ-encoded execution payload.
-    pub payload: Bytes,
+    /// Header and transactions.
+    pub block: OpBlock,
+}
+
+impl UnsafeBlock {
+    /// Returns the block number.
+    pub const fn number(&self) -> BlockNumber {
+        self.block.header.number
+    }
+
+    /// Returns the block timestamp, in seconds since the Unix epoch.
+    pub const fn timestamp_secs(&self) -> u64 {
+        self.block.header.timestamp
+    }
 }
 
 /// A decoded L2 block, with its receipts once they are known. The input of storage.

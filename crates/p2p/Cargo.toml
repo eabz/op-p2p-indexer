@@ -10,6 +10,7 @@ publish.workspace = true
 op-indexer-chainspec.workspace = true
 op-indexer-primitives.workspace = true
 
+alloy-eips.workspace = true
 alloy-primitives.workspace = true
 alloy-rpc-types-engine.workspace = true
 bytes.workspace = true
@@ -19,6 +20,7 @@ ethereum_ssz.workspace = true
 fjall.workspace = true
 libp2p.workspace = true
 metrics.workspace = true
+op-alloy-consensus.workspace = true
 op-alloy-rpc-types-engine.workspace = true
 sha2.workspace = true
 snap.workspace = true
