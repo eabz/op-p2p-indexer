@@ -66,9 +66,17 @@ again; a completed chunk is never redone.
   capped, jittered backoff. A 400, 401 or 403 fails at once. When a chunk fails for good, or
   free disk space falls below 16 GiB, no new chunk is started, the requests in flight finish
   and are written, and the phase ends with a summary of what is missing. It never spins.
-- **Progress**, every 10 seconds: chunks done, blocks, blocks per second and time left from
-  the last minute, requests in flight, bytes per second on the wire, the processor time spent
-  decoding (`decode_cpu_percent`, 100 = one core), bytes on disk, free disk space.
+- **Open files**: a request in flight holds a connection and a chunk file. At start the
+  soft limit is raised to what `--requests` needs if the hard limit allows; otherwise the step
+  refuses to start and prints the `ulimit -n` command. Running out of files while writing a
+  chunk is retried like a busy service.
+- **Progress**, every 10 seconds: chunks done, blocks, blocks per second over the last
+  minute, requests in flight, bytes per second on the wire, the processor time spent decoding
+  (`decode_cpu_percent`, 100 = one core), bytes on disk, free disk space, and `bytes_left` /
+  `secs_left`. The time left is estimated from bytes, not blocks: the bytes per block of each
+  era (before the Bedrock block, and from it on, where blocks are ten to thirty times larger)
+  times the blocks left in it, over the speed on the wire. It is absent until an era with
+  blocks left has been sampled, and within the second era it still grows as blocks do.
 
 ### 3.2 `verify`
 
@@ -101,8 +109,17 @@ the anchor (section 11). The bytes that passed are written as verified chunks.
 - Memory: the chunks verified at once are limited to 256 MiB of downloaded bytes (one chunk is
   always allowed); a chunk takes about twenty times its downloaded size while it is verified.
 - Progress every 10 seconds (chunks, blocks, transactions, their speed over the last minute,
-  time left, busy threads, bytes written), a line at start saying how many chunks are already
-  verified and how many are not downloaded, and lines during the linking pass.
+  busy threads, bytes written, free disk space, and the time left, estimated from the
+  downloaded bytes still to verify over those verified per second), a line at start saying
+  how many chunks are already verified, how many are not downloaded, the downloaded bytes to
+  read and the free space, and lines during the linking pass.
+- Disk: a verified chunk is about as large as its downloaded one. `verify` refuses to start
+  if free space is under half of the downloaded bytes it has to verify, warns under 64 GiB
+  free and stops cleanly under 16 GiB.
+- `--from-block N` verifies only the chunks from that block on and neither links nor accepts
+  the range: a quick check of one part of the chain (for example the first blocks after
+  Bedrock) without waiting for everything before it. The chunks it verifies are kept;
+  `verify` without the flag must still run before `load`.
 
 ### 3.3 `load`
 

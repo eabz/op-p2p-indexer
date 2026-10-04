@@ -29,7 +29,7 @@ use tracing::{debug, info, warn};
 
 use crate::progress::{self, Rate};
 use crate::source::{Encoding, HyperSync, Meters, SourceError};
-use crate::state::{Chunk, Plan, State, write_atomic};
+use crate::state::{Chunk, LOW_SPACE_BYTES, MIN_SPACE_BYTES, Plan, State, write_atomic};
 
 /// Attempts per chunk before the step stops.
 const MAX_ATTEMPTS: u32 = 6;
@@ -41,10 +41,11 @@ const BACKOFF_CAP: Duration = Duration::from_secs(20);
 /// hands over at once, tens of kilobytes; with the decoder that finds the cursor a request
 /// in flight holds about a megabyte.
 const WRITE_QUEUE_PIECES: usize = 16;
-/// Free space below which a warning is logged with the progress.
-const LOW_SPACE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
-/// Free space below which no new chunk is started: the chunks in flight still have to fit.
-const MIN_SPACE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+/// Open files a request in flight needs: its connection and its chunk file.
+const FILES_PER_REQUEST: u64 = 2;
+/// Open files the process needs besides: the standard streams, the lock, the directories
+/// being listed, the L1 lookup's connections.
+const FILES_BESIDES: u64 = 64;
 
 /// Why a chunk was not downloaded.
 #[derive(Debug, thiserror::Error)]
@@ -57,6 +58,70 @@ enum DownloadError {
     Io(#[from] io::Error),
     #[error("write task failed: {0}")]
     Task(#[from] JoinError),
+}
+
+/// Makes sure the process may hold the files `requests` requests in flight need, raising its
+/// soft limit up to the hard one if it has to.
+///
+/// # Errors
+///
+/// Returns an error, with the command that raises the limit, if the hard limit is too low
+/// for `requests`.
+pub(crate) fn ensure_open_files(requests: u64) -> eyre::Result<()> {
+    #[cfg(unix)]
+    {
+        use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+        let needed = requests
+            .saturating_mul(FILES_PER_REQUEST)
+            .saturating_add(FILES_BESIDES);
+        let limit = getrlimit(Resource::Nofile);
+        if limit.current.is_none_or(|current| current >= needed) {
+            return Ok(());
+        }
+        eyre::ensure!(
+            limit.maximum.is_none_or(|maximum| maximum >= needed),
+            "--requests {requests} needs about {needed} open files and this shell allows {}: \
+             run `ulimit -n {needed}` first, or lower --requests",
+            limit.maximum.unwrap_or_default()
+        );
+        setrlimit(
+            Resource::Nofile,
+            Rlimit {
+                current: Some(needed),
+                maximum: limit.maximum,
+            },
+        )
+        .wrap_err_with(|| {
+            format!("failed to raise the open-files limit: run `ulimit -n {needed}` first")
+        })?;
+        info!(open_files = needed, "raised the open-files limit");
+    }
+    Ok(())
+}
+
+impl DownloadError {
+    /// Whether another attempt at the chunk may succeed: the source says so, or the process
+    /// or the system had no file to give for the chunk just then.
+    fn may_pass(&self) -> bool {
+        match self {
+            Self::Source(err) => err.is_retryable(),
+            Self::Io(err) => {
+                #[cfg(unix)]
+                {
+                    use rustix::io::Errno;
+                    let code = err.raw_os_error();
+                    code == Some(Errno::MFILE.raw_os_error())
+                        || code == Some(Errno::NFILE.raw_os_error())
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = err;
+                    false
+                }
+            }
+            Self::NoProgress { .. } | Self::Task(_) => false,
+        }
+    }
 }
 
 /// Downloads the missing chunks of `plan` from `source`, `requests` at a time, until all are
@@ -83,7 +148,7 @@ pub(crate) async fn run(
         .await?
     };
     let meters = Arc::new(Meters::default());
-    let mut done = Progress::new(&missing, Arc::clone(&meters));
+    let mut done = Progress::new(&missing, plan.chain.bedrock_block, Arc::clone(&meters));
     info!(
         chunks = done.total_chunks,
         blocks = done.total_blocks,
@@ -157,6 +222,46 @@ pub(crate) async fn run(
     }
 }
 
+/// The blocks of one era of the chain, before the Bedrock block or from it on: they differ
+/// in size by an order of magnitude, so what is left is estimated for each on its own.
+#[derive(Debug)]
+struct Era {
+    /// Blocks still to download.
+    left_blocks: u64,
+    blocks: u64,
+    /// Bytes of the chunk files written.
+    bytes: u64,
+    blocks_rate: Rate,
+    bytes_rate: Rate,
+}
+
+impl Era {
+    fn new() -> Self {
+        Self {
+            left_blocks: 0,
+            blocks: 0,
+            bytes: 0,
+            blocks_rate: Rate::new(),
+            bytes_rate: Rate::new(),
+        }
+    }
+
+    /// Bytes still to download, from the bytes per block of the last minute (blocks grow
+    /// within an era too), else of the run; `None` if blocks are left and none was downloaded
+    /// yet, so their size is not known.
+    fn left_bytes(&mut self) -> Option<u64> {
+        let blocks_per_sec = self.blocks_rate.per_sec(self.blocks);
+        let bytes_per_sec = self.bytes_rate.per_sec(self.bytes);
+        if self.left_blocks == 0 {
+            return Some(0);
+        }
+        let bytes_per_block = bytes_per_sec
+            .checked_div(blocks_per_sec)
+            .or_else(|| self.bytes.checked_div(self.blocks))?;
+        Some(self.left_blocks.saturating_mul(bytes_per_block))
+    }
+}
+
 /// What the step has done so far, for the progress lines and the summary.
 #[derive(Debug)]
 struct Progress {
@@ -164,9 +269,10 @@ struct Progress {
     total_chunks: usize,
     total_blocks: u64,
     chunks: usize,
-    blocks: u64,
-    /// Bytes of the chunk files written.
-    disk_bytes: u64,
+    /// First block of the second era.
+    bedrock_block: u64,
+    /// Before the Bedrock block, and from it on.
+    eras: [Era; 2],
     /// What the requests in flight count as it happens.
     meters: Arc<Meters>,
     blocks_rate: Rate,
@@ -176,47 +282,79 @@ struct Progress {
 }
 
 impl Progress {
-    fn new(missing: &[Chunk], meters: Arc<Meters>) -> Self {
-        Self {
+    fn new(missing: &[Chunk], bedrock_block: u64, meters: Arc<Meters>) -> Self {
+        let mut progress = Self {
             started: Instant::now(),
             total_chunks: missing.len(),
             total_blocks: missing.iter().map(|chunk| chunk.blocks()).sum(),
             chunks: 0,
-            blocks: 0,
-            disk_bytes: 0,
+            bedrock_block,
+            eras: [Era::new(), Era::new()],
             meters,
             blocks_rate: Rate::new(),
             wire_rate: Rate::new(),
             decode_rate: Rate::new(),
+        };
+        for chunk in missing {
+            let era = progress.era(*chunk);
+            era.left_blocks = era.left_blocks.saturating_add(chunk.blocks());
+        }
+        progress
+    }
+
+    /// The era of `chunk`; a chunk never crosses the Bedrock block.
+    const fn era(&mut self, chunk: Chunk) -> &mut Era {
+        let [legacy, bedrock] = &mut self.eras;
+        if chunk.from < self.bedrock_block {
+            legacy
+        } else {
+            bedrock
         }
     }
 
     const fn chunk_done(&mut self, chunk: Chunk, disk_bytes: u64) {
         self.chunks = self.chunks.saturating_add(1);
-        self.blocks = self.blocks.saturating_add(chunk.blocks());
-        self.disk_bytes = self.disk_bytes.saturating_add(disk_bytes);
+        let era = self.era(chunk);
+        era.left_blocks = era.left_blocks.saturating_sub(chunk.blocks());
+        era.blocks = era.blocks.saturating_add(chunk.blocks());
+        era.bytes = era.bytes.saturating_add(disk_bytes);
     }
 
-    /// Logs one progress line. The speeds are those of the last minute. `decode_cpu_percent`
-    /// is the processor time spent decoding answers to find their cursors, in percent of one
-    /// core: near 100 times the number of cores, the processor is the limit, not the line.
+    fn blocks(&self) -> u64 {
+        self.eras.iter().map(|era| era.blocks).sum()
+    }
+
+    fn disk_bytes(&self) -> u64 {
+        self.eras.iter().map(|era| era.bytes).sum()
+    }
+
+    /// Logs one progress line. The speeds are those of the last minute. `bytes_left` and
+    /// `secs_left` are estimated from the bytes per block of each era and the speed on the
+    /// wire, and are absent while an era with blocks left has not been sampled.
+    /// `decode_cpu_percent` is the processor time spent decoding answers to find their
+    /// cursors, in percent of one core: near 100 times the number of cores, the processor is
+    /// the limit, not the line.
     fn log(&mut self, in_flight: usize, free_bytes: Option<u64>) {
-        let blocks_per_sec = self.blocks_rate.per_sec(self.blocks);
+        let blocks = self.blocks();
         let wire_bytes = self.meters.wire_bytes.load(Ordering::Relaxed);
+        let wire_bytes_per_sec = self.wire_rate.per_sec(wire_bytes);
         let decode_micros = self.meters.decode_nanos.load(Ordering::Relaxed) / 1000;
+        let [legacy, bedrock] = &mut self.eras;
+        let bytes_left = legacy
+            .left_bytes()
+            .zip(bedrock.left_bytes())
+            .map(|(legacy, bedrock)| legacy.saturating_add(bedrock));
         info!(
             chunks = self.chunks,
             of = self.total_chunks,
-            blocks = self.blocks,
-            blocks_per_sec,
-            secs_left = self
-                .total_blocks
-                .saturating_sub(self.blocks)
-                .checked_div(blocks_per_sec),
+            blocks,
+            blocks_per_sec = self.blocks_rate.per_sec(blocks),
+            bytes_left,
+            secs_left = bytes_left.and_then(|bytes| bytes.checked_div(wire_bytes_per_sec)),
             in_flight,
-            wire_bytes_per_sec = self.wire_rate.per_sec(wire_bytes),
+            wire_bytes_per_sec,
             decode_cpu_percent = self.decode_rate.per_sec(decode_micros) / 10_000,
-            disk_bytes = self.disk_bytes,
+            disk_bytes = self.disk_bytes(),
             free_bytes,
             "downloading"
         );
@@ -232,11 +370,11 @@ impl Progress {
         info!(
             chunks = self.chunks,
             missing,
-            blocks = self.blocks,
+            blocks = self.blocks(),
             wire_bytes = self.meters.wire_bytes.load(Ordering::Relaxed),
-            disk_bytes = self.disk_bytes,
-            disk_bytes_per_block = self.disk_bytes.checked_div(self.blocks),
-            blocks_per_sec = self.blocks / secs,
+            disk_bytes = self.disk_bytes(),
+            disk_bytes_per_block = self.disk_bytes().checked_div(self.blocks()),
+            blocks_per_sec = self.blocks() / secs,
             secs,
             "download ended"
         );
@@ -256,7 +394,7 @@ async fn fetch_chunk(
     let mut attempt = 1;
     loop {
         match attempt_chunk(source, meters, chunk, &path).await {
-            Err(DownloadError::Source(err)) if err.is_retryable() && attempt < MAX_ATTEMPTS => {
+            Err(err) if err.may_pass() && attempt < MAX_ATTEMPTS => {
                 // Up to half of the wait is random, so parallel requests do not retry together.
                 let wait = backoff.mul_f64(1.0 - fastrand::f64() / 2.0);
                 let (from, to) = (chunk.from, chunk.to);

@@ -31,12 +31,12 @@ use alloy_rlp::Decodable;
 use tokio::task::JoinSet;
 use tokio::time::{MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::chunk::{self, Link};
 use crate::progress::{self, Rate};
 use crate::rows::RowsError;
-use crate::state::{Anchor, Chunk, Plan, State, VerifiedRange};
+use crate::state::{Anchor, Chunk, LOW_SPACE_BYTES, MIN_SPACE_BYTES, Plan, State, VerifiedRange};
 
 /// Compressed size of the chunks verified at once, whatever the number of threads; one chunk
 /// is always allowed. A chunk takes about twenty times its compressed size while it is
@@ -118,8 +118,12 @@ struct Todo {
     chunks: Vec<(Chunk, u64)>,
     /// Blocks in them.
     blocks: u64,
+    /// Bytes of their downloaded files.
+    raw_bytes: u64,
     already_verified: usize,
     not_downloaded: usize,
+    /// Free space on the state directory's disk, where the system tells.
+    free_bytes: Option<u64>,
 }
 
 /// Verifies every downloaded chunk of `plan` that is not verified yet, `threads` at a time,
@@ -127,29 +131,26 @@ struct Todo {
 /// accepted. The record of an earlier run is removed first, so it exists only while the range
 /// on disk is one `verify` accepted.
 ///
+/// With `from_block`, only the chunks from that block on are verified and nothing is linked
+/// or accepted: a check of one part of the chain.
+///
 /// # Errors
 ///
 /// Returns an error naming the block and the check if a chunk fails, and an error if the
-/// range is not verified completely when the step ends (chunks not downloaded, cancelled, or
-/// a broken link).
+/// range is not verified completely when the step ends (chunks not downloaded, cancelled, the
+/// disk nearly full, or a broken link).
 pub(crate) async fn run(
     state: &State,
     plan: &Plan,
     threads: usize,
+    from_block: Option<u64>,
     cancel: &CancellationToken,
 ) -> eyre::Result<()> {
     let todo = {
         let (state, plan) = (state.clone(), *plan);
-        tokio::task::spawn_blocking(move || todo(&state, &plan)).await??
+        tokio::task::spawn_blocking(move || todo(&state, &plan, from_block)).await??
     };
-    info!(
-        chunks = todo.chunks.len(),
-        blocks = todo.blocks,
-        already_verified = todo.already_verified,
-        not_downloaded = todo.not_downloaded,
-        threads,
-        "verify starting"
-    );
+    announce(&todo, threads, from_block)?;
     let forks = Forks {
         regolith: plan.chain.regolith_time,
         canyon: plan.chain.canyon_time,
@@ -184,7 +185,7 @@ pub(crate) async fn run(
             finished = tasks.join_next() => match finished {
                 Some(Ok((_, bytes, Ok(verified)))) => {
                     in_flight_bytes = in_flight_bytes.saturating_sub(bytes);
-                    progress.chunk_done(verified);
+                    progress.chunk_done(verified, bytes);
                 }
                 Some(Ok((chunk, bytes, Err(err)))) => {
                     in_flight_bytes = in_flight_bytes.saturating_sub(bytes);
@@ -202,29 +203,83 @@ pub(crate) async fn run(
                 }
                 None => break,
             },
-            _ = tick.tick() => progress.log(tasks.len()),
+            _ = tick.tick() => {
+                let disk = state.clone();
+                let free = tokio::task::spawn_blocking(move || disk.free_bytes()).await??;
+                progress.log(tasks.len(), free);
+                if free.is_some_and(|free| free < MIN_SPACE_BYTES) {
+                    failure.get_or_insert_with(|| {
+                        format!(
+                            "less than {} GiB free on the state directory's disk",
+                            MIN_SPACE_BYTES >> 30
+                        )
+                    });
+                }
+            }
         }
     }
     progress.summary();
     if let Some(failure) = failure {
         eyre::bail!("verification failed: {failure}");
     }
+    if let Some(from_block) = from_block {
+        eyre::ensure!(
+            !cancel.is_cancelled(),
+            "stopped before the chunks were verified"
+        );
+        info!(
+            from_block,
+            "the chunks from that block on verify; the range is NOT accepted: run `verify` \
+             without --from-block before `load`"
+        );
+        return Ok(());
+    }
 
     let (state, plan) = (state.clone(), *plan);
     tokio::task::spawn_blocking(move || accept(&state, &plan)).await?
 }
 
+/// Logs what the run will do, and refuses it if the verified chunks clearly cannot fit on
+/// the disk.
+fn announce(todo: &Todo, threads: usize, from_block: Option<u64>) -> eyre::Result<()> {
+    info!(
+        chunks = todo.chunks.len(),
+        blocks = todo.blocks,
+        raw_bytes = todo.raw_bytes,
+        already_verified = todo.already_verified,
+        not_downloaded = todo.not_downloaded,
+        free_bytes = todo.free_bytes,
+        from_block,
+        threads,
+        "verify starting"
+    );
+    // A verified chunk is about as large as its downloaded one; half of that is the least
+    // that could do.
+    eyre::ensure!(
+        todo.free_bytes
+            .is_none_or(|free| free >= todo.raw_bytes / 2),
+        "the verified chunks will not fit: {} bytes of downloaded chunks to verify, {} bytes \
+         free on the state directory's disk",
+        todo.raw_bytes,
+        todo.free_bytes.unwrap_or_default()
+    );
+    Ok(())
+}
+
 /// Removes the record of an earlier run and lists what this one has to verify. Blocking.
-fn todo(state: &State, plan: &Plan) -> io::Result<Todo> {
+fn todo(state: &State, plan: &Plan, from_block: Option<u64>) -> io::Result<Todo> {
     // Whatever an earlier run accepted is not accepted again until this one ends well.
     state.clear_verified()?;
     let mut todo = Todo {
         chunks: Vec::new(),
         blocks: 0,
+        raw_bytes: 0,
         already_verified: 0,
         not_downloaded: 0,
+        free_bytes: state.free_bytes()?,
     };
-    for chunk in plan.chunks() {
+    let from_block = from_block.unwrap_or_default();
+    for chunk in plan.chunks().filter(|chunk| chunk.to > from_block) {
         if state.verified_path(chunk).exists() {
             todo.already_verified = todo.already_verified.saturating_add(1);
             continue;
@@ -232,6 +287,7 @@ fn todo(state: &State, plan: &Plan) -> io::Result<Todo> {
         match state.raw_path(chunk).metadata() {
             Ok(file) => {
                 todo.blocks = todo.blocks.saturating_add(chunk.blocks());
+                todo.raw_bytes = todo.raw_bytes.saturating_add(file.len());
                 todo.chunks.push((chunk, file.len()));
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -248,11 +304,15 @@ fn todo(state: &State, plan: &Plan) -> io::Result<Todo> {
 struct Progress {
     started: Instant,
     total_chunks: usize,
-    total_blocks: u64,
+    /// Bytes of the downloaded chunks to verify, and of those verified so far: the work
+    /// that scales, which the time left is estimated from.
+    total_raw_bytes: u64,
+    raw_bytes: u64,
     chunks: usize,
     done: Stats,
     blocks_rate: Rate,
     transactions_rate: Rate,
+    raw_rate: Rate,
 }
 
 impl Progress {
@@ -260,16 +320,19 @@ impl Progress {
         Self {
             started: Instant::now(),
             total_chunks: todo.chunks.len(),
-            total_blocks: todo.blocks,
+            total_raw_bytes: todo.raw_bytes,
+            raw_bytes: 0,
             chunks: 0,
             done: Stats::default(),
             blocks_rate: Rate::new(),
             transactions_rate: Rate::new(),
+            raw_rate: Rate::new(),
         }
     }
 
-    const fn chunk_done(&mut self, chunk: Stats) {
+    const fn chunk_done(&mut self, chunk: Stats, raw_bytes: u64) {
         self.chunks = self.chunks.saturating_add(1);
+        self.raw_bytes = self.raw_bytes.saturating_add(raw_bytes);
         self.done.blocks = self.done.blocks.saturating_add(chunk.blocks);
         self.done.transactions = self.done.transactions.saturating_add(chunk.transactions);
         self.done.zero_signatures = self
@@ -279,23 +342,31 @@ impl Progress {
         self.done.disk_bytes = self.done.disk_bytes.saturating_add(chunk.disk_bytes);
     }
 
-    fn log(&mut self, busy_threads: usize) {
-        let blocks_per_sec = self.blocks_rate.per_sec(self.done.blocks);
+    /// Logs one progress line. The time left is the downloaded bytes still to verify over
+    /// those verified per second in the last minute: bytes, unlike blocks, cost about the
+    /// same everywhere in the chain.
+    fn log(&mut self, busy_threads: usize, free_bytes: Option<u64>) {
+        let raw_bytes_per_sec = self.raw_rate.per_sec(self.raw_bytes);
         info!(
             chunks = self.chunks,
             of = self.total_chunks,
             blocks = self.done.blocks,
             transactions = self.done.transactions,
-            blocks_per_sec,
+            blocks_per_sec = self.blocks_rate.per_sec(self.done.blocks),
             transactions_per_sec = self.transactions_rate.per_sec(self.done.transactions),
+            raw_bytes_per_sec,
             secs_left = self
-                .total_blocks
-                .saturating_sub(self.done.blocks)
-                .checked_div(blocks_per_sec),
+                .total_raw_bytes
+                .saturating_sub(self.raw_bytes)
+                .checked_div(raw_bytes_per_sec),
             busy_threads,
             disk_bytes = self.done.disk_bytes,
+            free_bytes,
             "verifying"
         );
+        if free_bytes.is_some_and(|free| free < LOW_SPACE_BYTES) {
+            warn!(free_bytes, "the state directory's disk is running low");
+        }
     }
 
     fn summary(&self) {

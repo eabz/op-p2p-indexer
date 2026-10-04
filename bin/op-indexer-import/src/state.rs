@@ -34,6 +34,11 @@ use crate::game::GameAnchor;
 /// version is refused.
 const LAYOUT_VERSION: u32 = 1;
 
+/// Free space below which a step warns with its progress.
+pub(crate) const LOW_SPACE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+/// Free space below which a step starts no new chunk: the chunks in flight still have to fit.
+pub(crate) const MIN_SPACE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
 /// Blocks `from..to` (`to` excluded): one file per step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Chunk {

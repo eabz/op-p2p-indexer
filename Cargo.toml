@@ -114,8 +114,9 @@ clap = { version = "4", default-features = false, features = ["std", "derive", "
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 # Decoding of gzip answers when the service does not send zstd (already in the tree).
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
-# Free space of the state directory's filesystem (already in the tree; std has no call for it).
-rustix = { version = "1", default-features = false, features = ["std", "fs"] }
+# Free space of the state directory's filesystem and the open-files limit (already in the
+# tree; std has no call for either).
+rustix = { version = "1", default-features = false, features = ["std", "fs", "process"] }
 # Compression of the downloaded and verified chunks on disk (already in the tree).
 zstd = { version = "0.13", default-features = false }
 

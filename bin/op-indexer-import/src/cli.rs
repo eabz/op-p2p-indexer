@@ -128,6 +128,11 @@ pub(crate) struct VerifyArgs {
     /// Chunks verified at once (default: one per CPU).
     #[arg(long, env = "OP_INDEXER_IMPORT_VERIFY_THREADS")]
     pub(crate) verify_threads: Option<usize>,
+    /// Verify only the chunks from this block on, and do not link or accept the range: a
+    /// quick check of one part of the chain. The chunks it verifies are kept; `verify`
+    /// without this flag must still run before `load`.
+    #[arg(long, env = "OP_INDEXER_IMPORT_VERIFY_FROM_BLOCK")]
+    pub(crate) from_block: Option<u64>,
 }
 
 /// Settings of `run`: those of every step.

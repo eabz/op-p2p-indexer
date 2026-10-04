@@ -206,6 +206,7 @@ async fn download(
     let plan = plan(args, state).await?;
     let source = HyperSync::new(&args.endpoint, &args.api_token)?;
     let requests = usize::try_from(args.requests).wrap_err("--requests is too large")?;
+    download::ensure_open_files(args.requests)?;
     download::run(&source, state, &plan, requests, cancel).await?;
     Ok(plan)
 }
@@ -221,7 +222,7 @@ async fn verify(
         .or_else(|| std::thread::available_parallelism().ok().map(usize::from))
         .unwrap_or(1)
         .max(1);
-    verify::run(state, plan, threads, cancel).await
+    verify::run(state, plan, threads, args.from_block, cancel).await
 }
 
 /// Cancels `cancel` on Ctrl-C or, on Unix, SIGTERM, so the running step stops between chunks.
