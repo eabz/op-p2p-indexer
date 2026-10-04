@@ -202,9 +202,37 @@ pub(crate) struct DownloadArgs {
         default_value_t = OP_MAINNET_DISPUTE_GAME_FACTORY
     )]
     pub(crate) dispute_game_factory: Address,
-    /// The game type whose games are used; it must be a fault dispute game.
-    #[arg(long, env = "OP_INDEXER_IMPORT_GAME_TYPE", default_value_t = 0)]
-    pub(crate) game_type: u32,
+    /// Use only dispute games of this type (default: the newest game of any type; OP Mainnet
+    /// creates type 9 as of 2026-10).
+    #[arg(long, env = "OP_INDEXER_IMPORT_GAME_TYPE")]
+    pub(crate) game_type: Option<u32>,
+    /// The chain's id, to find its claim in a dispute game about several chains (default: OP
+    /// Mainnet).
+    #[arg(long, env = "OP_INDEXER_IMPORT_L2_CHAIN_ID", default_value_t = 10)]
+    pub(crate) l2_chain_id: u64,
+    /// A block since which the chain's blocks are evenly spaced, to find the block a dispute
+    /// game names by its time (default: OP Mainnet's Bedrock block).
+    #[arg(
+        long,
+        env = "OP_INDEXER_IMPORT_L2_GENESIS_BLOCK",
+        default_value_t = 105_235_063
+    )]
+    pub(crate) l2_genesis_block: u64,
+    /// The timestamp of that block, in Unix seconds (default: OP Mainnet's Bedrock block).
+    #[arg(
+        long,
+        env = "OP_INDEXER_IMPORT_L2_GENESIS_TIME",
+        default_value_t = 1_686_068_903
+    )]
+    pub(crate) l2_genesis_time: u64,
+    /// Seconds between the chain's blocks (default: OP Mainnet).
+    #[arg(
+        long,
+        env = "OP_INDEXER_IMPORT_L2_BLOCK_TIME",
+        default_value_t = 2,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub(crate) l2_block_time: u64,
     /// Use only a game resolved in the proposer's favour, which is days older than the newest
     /// game.
     #[arg(long, env = "OP_INDEXER_IMPORT_RESOLVED_ONLY")]

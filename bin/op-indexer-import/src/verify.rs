@@ -299,7 +299,12 @@ fn check_top(state: &State, plan: &Plan, chunk: Chunk, link: Link) -> io::Result
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
         .ok_or(io::ErrorKind::UnexpectedEof)?;
     Ok(game
-        .check(link.last_hash, header.state_root, header.withdrawals_root)
+        .check(
+            link.last_hash,
+            header.timestamp,
+            header.state_root,
+            header.withdrawals_root,
+        )
         .err()
         .map(|err| err.to_string()))
 }

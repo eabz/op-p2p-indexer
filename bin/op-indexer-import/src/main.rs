@@ -43,7 +43,7 @@ use crate::cli::{
     Cli, Command, DownloadArgs, OP_MAINNET_LAST_LEGACY_BLOCK, OP_MAINNET_LAST_LEGACY_HASH,
     VerifyArgs,
 };
-use crate::game::{GameAnchor, GameConfig};
+use crate::game::{GameAnchor, GameConfig, L2Chain};
 use crate::source::HyperSync;
 use crate::state::{Anchor, Forks, Plan, State};
 
@@ -143,6 +143,12 @@ async fn top(cli: &Cli, state: &State) -> eyre::Result<(u64, Anchor)> {
             factory: args.dispute_game_factory,
             game_type: args.game_type,
             resolved_only: args.resolved_only,
+            l2: L2Chain {
+                chain_id: args.l2_chain_id,
+                genesis_number: args.l2_genesis_block,
+                genesis_time: args.l2_genesis_time,
+                block_time_secs: args.l2_block_time,
+            },
         };
         let game = game::newest_game(&l1, &config).await.wrap_err_with(|| {
             format!(
