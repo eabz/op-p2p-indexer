@@ -2,10 +2,12 @@
 //!
 //! Does not validate what a block contains: the caller hands in bytes it has verified.
 
-use alloy_primitives::{BlockHash, Bytes};
+use alloy_primitives::{Address, BlockHash, Bytes};
 use op_indexer_primitives::BlockRef;
 
-use super::{Failure, Tables, compress_values, decode_number, end_ref, extends, record_usage};
+use super::{
+    Failure, Tables, compress_values, decode_number, encode_senders, end_ref, extends, record_usage,
+};
 use crate::{StorageError, Store, metrics};
 
 /// Most encoded bytes written in one batch by an append of many blocks (a single larger block
@@ -23,6 +25,8 @@ pub(in crate::archive_store) struct Entry {
     pub(in crate::archive_store) header: Bytes,
     pub(in crate::archive_store) body: Bytes,
     pub(in crate::archive_store) receipts: Option<Bytes>,
+    /// One per transaction, checked by the caller.
+    pub(in crate::archive_store) senders: Vec<Address>,
 }
 
 impl Entry {
@@ -34,7 +38,7 @@ impl Entry {
     /// The size of the RLP this block adds to a batch.
     fn encoded_len(&self) -> usize {
         let receipts = self.receipts.as_ref().map_or(0, |receipts| receipts.len());
-        self.header.len() + self.body.len() + receipts
+        self.header.len() + self.body.len() + receipts + self.senders.len() * super::ADDRESS_LEN
     }
 }
 
@@ -144,6 +148,7 @@ fn append_chunk(tables: &Tables, chunk: &[Entry]) -> Result<(), Failure> {
         if let Some(receipts) = receipts {
             batch.insert(&tables.receipts, key, receipts);
         }
+        batch.insert(&tables.senders, key, encode_senders(&block.senders));
         batch.insert(&tables.numbers, block.block.hash.0, key);
     }
     batch.commit()?;

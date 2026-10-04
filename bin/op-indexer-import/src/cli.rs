@@ -13,8 +13,7 @@ use clap::{Args, Parser, Subcommand};
 use crate::load::LoadArgs;
 
 /// Downloads a chain's blocks from an external archive, verifies every block, and loads
-/// them into the local block archive the node serves from. No database is needed: ClickHouse
-/// is optional, written only with `--clickhouse-url`.
+/// them into the block archive the node serves from. No database is needed.
 ///
 /// Run `download`, then `verify`, then `load`, or `run` for all three. Every step keeps its
 /// progress in the state directory and can be stopped and started again: nothing completed
@@ -48,11 +47,12 @@ pub(crate) enum Command {
     /// disk is nearly full.
     Download(DownloadArgs),
     /// Check every downloaded chunk offline: header hashes and parent links up to the anchor,
-    /// transactions roots and receipts roots. Senders are not checked.
+    /// transactions roots and receipts roots. Senders are checked by `load`.
     Verify(VerifyCommand),
-    /// Append the verified range to the local block archive the node serves from. Needs the
-    /// whole range accepted by `verify`, and no database: ClickHouse is written too only with
-    /// `--clickhouse-url`. The indexer must not be running.
+    /// Recover every transaction's sender from its signature, check it against the verified
+    /// chunk, and append the verified range to the block archive the node serves from. Stops at
+    /// the first sender that differs. Needs the whole range accepted by `verify`. The indexer
+    /// must not be running.
     Load(LoadArgs),
     /// `download`, `verify`, then `load`, stopping at the first step that cannot finish.
     Run(RunArgs),
@@ -154,8 +154,8 @@ pub(crate) struct RunArgs {
     pub(crate) load: LoadArgs,
 }
 
-/// A credential given on the command line: the archive service's API token, a database
-/// password. `Debug` never shows it.
+/// A credential given on the command line: the archive service's API token. `Debug` never
+/// shows it.
 #[derive(Clone)]
 pub(crate) struct Secret(String);
 

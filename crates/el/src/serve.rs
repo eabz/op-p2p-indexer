@@ -33,7 +33,7 @@ mod session;
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy_primitives::Bytes;
+use alloy_primitives::{BlockNumber, Bytes};
 use alloy_rlp::{Decodable, Encodable, Header};
 use op_alloy_consensus::{OpReceipt, OpReceiptEnvelope};
 use op_indexer_primitives::{BlockRead, BlockStart, ItemConvert, ReadLimits};
@@ -76,6 +76,8 @@ const RANGE_REFRESH: Duration = Duration::from_secs(10);
 #[derive(Debug)]
 struct Request {
     kind: ServeKind,
+    /// Blocks below this are not served to the peer: answered as not held.
+    lowest: BlockNumber,
     id: u64,
     /// The request without its message id byte.
     body: Bytes,
@@ -86,21 +88,20 @@ struct Request {
 /// The task that answers requests from the provider and keeps the held range current.
 #[derive(Debug)]
 pub(crate) struct Server<P> {
-    /// `None` when the node holds no blocks to serve: every request is answered empty.
-    provider: Option<Arc<P>>,
+    provider: Arc<P>,
     requests: mpsc::Receiver<Request>,
     range: watch::Sender<Option<HeldRange>>,
     /// Whether what is advertised has been logged once.
     logged: bool,
 }
 
-/// Builds the server over `provider` (`None`: nothing to serve) and what sessions use to
-/// reach it. The held range is unknown (nothing held) until the server runs.
-pub(crate) fn new<P: BlockProvider>(provider: Option<P>) -> (Server<P>, Serving) {
+/// Builds the server over `provider` and what sessions use to reach it. The held range is
+/// unknown (nothing held) until the server runs.
+pub(crate) fn new<P: BlockProvider>(provider: P) -> (Server<P>, Serving) {
     let (requests_tx, requests_rx) = mpsc::channel(MAX_QUEUED);
     let (range_tx, range_rx) = watch::channel(None);
     let server = Server {
-        provider: provider.map(Arc::new),
+        provider: Arc::new(provider),
         requests: requests_rx,
         range: range_tx,
         logged: false,
@@ -146,7 +147,7 @@ impl<P: BlockProvider> Server<P> {
                 request = self.requests.recv(), if answering.len() < MAX_CONCURRENT => {
                     // Closed: every session and the context are gone.
                     let Some(request) = request else { return Ok(()) };
-                    answering.spawn(answer(self.provider.clone(), request).in_current_span());
+                    answering.spawn(answer(Arc::clone(&self.provider), request).in_current_span());
                 }
             }
         }
@@ -154,10 +155,7 @@ impl<P: BlockProvider> Server<P> {
 
     /// Reads the held range from the provider. A failed read keeps the last one.
     async fn refresh_range(&mut self) {
-        let held = match &self.provider {
-            Some(provider) => provider.range().await,
-            None => Ok(None),
-        };
+        let held = self.provider.range().await;
         match held {
             Ok(held) => {
                 let before = self.range.send_replace(held);
@@ -205,17 +203,15 @@ const fn response_id(kind: ServeKind) -> u8 {
 }
 
 /// Answers one request from `provider` and hands the answer to its session.
-async fn answer<P: BlockProvider>(provider: Option<Arc<P>>, request: Request) {
+async fn answer<P: BlockProvider>(provider: Arc<P>, request: Request) {
     let Request {
         kind,
+        lowest,
         id,
         body,
         answer,
     } = request;
-    let items = match provider {
-        Some(provider) => gather(&*provider, kind, &body).await,
-        None => Ok(Vec::new()),
-    };
+    let items = gather(&*provider, kind, lowest, &body).await;
     let (items, outcome) = match items {
         Ok(items) if items.is_empty() => (items, ServeOutcome::Empty),
         Ok(items) => (items, ServeOutcome::Answered),
@@ -238,16 +234,18 @@ async fn answer<P: BlockProvider>(provider: Option<Arc<P>>, request: Request) {
 }
 
 /// Reads the items answering the request in `body`: one call of the provider, which applies
-/// the limits and ends the run at the first block that is not held (a response is a run of
-/// blocks, not a selection).
+/// the limits and ends the run at the first block that is not held, or is below `lowest` (a
+/// response is a run of blocks, not a selection).
 async fn gather<P: BlockProvider>(
     provider: &P,
     kind: ServeKind,
+    lowest: BlockNumber,
     mut body: &[u8],
 ) -> Result<Vec<Bytes>, Fault<P::Error>> {
     let mut limits = ReadLimits {
         items: MAX_ITEMS,
         bytes: SOFT_RESPONSE_BYTES,
+        lowest,
     };
     let (read, convert): (BlockRead, Option<ItemConvert>) = match kind {
         ServeKind::Headers => {

@@ -21,11 +21,11 @@ use crate::session::SessionError;
 /// Base wait before dialing a peer again after a TCP failure, a timeout, a failed hello or
 /// status, or a session that ended for an ordinary reason. Full peers are retried sooner.
 pub(super) const REDIAL_INTERVAL: Duration = Duration::from_mins(5);
-/// Most dials started in any minute: one a second. It bounds what a flood of node records can
-/// make us dial. On a network with few peers every one of them waits at least
+/// Most dials started in any minute: one every two seconds. It bounds what a flood of node
+/// records can make us dial. On a network with few peers every one of them waits at least
 /// [`FULL_PEER_RETRY`], so it is never reached; on one with hundreds of candidates, most of
 /// them full, it is what decides how fast a free slot is found.
-const MAX_DIALS_PER_MINUTE: usize = 60;
+const MAX_DIALS_PER_MINUTE: usize = 30;
 /// The window [`MAX_DIALS_PER_MINUTE`] is counted over.
 const DIAL_WINDOW: Duration = Duration::from_secs(60);
 /// Shortest wait before the same peer is dialed again, and the wait after "too many peers" or
@@ -127,6 +127,7 @@ impl Schedule {
                 let candidate = Candidate {
                     peer_id: peer.id,
                     addr: peer.addr,
+                    indexer: peer.indexer,
                 };
                 let known = Known {
                     candidate,
@@ -188,11 +189,13 @@ impl Schedule {
 
     /// Picks up to `wanted` peers to dial now, fewer if [`MAX_DIALS_PER_MINUTE`] is used up,
     /// and counts them as dialed: none of them is due again before [`FULL_PEER_RETRY`].
-    /// `in_use` says whether a peer has a session or a dial in progress.
+    /// `in_use` says whether a peer has a session or a dial in progress; with
+    /// `indexers_only`, only op-p2p-indexers are picked.
     pub(super) fn take_due(
         &mut self,
         wanted: usize,
         in_use: impl Fn(&PeerId) -> bool,
+        indexers_only: bool,
     ) -> Vec<Candidate> {
         let now = Instant::now();
         while self
@@ -209,7 +212,12 @@ impl Schedule {
         let mut due: Vec<(bool, u32, u32, Instant, PeerId)> = self
             .known
             .iter()
-            .filter(|(id, known)| known.next_dial <= now && !in_use(id) && !self.is_banned(id))
+            .filter(|(id, known)| {
+                known.next_dial <= now
+                    && (known.candidate.indexer || !indexers_only)
+                    && !in_use(id)
+                    && !self.is_banned(id)
+            })
             .map(|(id, known)| {
                 let key = (!known.proven, known.failures, known.attempts);
                 (key.0, key.1, key.2, known.next_dial, *id)
@@ -250,11 +258,12 @@ impl Schedule {
     pub(super) fn dial_failed(&mut self, peer: PeerId, err: &SessionError) {
         // The outcome, the wait after a first failure, and whether failures in a row double it.
         let (outcome, base, grows) = match err {
-            // A full peer: its slots churn, so ask again soon, every time.
+            // A full peer: its slots churn, so ask again soon, but less often each time it is
+            // still full, so a full node is not asked every minute for ever.
             SessionError::Hello(Some(DisconnectReason::TooManyPeers))
             | SessionError::Status {
                 reason: Some(DisconnectReason::TooManyPeers),
-            } => (DialOutcome::TooManyPeers, FULL_PEER_RETRY, false),
+            } => (DialOutcome::TooManyPeers, FULL_PEER_RETRY, true),
             // How a full reth node refuses: the same, but back off if it keeps happening.
             SessionError::Ecies => (DialOutcome::HandshakeDropped, FULL_PEER_RETRY, true),
             SessionError::Tcp(_) => (DialOutcome::Unreachable, REDIAL_INTERVAL, true),

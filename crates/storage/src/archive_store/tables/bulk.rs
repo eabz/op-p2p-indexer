@@ -1,10 +1,10 @@
 //! The importer's bulk load: blocks prepared off the writer, written straight into new tables
 //! and blob files with fjall's ingestion, bypassing the journal and the memtables.
 //!
-//! Each keyspace takes its part of a list in one ingestion, all four at once on their own
+//! Each keyspace takes its part of a list in one ingestion, all five at once on their own
 //! threads. An ingestion is registered atomically, and durably, by its `finish`: its tables and
 //! blob files are synced before the keyspace's version that lists them is. `headers` is
-//! finished last, after the other three, and its last key is the archive's tip, so a crash
+//! finished last, after the other four, and its last key is the archive's tip, so a crash
 //! leaves the archive holding a contiguous prefix.
 //!
 //! The other keyspaces may then hold blocks of the unfinished list above the tip. Reads by
@@ -20,11 +20,11 @@ use std::panic::resume_unwind;
 use std::sync::mpsc;
 use std::thread;
 
-use alloy_primitives::BlockHash;
+use alloy_primitives::{Address, BlockHash};
 use fjall::{Keyspace, UserKey, UserValue};
 use op_indexer_primitives::BlockRef;
 
-use super::{Failure, Tables, compress_values, end_ref, extends, record_usage};
+use super::{Failure, Tables, compress_values, encode_senders, end_ref, extends, record_usage};
 use crate::{StorageError, Store, metrics};
 
 /// A block ready for [`FjallArchive::bulk_append`](crate::archive_store::FjallArchive::bulk_append):
@@ -37,16 +37,19 @@ pub(in crate::archive_store) struct Prepared {
     header: UserValue,
     body: UserValue,
     receipts: Option<UserValue>,
+    senders: UserValue,
 }
 
 impl Prepared {
-    /// Compresses the values of `block`, whose number, hash and parent are already known.
+    /// Compresses the values of `block`, whose number, hash and parent are already known, and
+    /// whose `senders` are one per transaction.
     pub(in crate::archive_store) fn new(
         block: BlockRef,
         parent_hash: BlockHash,
         header: &[u8],
         body: &[u8],
         receipts: Option<&[u8]>,
+        senders: &[Address],
     ) -> Result<Self, StorageError> {
         let (header, body, receipts) = compress_values(block.number, header, body, receipts)?;
         Ok(Self {
@@ -55,6 +58,7 @@ impl Prepared {
             header: UserValue::from(&header[..]),
             body: UserValue::from(&body[..]),
             receipts: receipts.map(|receipts| UserValue::from(&receipts[..])),
+            senders: UserValue::from(encode_senders(senders)),
         })
     }
 }
@@ -105,6 +109,7 @@ pub(in crate::archive_store) fn bulk_append(
         let others = [
             scope.spawn(|| ingest(&tables.bodies, by_number(|block| Some(&block.body)))),
             scope.spawn(|| ingest(&tables.receipts, by_number(|block| block.receipts.as_ref()))),
+            scope.spawn(|| ingest(&tables.senders, by_number(|block| Some(&block.senders)))),
             scope.spawn(|| {
                 // Hash order. Hashes are distinct (keccak), but a duplicate must not reach the
                 // ingestion, which requires strictly ascending keys.

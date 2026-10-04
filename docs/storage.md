@@ -6,8 +6,11 @@ Scope: the `storage` crate only, plus the shared types it needs in `primitives`.
 | Store | Holds | Why |
 |---|---|---|
 | **Redis** (unsafe store) | Unsafe blocks: live, not yet committed to L1. Decoded, readable by other services. | Small, changes shape on reorgs. |
-| **ClickHouse** (committed store) | Blocks committed to L1, and historical backfill. | Large, append-mostly, analytical queries. |
-| **fjall** (archive) | A window of committed blocks, or optionally all of them, in their consensus encoding. | Serving other nodes by number or hash without touching ClickHouse (section 9). |
+| **fjall** (archive, the committed store) | Every committed block (or a window of the newest) in its consensus encoding, with each transaction's sender, and the committed L1 heads. | Embedded, needs no service; serves peers and the stream by number or hash (section 9). |
+
+There was a third store, ClickHouse, for committed blocks as rows; it was removed on 2026-10-04
+when the node became a data source streamed over gRPC (see the roadmap). Sections 4 and 5.1
+say so; the numbering is kept.
 
 **Input.** Storage takes a block that is already decoded, with or without its receipts. (The
 type is named `DecodedBlock` from an earlier plan; receipts are now expected to come from
@@ -18,7 +21,7 @@ decode gossip payloads, execute transactions or know about L1. Whoever calls it 
 - the L1 safe and finalized heads, when known.
 
 **Out of scope here:** decoding gossip payloads, execution, the promotion loop that moves blocks
-from Redis to ClickHouse (that is `pipeline`). Storage provides the operations promotion needs.
+from Redis to the archive (that is `pipeline`). Storage provides the operations promotion needs.
 
 ## 1. Shared types (`crates/primitives`)
 
@@ -27,12 +30,15 @@ Use alloy and op-alloy types; do not redefine blocks, transactions or receipts.
 | Type | Meaning |
 |---|---|
 | `DecodedBlock` | `block: op_alloy_consensus::OpBlock`, `hash: BlockHash`, `senders: Vec<Address>` (one per transaction, recovered by the caller), `receipts: Option<Vec<OpReceiptEnvelope>>` (`None` until known; when present, one per transaction), `source: BlockSource`. |
-| `BlockSource { Gossip, L1, Import, Sync }` | Where the block came from: gossip, a block derived from L1, the importer, or range sync from execution peers. |
+| `BlockSource { Gossip, Sync }` | Where the block came from: gossip, or range sync from execution peers. (Imported blocks go straight to the archive and need none.) |
 | `BlockRef { number: BlockNumber, hash: BlockHash }` | A block identified by height and hash. Used for heads. |
 | `Reorg { common_ancestor: Option<BlockRef>, old_head: BlockRef, new_head: BlockRef, replaced: Vec<BlockHash> }` | Canonical entries were replaced or removed. `replaced` is newest first. `common_ancestor` is `None` when it is not known (the replaced range ends in a gap). `old_head == new_head` when only entries below the head changed. |
 | `UnsafeEvent { NewHead { head: BlockRef, gap: bool }, Reorg(Reorg), Filled(BlockRef), Receipts(BlockRef), Pruned { up_to: BlockRef } }` | What an unsafe-store write did. Also published to readers (section 3.3). |
 | `L1Heads { safe: Option<BlockRef>, finalized: Option<BlockRef> }` | `None` until the L1 side has published that head (no L1 configured, or no matching dispute game yet). |
-| `EncodedBlock { hash, header: Bytes, body: Bytes, receipts: Option<Bytes> }` | A block in its consensus encoding: the one input of the archive (section 9.2). `From<&DecodedBlock>` encodes a gossip block. |
+| `EncodedBlock { hash, header: Bytes, body: Bytes, receipts: Option<Bytes> }` | A block in its consensus encoding. `From<&DecodedBlock>` encodes a gossip block. |
+| `ArchivedBlock { encoded: EncodedBlock, senders: Vec<Address> }` | What the archive takes and gives back (section 9.2): the encoding and one sender per transaction. `From<&DecodedBlock>` for a promoted block. |
+| `ReadLimits { items, bytes, lowest }` | Where an archive read ends even if more is held; blocks below `lowest` count as not held. |
+| `ChainIdentity { chain_id, genesis_hash }` | The chain the archive (and the p2p node store) records and checks on open. |
 | `InsertOutcome { stored: bool, events: Vec<UnsafeEvent> }` | Result of an unsafe-store insert. `stored` is `false` for a block that was already stored or is at or below the safe head; `events` is then empty. |
 
 `UnsafeBlock` (a gossiped block, decoded and hash-checked by `p2p`, senders not yet recovered)
@@ -58,39 +64,19 @@ pub trait UnsafeStore {
     async fn set_l1_heads(&self, heads: L1Heads) -> Result<(), StorageError>;
 }
 
-pub trait CommittedStore {
-    /// Inserts blocks with their transactions, receipts and logs. Idempotent.
-    async fn insert(&self, blocks: &[DecodedBlock]) -> Result<(), StorageError>;
-    /// Deletes everything above `safe` (an L1 reorg moved the safe head back).
-    async fn rollback_to(&self, safe: BlockRef) -> Result<(), StorageError>;
-    async fn l1_heads(&self) -> Result<L1Heads, StorageError>;
-    async fn set_l1_heads(&self, heads: L1Heads) -> Result<(), StorageError>;
-}
 ```
 
-`ClickHouseStore` also has a bulk path for loading history, next to the live
-`CommittedStore::insert`: `bulk_rows(&[DecodedBlock]) -> BulkRows` builds the rows (CPU work,
-for a blocking thread) with the same row definitions, and `bulk_insert(&BulkRows)` writes them
-in one synchronous insert per table (`async_insert = 0`), the three child tables at once and
-`blocks` after them. `BulkRows` can be joined (`append`) so one insert carries many chunks. The
-importer's `load` uses it with several inserts in flight.
+The committed store is the archive's trait, `ArchiveStore` (section 9.2).
 
-- `RedisStore` and `ClickHouseStore` are the implementations. Both are cheap to clone.
+- `RedisStore` and `FjallArchive` are the implementations. Both are cheap to clone.
 - `StorageError` is one `thiserror` enum with `severity(&self) -> Severity`:
   - **Transient** (retry can help): connection lost, timeout, a local disk I/O failure in the
     archive, and a busy server. Busy is
     recognised by the server's error code: Redis `BUSY`, `LOADING`, `READONLY`, `TRYAGAIN`,
-    `CLUSTERDOWN`, `MASTERDOWN`; ClickHouse `Code: 159` (timeout exceeded), `202` (too many
-    simultaneous queries), `209` (socket timeout), `210` (network error), `241` (memory
-    limit: usually the server's total memory under merges or other queries), `242` (table
-    read-only, as during a replica change), `252` (too many parts), `319` (status of an
-    insert unknown: repeating it is safe, inserts are idempotent) and `999` (Keeper
-    exception). The pipeline retries without a time limit, so a statement that can never fit
-    in the server's memory is retried forever, with a warning on each attempt; its statements
-    are small, so that is not expected.
+    `CLUSTERDOWN`, `MASTERDOWN`.
   - **Expected** (the caller handles it, nothing is wrong with the store): `MissingAncestor`,
     `AncestryTooLong`, and the archive's `NotContiguous`.
-  - **Fatal** (needs an operator): everything else, including schema or checksum mismatch, bad
+  - **Fatal** (needs an operator): everything else, including a schema or chain mismatch, bad
     credentials, undecodable stored data, and a block that does not fit the schema.
   Variants carry what failed: the operation for driver errors, the block for decode errors.
   The stores do not retry: each call is one attempt with a timeout. The crate exports
@@ -102,11 +88,10 @@ importer's `load` uses it with several inserts in flight.
   events: the events of the first attempt are on the stream only. A caller that needs them
   re-reads `head()`.
 - **Cancel safety.** Dropping a future never corrupts a store. A multi-step operation that is
-  dropped part-way (`prune`, `ancestry`, `rollback_to`, `migrate`, a batched `insert`) is
-  finished by calling it again.
-- Module layout: `storage::unsafe_store` (Redis; keys and every limit of that store in its `layout`
-  module), `storage::committed_store` (ClickHouse: client,
-  `rows`, `migrations`), `storage::archive_store` (fjall), `storage::metrics`; the traits, the
+  dropped part-way (`prune`, `ancestry`, `trim`, `truncate_above`) is finished by calling it
+  again.
+- Module layout: `storage::unsafe_store` (Redis; keys and every limit of that store in its
+  `layout` module), `storage::archive_store` (fjall), `storage::metrics`; the traits, the
   configuration types, `StorageError`, `Severity`, `InvalidBlockReason` and `Store` are exported
   from the crate root.
 
@@ -240,7 +225,7 @@ bounded batches until none are left, then emits `Pruned`. It is exact and resuma
 again at a pruned height would be stored and could be filled back in.
 
 `set_l1_heads`: a `None` head means "unknown" and leaves the stored key untouched, as in the
-committed store. Deleting `safe_head` would silently switch off step 2.
+archive's `set_heads`. Deleting `safe_head` would silently switch off step 2.
 
 `ancestry(head, stop_at)` returns the complete range or an error, never a partial one:
 `MissingAncestor` if a parent on the way down to `stop_at + 1` is not stored (pruned, expired,
@@ -248,11 +233,11 @@ or never received), and `AncestryTooLong` if the range exceeds `MAX_ANCESTRY_BLO
 before any read. Callers ask for bounded ranges.
 
 Only the header and transactions are stored. `insert` rejects a block with ommers or
-non-empty withdrawals (`InvalidBlock`), so nothing is dropped silently. One shared validation (`validate_block`) runs first in every store, so all three accept
-exactly the same blocks: a transaction type the schema has no columns for is
-`UnsupportedTransaction`, and a block the committed store could never accept is not stored
-unsafe either. Block numbers above 2^53 are
-rejected before a script is called, because Lua numbers are doubles.
+non-empty withdrawals (`InvalidBlock`), so nothing is dropped silently. The checks
+(`validate_block`) run before any write: one sender (and, with receipts, one receipt) per
+transaction, and a transaction type the JSON layout has no place for is
+`UnsupportedTransaction`. Block numbers above 2^53 are rejected before a script is called,
+because Lua numbers are doubles.
 
 Operations that make several calls (`ancestry`, `prune`, the schema wipe) have an overall
 deadline as well as the per-request timeout.
@@ -271,141 +256,22 @@ deadline as well as the per-request timeout.
 
 A `reorg` event that moves the head is always followed by the `head` event for the new head, from the same script.
 
-## 4. ClickHouse (committed store)
+## 4. Committed store
 
-Database from configuration (default `op_indexer`). Conventions: hashes `FixedString(32)`,
-addresses `FixedString(20)`, wei amounts `UInt256`, gas prices `UInt128`, timestamps `DateTime('UTC')`, every table
-starts with `chain_id UInt64`. Block-data tables are `ReplacingMergeTree(version)`, `version` =
-insert time in microseconds as `UInt64`: inserting the same block twice is harmless and the newest row
-wins. Read with `FINAL`. Partition by `toYYYYMM` of the block timestamp.
-
-**One database per chain** is the model, but nothing depends on it: every query that reads or
-deletes filters by `chain_id`, so two chains sharing a database never see each other's rows.
-The database therefore records no chain, unlike the archive (section 9.1).
-
-No per-row status column: a block is finalized if `number <= finalized head`, else safe.
-
-Exceptions to the conventions: `schema_migrations` has no `chain_id` (it describes the schema,
-not a chain) and is created before the numbered migrations; `blocks.base_fee_per_gas` is
-`Nullable(UInt64)`, the width alloy's header uses. `migrate` creates the configured database
-if it is missing (`CREATE DATABASE IF NOT EXISTS`, before `schema_migrations`); that statement
-is configuration, not a migration, and is not recorded or checksummed. A ClickHouse Cloud
-service starts with only `default`, which is why the database is created. What has run: a
-local ClickHouse 25.12 server, over HTTP; HTTPS and Cloud are supported by the client's TLS
-features (section 6) but no Cloud run is recorded here.
-
-**Codecs.** Every column has an explicit codec, chosen by the kind of data. The 32-byte
-columns were measured on 2,000 real OP Mainnet blocks after Isthmus, 140,000,063 to
-140,002,062, from the importer's verified chunks (50,368 transactions, 424,398 logs, loaded
-into a local ClickHouse and merged): only a value that is unique per row is left
-uncompressed. A hash
-repeated on every row of its block or transaction, and a nullable hash that is usually empty
-(stored as 32 zero bytes) or an address padded with zeros, compress well:
-
-| Column | `NONE` | `ZSTD(1)` |
-|---|---|---|
-| `logs.block_hash` | 13.6 MB | 0.08 MB |
-| `logs.tx_hash` | 13.6 MB | 0.83 MB |
-| `logs.topic1` / `topic2` / `topic3` | 14.0 MB each | 0.90 / 0.66 / 2.96 MB |
-| `transactions.block_hash` | 1.61 MB | 0.07 MB |
-| `transactions.source_hash` | 1.66 MB | 0.08 MB |
-| `transactions.hash` (kept `NONE`) | 1.61 MB | 1.61 MB |
-
-The four tables went from 2,048 to 690 bytes per transaction on disk, `logs` from 1,460 to
-194.
-
-| Kind of column | Columns | Codec |
-|---|---|---|
-| Steadily increasing | `number`, `block_number`, `timestamp`, `block_timestamp`, `version`, `updated_at` | `DoubleDelta, ZSTD(1)` for block numbers and timestamps; `Delta, ZSTD(1)` for `version` |
-| Small or slowly changing integers | `tx_index`, `log_index`, `tx_count`, `logs_count`, `gas_limit`, `gas_used`, `base_fee_per_gas`, `nonce`, `cumulative_gas_used`, gas prices, `blob_gas_used`, `excess_blob_gas`, `tx_type`, `status` | `T64, ZSTD(1)`. ClickHouse 25.8 rejects `T64` on `UInt128`, so the three gas-price columns use `ZSTD(1)`; `T64` under `Nullable(UInt64)` is accepted. |
-| A row's own random 32-byte hash | `blocks.hash`, `parent_hash`, the header roots, `prev_randao`, `transactions.hash`, `receipts.tx_hash` | `NONE`: unique per row, they do not compress |
-| Hashes repeated across rows, or mostly empty | `block_hash` (transactions, receipts, logs), `logs.tx_hash`, `source_hash`, `topic1` to `topic3` | `ZSTD(1)` |
-| Repeating addresses and signatures | `fee_recipient`, `from`, `to`, `address`, `topic0` | `ZSTD(1)` |
-| Sparse or mostly zero bytes | `value`, `mint`, `logs_bloom`, `extra_data` | `ZSTD(1)` |
-| Large byte strings | `input`, `raw`, `data` | `ZSTD(3)` |
-| Constant or tiny | `chain_id`, `source`, `has_receipts`, `is_system_tx`, `key` | `ZSTD(1)` |
-
-If ClickHouse rejects a codec for a column type, use `ZSTD(1)` for that column and say so in
-the migration file.
-
-**Inserts and merges.** Also standard choices, to be confirmed on the compose ClickHouse and
-revisited with real load:
-
-- **Batch on our side first.** Each insert creates a part per table, so the caller writes many
-  blocks per call, not one call per block. This is the main protection against too many parts.
-- **Async inserts as a safety net.** Every insert request sets `async_insert = 1` and
-  `wait_for_async_insert = 1`: the server groups small inserts that arrive close together into
-  one part, and still acknowledges only after the data is written, so nothing is lost if the
-  indexer or the server stops.
-- `fee_recipient` is `LowCardinality(FixedString(20))`: a chain has one or a few fee vaults.
-- **Old partitions merge down to one part.** The four block-data tables set
-  `min_age_to_force_merge_seconds = 86400` and `min_age_to_force_merge_on_partition_only = 1`.
-  A month that no longer receives inserts is merged into a single part, which also completes
-  the `ReplacingMergeTree` deduplication there and makes `FINAL` on old data cheap.
-- **`FINAL` stays inside a partition.** A block's rows only ever live in one monthly partition,
-  so queries that use `FINAL` on the block-data tables set
-  `do_not_merge_across_partitions_select_final = 1`. This crate has no such query yet (its only
-  `FINAL` is on `chain_state`, which is not partitioned); the `query` crate applies it.
-- **Not done here:** a fast path for "transaction by hash" (a projection or a lookup table
-  ordered by hash). The bloom-filter index is enough for correctness; the `query` crate decides
-  the fast path when it defines its queries.
-
-| Table | Order key | Columns |
-|---|---|---|
-| `blocks` | `(chain_id, number)` | `hash`, `parent_hash`, `timestamp`, `fee_recipient`, `state_root`, `transactions_root`, `receipts_root`, `logs_bloom`, `prev_randao`, `gas_limit`, `gas_used`, `base_fee_per_gas` (nullable), `extra_data`, `tx_count`, `withdrawals_root` (nullable), `blob_gas_used` (nullable), `excess_blob_gas` (nullable), `parent_beacon_block_root` (nullable), `requests_hash` (nullable), `source` (`Enum8` gossip / l1 / import / sync), `has_receipts` (`Bool`), `version` |
-| `transactions` | `(chain_id, block_number, tx_index)` | `block_hash`, `block_timestamp`, `hash`, `tx_type`, `from`, `to` (nullable), `nonce` (nullable: deposits have none), `value`, `gas_limit`, `gas_price` (nullable: legacy and EIP-2930), `max_fee_per_gas` and `max_priority_fee_per_gas` (nullable: EIP-1559 and EIP-7702), `input` (`CODEC(ZSTD(3))`), deposit fields `source_hash`, `mint`, `is_system_tx` (all nullable, set only for deposits), `raw` (EIP-2718 bytes, `CODEC(ZSTD(3))`), `version`. Bloom-filter index on `hash`. |
-| `receipts` | `(chain_id, block_number, tx_index)` | `block_hash`, `block_timestamp`, `tx_hash`, `status`, `cumulative_gas_used`, `logs_count`, deposit fields `deposit_nonce`, `deposit_receipt_version` (both nullable, set only for deposits), `version` |
-| `logs` | `(chain_id, block_number, log_index)` | `log_index` is the running index across the block's receipts. `block_hash`, `block_timestamp`, `tx_index`, `tx_hash`, `address`, `topic0` to `topic3` (nullable), `data` (`CODEC(ZSTD(3))`), `version`. Bloom-filter indexes on `address` and `topic0`. |
-| `chain_state` | `(chain_id, key)` | `key` (`Enum8` safe_head / finalized_head), `number`, `hash`, `updated_at` (`UInt64` microseconds). `ReplacingMergeTree(updated_at)`. |
-| `imported_ranges` | `(chain_id, first, last)` | `loaded_at`. One row per chunk a bulk load has written to all four block tables (`record_imported`, after `bulk_insert`); read at the start of a load (`imported_ranges`) to skip those chunks. `ReplacingMergeTree`. |
-| `schema_migrations` | `version` | `version` (`UInt32`), `name`, `checksum` (`FixedString(32)`, raw SHA-256), `applied_at`. Plain `MergeTree`. |
-
-Only what is in the block and its consensus receipts is stored. Fields that need more than
-that (gas used per transaction, effective gas price, created contract address, OP L1 fee) are
-left for the crate that supplies them to define (see the roadmap); add them with a migration
-then.
-
-`insert` writes `transactions` for every block, `receipts` and `logs` for blocks that have
-receipts, and `blocks` last, so a `blocks` row means its child rows are stored. Large inputs
-are written in chunks of at most `MAX_INSERT_BLOCKS` blocks.
-
-Rows are deduplicated by position (`block_number`, `tx_index` / `log_index`), not by block
-hash. Replacing the block at a height with a different one therefore requires `rollback_to`
-below that height first; otherwise rows of the old block at higher indexes would remain.
-
-`rollback_to(safe)` first writes the new safe head to `chain_state`, then deletes the
-`imported_ranges` rows whose `last` is above it (so a later bulk load writes those ranges
-again), then runs a lightweight delete of everything above it on the four block-data tables,
-`blocks` first (the block-number
-column is `number` in `blocks` and `block_number` in the other three). Writing the head first
-means an interrupted rollback never leaves the recorded safe head pointing at a deleted block;
-call it again to finish. The finalized head is not touched. A rollback is rare (an L1 reorg),
-so the cost of a delete is acceptable.
-
-In `set_l1_heads`, a `None` head means "unknown": the stored row is left as it is.
+The archive (section 9) is the committed store. The ClickHouse committed store that was here
+(tables `blocks`, `transactions`, `receipts`, `logs`, `chain_state`, `imported_ranges`) was
+removed with its client, migrations and configuration. A database an earlier build wrote is
+not read; drop it when convenient.
 
 ## 5. Migrations
 
-### 5.1 ClickHouse
+### 5.1 Archive
 
-- Until the first release the initial migrations may still be edited in place; a database
-  that already recorded them must be dropped (`DROP DATABASE <name>`) and is recreated on the
-  next start. After a release, never.
-- One statement per file: `crates/storage/migrations/clickhouse/NNNN_name.sql`, embedded with
-  `include_str!` and listed in order in one Rust table. ClickHouse's HTTP interface runs one
-  statement per request, so this avoids parsing SQL.
-- `schema_migrations` records each applied version with the SHA-256 of its SQL.
-- `ClickHouseStore::migrate()` runs before anything else uses the store: create the database
-  if missing, create `schema_migrations` if missing, read the applied versions, then
-  - an applied version whose checksum differs from the embedded file is a **fatal error**
-    (an applied migration was edited). Until the first release that is how a schema change
-    arrives; the error names the database and says to drop it (`DROP DATABASE <name>`) if it
-    holds no data. After a release a change is a new migration;
-  - an applied version the binary does not know is a fatal error (the binary is older than the schema);
-  - pending versions are applied in order, each recorded after it succeeds.
-- ClickHouse DDL is not transactional, so every migration must be safe to run twice
-  (`CREATE TABLE IF NOT EXISTS`, `ADD COLUMN IF NOT EXISTS`). A crash mid-migration is fixed by restarting.
-- One indexer instance migrates at a time; there is no migration lock. Documented, not enforced.
+The archive's layout has a version in `meta` (`schema_version`, section 9.1). An archive of
+another version is refused on open and left as it is; there is no migration in place. Version
+2 added the `senders` keyspace and the heads in `meta`; an archive of version 1 is loaded again
+from the importer's verified chunks (`op-indexer-import load`, no download needed) into a new
+directory.
 
 ### 5.2 Redis
 
@@ -419,48 +285,72 @@ Lua scripts are embedded with `include_str!` from `crates/storage/scripts/` and 
 
 | Store | Crate | Notes |
 |---|---|---|
-| ClickHouse | `clickhouse` 0.15 (the official client, HTTP) | `Row` derive for the row types, batched inserts, LZ4 compression. |
 | Redis | `redis` 1.x with `tokio-comp`, `connection-manager`, `script` | One multiplexed connection that reconnects on its own. |
+| Archive | `fjall` 3.x | Embedded; a directory. |
 
 Both keep `default-features = false` and get a justification comment in the root `Cargo.toml`.
-The ClickHouse client has `rustls-tls-ring` and `rustls-tls-webpki-roots`, so an `https://` URL
-works (ClickHouse Cloud is HTTPS only) with the TLS provider and root store reqwest already
-uses in the workspace; `http://` works as before. Redis has no TLS feature. Every network call
-has a timeout.
+Redis has no TLS feature. Every network call has a timeout.
 
-`storage::config` defines `StorageConfig { redis: RedisConfig, clickhouse: ClickHouseConfig,
-archive: Option<ArchiveConfig>, chain_id }` as plain data, with `ArchiveConfig { path,
-retention: ArchiveRetention }` and `ArchiveRetention { Blocks(u64), All }` (`None` disables the
-archive). The binary fills it from the environment:
+`storage::config` defines `StorageConfig { redis: RedisConfig, archive: ArchiveConfig, chain:
+ChainIdentity }` as plain data, with `ArchiveConfig { path, retention: ArchiveRetention }` and
+`ArchiveRetention { Blocks(u64), All }`. The archive cannot be disabled. The binary fills it
+from the environment:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OP_INDEXER_REDIS_URL` | `redis://127.0.0.1:6379` | Unsafe store. |
-| `OP_INDEXER_CLICKHOUSE_URL` | `http://127.0.0.1:8123` | Committed store, HTTP interface. |
-| `OP_INDEXER_CLICKHOUSE_DATABASE` | `op_indexer` | |
-| `OP_INDEXER_CLICKHOUSE_USER` | `indexer` | |
-| `OP_INDEXER_CLICKHOUSE_PASSWORD` | none | Never logged; `Debug` on the config redacts it. |
+| `OP_INDEXER_REDIS_URL` | `redis://127.0.0.1:6379` | Unsafe store. Never logged with its credentials. |
+| `OP_INDEXER_ARCHIVE_RETENTION_BLOCKS` | `all` | Section 9.3. |
 
-The binary connects to both stores at startup, pings them, runs the ClickHouse migrations and
-the Redis schema check, and fails fast if either store is unreachable. The pipeline then
-writes the blocks.
+The binary opens the archive, then connects to Redis and checks its schema, and fails fast if
+either fails. The pipeline then writes the blocks.
+
+### Several instances on one host
+
+Several indexers can run on one server: several chains (OP Mainnet and Unichain), or several
+builds of one chain. Each needs:
+
+- **Its own data directory** (`OP_INDEXER_DATA_DIR`). The archive and the node store record
+  their chain and refuse another's, so two instances never share one.
+- **Its own ports**: `OP_INDEXER_LISTEN_ADDR`, `OP_INDEXER_EL_LISTEN_ADDR`,
+  `OP_INDEXER_L1_LISTEN_ADDR`, `OP_INDEXER_L1_BEACON_LISTEN_ADDR` and
+  `OP_INDEXER_STREAM_LISTEN_ADDR`, plus the advertised addresses on a public host.
+- **Its own Redis keys.** Keys are prefixed by chain id (`opidx:{chain_id}:`), so two chains
+  can share a Redis database. Two instances of the same chain must use different databases:
+  the database index is part of the URL, `redis://host:6379/1` (the `redis` crate selects it
+  on every connection).
+- **Its own L1 side**, if L1 is enabled: each instance runs its own beacon light client and
+  its own L1 execution peers. Two instances do not share them; nothing on L1 is
+  per-chain except the dispute game factory.
+
+With docker compose, every host port comes from a variable with today's value as its default
+(`OP_INDEXER_P2P_PORT`, `OP_INDEXER_EL_PORT`, `OP_INDEXER_L1_PORT`, `OP_INDEXER_L1_BEACON_PORT`,
+`OP_INDEXER_STREAM_PORT`, and `OP_INDEXER_STREAM_HOST_BIND`). The listen addresses follow the
+same variables, so a port is the same inside the container and on the host and the node
+records advertise it. A project name gives a second instance its own container and data
+volume. `--no-deps` keeps it on the first project's Redis, reached through the host's
+published port:
+
+```bash
+docker compose up -d
+docker compose -p unichain --env-file unichain.env.example up -d --no-deps indexer
+```
+
+`unichain.env.example` shifts every port by 100 and sets
+`OP_INDEXER_REDIS_URL=redis://host.docker.internal:6379`. A second instance of the same chain
+would set `…:6379/1` instead.
 
 `storage::metrics` follows `crates/p2p/src/metrics.rs` (the binary calls its `describe()` at
 startup): operation counts and durations by store, operation and outcome (`ok`, `transient`,
-`expected`, `fatal`), blocks inserted, reorgs and their depth, receipts attached, blocks pruned, rows
-inserted per table, rollbacks.
+`expected`, `fatal`), blocks inserted, reorgs and their depth, receipts attached, blocks pruned,
+blocks removed from the archive, and the archive's disk gauges.
 
 ## 7. Open points
 
-- **Pre-Bedrock headers.** The importer loads the legacy blocks (before Bedrock) into
-  `blocks`, which has no `difficulty`, `nonce` or `ommers_hash` columns, so a legacy header
-  cannot be rebuilt from ClickHouse. The archive holds those headers in full; add the columns
-  with a migration if ClickHouse ever has to serve them.
-- **Wall-clock versions.** Row versions come from the system clock; a clock stepping backwards
-  could make an older row win.
-- **Encoding runs on the calling task.** JSON and row encoding are not moved to a blocking
-  thread; blocks are small. A caller writing large batches should do so from a blocking-friendly
-  context.
+- **Senders.** Promoted and synced blocks get senders the pipeline recovered; imported ones
+  are recovered and checked by the importer's `load` (`docs/import.md`). Unproven: the zero
+  address of a pre-Bedrock legacy transaction signed with all zeros, which has no signer.
+- **Encoding runs on the calling task.** JSON encoding for Redis is not moved to a blocking
+  thread; blocks are small.
 - **Tests.** `CLAUDE.md` says no tests for now. Fork choice (3.2) is a state machine that live
   runs will rarely exercise. Until the rule changes, verify it by driving the script against the
   compose Redis with hand-made block sequences, and report the sequences and results.
@@ -479,18 +369,15 @@ inserted per table, rollbacks.
 | Archive cache / journal cap / memtable | 64 MiB / 128 MiB / 16 MiB per keyspace | fjall archive |
 | Archive background threads / delete batch | 2 / 1024 blocks | fjall archive |
 | `REMOVE_DEADLINE` | 60 s | overall limit for one archive `trim` or `truncate_above`, checked between batches |
-| `MAX_INSERT_BLOCKS` | 256 | blocks per chunk of a committed-store insert |
 | Redis connect / request timeout | 5 s / 10 s | every request |
 | `OPERATION_DEADLINE` | 60 s | overall limit for `ancestry`, `prune` and the schema wipe, checked between requests |
-| ClickHouse query / insert timeout | 30 s / 120 s | also sent as `max_execution_time` |
 
 ## 9. Local block archive (fjall)
 
-**Why.** The indexer will serve headers, bodies and receipts to execution-network peers (see
-roadmap). Doing that from ClickHouse would cost several queries per block, with load driven by
-strangers. The archive is a local, embedded copy of a recent window of committed blocks, kept
-in the encoding peers ask for. Promotion (pipeline) appends to it, the importer and range sync
-fill it, and serving (`el`) reads it.
+**Why.** The archive is the committed store: every block committed to L1 (or a window of the
+newest), kept in the encoding peers ask for, with each transaction's sender, and the committed
+L1 heads. Promotion (pipeline) appends to it and records the heads, the importer and range
+sync fill it, serving (`el`) and the stream (`stream`) read it.
 
 **Engine.** fjall (3.x): a log-structured store, pure Rust, published on crates.io, with no
 native code and nothing our `cargo deny` rejects. It is a directory, `archive/` in the data
@@ -537,23 +424,31 @@ so key order is block order. Values are RLP, snappy-compressed (`snap`).
 | `bodies` | number | RLP of the body (transactions in network encoding, ommers, withdrawals) |
 | `receipts` | number | RLP list of the receipts in network encoding, with bloom (one `Receipts` entry up to eth/68; a caller serving eth/69 re-encodes without the bloom); absent until set |
 | `numbers` | block hash (32 bytes) | number |
-| `meta` | name | `schema_version`; `chain`, the chain the archive holds: its id (8 bytes, big-endian), then its genesis hash (32 bytes) |
+| `senders` | number | the sender of each transaction, 20 bytes each, in block order, uncompressed |
+| `meta` | name | `schema_version` (2); `chain`, the chain the archive holds: its id (8 bytes, big-endian), then its genesis hash (32 bytes); `safe_head` and `finalized_head`, the committed heads: number (8 bytes, big-endian) then hash, absent until promotion records one |
 
 `bodies` and `receipts` use fjall's key-value separation, which keeps large values out of the
 index tree; its own blob compression is off, because the values are already compressed.
 
-Senders are not stored: a peer does not ask for them and they can be recovered.
+Senders are stored because recovering them costs one signature recovery per transaction, which
+a reader of the history would otherwise pay on every read. A peer does not ask for them.
 
 ### 9.2 Trait
 
 ```rust
 pub trait ArchiveStore {
-    /// Appends consecutive blocks, oldest first, in their original encoding, unchanged.
-    async fn append_batch(&self, blocks: Vec<EncodedBlock>) -> Result<(), StorageError>;
+    /// Appends consecutive blocks, oldest first, in their original encoding, unchanged, with
+    /// their senders.
+    async fn append_batch(&self, blocks: Vec<ArchivedBlock>) -> Result<(), StorageError>;
     /// Attaches receipts to an archived block. Ok(false) if it is not archived.
     async fn set_receipts(&self, block: BlockRef, receipts: &[OpReceiptEnvelope]) -> Result<bool, StorageError>;
     /// A run of headers, bodies or receipts, read in one call on one snapshot, up to `limits`.
     async fn read(&self, read: BlockRead, limits: ReadLimits, convert: Option<ItemConvert>) -> Result<Vec<Bytes>, StorageError>;
+    /// Whole blocks (header, body, receipts if set, senders) from `from` upwards, on one snapshot.
+    async fn blocks(&self, from: BlockNumber, limits: ReadLimits) -> Result<Vec<ArchivedBlock>, StorageError>;
+    /// The committed L1 heads; `set_heads` records them, a `None` head leaving the recorded one.
+    async fn heads(&self) -> Result<L1Heads, StorageError>;
+    async fn set_heads(&self, heads: L1Heads) -> Result<(), StorageError>;
     /// The number of the archived block with this hash.
     async fn number_of(&self, hash: BlockHash) -> Result<Option<BlockNumber>, StorageError>;
     /// The first and last archived block, or None if empty.
@@ -565,18 +460,21 @@ pub trait ArchiveStore {
 }
 ```
 
-- `append_batch` is the write path of the trait: `EncodedBlock { hash, header: Bytes, body: Bytes,
-  receipts: Option<Bytes> }` (primitives). **The bytes are stored unchanged**, never encoded
+- `append_batch` is the write path of the trait: `ArchivedBlock { encoded: EncodedBlock { hash,
+  header, body, receipts }, senders }` (primitives). **The bytes are stored unchanged**, never encoded
   again from a decoded value, so what is served later is what was verified: a legacy
   transaction with an all-zero signature does not survive a decode and re-encode. Import and
   range sync hand over the bytes they verified; promotion encodes its gossip blocks once
-  (`EncodedBlock::from(&DecodedBlock)`), which gives their original bytes because their
-  transactions are signed.
+  (`ArchivedBlock::from(&DecodedBlock)`), which gives their original bytes because their
+  transactions are signed. Promotion and range sync pass the senders the pipeline recovered;
+  the importer passes those of its verified chunks.
 - The archive checks keccak(header) = `hash`, so it never holds a block whose bytes do not
   match its hash, reads the number and parent hash from that header, and checks that each
   block is the child of the one before and that the list extends the tip (or the archive is
-  empty). It does not decode bodies or receipts: the caller has verified the transactions
-  root and receipts root over these bytes. Receipts are in the form
+  empty), and that there is one sender per transaction (the body is cut, not decoded:
+  `InvalidBlock` with `SenderCount` otherwise). It does not decode bodies or receipts: the
+  caller has verified the transactions root and receipts root over these bytes, and recovered
+  the senders. Receipts are in the form
   `op_indexer_primitives::encode_receipts` gives.
 - Blocks already held are skipped, so a resumed import or sync can resend any amount: the
   leading blocks when the tip is among the list, and the whole list when it ends at or below
@@ -599,9 +497,20 @@ pub trait ArchiveStore {
 - `read` answers one peer request in one blocking call on one snapshot: a run of headers
   (from a number or a hash, every `step`-th block, rising or falling; consecutive headers are
   one range scan), or the bodies or receipts of a list of hashes. The run ends at the first
-  block not held and at the limits (items, and bytes after the item that crosses them). With
+  block not held, at the first block below `limits.lowest`, and at the limits (items, and
+  bytes after the item that crosses them). With
   `convert`, each item is passed through it inside the same call (serving strips the receipts'
   blooms there); an item it refuses ends the run.
+- `blocks(from, limits)` reads whole blocks from `from` upwards in one blocking call on one
+  snapshot: header, body, receipts (`None` if not set) and senders, each decompressed. It ends
+  at the first block not held, below `limits.lowest`, or at the limits (header, body and
+  receipt bytes count). It is what the stream reads history with; a block by hash is
+  `number_of`, then `blocks(number, one item)`.
+- `heads()` / `set_heads(heads)`: the committed safe and finalized heads, in `meta`, written
+  by promotion as its marker that the blocks up to the safe head are committed (one durable
+  batch; a `None` head leaves the recorded one). Promotion never records a head the archive
+  does not hold (`docs/pipeline.md` section 4, step 5), so a reader of the archive finds every
+  block up to the recorded safe head.
 - `set_receipts` requires one receipt per transaction and the stored number to match
   (`InvalidBlock`), as in the unsafe store. A block appended with receipts stores them at once.
 - Every write is one fjall batch across the keyspaces it touches: one journal record, applied
@@ -617,12 +526,12 @@ pub trait ArchiveStore {
   prepared off the writer (`PreparedBlock::new`: the header decoded for its number and
   parent, its keccak checked against the block's hash, the three values compressed as
   `append_batch` compresses them, into the buffers the ingestion takes, so the writer copies
-  nothing). Under the writer lock the list is checked to extend the
+  nothing; the senders checked one per transaction). Under the writer lock the list is checked to extend the
   tip block by block (the same parent and number rule as `append_batch`; held leading
   blocks are not skipped: the importer starts after the tip). Each keyspace then gets one
   fjall ingestion, on its own thread: entries in ascending key order (`numbers` sorted by
   hash) written straight into new table and blob files, without journal or memtable.
-  `bodies`, `receipts` and `numbers` are finished first; `headers` is written alongside and
+  `bodies`, `receipts`, `senders` and `numbers` are finished first; `headers` is written alongside and
   finished only once they all are. Finishing an ingestion syncs its files and then registers
   them in the keyspace's version atomically, so when the call returns the blocks are durable.
   A crash before `headers` is finished leaves the held range as it was. The other
@@ -652,8 +561,9 @@ pub trait ArchiveStore {
   a blocking thread, so the trait is async like the other two.
 - On open: a directory holding an archive of another `schema_version` (or blocks and no
   version) is refused with `StorageError::ArchiveSchema`, naming the directory and both
-  versions. Nothing is deleted: an archive can hold an import of the whole chain, so removing
-  it is the operator's decision.
+  versions and telling the operator to load a new archive with `op-indexer-import load` from
+  the verified chunks. Nothing is deleted: an archive can hold an import of the whole chain,
+  so removing it is the operator's decision.
 - On open, the chain: `open` takes the node's `ChainIdentity` (chain id and genesis hash). An
   archive recording another chain is refused with `StorageError::ArchiveChain`, naming the
   directory and both chains, and left as it is; one whose record does not decode is refused
@@ -678,16 +588,15 @@ after appending; with unlimited retention it never trims.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OP_INDEXER_ARCHIVE_RETENTION_BLOCKS` | 30 days of the chain's blocks (`1296000` on OP Mainnet, `2592000` on Unichain) | Blocks kept for serving. `all` keeps every block. `0` disables the archive: nothing is opened or written. |
+| `OP_INDEXER_ARCHIVE_RETENTION_BLOCKS` | `all` | `all` keeps every block: the archive is the history the node serves and streams. A block count keeps a window of the newest. The archive cannot be disabled. |
 
-The archive lives at `{OP_INDEXER_DATA_DIR}/archive/`. The binary opens it at startup when
-enabled; promotion and range sync write to it, the importer's `load` too (with the indexer
-stopped).
+The archive lives at `{OP_INDEXER_DATA_DIR}/archive/`. The binary opens it at startup;
+promotion and range sync write to it, the importer's `load` too (with the indexer stopped).
 
 **Sizing.** Real blocks (264 consecutive OP Mainnet blocks from live gossip, 2026-10-03
 22:32-22:42 UTC, a Saturday): compressed header plus body averages 17.8 KB per block (median
 6.7 KB, p95 76.9 KB, max 83.7 KB), bimodal, about one block in six carrying roughly 94 KB of
-poorly compressible data. That is about 23 GB of values for the 30-day window, **without
+poorly compressible data. That is about 23 GB of values for 30 days, **without
 receipts** (gossip carries none, so they are unmeasured) and before the engine's overhead. The
 whole history is plausibly 300 to 500 GB today and grows by roughly 200 GB a year; a full OP
 Mainnet node, state included, is about 700 GB. One short weekend sample: repeat at a weekday

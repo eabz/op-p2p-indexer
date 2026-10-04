@@ -1,14 +1,13 @@
 //! Indexer for the OP Stack peer-to-peer network.
 //!
-//! Wires the components together: loads config and the node identity, checks that Redis and
-//! ClickHouse are reachable and their schemas current, opens the local block archive when it is
-//! enabled, and runs the p2p network next to the pipeline that stores the blocks it emits. When
-//! the execution network is enabled it runs too: it fetches the receipts the pipeline asks
-//! for and serves the archive's blocks to peers, and, when the range sync is on, fetches
-//! the blocks between the archive's last one and the chain from peers for the pipeline to
-//! store, round after round. When the L1 side is enabled, a
-//! beacon light client and an L1 execution p2p node read the chain's dispute games, and the
-//! pipeline promotes the blocks they commit to. Shuts down cleanly on Ctrl-C or SIGTERM: the
+//! Wires the components together: loads config and the node identity, opens the block archive (the
+//! committed store), checks that Redis is reachable and its key layout current, and runs the p2p
+//! network next to the pipeline that stores the blocks it emits. When the execution network is
+//! enabled it runs too: it fetches the receipts the pipeline asks for and serves the archive's
+//! blocks to peers, and, when the range sync is on, fetches the blocks between the archive's last
+//! one and the chain from peers for the pipeline to store, round after round. When the L1 side is
+//! enabled, a beacon light client and an L1 execution p2p node read the chain's dispute games, and
+//! the pipeline promotes the blocks they commit to. Shuts down cleanly on Ctrl-C or SIGTERM: the
 //! networks first, then the pipeline, which stores what they had already delivered.
 
 mod config;
@@ -26,9 +25,9 @@ use op_indexer_p2p::{Network, NodeStore, StoreError};
 use op_indexer_pipeline::{Pipeline, ReceiptsChannels};
 use op_indexer_primitives::{BlockRef, EncodedBlock, ExecutionPeer, L1Games, L1Heads, SyncRange};
 use op_indexer_storage::archive_store::FjallArchive;
-use op_indexer_storage::committed_store::ClickHouseStore;
 use op_indexer_storage::unsafe_store::RedisStore;
 use op_indexer_storage::{ArchiveRetention, ArchiveStore, StorageConfig, UnsafeStore};
+use op_indexer_stream::StreamServer;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -130,11 +129,7 @@ async fn main() -> eyre::Result<()> {
     // With the range sync on, it closes the gaps gossip cannot: promotion extends the archive
     // from the unsafe store, which reaches only so far back, so an L1 head is held while the
     // archive is further than that below its safe block, and a sync round closes the gap.
-    let sync_archive = stores
-        .archive
-        .as_ref()
-        .filter(|_| config.sync)
-        .map(|(archive, _)| archive.clone());
+    let sync_archive = config.sync.then(|| stores.archive.0.clone());
     let gate_archive = sync_archive.clone();
 
     let execution = config
@@ -163,9 +158,14 @@ async fn main() -> eyre::Result<()> {
         },
     );
 
+    // Reads the stores the pipeline writes, and the unsafe store's events.
+    let stream = StreamServer::new(
+        config.stream,
+        stores.unsafe_store.clone(),
+        stores.archive.0.clone(),
+    );
     let pipeline = Pipeline::new(
         stores.unsafe_store,
-        stores.committed,
         stores.archive,
         blocks_rx,
         l1_heads_rx,
@@ -196,7 +196,7 @@ async fn main() -> eyre::Result<()> {
         None => (None, pipeline, Some(l1_source_tx)),
     };
     let network = Network::new(config.network, keypair, store, blocks_tx, safe_number_rx);
-    run(network, execution, l1, pipeline, saves).await
+    run(network, execution, l1, (pipeline, stream), saves).await
 }
 
 /// The L1 side: the two components and what connects them to the rest.
@@ -267,7 +267,10 @@ async fn run(
     network: Network,
     execution: Option<ExecutionNetwork<ArchiveProvider>>,
     l1: Option<(L1Network, LightClient)>,
-    pipeline: Pipeline<RedisStore, ClickHouseStore, FjallArchive>,
+    (pipeline, stream): (
+        Pipeline<RedisStore, FjallArchive>,
+        StreamServer<RedisStore, FjallArchive>,
+    ),
     saves: Vec<JoinHandle<()>>,
 ) -> eyre::Result<()> {
     let cancel = CancellationToken::new();
@@ -280,6 +283,8 @@ async fn run(
     let mut light_client =
         light_client.map(|light_client| tokio::spawn(light_client.run(networks_cancel.clone())));
     let mut pipeline = Some(tokio::spawn(pipeline.run(cancel.clone())));
+    // Stopped with the networks: consumers are told the node is shutting down.
+    let mut stream = Some(tokio::spawn(stream.run(networks_cancel.clone())));
 
     // Any component stopping ends the process; the others are stopped and waited for.
     let stopped = tokio::select! {
@@ -304,6 +309,10 @@ async fn run(
             warn!("pipeline stopped unexpectedly");
             result.wrap_err("pipeline failed")
         }
+        result = finished(&mut stream) => {
+            warn!("stream server stopped unexpectedly");
+            result.wrap_err("stream server failed")
+        }
     };
 
     networks_cancel.cancel();
@@ -313,6 +322,7 @@ async fn run(
     let light_client = join(light_client)
         .await
         .wrap_err("beacon light client failed");
+    let stream = join(stream).await.wrap_err("stream server failed");
     cancel.cancel();
     let pipeline = join(pipeline).await.wrap_err("pipeline failed");
     // Their senders are gone with the execution network, so they end.
@@ -327,6 +337,7 @@ async fn run(
         .and(execution)
         .and(l1)
         .and(light_client)
+        .and(stream)
         .and(pipeline)
 }
 
@@ -367,7 +378,7 @@ struct Execution {
 }
 
 /// Builds the execution network from its settings and what the node store has saved for it.
-/// Peers are served from the archive; without one the node serves nothing. `head` is the
+/// Peers are served from the archive. `head` is the
 /// newest block the node knows. With `sync`, the blocks between the archive and the chain's
 /// head are fetched from peers.
 fn execution_network(
@@ -387,10 +398,7 @@ fn execution_network(
     let (requests_tx, requests_rx) = mpsc::channel(RECEIPT_REQUEST_CAPACITY);
     let (verified_tx, verified_rx) = mpsc::channel(VERIFIED_RECEIPTS_CAPACITY);
     let (served_tx, served_rx) = mpsc::channel(SERVED_PEERS_CAPACITY);
-    let provider = stores
-        .archive
-        .as_ref()
-        .map(|(archive, _)| ArchiveProvider(archive.clone()));
+    let provider = ArchiveProvider(stores.archive.0.clone());
     let network = ExecutionNetwork::new(
         el.into_config(saved_peers),
         key,
@@ -802,65 +810,43 @@ async fn save_sync_checkpoints(store: Arc<NodeStore>, mut verified: mpsc::Receiv
     }
 }
 
-/// The three stores, connected and ready.
+/// The two stores, connected and ready.
 struct Stores {
     unsafe_store: RedisStore,
-    committed: ClickHouseStore,
-    /// The local block archive with how much it keeps; `None` when it is disabled.
-    archive: Option<(FjallArchive, ArchiveRetention)>,
-    /// The archive's first and last block at startup; `None` when it is empty or disabled.
+    /// The block archive, the committed store, with how much it keeps.
+    archive: (FjallArchive, ArchiveRetention),
+    /// The archive's first and last block at startup; `None` when it is empty.
     archive_range: Option<(BlockRef, BlockRef)>,
 }
 
-/// Opens the local block archive when it is enabled, checking that it holds the configured
-/// chain. Startup-only blocking I/O, like the node store.
-fn open_archive(config: &StorageConfig) -> eyre::Result<Option<(FjallArchive, ArchiveRetention)>> {
-    config
-        .archive
-        .as_ref()
-        .map(|archive| {
-            let store = FjallArchive::open(&archive.path, config.chain)
-                .wrap_err("failed to open the block archive")?;
-            Ok((store, archive.retention))
-        })
-        .transpose()
+/// Opens the block archive, checking that it holds the configured chain. Startup-only
+/// blocking I/O, like the node store.
+fn open_archive(config: &StorageConfig) -> eyre::Result<(FjallArchive, ArchiveRetention)> {
+    let store = FjallArchive::open(&config.archive.path, config.chain)
+        .wrap_err("failed to open the block archive")?;
+    Ok((store, config.archive.retention))
 }
 
-/// Connects to both stores, runs the Redis schema check and the ClickHouse migrations, reads
-/// the range of `archive` (opened by [`open_archive`]), and returns the stores once all are
-/// ready, so an unreachable or mismatched store stops startup.
+/// Reads the range of `archive` (opened by [`open_archive`]), connects to Redis and runs its
+/// schema check, and returns the stores once both are ready, so an unreachable or mismatched
+/// store stops startup.
 async fn prepare_storage(
     config: &StorageConfig,
-    archive: Option<(FjallArchive, ArchiveRetention)>,
+    archive: (FjallArchive, ArchiveRetention),
 ) -> eyre::Result<Stores> {
     op_indexer_storage::metrics::describe();
-    let archive_range = match &archive {
-        Some((store, retention)) => {
-            let range = store
-                .range()
-                .await
-                .wrap_err("failed to read the block archive")?;
-            info!(?range, ?retention, "block archive ready");
-            range
-        }
-        None => None,
-    };
+    let (store, retention) = &archive;
+    let archive_range = store
+        .range()
+        .await
+        .wrap_err("failed to read the block archive")?;
+    info!(range = ?archive_range, ?retention, "block archive ready");
     let unsafe_store = RedisStore::connect(&config.redis, config.chain.chain_id)
         .await
         .wrap_err("failed to connect to Redis")?;
-    let committed = ClickHouseStore::new(&config.clickhouse, config.chain.chain_id);
-    committed
-        .ping()
-        .await
-        .wrap_err("failed to reach ClickHouse")?;
-    committed
-        .migrate()
-        .await
-        .wrap_err("failed to migrate ClickHouse")?;
     info!(?config, "storage ready");
     Ok(Stores {
         unsafe_store,
-        committed,
         archive,
         archive_range,
     })

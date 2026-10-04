@@ -19,16 +19,16 @@
 //! about a block we do not hold yet, or one whose height our canonical chain has since changed
 //! at, is decided by the block we hold then.
 //!
-//! **Heads only move up, across runs too.** The heads start at what the committed store
-//! recorded and are never published below it: after a restart the L1 side finds older games
-//! first, and promoting on them would undo committed work. A recorded finalized head above
-//! the safe one (left by a rollback) is not taken over: the finalized head starts unknown.
+//! **Heads only move up, across runs too.** The heads start at what the archive recorded and are
+//! never published below it: after a restart the L1 side finds older games first, and promoting on
+//! them would undo committed work. A recorded finalized head above the safe one (left by a
+//! rollback) is not taken over: the finalized head starts unknown.
 //!
 //! **A game that matched is remembered** (the whole game and our block's hash) while it is
 //! recent, and not read again: when its L1 block finalizes, minutes after it raised the safe
-//! head, promotion has usually pruned the block from the unsafe store, and without the archive
-//! it could not be read. The memory starts empty: after a restart, a finalized game at or
-//! below the committed safe head is judged from the archive.
+//! head, promotion has usually pruned the block from the unsafe store; the archive has it
+//! only if promotion could extend it. The memory starts empty: after a restart, a finalized
+//! game at or below the committed safe head is judged from the archive.
 //!
 //! Our block is read from the unsafe store (the canonical block at that height) or, when it
 //! has been promoted or imported, from the archive. Does not fetch anything from L1 and does
@@ -88,7 +88,7 @@ struct OurBlock {
 
 /// Checks the games `games` holds against our chain, each time they change and every
 /// [`RECHECK_INTERVAL`], and publishes the heads on `heads`, starting from `committed`, the
-/// heads the committed store recorded, until the L1 side drops its sender or `cancel` fires.
+/// heads the archive recorded, until the L1 side drops its sender or `cancel` fires.
 /// `isthmus_time` is the chain's Isthmus activation: claims about blocks before it cannot be
 /// checked.
 ///
@@ -98,7 +98,7 @@ struct OurBlock {
 /// block is read.
 pub(crate) async fn run<U: UnsafeStore, A: ArchiveStore>(
     unsafe_store: U,
-    archive: Option<A>,
+    archive: A,
     mut games: watch::Receiver<L1Games>,
     isthmus_time: u64,
     heads: watch::Sender<L1Heads>,
@@ -120,7 +120,7 @@ pub(crate) async fn run<U: UnsafeStore, A: ArchiveStore>(
         let current = games.borrow_and_update().clone();
         let Some(next) = judge_all(
             &unsafe_store,
-            archive.as_ref(),
+            &archive,
             &current,
             isthmus_time,
             held,
@@ -157,7 +157,7 @@ pub(crate) async fn run<U: UnsafeStore, A: ArchiveStore>(
 /// cancellation ended a read.
 async fn judge_all<U: UnsafeStore, A: ArchiveStore>(
     unsafe_store: &U,
-    archive: Option<&A>,
+    archive: &A,
     games: &L1Games,
     isthmus_time: u64,
     current: L1Heads,
@@ -280,7 +280,7 @@ fn judge(
 /// `None` means cancellation ended a retry; the inner one that neither store holds it.
 async fn our_block<U: UnsafeStore, A: ArchiveStore>(
     unsafe_store: &U,
-    archive: Option<&A>,
+    archive: &A,
     number: BlockNumber,
     cancel: &CancellationToken,
 ) -> Result<Option<Option<OurBlock>>, PipelineError> {
@@ -295,12 +295,10 @@ async fn our_block<U: UnsafeStore, A: ArchiveStore>(
     if let Some(block) = canonical {
         return Ok(Some(Some(OurBlock::new(block.hash, &block.block.header))));
     }
-    let Some(archive) = archive else {
-        return Ok(Some(None));
-    };
     let one = ReadLimits {
         items: 1,
         bytes: usize::MAX,
+        lowest: 0,
     };
     let header = retry(cancel, Store::Archive, READ, || {
         let headers = BlockRead::Headers {

@@ -35,6 +35,11 @@ const ACCEPTED_CAPACITY: usize = 16;
 pub const ETH_RECORD_KEY: &str = "eth";
 /// Node record key under which op-reth publishes its fork id.
 pub const OPEL_RECORD_KEY: &str = "opel";
+/// Node record key that marks an op-p2p-indexer. Its value is [`INDEXER_RECORD_VERSION`].
+pub(crate) const INDEXER_RECORD_KEY: &str = "opidx";
+/// Version of the op-p2p-indexer entry: how indexers share with each other. Any version marks
+/// an indexer.
+pub(crate) const INDEXER_RECORD_VERSION: u8 = 1;
 
 /// What identifies one devp2p `eth` network to its peers.
 #[derive(Debug, Clone)]
@@ -57,6 +62,11 @@ pub struct NetworkSpec {
     /// The node record keys this network's nodes publish their fork id under, preferred
     /// first. Our own record carries all of them.
     pub record_keys: &'static [&'static str],
+    /// On a network op-p2p-indexers share: blocks below this number are served to, and
+    /// fetched from, indexer peers only, and our node record carries the `opidx` entry.
+    /// The chain's Bedrock block, so 0 (nothing held back) on a chain without a legacy chain.
+    /// `None` on a network without indexers (Ethereum's).
+    pub indexers_only_below: Option<BlockNumber>,
 }
 
 impl NetworkSpec {
@@ -77,6 +87,7 @@ impl NetworkSpec {
             fork_times: chain.fork_times().to_vec(),
             bootnodes,
             record_keys: &[OPEL_RECORD_KEY, ETH_RECORD_KEY],
+            indexers_only_below: Some(chain.bedrock_block),
         }
     }
 
@@ -121,6 +132,15 @@ pub struct PeerConfig {
     pub advertised_addr: Option<SocketAddr>,
     /// Peers that served us in an earlier run, most recently served first: dialed first.
     pub saved_peers: Vec<ExecutionPeer>,
+    /// Sessions kept in each direction: this many dialed, as many accepted. On a network
+    /// op-p2p-indexers share, one more is dialed for an indexer peer.
+    pub max_sessions: usize,
+}
+
+impl PeerConfig {
+    /// Default of [`Self::max_sessions`]: a node that asks slowly needs few, and full nodes
+    /// ration their slots.
+    pub const DEFAULT_MAX_SESSIONS: usize = 4;
 }
 
 /// Discovery, the session listener and the peer set of one network.
@@ -174,6 +194,10 @@ impl PeerNetwork {
             serving,
             head,
         ));
+        // Saved peers are known indexers before discovery finds them again.
+        for peer in config.saved_peers.iter().filter(|peer| peer.indexer) {
+            ctx.mark_indexer(peer.id);
+        }
         let (peers, reports, published) = Peers::new();
         let network = Self {
             config,
@@ -208,7 +232,7 @@ impl PeerNetwork {
             Arc::clone(&ctx),
             candidates_rx,
             accepted_rx,
-            &config.saved_peers,
+            &config,
             served,
             reports,
             published,

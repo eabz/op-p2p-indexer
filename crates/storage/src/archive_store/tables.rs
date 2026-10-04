@@ -14,13 +14,14 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use alloy_primitives::{BlockHash, BlockNumber, Bytes, keccak256};
+use alloy_primitives::{Address, BlockHash, BlockNumber, Bytes, keccak256};
 use fjall::{
     CompressionType, Database, Guard, Keyspace, KeyspaceCreateOptions, KvSeparationOptions,
     PersistMode, Readable,
 };
 use op_indexer_primitives::{
-    BlockRead, BlockRef, BlockStart, ChainIdentity, ItemConvert, ReadLimits, split_body,
+    ArchivedBlock, BlockRead, BlockRef, BlockStart, ChainIdentity, EncodedBlock, ItemConvert,
+    L1Heads, ReadLimits, split_body,
 };
 use tokio::sync::{Mutex, MutexGuard};
 use tracing::debug;
@@ -36,8 +37,8 @@ const CACHE_SIZE_BYTES: u64 = 64 * 1024 * 1024;
 /// Most journal kept on disk before memtables are flushed to make room. It also bounds how much
 /// is replayed on open after a crash (fjall's default is 512 MiB, its minimum 64 MiB).
 const MAX_JOURNAL_BYTES: u64 = 128 * 1024 * 1024;
-/// Memtable of one keyspace before it is flushed. With five keyspaces this bounds the active
-/// memtables to 80 MiB; fjall 3.1's database-wide cap (`max_write_buffer_size`) is deprecated
+/// Memtable of one keyspace before it is flushed. With six keyspaces this bounds the active
+/// memtables to 96 MiB; fjall 3.1's database-wide cap (`max_write_buffer_size`) is deprecated
 /// and not enforced, so this and [`MAX_JOURNAL_BYTES`] are the bounds. Live appends add about
 /// 20 KB a block, so a memtable fills in under an hour; a smaller one only means more, smaller
 /// flushes (fjall's default is 64 MiB per keyspace).
@@ -48,9 +49,16 @@ const WORKER_THREADS: usize = 2;
 /// Name of the schema version entry in `meta`.
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 /// Layout version of the keyspaces. An archive written with another version is refused on open.
-const SCHEMA_VERSION: u64 = 1;
+/// Version 2 added `senders` and the heads in `meta`.
+const SCHEMA_VERSION: u64 = 2;
 /// Name of the entry in `meta` recording the archive's chain ([`ChainIdentity::to_bytes`]).
 const CHAIN_KEY: &str = "chain";
+/// Names of the entries in `meta` recording the committed safe and finalized heads: the
+/// block's number (big-endian) and hash, 40 bytes. Absent until promotion records one.
+const SAFE_HEAD_KEY: &str = "safe_head";
+const FINALIZED_HEAD_KEY: &str = "finalized_head";
+/// Length of an address in `senders`.
+const ADDRESS_LEN: usize = Address::len_bytes();
 /// Most blocks removed in one batch by [`truncate_above`] and [`trim`], so one batch stays small
 /// and the writer lock is held briefly: appends go in between batches.
 const DELETE_BATCH_BLOCKS: u64 = 1024;
@@ -73,7 +81,11 @@ pub(super) struct Tables {
     receipts: Keyspace,
     /// Block hash -> block number.
     numbers: Keyspace,
-    /// Name -> value; holds [`SCHEMA_VERSION_KEY`] and [`CHAIN_KEY`].
+    /// Block number -> the sender of each transaction, 20 bytes each, in block order,
+    /// uncompressed (addresses do not compress).
+    senders: Keyspace,
+    /// Name -> value; holds [`SCHEMA_VERSION_KEY`], [`CHAIN_KEY`], [`SAFE_HEAD_KEY`] and
+    /// [`FINALIZED_HEAD_KEY`].
     meta: Keyspace,
     /// Held by every write: a batch has no conflict detection, so two appends must not both
     /// read the same tip. tokio's mutex because it is granted in arrival order: with std's, a
@@ -208,6 +220,7 @@ fn open_schema(path: &Path) -> Result<Tables, Failure> {
         bodies: db.keyspace("bodies", separated)?,
         receipts: db.keyspace("receipts", separated)?,
         numbers: db.keyspace("numbers", inline)?,
+        senders: db.keyspace("senders", inline)?,
         meta: db.keyspace("meta", inline)?,
         db,
         writer: Arc::default(),
@@ -322,14 +335,18 @@ pub(super) fn read(
                 let mut expected = Some(start);
                 for guard in scan {
                     let (key, header) = guard.into_inner()?;
+                    let number = decode_number(&key)?;
                     // The first key at or past `start` is another block if `start` is not held.
-                    if Some(decode_number(&key)?) != expected || !run.push(&header, "header")? {
+                    if Some(number) != expected
+                        || number < limits.lowest
+                        || !run.push(&header, "header")?
+                    {
                         break;
                     }
                     expected = expected.and_then(|number| step_from(number, 1, *rising));
                 }
             } else {
-                let mut next = Some(start);
+                let mut next = Some(start).filter(|start| *start >= limits.lowest);
                 while let Some(number) = next {
                     let Some(header) = snapshot.get(&tables.headers, number.to_be_bytes())? else {
                         break;
@@ -337,7 +354,8 @@ pub(super) fn read(
                     if !run.push(&header, "header")? {
                         break;
                     }
-                    next = step_from(number, *step, *rising);
+                    next =
+                        step_from(number, *step, *rising).filter(|number| *number >= limits.lowest);
                 }
             }
         }
@@ -348,7 +366,8 @@ pub(super) fn read(
                 (&tables.receipts, "receipts")
             };
             for hash in hashes {
-                let Some(number) = number_of(hash)? else {
+                let Some(number) = number_of(hash)?.filter(|number| *number >= limits.lowest)
+                else {
                     break;
                 };
                 let Some(value) = snapshot.get(keyspace, number.to_be_bytes())? else {
@@ -408,6 +427,105 @@ pub(super) fn number_of(tables: &Tables, hash: BlockHash) -> Result<Option<Block
         .get(hash.0)?
         .map(|number| decode_number(&number))
         .transpose()?)
+}
+
+/// Reads whole blocks from `from` upwards on one snapshot, decompressed: header, body,
+/// receipts if set, and senders. The run ends at the first block not held, below
+/// `limits.lowest`, or at `limits` (the bytes of header, body and receipts count).
+pub(super) fn blocks(
+    tables: &Tables,
+    from: BlockNumber,
+    limits: ReadLimits,
+) -> Result<Vec<ArchivedBlock>, Failure> {
+    let snapshot = tables.db.snapshot();
+    let mut blocks = Vec::new();
+    let mut bytes: usize = 0;
+    if from < limits.lowest {
+        return Ok(blocks);
+    }
+    for guard in snapshot.range(&tables.headers, from.to_be_bytes()..) {
+        if blocks.len() >= limits.items || bytes >= limits.bytes {
+            break;
+        }
+        let (key, header) = guard.into_inner()?;
+        let number = decode_number(&key)?;
+        let expected = from.checked_add(u64::try_from(blocks.len()).unwrap_or(u64::MAX));
+        if Some(number) != expected {
+            break;
+        }
+        let header = decompress(&header, "header", None)?;
+        let hash = keccak256(&header);
+        let body = snapshot
+            .get(&tables.bodies, key.clone())?
+            .ok_or_else(|| missing("body", hash))?;
+        let body = decompress(&body, "body", Some(hash))?;
+        let receipts = snapshot
+            .get(&tables.receipts, key.clone())?
+            .map(|receipts| decompress(&receipts, "receipts", Some(hash)))
+            .transpose()?;
+        let senders = snapshot
+            .get(&tables.senders, key)?
+            .ok_or_else(|| missing("senders", hash))?;
+        let senders = decode_senders(&senders, hash)?;
+        bytes = bytes
+            .saturating_add(header.len())
+            .saturating_add(body.len())
+            .saturating_add(receipts.as_ref().map_or(0, Vec::len));
+        blocks.push(ArchivedBlock {
+            encoded: EncodedBlock {
+                hash,
+                header: header.into(),
+                body: body.into(),
+                receipts: receipts.map(Into::into),
+            },
+            senders,
+        });
+    }
+    Ok(blocks)
+}
+
+/// The committed heads recorded by [`set_heads`].
+pub(super) fn heads(tables: &Tables) -> Result<L1Heads, Failure> {
+    let snapshot = tables.db.snapshot();
+    let head = |key: &str| -> Result<Option<BlockRef>, Failure> {
+        let Some(value) = snapshot.get(&tables.meta, key)? else {
+            return Ok(None);
+        };
+        let head = BlockRef::from_bytes(&value).ok_or(invalid("head", None))?;
+        Ok(Some(head))
+    };
+    Ok(L1Heads {
+        safe: head(SAFE_HEAD_KEY)?,
+        finalized: head(FINALIZED_HEAD_KEY)?,
+    })
+}
+
+/// Records `heads` in one durable batch; a `None` head leaves the recorded one in place.
+pub(super) fn set_heads(tables: &Tables, heads: L1Heads) -> Result<(), Failure> {
+    let mut batch = tables.durable_batch();
+    for (key, head) in [
+        (SAFE_HEAD_KEY, heads.safe),
+        (FINALIZED_HEAD_KEY, heads.finalized),
+    ] {
+        if let Some(head) = head {
+            batch.insert(&tables.meta, key, head.to_bytes());
+        }
+    }
+    batch.commit()?;
+    Ok(())
+}
+
+/// The senders as stored: 20 bytes each, concatenated.
+fn encode_senders(senders: &[Address]) -> Vec<u8> {
+    senders.iter().flat_map(|sender| sender.0.0).collect()
+}
+
+fn decode_senders(bytes: &[u8], block: BlockHash) -> Result<Vec<Address>, StorageError> {
+    let (addresses, rest) = bytes.as_chunks::<ADDRESS_LEN>();
+    if !rest.is_empty() {
+        return Err(invalid("senders", Some(block)));
+    }
+    Ok(addresses.iter().map(Address::from).collect())
 }
 
 /// The first and last archived block, from the first and last keys of `headers` in one
@@ -499,7 +617,8 @@ fn remove_batch(
         let hash = keccak256(decompress(&header, "header", None)?);
         batch.remove(&tables.headers, key.clone());
         batch.remove(&tables.bodies, key.clone());
-        batch.remove(&tables.receipts, key);
+        batch.remove(&tables.receipts, key.clone());
+        batch.remove(&tables.senders, key);
         batch.remove(&tables.numbers, hash.0);
         removed = removed.saturating_add(1);
     }
@@ -549,12 +668,7 @@ fn end_key(guard: Option<Guard>) -> Result<Option<BlockNumber>, Failure> {
 fn decode_number(bytes: &[u8]) -> Result<BlockNumber, StorageError> {
     <[u8; 8]>::try_from(bytes)
         .map(u64::from_be_bytes)
-        .map_err(|_wrong_length| StorageError::InvalidData {
-            store: Store::Archive,
-            what: "block number",
-            block: None,
-            source: None,
-        })
+        .map_err(|_wrong_length| invalid("block number", None))
 }
 
 /// Checks that `block`, whose header names `parent_hash`, is the child of `parent`.
@@ -620,6 +734,16 @@ const fn invalid_data(
         what,
         block,
         source: Some(source),
+    }
+}
+
+/// Stored data that is present but not what the layout promises, with nothing to say why.
+const fn invalid(what: &'static str, block: Option<BlockHash>) -> StorageError {
+    StorageError::InvalidData {
+        store: Store::Archive,
+        what,
+        block,
+        source: None,
     }
 }
 

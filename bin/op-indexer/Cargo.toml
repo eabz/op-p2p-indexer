@@ -14,6 +14,7 @@ op-indexer-p2p.workspace = true
 op-indexer-pipeline.workspace = true
 op-indexer-primitives.workspace = true
 op-indexer-storage.workspace = true
+op-indexer-stream.workspace = true
 
 alloy-primitives.workspace = true
 eyre.workspace = true

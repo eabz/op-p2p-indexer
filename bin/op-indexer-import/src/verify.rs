@@ -12,10 +12,10 @@
 //! encodings; its receipts root is the root over the stored receipts. That is what a peer
 //! checks when these bytes are served to it.
 //!
-//! What is not proven: senders. No signature is checked. The sender recorded for the optional
-//! database rows is the one the service reports; a transaction signed with all zeros (an
-//! L1-to-L2 message of OP Mainnet's client before Bedrock) has none and gets the zero
-//! address. They are counted.
+//! What is not proven here: senders. No signature is checked; the sender recorded with each
+//! block is the one the service reports, and `load` recovers and checks it before archiving it.
+//! A transaction signed with all zeros (an L1-to-L2 message of OP Mainnet's client before
+//! Bedrock) has no signer and gets the zero address. They are counted.
 
 mod block;
 mod lists;

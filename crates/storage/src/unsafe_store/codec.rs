@@ -29,8 +29,8 @@ pub(super) struct EncodedBlock {
 
 /// Encodes a block's fields as JSON in alloy's serde form, each transaction with its `from`.
 ///
-/// Expects a block that passed [`validate_block`](crate::validate::validate_block), which rejects what the scripts or the
-/// committed store could not hold.
+/// Expects a block that passed [`validate_block`](crate::validate::validate_block), which
+/// rejects what the scripts and this layout could not hold.
 pub(super) fn encode_block(block: &DecodedBlock) -> Result<EncodedBlock, StorageError> {
     let transactions = &block.block.body.transactions;
     let transactions = transactions
@@ -56,8 +56,6 @@ pub(super) fn encode_block(block: &DecodedBlock) -> Result<EncodedBlock, Storage
         },
         source: match block.source {
             BlockSource::Gossip => "gossip",
-            BlockSource::L1 => "l1",
-            BlockSource::Import => "import",
             BlockSource::Sync => "sync",
         },
     })
@@ -98,8 +96,6 @@ pub(super) fn decode_block(
         .transpose()?;
     let source = match field(fields, "source", block)? {
         "gossip" => BlockSource::Gossip,
-        "l1" => BlockSource::L1,
-        "import" => BlockSource::Import,
         "sync" => BlockSource::Sync,
         _ => return Err(invalid("block source", block, None)),
     };
@@ -142,7 +138,7 @@ pub(super) fn block_ref(
 }
 
 /// Decodes one event: every type the scripts write to the stream (section 3.3).
-fn decode_event(fields: &HashMap<String, String>) -> Result<UnsafeEvent, StorageError> {
+pub(super) fn decode_event(fields: &HashMap<String, String>) -> Result<UnsafeEvent, StorageError> {
     match field(fields, "type", None)? {
         "head" => Ok(UnsafeEvent::NewHead {
             head: block_ref(fields, "number", "hash")?,

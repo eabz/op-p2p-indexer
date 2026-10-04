@@ -1,26 +1,23 @@
-//! Block storage: an unsafe store for live blocks, a committed store for blocks on L1, and a
-//! local archive of committed blocks for serving to peers.
+//! Block storage: an unsafe store for live blocks, and the archive of blocks committed to L1.
 //!
 //! ```text
 //! DecodedBlock ─▶ UnsafeStore (Redis: unsafe blocks, fork choice, events for readers)
-//!               ├▶ CommittedStore (ClickHouse: blocks committed to L1 and backfill)
-//!               └▶ ArchiveStore (fjall: a contiguous range of committed blocks, as RLP)
+//! ArchivedBlock ─▶ ArchiveStore (fjall: the committed store, a contiguous range of committed
+//!                  blocks as RLP with their senders, and the committed L1 heads)
 //! ```
 //!
-//! - [`UnsafeStore`], [`CommittedStore`] and [`ArchiveStore`] are the contracts;
-//!   [`unsafe_store`], [`committed_store`] and [`archive_store`] hold the Redis, ClickHouse and
-//!   fjall implementations.
+//! - [`UnsafeStore`] and [`ArchiveStore`] are the contracts; [`unsafe_store`] and
+//!   [`archive_store`] hold the Redis and fjall implementations.
 //! - [`StorageConfig`] is plain data filled by the binary; [`StorageError`] classifies failures
 //!   by [`Severity`]: transient, expected or fatal.
-//! - [`metrics`] names and records every metric of the three stores.
+//! - [`metrics`] names and records every metric of the two stores.
 //!
-//! Takes blocks that are already decoded, with or without their receipts. Does not decode gossip
-//! payloads, execute transactions, know about L1 or networking, or retry: moving blocks from
-//! the unsafe store to the committed store and the archive, and retrying transient errors, is
-//! the caller's job.
+//! Takes blocks that are already decoded or verified, with or without their receipts. Does not
+//! decode gossip payloads, execute transactions, know about L1 or networking, or retry: moving
+//! blocks from the unsafe store to the archive, and retrying transient errors, is the caller's
+//! job.
 
 pub mod archive_store;
-pub mod committed_store;
 mod config;
 mod error;
 pub mod metrics;
@@ -29,37 +26,36 @@ pub mod unsafe_store;
 mod validate;
 
 use std::fmt;
+use std::str::FromStr;
+use std::time::Duration;
 
 use alloy_primitives::{BlockHash, BlockNumber, Bytes};
 use op_alloy_consensus::OpReceiptEnvelope;
 use op_indexer_primitives::{
-    BlockRead, BlockRef, DecodedBlock, EncodedBlock, InsertOutcome, ItemConvert, L1Heads,
-    ReadLimits,
+    ArchivedBlock, BlockRead, BlockRef, DecodedBlock, InsertOutcome, ItemConvert, L1Heads,
+    ReadLimits, UnsafeEvent,
 };
 
-pub use config::{ArchiveConfig, ArchiveRetention, ClickHouseConfig, RedisConfig, StorageConfig};
+pub use config::{ArchiveConfig, ArchiveRetention, RedisConfig, StorageConfig};
 pub use error::{InvalidBlockReason, ParseError, Severity, StorageError};
 pub use retry::{RetryError, retry};
 
-/// One of the three stores, for errors and metric labels.
+/// One of the two stores, for errors and metric labels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Store {
     /// The unsafe store (Redis).
     Unsafe,
-    /// The committed store (ClickHouse).
-    Committed,
-    /// The local block archive (fjall).
+    /// The local block archive (fjall), the committed store.
     Archive,
 }
 
 impl Store {
-    /// The store's backend: `redis`, `clickhouse` or `fjall`.
+    /// The store's backend: `redis` or `fjall`.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Unsafe => "redis",
-            Self::Committed => "clickhouse",
             Self::Archive => "fjall",
         }
     }
@@ -69,6 +65,51 @@ impl fmt::Display for Store {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+/// A position in the unsafe store's event stream: a Redis stream id, `millis-seq`. Ordered as
+/// the events are; [`EventId::START`] is before every event.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EventId {
+    /// Milliseconds part.
+    pub millis: u64,
+    /// Sequence within the millisecond.
+    pub seq: u64,
+}
+
+impl EventId {
+    /// Before every event: `0-0`.
+    pub const START: Self = Self { millis: 0, seq: 0 };
+}
+
+impl fmt::Display for EventId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}-{}", self.millis, self.seq)
+    }
+}
+
+impl FromStr for EventId {
+    type Err = std::num::ParseIntError;
+
+    /// Parses `millis-seq`; `millis` alone means sequence 0, as Redis reads it.
+    fn from_str(id: &str) -> Result<Self, Self::Err> {
+        let (millis, seq) = id.split_once('-').unwrap_or((id, "0"));
+        Ok(Self {
+            millis: millis.parse()?,
+            seq: seq.parse()?,
+        })
+    }
+}
+
+/// What [`UnsafeStore::events`] read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Events {
+    /// The events after the position asked for, oldest first.
+    pub events: Vec<(EventId, UnsafeEvent)>,
+    /// Events after the position asked for may have been trimmed from the stream (it keeps
+    /// about the newest ten thousand): the reader must read the state again. Can be set when
+    /// nothing was lost; never set for [`EventId::START`].
+    pub missed: bool,
 }
 
 /// Live blocks not yet committed to L1, with fork choice.
@@ -183,58 +224,41 @@ pub trait UnsafeStore {
     /// Returns [`StorageError`] if the store cannot be reached.
     fn set_l1_heads(&self, heads: L1Heads)
     -> impl Future<Output = Result<(), StorageError>> + Send;
-}
 
-/// Blocks committed to L1, and historical backfill.
-///
-/// Every remote call has a timeout and nothing is retried; most methods make several calls.
-/// Every write is idempotent, so a caller may retry it. The returned futures are `Send`, so a
-/// store can be driven from any task. Dropping a future never corrupts the store.
-pub trait CommittedStore {
-    /// Inserts blocks with their transactions, receipts and logs. Idempotent.
+    /// Returns the id of the newest event in the stream, or [`EventId::START`] if it is empty:
+    /// where a reader that has just read the store's state starts following [`Self::events`].
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError`] if the store cannot be reached or rejects the rows.
+    /// Returns [`StorageError`] if the store cannot be reached or the id does not parse.
+    fn last_event_id(&self) -> impl Future<Output = Result<EventId, StorageError>> + Send;
+
+    /// Returns up to `count` events after `after`, oldest first, every write's events in the
+    /// order the writes were applied (docs/storage.md section 3.3). Waits up to `block_for` for
+    /// the first one when there is none yet (not at all when it is zero); empty if none came.
+    ///
+    /// Runs on a connection of its own, so a wait does not hold up the store's other calls.
+    /// Clones share that connection: concurrent calls of this method wait for each other.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the store cannot be reached, does not answer within
+    /// `block_for` and the request timeout, or an event does not decode.
     ///
     /// # Cancel safety
     ///
-    /// Writes one table after another. A future dropped part-way may leave some tables without
-    /// the batch; inserting the same blocks again completes it.
-    fn insert(
+    /// Reads only. A dropped future loses nothing: call it again with the same `after`.
+    fn events(
         &self,
-        blocks: &[DecodedBlock],
-    ) -> impl Future<Output = Result<(), StorageError>> + Send;
-
-    /// Deletes everything above `safe` (an L1 reorg moved the safe head back).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StorageError`] if the store cannot be reached.
-    ///
-    /// # Cancel safety
-    ///
-    /// Deletes from one table after another. A future dropped part-way leaves some tables
-    /// with rows above `safe`; calling it again with the same `safe` finishes the job.
-    fn rollback_to(&self, safe: BlockRef) -> impl Future<Output = Result<(), StorageError>> + Send;
-
-    /// Returns the recorded L1 safe and finalized heads.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StorageError`] if the store cannot be reached or stored data cannot be decoded.
-    fn l1_heads(&self) -> impl Future<Output = Result<L1Heads, StorageError>> + Send;
-
-    /// Records the L1 safe and finalized heads.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StorageError`] if the store cannot be reached.
-    fn set_l1_heads(&self, heads: L1Heads)
-    -> impl Future<Output = Result<(), StorageError>> + Send;
+        after: EventId,
+        count: usize,
+        block_for: Duration,
+    ) -> impl Future<Output = Result<Events, StorageError>> + Send;
 }
 
-/// A local, contiguous window of recent committed blocks, kept in the encoding peers ask for.
+/// The committed store: a local, contiguous range of committed blocks (all of them, or a
+/// window of the newest), kept in the encoding peers ask for, with their senders, and the
+/// committed L1 heads.
 ///
 /// The archive holds one range of blocks, each the parent of the next. Every write is one
 /// fjall batch, applied entirely or not at all, so a crash or a dropped future leaves the range
@@ -242,17 +266,18 @@ pub trait CommittedStore {
 /// does not stop it: `append_batch` and `set_receipts` still run to completion.
 /// The returned futures are `Send`, so a store can be driven from any task.
 pub trait ArchiveStore {
-    /// Appends consecutive blocks, oldest first, in their original encoding. (For bulk loads
-    /// the fjall archive also has `FjallArchive::bulk_append`.) The bytes are stored unchanged, so they must be bytes the
-    /// caller has verified (import, range sync) or encoded from a verified block that
-    /// survives the round trip (promoted gossip blocks). A block with receipts stores them at
-    /// once.
+    /// Appends consecutive blocks, oldest first, in their original encoding with their
+    /// senders. (For bulk loads the fjall archive also has `FjallArchive::bulk_append`.) The
+    /// bytes are stored unchanged, so they must be bytes the caller has verified (import,
+    /// range sync) or encoded from a verified block that survives the round trip (promoted
+    /// gossip blocks), and the senders must be the ones recovered from them. A block with
+    /// receipts stores them at once.
     ///
-    /// The archive checks what it can without decoding a body: each header hashes to its
-    /// `hash`, each block is the child of the one before it, and the first one extends the held
-    /// range unless the archive is empty. It does **not** check that the body and the receipts
-    /// belong to the header: the caller must have verified the transactions root and the
-    /// receipts root over exactly these bytes.
+    /// The archive checks what it can without decoding a body: each header hashes to its `hash`,
+    /// there is one sender per transaction, each block is the child of the one before it, and the
+    /// first one extends the held range unless the archive is empty. It does **not** check that the
+    /// body and the receipts belong to the header: the caller must have verified the transactions
+    /// root and the receipts root over exactly these bytes.
     ///
     /// Blocks the archive already holds are skipped, so repeating a call is harmless: the
     /// leading blocks up to the tip when the tip is among them, and the whole list when it
@@ -264,8 +289,9 @@ pub trait ArchiveStore {
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError::InvalidBlock`] if a header does not hash to its `hash`,
-    /// [`StorageError::InvalidData`] if a header is not a header, [`StorageError::NotContiguous`]
+    /// Returns [`StorageError::InvalidBlock`] if a header does not hash to its `hash` or the
+    /// senders are not one per transaction, [`StorageError::InvalidData`] if a header is not a
+    /// header or a body not a body, [`StorageError::NotContiguous`]
     /// if a block is not the child of the one before it or the list does not extend the held
     /// range, and another [`StorageError`] if the archive cannot be written.
     ///
@@ -274,7 +300,7 @@ pub trait ArchiveStore {
     /// Dropping the future does not stop the call: it runs to its end on a blocking thread.
     fn append_batch(
         &self,
-        blocks: Vec<EncodedBlock>,
+        blocks: Vec<ArchivedBlock>,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
     /// Attaches receipts to an archived block. `Ok(false)` if it is not archived.
@@ -308,6 +334,37 @@ pub trait ArchiveStore {
         convert: Option<ItemConvert>,
     ) -> impl Future<Output = Result<Vec<Bytes>, StorageError>> + Send;
 
+    /// Reads whole blocks (header, body, receipts if set, senders) from `from` upwards, in one
+    /// call on one snapshot: what a reader of the committed chain streams. The run ends at the
+    /// first block that is not held, and at `limits` (header, body and receipt bytes count);
+    /// it is empty if `from` is not held. A block by hash is [`Self::number_of`], then this.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the archive cannot be read or holds a block only in part.
+    fn blocks(
+        &self,
+        from: BlockNumber,
+        limits: ReadLimits,
+    ) -> impl Future<Output = Result<Vec<ArchivedBlock>, StorageError>> + Send;
+
+    /// Returns the committed L1 safe and finalized heads, as [`Self::set_heads`] recorded
+    /// them; `None` for a head never recorded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the archive cannot be read or a head does not decode.
+    fn heads(&self) -> impl Future<Output = Result<L1Heads, StorageError>> + Send;
+
+    /// Records the committed L1 safe and finalized heads, durably and at once; a `None` head
+    /// leaves the recorded one in place. Promotion's marker that the blocks up to the safe
+    /// head are committed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the archive cannot be written.
+    fn set_heads(&self, heads: L1Heads) -> impl Future<Output = Result<(), StorageError>> + Send;
+
     /// Returns the number of the archived block with this hash.
     ///
     /// # Errors
@@ -328,6 +385,7 @@ pub trait ArchiveStore {
     ) -> impl Future<Output = Result<Option<(BlockRef, BlockRef)>, StorageError>> + Send;
 
     /// Removes every block above `number` (an L1 reorg moved the safe head back).
+    /// The recorded heads are not changed: the caller records the new ones first.
     ///
     /// # Errors
     ///

@@ -14,9 +14,8 @@
 //!   L1-attributes deposit before Regolith has it ([L1 attributes deposited transaction],
 //!   [Regolith]).
 //!
-//! No signature is checked and no sender recovered: one recovery per transaction would be most
-//! of the work of `verify`, and the bytes served to peers do not contain senders. The sender
-//! recorded for the optional database rows is the one the service reports.
+//! No signature is checked and no sender recovered here: the sender recorded with each block is
+//! the one the service reports, and `load` recovers and checks it before archiving it.
 //!
 //! [L1 attributes deposited transaction]: https://specs.optimism.io/protocol/deposits.html#l1-attributes-deposited-transaction
 //! [Regolith]: https://specs.optimism.io/protocol/regolith/overview.html

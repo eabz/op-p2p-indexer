@@ -9,10 +9,11 @@
 //!   on the transfer only.
 //! - `verify` ([`mod@verify`]) rebuilds every block's consensus encoding from the downloaded rows
 //!   and checks it: header hash, parent links up to a trusted anchor, transactions root and
-//!   receipts root (senders are not checked). What passes is written as the exact verified bytes
-//!   ([`chunk`]).
-//! - `load` ([`load`]) appends verified chunks to the local block archive the node serves
-//!   from; ClickHouse is written too only when asked.
+//!   receipts root (senders are checked later, by `load`). What passes is written as the exact
+//!   verified bytes ([`chunk`]).
+//! - `load` ([`load`]) recovers every sender from its signature, checks it against the one the
+//!   service reported, and appends the verified chunks, with those senders, to the block
+//!   archive the node serves from.
 //!
 //! Every step is resumable: a chunk's file exists only when the chunk is complete. The
 //! indexer never links this binary and never talks to the archive service. See

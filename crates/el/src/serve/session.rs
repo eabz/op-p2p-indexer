@@ -68,6 +68,7 @@ impl Serving {
     pub(crate) fn session(
         &self,
         tip: watch::Receiver<Option<BlockRef>>,
+        lowest: BlockNumber,
     ) -> (SessionServing, mpsc::Receiver<Bytes>) {
         let (answers_tx, answers_rx) = mpsc::channel(MAX_IN_FLIGHT_PER_PEER);
         let now = Instant::now();
@@ -76,6 +77,7 @@ impl Serving {
             answers: answers_tx,
             held: self.range.clone(),
             tip,
+            lowest,
             advertised: None,
             advertised_at: now,
             window_start: now,
@@ -104,6 +106,9 @@ pub(crate) struct SessionServing {
     answers: mpsc::Sender<Bytes>,
     held: watch::Receiver<Option<HeldRange>>,
     tip: watch::Receiver<Option<BlockRef>>,
+    /// The lowest block this peer is served and told about: 0 for an op-p2p-indexer, the
+    /// network's Bedrock block for anyone else (`NetworkSpec::indexers_only_below`).
+    lowest: BlockNumber,
     /// The range the peer was last told.
     advertised: Option<AdvertisedRange>,
     advertised_at: Instant,
@@ -121,14 +126,15 @@ impl SessionServing {
     /// The range to advertise now; `None` until the node knows a tip.
     fn range(&self) -> Option<AdvertisedRange> {
         let tip = (*self.tip.borrow())?;
-        let held = *self.held.borrow();
+        // Blocks below `lowest` are not this peer's to ask for.
+        let held = (*self.held.borrow()).filter(|(_, last)| last.number >= self.lowest);
         Some(held.map_or(
             AdvertisedRange {
                 earliest: tip.number,
                 latest: tip,
             },
             |(first, last)| AdvertisedRange {
-                earliest: first.number,
+                earliest: first.number.max(self.lowest),
                 latest: last,
             },
         ))
@@ -168,6 +174,7 @@ impl SessionServing {
         };
         let request = Request {
             kind,
+            lowest: self.lowest,
             id: request_id,
             body: Bytes::copy_from_slice(body),
             answer,

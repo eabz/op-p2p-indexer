@@ -11,13 +11,18 @@ op-indexer-chainspec.workspace = true
 op-indexer-primitives.workspace = true
 op-indexer-storage.workspace = true
 
-alloy-consensus.workspace = true
+# `secp256k1`: `load` recovers every sender (one signature recovery per transaction), and with
+# this feature alloy recovers with libsecp256k1, about five times faster than k256 (measured:
+# 32 against 148 us per transaction on one core), which keeps the load bound by the disk.
+alloy-consensus = { workspace = true, features = ["secp256k1"] }
 alloy-eips = { workspace = true, features = ["serde"] }
 # `asm-keccak`: `verify` is hash-bound (two tries per block and the header); the assembly
 # implementation is the faster one on x86-64. It needs a C toolchain at build time, as zstd does.
 alloy-primitives = { workspace = true, features = ["serde", "asm-keccak"] }
 alloy-rlp.workspace = true
-op-alloy-consensus.workspace = true
+# `k256`: op-alloy implements sender recovery only with it; the recovery itself then runs on
+# libsecp256k1 (alloy-consensus's `secp256k1` above takes precedence).
+op-alloy-consensus = { workspace = true, features = ["k256"] }
 
 bytes.workspace = true
 clap.workspace = true

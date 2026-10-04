@@ -2,7 +2,9 @@
 
 Status: **built on `feat/el`; the whole OP Mainnet chain (blocks 0 to 157,745,023) has been
 downloaded and verified on the real service, and its load into the block archive was running
-when this was written (section 6). The ClickHouse load has run only against a local server.**
+when this was written (section 6). The archive's layout has since changed (schema version 2:
+senders and the committed heads), so that archive must be loaded again from the verified
+chunks; no download is needed. ClickHouse is no longer part of the project.**
 
 **Goal (user, 2026-10-04): sync the whole chain from HyperSync as a separate process, usable
 for any chain, into a local store that the node serves over p2p; then test a normal p2p sync
@@ -95,11 +97,18 @@ the anchor (section 11). The bytes that passed are written as verified chunks.
   parent up to the anchor; its transactions root is the root over the stored transaction
   encodings; its receipts root is the root over the stored receipts. That is what a peer
   checks when the bytes are served to it.
-- **What is not proven: senders.** No signature is checked: one recovery per transaction was
-  most of the work of `verify`, and the bytes served to peers contain no senders. The sender
-  written to the optional ClickHouse rows is the `from` HyperSync reports, trusted as given. A
-  transaction signed with all zeros (an L1-to-L2 message of OP Mainnet's client before
-  Bedrock) has no signer and gets the zero address; they are counted.
+- **Senders are proven by `load`, not by `verify`.** `verify` checks no signature: the sender
+  it records in each verified chunk is the `from` HyperSync reports. `load` then proves it
+  before anything is archived (user decision, 2026-10-04): for every signed transaction it
+  recovers the sender from the signature and compares; for a deposit it compares with the
+  `from` in the deposit's encoding, which the transactions root and so the block hash cover.
+  A mismatch stops `load` before that block, naming the block, the transaction's index and
+  both addresses. So every sender in the archive is proven (recovered, or hashed for
+  deposits) except one kind: a legacy transaction signed with all zeros (an L1-to-L2 message
+  of OP Mainnet's client before Bedrock) has no signer, keeps the recorded zero address, and
+  is counted, by `verify` and again at the end of `load` (`zero_signature_transactions`).
+  The recovery runs on libsecp256k1 (alloy's `secp256k1` backend), which does it in about a
+  fifth of the time of k256.
 - **The accepted range.** Only when every chunk is verified, every link holds and the anchor
   matches does `verify` write `verified.json` (range, anchor, hash of the last block, time).
   Every run of `verify` removes it first. `load` refuses to load without a record that matches
@@ -124,18 +133,26 @@ the anchor (section 11). The bytes that passed are written as verified chunks.
 
 ### 3.3 `load`
 
-- **By default `load` writes to the local archive only** (section 4): the fjall store the
-  node serves peers from. It needs no database.
-- Loading the committed store (ClickHouse) is optional and happens only when its settings are
-  given: verified chunks become `DecodedBlock`s with `BlockSource::Import`, are turned into
-  rows (`ClickHouseStore::bulk_rows`) in batches of about half a million rows, and are written
-  by `ClickHouseStore::bulk_insert`, `--clickhouse-inserts` batches at once (default 4). It
-  can be done later from the same chunks, without HyperSync and without touching the archive
-  again. It has run only against a local ClickHouse server.
-- **A database created by an older build is refused.** The ClickHouse migrations were edited
-  in place before the first release, so `load --clickhouse-url` against a database an older
-  build migrated fails with the migration checksum error, which names the database. Drop it
-  (`DROP DATABASE <name>`) and load again; the archive is not affected.
+- **`load` writes to the archive only** (section 4): the fjall store that is the node's
+  committed store, which it serves peers and the stream from. It needs no database. Each
+  block goes in with its senders, recovered and checked first (section 3.2): the chunks on
+  disk are checked again on every load, so an existing state directory needs no new
+  download. Its last line reports `senders_recovered` and `zero_signature_transactions`.
+- **Cost of the check** (20 chunks after Isthmus, blocks 140,000,063 to 140,002,062, 2,000
+  blocks, 48,357 signed transactions, 146 MB of RLP; M1 Pro, 10 cores, release build):
+  recovery is about 32 µs per transaction on one core, 37 µs with decoding. The load used
+  2.0 s of CPU instead of 0.22 s, and took 0.9 s instead of 0.7 s of wall time (one bulk
+  append, so mostly the write). Preparing a block after Isthmus now takes about 1 ms of CPU
+  instead of 0.11 ms. On this 10-core laptop that makes the bulk load bound by the cores:
+  about 9,900 blocks/s (720 MB/s of RLP) instead of the 32,000 blocks/s (2.35 GB/s) measured
+  above. On a 32-core server it is about 31,000 blocks/s (2.2 GB/s) of preparation, above
+  the 580 to 665 MB/s of RLP the full load wrote (bound by its disk, section 6), so that load
+  should stay bound by the disk; an estimate, assuming cores as fast as an M1 Pro's.
+  Extrapolated to the whole chain, about 1.3 billion transactions: about 13 CPU-hours of
+  recovery, some 25 minutes on 32 cores, spread over the load next to the writes.
+- **An archive written by an older build is refused** when its schema version differs
+  (version 2 added the senders and the committed heads). Move it away and `load` into a new
+  directory from the same verified chunks; nothing is downloaded again.
 - It loads only the range `verify` accepted (`verified.json`), and once the archive holds the
   range it checks that the archive's block at the top of the range is the one `verify`
   accepted (`last_hash`), so what was loaded is bound to what was verified.
@@ -207,27 +224,16 @@ machine: `cargo build --release -p op-indexer-import` produces one file to copy.
   size (`OP_INDEXER_IMPORT_CHUNK_BLOCKS`), requests in flight (`OP_INDEXER_IMPORT_REQUESTS`),
   `verify`'s threads and start (`OP_INDEXER_IMPORT_VERIFY_THREADS`,
   `OP_INDEXER_IMPORT_VERIFY_FROM_BLOCK`), and for `load` the archive directory
-  (`OP_INDEXER_IMPORT_ARCHIVE_DIR`) and the ClickHouse settings below.
-- **By default the importer fills the local block archive the node serves from, and needs no
-  database.** `load` appends the verified bytes to the archive directory (`--archive-dir`,
-  default `data/archive`) and contacts nothing else.
-- **ClickHouse is optional.** It is written only when `--clickhouse-url` is given
-  (`OP_INDEXER_IMPORT_CLICKHOUSE_URL`); its database is then created and its migrations
-  applied if missing, and `--clickhouse-database` (`OP_INDEXER_CLICKHOUSE_DATABASE`, default
-  `op_indexer`), `--clickhouse-user` (`OP_INDEXER_CLICKHOUSE_USER`, default `indexer`),
-  `--clickhouse-password` (`OP_INDEXER_CLICKHOUSE_PASSWORD`) and `--clickhouse-inserts`
-  (`OP_INDEXER_IMPORT_CLICKHOUSE_INSERTS`, batches in flight, 1 to 16, default 4) apply.
-  Redis is never needed.
+  (`OP_INDEXER_IMPORT_ARCHIVE_DIR`).
+- **The importer fills the block archive the node serves from, and needs no database.**
+  `load` appends the verified bytes and senders to the archive directory (`--archive-dir`,
+  default `data/archive`) and contacts nothing else. Redis is never needed.
 - `load` needs the range accepted by `verify` (`verified.json`) and refuses anything else.
   What the archive holds is asked of the archive: `load` continues after its last block, and
   refuses an archive that does not start at the range's first block or holds another chain.
   The archive also records the chain it is for (chain id and genesis hash) on first open: one
-  recorded for another chain is refused before anything is read or appended, and one with no
-  record (new, or written by an earlier build) takes the plan's chain.
-  ClickHouse records each chunk it holds in its own table (`imported_ranges`, written after
-  the chunk's rows), and `load` loads the chunks it has no record of, so it can be loaded on a
-  later run from the same verified chunks without touching the archive. The record lives in
-  the database: a dropped or different database gets every chunk again.
+  recorded for another chain is refused before anything is read or appended (see
+  `docs/storage.md` section 9.2 for an archive with no record).
 - `load` exits with an error if it stops before the end of the range, and says what to run.
 
 ### How to run it

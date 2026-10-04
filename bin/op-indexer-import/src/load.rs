@@ -1,24 +1,26 @@
-//! `load`: appends the verified range to the local block archive the node serves from, and,
-//! only when asked, writes it to ClickHouse too.
+//! `load`: checks the senders of the verified range and appends it to the block archive the
+//! node serves from, its committed store.
 //!
 //! ```text
-//! <state>/verified/<chunk>.blk ─▶ the verified bytes ─▶ FjallArchive::bulk_append (fjall)
-//!            with --clickhouse-url ─▶ typed blocks ─▶ ClickHouseStore::bulk_insert (ClickHouse)
-//!                                 ─▶ ClickHouseStore::record_imported (the chunk's range)
+//! <state>/verified/<chunk>.blk ─▶ senders recovered and checked ─▶ FjallArchive::bulk_append
 //! ```
 //!
-//! By default nothing but the archive is touched: no database is needed, contacted or
-//! migrated. Only a range `verify` accepted whole is loaded.
+//! **Senders.** The sender of every signed transaction is recovered from its signature and
+//! must equal the one in the verified chunk (the service's); a deposit's must equal the `from`
+//! its encoding carries, which the block hash covers. A legacy transaction signed with all
+//! zeros has no signer: its recorded sender (the zero address) is kept, unproven, and counted.
+//! The first difference stops `load` before its block is appended. The recovery runs in the
+//! threads that prepare the blocks, next to the writes; it is most of the load's CPU (about
+//! 37 µs per transaction with decoding, on one core of an M1 Pro, with libsecp256k1).
+//!
+//! Nothing but the archive is touched. Only a range `verify` accepted whole is loaded.
 //!
 //! What the archive holds is asked of the archive, never recorded beside it: `load` starts
 //! after the archive's last block, so a stopped run or a new archive directory cannot make it
 //! skip blocks. Before it writes, it checks that the archive starts at the first block of the
 //! range and that its last block is the verified one at that height; an archive of another
-//! range or chain is refused. ClickHouse records the range of every chunk it holds in its own
-//! table (`imported_ranges`), written once the chunk is in all four tables; `load` reads that
-//! record at start and loads the chunks it lacks. The record lives in the database, so a
-//! dropped, recreated or different database has none and gets every chunk. (Earlier builds
-//! kept marker files in `<state>/loaded/`; they are not read.)
+//! range or chain is refused. (Earlier builds kept marker files in `<state>/loaded/`; they are
+//! not read.)
 //!
 //! The archive is written in block order by bulk appends (`FjallArchive::bulk_append`):
 //! chunks are read, decompressed and their blocks prepared (hash checked, values compressed)
@@ -27,62 +29,44 @@
 //! stop or a crash leaves the archive holding a contiguous prefix of the range.
 //!
 //! `load` succeeds only if it reaches the end of the range: stopping on a signal is reported
-//! as a failure that says what to run next. Both writes are idempotent, so repeating a chunk
-//! is harmless.
+//! as a failure that says what to run next.
 //!
-//! The archive gets the bytes `verify` checked, unchanged. The typed blocks for ClickHouse
-//! are decoded from those same bytes; nothing is encoded again. Does not download or verify
-//! anything, and trusts a verified chunk's file.
+//! The archive gets the bytes `verify` checked, unchanged, with the senders `load` checked;
+//! nothing is encoded again. Does not download or verify anything, and trusts a verified
+//! chunk's file.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
+use alloy_consensus::transaction::SignerRecoverable;
 use alloy_primitives::B256;
 use clap::Args;
 use eyre::{WrapErr, ensure, eyre};
-use op_indexer_primitives::{BlockSource, ChainIdentity, DecodedBlock, EncodedBlock, decode_block};
-use op_indexer_storage::archive_store::{FjallArchive, PreparedBlock};
-use op_indexer_storage::committed_store::{BulkRows, ClickHouseStore};
-use op_indexer_storage::{
-    ArchiveStore, ClickHouseConfig, RetryError, Severity, StorageError, Store,
+use op_alloy_consensus::OpTxEnvelope;
+use op_indexer_primitives::{
+    ChainIdentity, EncodedBlock, decode_transaction, is_zero_signature, split_body,
 };
-use tokio::task::{JoinHandle, JoinSet, spawn_blocking};
+use op_indexer_storage::archive_store::{FjallArchive, PreparedBlock};
+use op_indexer_storage::{ArchiveStore, StorageError};
+use tokio::task::{JoinHandle, spawn_blocking};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::chunk::{self, VerifiedBlock};
-use crate::cli::Secret;
 use crate::progress::{self, Rate};
 use crate::state::{Chunk, Plan, State};
 
 /// Fewest and most chunks read, decompressed and prepared at once ahead of the archive's
-/// writer: one per core within these bounds. Preparing (hashing the header, compressing the
-/// values) is most of the CPU of a load; a chunk after Bedrock is a few megabytes in memory.
+/// writer: one per core within these bounds. Preparing (recovering the senders, hashing the
+/// header, compressing the values) is the CPU of a load, mostly the recovery; a chunk after
+/// Bedrock is a few megabytes in memory.
 const READ_AHEAD: (usize, usize) = (4, 32);
 /// Bytes of block encodings collected before they are appended to the archive in one bulk
 /// append. Each writes new table and blob files and syncs them, so it must be large; one is
 /// written while the next is prepared, and a prepared one takes about half this in memory.
 const APPEND_BYTES: u64 = 1024 * 1024 * 1024;
-/// Rows (of every table together) per bulk insert into ClickHouse: large enough that the
-/// server writes few, large parts and a round trip is small next to the data, small enough
-/// that a batch takes a few hundred megabytes in memory at most.
-const BULK_ROWS: usize = 500_000;
-/// Batches written at once by default: each waits on the network and the server, not on this
-/// machine, so a few overlap well; a remote service benefits most.
-const DEFAULT_INSERTS: u64 = 4;
-/// Most batches written at once. A batch takes about 0.8 GB while it is built and sent
-/// (measured: half a million rows of post-Bedrock blocks), so this keeps the pass near 14 GB
-/// with the chunks being read, well inside a 64 GB machine.
-const MAX_INSERTS: u64 = 16;
-/// How long a store call is retried, from its first failure, before `load` gives up: several
-/// times the longest a single call may take (a bulk insert's five minutes), so a call that
-/// timed out is retried. A store that is down for longer needs an operator; `load` continues
-/// where it stopped when it is run again.
-const RETRY_BUDGET: Duration = Duration::from_mins(30);
-
-/// Settings of `load`. By default it fills the local block archive the node serves from and
-/// needs no database; ClickHouse is loaded only when `--clickhouse-url` is given.
+/// Settings of `load`: it checks the senders and fills the block archive the node serves from.
 #[derive(Debug, Clone, Args)]
 pub(crate) struct LoadArgs {
     /// Directory of the indexer's block archive: `archive` inside its data directory. The
@@ -94,48 +78,16 @@ pub(crate) struct LoadArgs {
         default_value = "data/archive"
     )]
     pub(crate) archive_dir: PathBuf,
-    /// Also write the blocks to ClickHouse, at this HTTP interface (for example
-    /// `http://127.0.0.1:8123`). Optional: without it no database is contacted. Its
-    /// migrations are applied if missing. Can be given on a later run: the archive is then
-    /// left as it is and only ClickHouse is written.
-    #[arg(long, env = "OP_INDEXER_IMPORT_CLICKHOUSE_URL")]
-    pub(crate) clickhouse_url: Option<String>,
-    /// ClickHouse database. Only used with `--clickhouse-url`.
-    #[arg(
-        long,
-        env = "OP_INDEXER_CLICKHOUSE_DATABASE",
-        default_value = "op_indexer"
-    )]
-    pub(crate) clickhouse_database: String,
-    /// ClickHouse user. Only used with `--clickhouse-url`.
-    #[arg(long, env = "OP_INDEXER_CLICKHOUSE_USER", default_value = "indexer")]
-    pub(crate) clickhouse_user: String,
-    /// ClickHouse password. Only used with `--clickhouse-url`. A flag is visible in the
-    /// process list; the environment variable is not. It is never logged.
-    #[arg(long, env = "OP_INDEXER_CLICKHOUSE_PASSWORD", hide_env_values = true)]
-    pub(crate) clickhouse_password: Option<Secret>,
-    /// ClickHouse inserts in flight at once, each a batch of about half a million rows on its
-    /// own connection and about 0.8 GB of memory, at most 16. Only used with `--clickhouse-url`.
-    /// More helps a remote service (4 to 8 for ClickHouse Cloud); a local server is busy with 2.
-    #[arg(
-        long,
-        env = "OP_INDEXER_IMPORT_CLICKHOUSE_INSERTS",
-        default_value_t = DEFAULT_INSERTS,
-        value_parser = clap::value_parser!(u64).range(1..=MAX_INSERTS)
-    )]
-    pub(crate) clickhouse_inserts: u64,
 }
 
-/// Loads the verified range of `plan` into the archive, then into ClickHouse when it is asked
-/// for, to the end of the range.
+/// Loads the verified range of `plan` into the archive, to the end of the range.
 ///
 /// # Errors
 ///
 /// Returns an error if `verify` has not accepted the range, or `cancel` fires before the end
 /// of the range. Also if the archive cannot be opened, is open in another process, does not
 /// start at the first block of the range or holds another chain; if a chunk's file cannot be
-/// read or does not hold its blocks; if a store keeps failing; and, when ClickHouse is asked
-/// for, if it cannot be reached or migrated or refuses a chunk.
+/// read or does not hold its blocks; and if the archive refuses or fails a write.
 pub(crate) async fn run(
     args: &LoadArgs,
     state: &State,
@@ -155,10 +107,6 @@ pub(crate) async fn run(
                 plan.last
             )
         })?;
-    let committed = match &args.clickhouse_url {
-        Some(url) => Some(clickhouse(args, url, plan).await?),
-        None => None,
-    };
     // Startup-only blocking I/O, before any chunk is read.
     let identity = ChainIdentity {
         chain_id: plan.chain.chain_id,
@@ -181,13 +129,6 @@ pub(crate) async fn run(
     if stopped_at.is_none() {
         check_top(&archive, &args.archive_dir, plan, accepted.last_hash).await?;
     }
-    let stopped_at = match (stopped_at, &committed) {
-        (None, Some(committed)) => {
-            let inserts = usize::try_from(args.clickhouse_inserts).unwrap_or(1);
-            fill_clickhouse(committed, state, plan, inserts, cancel).await?
-        }
-        (stopped_at, _) => stopped_at,
-    };
     match stopped_at {
         None => Ok(()),
         Some(block) => Err(eyre!(
@@ -289,6 +230,10 @@ struct Amount {
     rlp_bytes: u64,
     /// Bytes of the verified chunk files they were read from.
     file_bytes: u64,
+    /// Transactions whose sender was recovered from the signature and matched.
+    recovered: u64,
+    /// Legacy transactions signed with all zeros, whose recorded sender is kept unproven.
+    zero_signatures: u64,
 }
 
 impl Amount {
@@ -296,6 +241,8 @@ impl Amount {
         self.blocks = self.blocks.saturating_add(other.blocks);
         self.rlp_bytes = self.rlp_bytes.saturating_add(other.rlp_bytes);
         self.file_bytes = self.file_bytes.saturating_add(other.file_bytes);
+        self.recovered = self.recovered.saturating_add(other.recovered);
+        self.zero_signatures = self.zero_signatures.saturating_add(other.zero_signatures);
     }
 }
 
@@ -313,8 +260,9 @@ impl Collected {
     }
 }
 
-/// Reads the verified chunk at `path`, `file_bytes` long, and prepares its blocks from
-/// `next` on for the archive. Blocking: decompression, a hash and compression per block.
+/// Reads the verified chunk at `path`, `file_bytes` long, checks the senders of its blocks
+/// from `next` on ([`check_senders`]) and prepares those blocks for the archive. Blocking:
+/// decompression, one signature recovery per transaction, a hash and compression per block.
 fn prepare(path: &Path, chunk: Chunk, next: u64, file_bytes: u64) -> eyre::Result<Collected> {
     let held =
         usize::try_from(next.saturating_sub(chunk.from)).wrap_err("a chunk has too many blocks")?;
@@ -325,18 +273,64 @@ fn prepare(path: &Path, chunk: Chunk, next: u64, file_bytes: u64) -> eyre::Resul
         },
         ..Collected::default()
     };
-    for block in read(path, chunk)?.into_iter().skip(held) {
-        let rlp_bytes = u64::try_from(size(&block.encoded)).unwrap_or(u64::MAX);
+    for (number, block) in (next..).zip(read(path, chunk)?.into_iter().skip(held)) {
+        // Checks one sender per transaction, which `check_senders` relies on.
+        let prepared = PreparedBlock::new(&block)
+            .wrap_err_with(|| format!("{} does not hold archivable blocks", path.display()))?;
+        let senders = check_senders(number, &block)?;
         collected.amount.add(Amount {
             blocks: 1,
-            rlp_bytes,
-            file_bytes: 0,
+            rlp_bytes: u64::try_from(size(&block.encoded)).unwrap_or(u64::MAX),
+            ..senders
         });
-        let block = PreparedBlock::new(&block.encoded)
-            .wrap_err_with(|| format!("{} does not hold archivable blocks", path.display()))?;
-        collected.blocks.push(block);
+        collected.blocks.push(prepared);
     }
     Ok(collected)
+}
+
+/// Checks the sender recorded for every transaction of `block` (number `number`, already
+/// checked to have one sender per transaction) in its verified chunk, which is the one the
+/// archive service reported:
+///
+/// - a signed transaction: the sender is recovered from its signature and must equal it;
+/// - a deposit: it must equal the `from` in the deposit's encoding, which the block hash
+///   covers;
+/// - a legacy transaction signed with all zeros (an L1-to-L2 message before Bedrock) has no
+///   signer: the recorded sender is kept and counted, unproven.
+///
+/// Returns what was checked, as an [`Amount`] with only the sender counts set.
+///
+/// # Errors
+///
+/// Returns an error naming the block, the transaction's index and both addresses for the
+/// first sender that differs, or if a transaction does not decode or has no recoverable
+/// sender.
+fn check_senders(number: u64, block: &VerifiedBlock) -> eyre::Result<Amount> {
+    let body = split_body(&block.encoded.body)
+        .ok_or_else(|| eyre!("block {number}: the verified body does not decode"))?;
+    let mut checked = Amount::default();
+    for (index, (leaf, recorded)) in body.transactions.iter().zip(&block.senders).enumerate() {
+        let transaction = decode_transaction(leaf)
+            .map_err(|err| eyre!("block {number}: transaction {index} does not decode: {err}"))?;
+        if is_zero_signature(&transaction) {
+            checked.zero_signatures = checked.zero_signatures.saturating_add(1);
+            continue;
+        }
+        if !matches!(transaction, OpTxEnvelope::Deposit(_)) {
+            checked.recovered = checked.recovered.saturating_add(1);
+        }
+        // A deposit's sender is the `from` in its encoding.
+        let proven = transaction.recover_signer().map_err(|err| {
+            eyre!("block {number}: transaction {index} has no recoverable sender: {err}")
+        })?;
+        ensure!(
+            proven == *recorded,
+            "block {number}: transaction {index} was sent by {proven}, but its verified chunk \
+             records {recorded}: the archive service reported a wrong sender. Nothing from this \
+             block on is loaded"
+        );
+    }
+    Ok(checked)
 }
 
 /// Bytes of the verified file of each of `chunks`, which progress is measured in.
@@ -357,206 +351,6 @@ async fn file_sizes(state: &State, chunks: &[Chunk]) -> eyre::Result<Vec<u64>> {
     })
     .await
     .wrap_err("measuring the chunks panicked")?
-}
-
-/// Writes every chunk of the range the ClickHouse database has no record of, and records it.
-/// Returns the first block of the earliest chunk not written when `cancel` stopped it, `None`
-/// when ClickHouse holds the whole range.
-///
-/// Chunks are read and turned into rows on blocking threads, joined into batches of about
-/// [`BULK_ROWS`] rows, and written by up to `inserts` batches at once, each in one synchronous
-/// insert per table (`ClickHouseStore::bulk_insert`, child tables before `blocks`). A chunk's
-/// range is recorded (`ClickHouseStore::record_imported`) only once its batch is in every
-/// table, so a stop leaves no record for a chunk ClickHouse does not fully hold; a chunk
-/// written twice is harmless, the tables keep one row per position. Memory is bounded by the batches in flight and the chunks being read.
-async fn fill_clickhouse(
-    committed: &ClickHouseStore,
-    state: &State,
-    plan: &Plan,
-    inserts: usize,
-    cancel: &CancellationToken,
-) -> eyre::Result<Option<u64>> {
-    let Some(queue) = unloaded_chunks(committed, plan, cancel).await? else {
-        return Ok(Some(plan.first));
-    };
-    let mut queue = queue.into_iter();
-    let readers = std::thread::available_parallelism().map_or(1, usize::from);
-    info!(
-        first = plan.first,
-        last = plan.last,
-        chunks = queue.len(),
-        inserts,
-        readers,
-        "loading ClickHouse"
-    );
-    let mut tally = Tally::new();
-    let mut reading: JoinSet<eyre::Result<(Chunk, BulkRows)>> = JoinSet::new();
-    let mut writing: JoinSet<eyre::Result<Result<Batch, u64>>> = JoinSet::new();
-    let mut batch = Batch::default();
-    // The first block of a chunk whose insert was abandoned on a stop.
-    let mut abandoned: Option<u64> = None;
-    loop {
-        let stopping = cancel.is_cancelled();
-        // Read ahead until the batch being built is full: the batches in flight, that one and
-        // the chunks being read are what the pass holds in memory.
-        while !stopping
-            && reading.len() < readers
-            && batch.rows.rows() < BULK_ROWS
-            && let Some(chunk) = queue.next()
-        {
-            let (committed, path) = (committed.clone(), state.verified_path(chunk));
-            reading.spawn_blocking(move || {
-                let blocks = read(&path, chunk)?
-                    .into_iter()
-                    .map(decode)
-                    .collect::<eyre::Result<Vec<DecodedBlock>>>()
-                    .wrap_err_with(|| format!("{} does not decode", path.display()))?;
-                Ok((chunk, committed.bulk_rows(&blocks)?))
-            });
-        }
-        let due = batch.rows.rows() >= BULK_ROWS || reading.is_empty() || stopping;
-        if due && !batch.chunks.is_empty() && writing.len() < inserts {
-            let (batch, committed, cancel) = (
-                std::mem::take(&mut batch),
-                committed.clone(),
-                cancel.clone(),
-            );
-            writing.spawn(async move {
-                let insert = retry(&cancel, Store::Committed, "ClickHouse insert", || {
-                    committed.bulk_insert(&batch.rows)
-                });
-                // The record follows the rows: a chunk is recorded only once every table
-                // holds it.
-                let ranges: Vec<(u64, u64)> = batch
-                    .chunks
-                    .iter()
-                    .map(|chunk| (chunk.from, chunk.to.saturating_sub(1)))
-                    .collect();
-                let insert = async {
-                    let Some(()) = insert.await? else {
-                        return Ok(None);
-                    };
-                    retry(
-                        &cancel,
-                        Store::Committed,
-                        "ClickHouse record_imported",
-                        || committed.record_imported(&ranges),
-                    )
-                    .await
-                };
-                // On a stop, the first block of the batch, whose chunks stay unmarked.
-                let first = batch.chunks.first().map_or(u64::MAX, |chunk| chunk.from);
-                Ok(Box::pin(insert).await?.map(|()| batch).ok_or(first))
-            });
-            continue;
-        }
-        if reading.is_empty() && writing.is_empty() {
-            break;
-        }
-        tokio::select! {
-            Some(read) = reading.join_next() => {
-                let (chunk, rows) = read.wrap_err("reading a chunk panicked")??;
-                batch.chunks.push(chunk);
-                batch.rows.append(rows);
-            }
-            Some(written) = writing.join_next() => {
-                match written.wrap_err("an insert panicked")?? {
-                    Ok(written) => tally.add(&written.rows, writing.len()),
-                    // Cancelled while retrying: those chunks stay unmarked.
-                    Err(first) => abandoned = Some(abandoned.map_or(first, |a| a.min(first))),
-                }
-            }
-        }
-    }
-    tally.summary();
-    // A stop leaves unmarked chunks, which the next run writes; nothing is skipped. The run
-    // is complete only if no chunk is left unread and no insert was abandoned.
-    let unread = queue.as_slice().first().map(|chunk| chunk.from);
-    Ok(match (unread, abandoned) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (first, None) | (None, first) => first,
-    })
-}
-
-/// Chunks whose rows are being joined into one bulk insert, and those rows.
-#[derive(Debug, Default)]
-struct Batch {
-    chunks: Vec<Chunk>,
-    rows: BulkRows,
-}
-
-/// What the ClickHouse pass has written, for its progress lines.
-struct Tally {
-    started: Instant,
-    logged: Instant,
-    rate: Rate,
-    blocks: u64,
-    transactions: u64,
-}
-
-impl Tally {
-    fn new() -> Self {
-        Self {
-            started: Instant::now(),
-            logged: Instant::now(),
-            rate: Rate::new(),
-            blocks: 0,
-            transactions: 0,
-        }
-    }
-
-    /// Records a written batch and logs a progress line when one is due.
-    fn add(&mut self, rows: &BulkRows, in_flight: usize) {
-        let count = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
-        self.blocks = self.blocks.saturating_add(count(rows.blocks()));
-        self.transactions = self.transactions.saturating_add(count(rows.transactions()));
-        if self.logged.elapsed() >= progress::INTERVAL {
-            self.logged = Instant::now();
-            info!(
-                blocks = self.blocks,
-                transactions = self.transactions,
-                transactions_per_sec = self.rate.per_sec(self.transactions),
-                in_flight,
-                "loading ClickHouse"
-            );
-        }
-    }
-
-    fn summary(&self) {
-        let secs = self.started.elapsed().as_secs().max(1);
-        info!(
-            blocks = self.blocks,
-            transactions = self.transactions,
-            transactions_per_sec = self.transactions / secs,
-            secs,
-            "ClickHouse pass ended"
-        );
-    }
-}
-
-/// The chunks of the plan the ClickHouse database has no record of, in block order. The
-/// record is in the database itself (`imported_ranges`), so a dropped, recreated or different
-/// database has none and every chunk is loaded again.
-async fn unloaded_chunks(
-    committed: &ClickHouseStore,
-    plan: &Plan,
-    cancel: &CancellationToken,
-) -> eyre::Result<Option<Vec<Chunk>>> {
-    let read = retry(
-        cancel,
-        Store::Committed,
-        "ClickHouse imported_ranges",
-        || committed.imported_ranges(),
-    );
-    let Some(loaded) = read.await? else {
-        return Ok(None);
-    };
-    let loaded: HashSet<(u64, u64)> = loaded.into_iter().collect();
-    Ok(Some(
-        plan.chunks()
-            .filter(|chunk| !loaded.contains(&(chunk.from, chunk.to.saturating_sub(1))))
-            .collect(),
-    ))
 }
 
 /// What the archive pass has done, for its progress lines. The time left is reckoned from
@@ -621,6 +415,8 @@ impl Progress {
             secs,
             archive_first = archive.map(|(first, _)| first),
             archive_last = archive.map(|(_, last)| last),
+            senders_recovered = self.done.recovered,
+            zero_signature_transactions = self.done.zero_signatures,
             "{}",
             if self.done.blocks == self.total_blocks {
                 "load finished: the range is in the block archive"
@@ -724,29 +520,6 @@ async fn check_top(
     Ok(())
 }
 
-/// Connects to ClickHouse at `url` and applies its migrations.
-async fn clickhouse(args: &LoadArgs, url: &str, plan: &Plan) -> eyre::Result<ClickHouseStore> {
-    let config = ClickHouseConfig {
-        url: url.to_owned(),
-        database: args.clickhouse_database.clone(),
-        user: args.clickhouse_user.clone(),
-        password: args
-            .clickhouse_password
-            .as_ref()
-            .map(|password| password.expose().to_owned()),
-    };
-    let committed = ClickHouseStore::new(&config, plan.chain.chain_id);
-    committed
-        .ping()
-        .await
-        .wrap_err("failed to reach ClickHouse")?;
-    committed
-        .migrate()
-        .await
-        .wrap_err("failed to migrate ClickHouse")?;
-    Ok(committed)
-}
-
 /// Reads the verified chunk at `path`: the blocks of `chunk`, in block order. Blocking.
 fn read(path: &Path, chunk: Chunk) -> eyre::Result<Vec<VerifiedBlock>> {
     let (_link, blocks) = chunk::read(path)
@@ -759,57 +532,4 @@ fn read(path: &Path, chunk: Chunk) -> eyre::Result<Vec<VerifiedBlock>> {
         chunk.blocks()
     );
     Ok(blocks)
-}
-
-/// Decodes one verified block from its consensus encoding into the typed form ClickHouse's
-/// rows are built from.
-fn decode(block: VerifiedBlock) -> eyre::Result<DecodedBlock> {
-    let (typed, receipts) = decode_block(&block.encoded)?;
-    ensure!(
-        typed.body.transactions.len() == block.senders.len(),
-        "block {}: {} transactions and {} senders",
-        typed.header.number,
-        typed.body.transactions.len(),
-        block.senders.len()
-    );
-    Ok(DecodedBlock {
-        block: typed,
-        hash: block.encoded.hash,
-        senders: block.senders,
-        receipts,
-        source: BlockSource::Import,
-    })
-}
-
-/// Runs a call to `store` through storage's retry helper, for at most [`RETRY_BUDGET`].
-/// `None` if `cancel` fired while it was waiting to retry.
-///
-/// # Errors
-///
-/// Returns the first error that is not transient, and the last transient one once the call
-/// has been failing for [`RETRY_BUDGET`].
-async fn retry<T, F, Fut>(
-    cancel: &CancellationToken,
-    store: Store,
-    operation: &'static str,
-    call: F,
-) -> eyre::Result<Option<T>>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, StorageError>>,
-{
-    let result = op_indexer_storage::retry(cancel, store, operation, Some(RETRY_BUDGET), call);
-    match result.await {
-        Ok(value) => Ok(Some(value)),
-        Err(RetryError::Cancelled) => Ok(None),
-        Err(RetryError::Storage(err)) if err.severity() == Severity::Transient => Err(err)
-            .wrap_err_with(|| {
-                format!(
-                    "{operation} kept failing for {} minutes; run `load` again once the store \
-                     is reachable",
-                    RETRY_BUDGET.as_secs() / 60
-                )
-            }),
-        Err(RetryError::Storage(err)) => Err(err).wrap_err(operation),
-    }
 }

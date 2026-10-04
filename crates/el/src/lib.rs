@@ -78,7 +78,7 @@ impl<P: BlockProvider> ExecutionNetwork<P> {
     /// verified receipts leave on `verified`. A peer worth saving for the next start (see
     /// [`ElConfig::saved_peers`]) is reported on `served`, without waiting: once per session
     /// we opened, at its first verified answer. Peers' requests for headers, bodies and
-    /// receipts are answered from `provider`; with `None` the node serves nothing.
+    /// receipts are answered from `provider`, the node's archive.
     ///
     /// # Errors
     ///
@@ -90,7 +90,7 @@ impl<P: BlockProvider> ExecutionNetwork<P> {
         requests: mpsc::Receiver<ReceiptsRequest>,
         verified: mpsc::Sender<VerifiedReceipts>,
         served: mpsc::Sender<ExecutionPeer>,
-        provider: Option<P>,
+        provider: P,
     ) -> Result<Self, ElError> {
         let (block_server, serving) = serve::new(provider);
         let spec = NetworkSpec::op_stack(config.chain, config.bootnodes.clone());
@@ -99,6 +99,7 @@ impl<P: BlockProvider> ExecutionNetwork<P> {
             listen_addr: config.listen_addr,
             advertised_addr: config.advertised_addr,
             saved_peers: config.saved_peers.clone(),
+            max_sessions: config.max_sessions,
         };
         let (network, peers) =
             PeerNetwork::with_serving(spec, peer_config, node_key, head, served, serving)?;
@@ -154,8 +155,8 @@ impl<P: BlockProvider> ExecutionNetwork<P> {
         }
         if let Some(sync) = sync {
             let (peers, stop) = (peers.clone(), stop.clone());
-            let canyon_time = config.chain.canyon_time;
-            let run = async move { sync::run(canyon_time, peers, sync, stop).await };
+            let chain = config.chain;
+            let run = async move { sync::run(chain, peers, sync, stop).await };
             tasks.spawn(run.instrument(span.clone()));
         }
         let fetcher = Fetcher::new(config.chain, peers, requests, verified);

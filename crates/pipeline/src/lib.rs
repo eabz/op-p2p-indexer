@@ -2,25 +2,24 @@
 //!
 //! ```text
 //! network ─▶ [ingest]  recover senders ─▶ UnsafeStore::insert
-//! L1      ─▶ [promote] UnsafeStore::ancestry ─▶ CommittedStore::insert
-//!                      ─▶ ArchiveStore::append_batch ─▶ CommittedStore::set_l1_heads
-//!                      ─▶ UnsafeStore::prune ─▶ safe number
-//! peers   ─▶ [range]   recover senders ─▶ CommittedStore::insert ─▶ ArchiveStore::append_batch
+//! L1      ─▶ [promote] UnsafeStore::ancestry ─▶ ArchiveStore::append_batch
+//!                      ─▶ ArchiveStore::set_heads ─▶ UnsafeStore::prune ─▶ safe number
+//! peers   ─▶ [range]   recover senders ─▶ ArchiveStore::append_batch
 //! peers   ─▶ [receipts] UnsafeStore / ArchiveStore::set_receipts
 //! L1      ─▶ [commit]  dispute games checked against our blocks ─▶ L1 heads
 //! ```
 //!
-//! - [`Pipeline`] owns separate tasks, so a slow committed store never delays a gossiped
-//!   block: ingest (`ingest`, `recover`), promotion (`promote`) and, when something fetches
-//!   receipts, the task that attaches them (`receipts`); and, when a range of blocks is
-//!   fetched from peers, the task that stores it (`range`); and, when the L1 side runs, the
-//!   task that turns its dispute games into heads (`commit`).
+//! - [`Pipeline`] owns separate tasks, so a slow archive never delays a gossiped block: ingest
+//!   (`ingest`, `recover`), promotion (`promote`) and, when something fetches receipts, the task
+//!   that attaches them (`receipts`); and, when a range of blocks is fetched from peers, the task
+//!   that stores it (`range`); and, when the L1 side runs, the task that turns its dispute games
+//!   into heads (`commit`).
 //! - `retry` is how store calls are made: transient store errors are retried with backoff
 //!   (storage's helper, without a time limit), everything else is decided by the task that
 //!   made the call.
 //! - [`metrics`] names and records what the tasks do.
 //!
-//! Generic over the three store traits, so it does not know about Redis, ClickHouse or fjall,
+//! Generic over the two store traits, so it does not know about Redis or fjall,
 //! and it talks to the networks through channels, so it depends on neither. It does not fetch
 //! or verify receipts, it asks for them and stores the answers; it does not fetch missing
 //! blocks. The design is in `docs/pipeline.md`.
@@ -39,7 +38,7 @@ use std::fmt;
 
 use alloy_primitives::BlockNumber;
 use op_indexer_primitives::{BlockRef, EncodedBlock, L1Games, L1Heads, UnsafeBlock};
-use op_indexer_storage::{ArchiveRetention, ArchiveStore, CommittedStore, UnsafeStore};
+use op_indexer_storage::{ArchiveRetention, ArchiveStore, UnsafeStore};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -48,16 +47,14 @@ pub use error::PipelineError;
 use promote::Promoter;
 pub use receipts::ReceiptsChannels;
 
-/// Writes gossiped blocks to the unsafe store and moves them to the committed store and the
-/// archive once L1 commits them.
-pub struct Pipeline<U, C, A> {
+/// Writes gossiped blocks to the unsafe store and moves them to the archive, the committed
+/// store, once L1 commits them.
+pub struct Pipeline<U, A> {
     unsafe_store: U,
-    /// The committed store, for the range task.
-    committed: C,
-    /// The archive, for receipts that arrive after their block was promoted and for the
-    /// range task.
-    archive: Option<A>,
-    promoter: Promoter<U, C, A>,
+    /// The archive, also for receipts that arrive after their block was promoted, the
+    /// commitment task and the range task.
+    archive: A,
+    promoter: Promoter<U, A>,
     blocks: mpsc::Receiver<UnsafeBlock>,
     receipts: Option<ReceiptsChannels>,
     range: Option<mpsc::Receiver<Vec<EncodedBlock>>>,
@@ -76,16 +73,14 @@ enum Task {
     Commit,
 }
 
-impl<U, C, A> Pipeline<U, C, A>
+impl<U, A> Pipeline<U, A>
 where
     U: UnsafeStore + Clone + Send + Sync + 'static,
-    C: CommittedStore + Clone + Send + Sync + 'static,
     A: ArchiveStore + Clone + Send + Sync + 'static,
 {
-    /// Creates a pipeline over the three stores.
+    /// Creates a pipeline over the two stores.
     ///
-    /// - `archive` is the local block archive with how much it keeps, or `None` when it is
-    ///   disabled.
+    /// - `archive` is the local block archive, the committed store, with how much it keeps.
     /// - `blocks` are the gossiped blocks; the pipeline stops when the channel closes.
     /// - `l1_heads` are the safe and finalized heads; each change starts a promotion.
     /// - `safe_number` receives the number of the safe head once its blocks are committed.
@@ -93,25 +88,23 @@ where
     ///   does: then no receipts are asked for and blocks stay without them.
     pub fn new(
         unsafe_store: U,
-        committed: C,
-        archive: Option<(A, ArchiveRetention)>,
+        archive: (A, ArchiveRetention),
         blocks: mpsc::Receiver<UnsafeBlock>,
         l1_heads: watch::Receiver<L1Heads>,
         safe_number: watch::Sender<BlockNumber>,
         receipts: Option<ReceiptsChannels>,
     ) -> Self {
-        let receipts_archive = archive.as_ref().map(|(archive, _)| archive.clone());
+        let (archive, retention) = archive;
         let promoter = Promoter::new(
             unsafe_store.clone(),
-            committed.clone(),
-            archive,
+            archive.clone(),
+            retention,
             l1_heads,
             safe_number,
         );
         Self {
             unsafe_store,
-            committed,
-            archive: receipts_archive,
+            archive,
             promoter,
             blocks,
             receipts,
@@ -132,7 +125,7 @@ where
     /// Adds the dispute games verified on L1 (the recent ones, and how far L1 is finalized):
     /// each is checked against our own block at its height, and the highest match is published
     /// on `heads` as the safe head, the highest in a finalized L1 block as the finalized head.
-    /// The heads start at what the committed store recorded and never go below it. `heads` is
+    /// The heads start at what the archive recorded and never go below it. `heads` is
     /// what feeds the `l1_heads` given to [`Self::new`], directly or through whatever decides
     /// when promotion may act on them. `isthmus_time` is the chain's Isthmus activation: a
     /// claim about a block before it cannot be checked.
@@ -148,14 +141,12 @@ where
     }
 
     /// Adds a range of blocks fetched from peers: `batches` are verified blocks in ascending
-    /// order, each batch consecutive, written to the committed store and appended to the
-    /// archive. The range task ends when the channel closes.
+    /// order, each batch consecutive, appended to the archive with their recovered senders.
+    /// The range task ends when the channel closes.
     ///
     /// The archive must be empty or end at the block before the first batch, and keep every
-    /// block: it holds one contiguous range, which the range task extends. A batch a store
+    /// block: it holds one contiguous range, which the range task extends. A batch the archive
     /// refuses stops the pipeline with the error.
-    ///
-    /// A builder method because [`Self::new`] is at the argument limit.
     #[must_use]
     pub fn with_range(mut self, batches: mpsc::Receiver<Vec<EncodedBlock>>) -> Self {
         self.range = Some(batches);
@@ -205,7 +196,7 @@ where
             tasks.spawn(async move { (Task::Commit, commit.await) });
         }
         if let Some(channels) = self.range {
-            let range = range::run(self.committed, self.archive.clone(), channels, stop.clone());
+            let range = range::run(self.archive.clone(), channels, stop.clone());
             tasks.spawn(async move { (Task::Range, range.await) });
         }
         if let Some(channels) = self.receipts {
@@ -239,7 +230,7 @@ where
 }
 
 // The stores and channel ends have nothing useful to print.
-impl<U, C, A> fmt::Debug for Pipeline<U, C, A> {
+impl<U, A> fmt::Debug for Pipeline<U, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Pipeline").finish_non_exhaustive()
     }

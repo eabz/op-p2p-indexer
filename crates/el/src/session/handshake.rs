@@ -61,6 +61,9 @@ pub(crate) struct PeerStatus {
     pub(crate) latest: Option<u64>,
     /// Hash of the peer's head.
     pub(crate) head_hash: B256,
+    /// Whether the peer is a known op-p2p-indexer: blocks held back from other peers are
+    /// shared with it.
+    pub(crate) indexer: bool,
 }
 
 /// Why a session could not be established.
@@ -177,9 +180,11 @@ async fn handshake(
     }
 
     let fork_filter = ctx.fork_filter();
-    // What is advertised: the held range as it is, else the tip alone (see
-    // `AdvertisedRange`). Sessions open only once a tip is known.
-    let (serving, answers) = ctx.session_serving();
+    let indexer = ctx.is_indexer(&peer_id);
+    // What is advertised: the held range as it is (from the Bedrock block on, for a peer that
+    // is not an indexer), else the tip alone (see `AdvertisedRange`). Sessions open only once
+    // a tip is known.
+    let (serving, answers) = ctx.session_serving(indexer);
     let advertised = serving.advertised();
     let latest = advertised.map(|range| range.latest);
     let status = UnifiedStatus {
@@ -209,6 +214,7 @@ async fn handshake(
         earliest: theirs.earliest_block,
         latest: theirs.latest_block,
         head_hash: theirs.blockhash,
+        indexer,
     };
     Ok(driver::new(peer, eth.into_inner(), serving, answers))
 }

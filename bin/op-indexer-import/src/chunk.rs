@@ -18,22 +18,17 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 
 use alloy_primitives::{Address, B256, Bytes};
-use op_indexer_primitives::EncodedBlock;
+use op_indexer_primitives::{ArchivedBlock, EncodedBlock};
 
 use crate::state::write_atomic;
 
 /// Compression level of the verified chunks: zstd's default.
 const COMPRESSION_LEVEL: i32 = 3;
 
-/// A verified block.
-#[derive(Debug, Clone)]
-pub(crate) struct VerifiedBlock {
-    /// Header, body and receipts as verified; the receipts are always present.
-    pub(crate) encoded: EncodedBlock,
-    /// Sender of each transaction, in block order; the zero address for a transaction signed
-    /// with all zeros.
-    pub(crate) senders: Vec<Address>,
-}
+/// A verified block, as the archive takes it: header, body and receipts as verified (the
+/// receipts are always present), and the sender of each transaction as the service reported
+/// it (the zero address for a transaction signed with all zeros).
+pub(crate) type VerifiedBlock = ArchivedBlock;
 
 /// How a chunk attaches to its neighbours.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

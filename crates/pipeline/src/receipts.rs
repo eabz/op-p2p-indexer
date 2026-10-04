@@ -53,7 +53,7 @@ pub(crate) fn request(requests: &mpsc::Sender<ReceiptsRequest>, block: &DecodedB
 /// a refusal of one block's receipts.
 pub(crate) async fn run<U: UnsafeStore, A: ArchiveStore>(
     unsafe_store: U,
-    archive: Option<A>,
+    archive: A,
     channels: ReceiptsChannels,
     cancel: CancellationToken,
 ) -> Result<(), PipelineError> {
@@ -74,7 +74,7 @@ pub(crate) async fn run<U: UnsafeStore, A: ArchiveStore>(
             receipts = verified.recv() => {
                 // A closed channel is the fetcher shutting down.
                 let Some(receipts) = receipts else { return Ok(()) };
-                if attach(&unsafe_store, archive.as_ref(), &receipts, &cancel).await?.is_break() {
+                if attach(&unsafe_store, &archive, &receipts, &cancel).await?.is_break() {
                     return Ok(());
                 }
             }
@@ -124,7 +124,7 @@ async fn request_missing<U: UnsafeStore>(
 /// block has been promoted. Breaks when cancellation ended a retry.
 async fn attach<U: UnsafeStore, A: ArchiveStore>(
     unsafe_store: &U,
-    archive: Option<&A>,
+    archive: &A,
     verified: &VerifiedReceipts,
     cancel: &CancellationToken,
 ) -> Result<ControlFlow<()>, PipelineError> {
@@ -140,23 +140,16 @@ async fn attach<U: UnsafeStore, A: ArchiveStore>(
         return Ok(ControlFlow::Continue(()));
     }
 
-    // Not in the unsafe store any more: promoted. The archive can take the receipts; the
-    // committed store has no call for it yet, which the archive's count stands for.
-    let held = match archive {
-        Some(archive) => {
-            let in_archive = set(
-                cancel,
-                Store::Archive,
-                "archive set_receipts",
-                block,
-                || archive.set_receipts(block, receipts),
-            );
-            let Some(held) = in_archive.await? else {
-                return Ok(ControlFlow::Break(()));
-            };
-            held
-        }
-        None => false,
+    // Not in the unsafe store any more: promoted to the archive.
+    let in_archive = set(
+        cancel,
+        Store::Archive,
+        "archive set_receipts",
+        block,
+        || archive.set_receipts(block, receipts),
+    );
+    let Some(held) = in_archive.await? else {
+        return Ok(ControlFlow::Break(()));
     };
     if !held {
         // Pruned, expired or trimmed in the meantime.

@@ -33,6 +33,7 @@ use tokio::time::{Instant, MissedTickBehavior, interval, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::network::{INDEXER_RECORD_KEY, INDEXER_RECORD_VERSION};
 use crate::session::SessionContext;
 use crate::{ElError, metrics};
 
@@ -75,6 +76,8 @@ pub(crate) struct Candidate {
     pub(crate) peer_id: PeerId,
     /// The peer's TCP address.
     pub(crate) addr: SocketAddr,
+    /// Whether its node record says it is an op-p2p-indexer.
+    pub(crate) indexer: bool,
 }
 
 /// A discv5 node that finds execution peers of our chain and fork.
@@ -138,6 +141,9 @@ impl Discovery {
         }
         for key in ctx.spec().record_keys {
             builder.add_value(*key, &fork_entry);
+        }
+        if ctx.spec().indexers_only_below.is_some() {
+            builder.add_value(INDEXER_RECORD_KEY, &INDEXER_RECORD_VERSION);
         }
         let enr = builder.build(&key).map_err(ElError::Enr)?;
 
@@ -386,6 +392,9 @@ impl Discovery {
             let Some(candidate) = candidate(enr) else {
                 continue;
             };
+            if candidate.indexer {
+                self.ctx.mark_indexer(candidate.peer_id);
+            }
             if self.known.len() >= MAX_KNOWN_PEERS {
                 self.known.clear();
             }
@@ -437,6 +446,7 @@ fn candidate(enr: &Enr) -> Option<Candidate> {
     Some(Candidate {
         peer_id: PeerId::from_slice(public.encode_uncompressed().as_ref()),
         addr: SocketAddr::V4(addr),
+        indexer: enr.get_raw_rlp(INDEXER_RECORD_KEY).is_some(),
     })
 }
 

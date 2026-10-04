@@ -53,5 +53,7 @@ pub(crate) fn mainnet(bootnodes: Vec<String>) -> NetworkSpec {
         fork_times,
         bootnodes,
         record_keys: &[ETH_RECORD_KEY],
+        // Ethereum's network has no op-p2p-indexers.
+        indexers_only_below: None,
     }
 }

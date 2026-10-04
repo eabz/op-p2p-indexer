@@ -1,5 +1,5 @@
 # Identifiers that `doc_markdown` should not demand backticks for.
-doc-valid-idents = ["..", "ClickHouse", "GossipSub", "OpStack"]
+doc-valid-idents = ["..", "GossipSub", "OpStack"]
 
 disallowed-methods = [
     { path = "std::thread::sleep", reason = "blocks the async runtime; use tokio::time::sleep" },

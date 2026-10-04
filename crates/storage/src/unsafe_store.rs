@@ -12,7 +12,7 @@ mod layout;
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 
 use alloy_primitives::{BlockHash, BlockNumber, ChainId};
 use op_alloy_consensus::OpReceiptEnvelope;
@@ -28,8 +28,11 @@ use self::layout::{
     SCHEMA_VERSION, UNSAFE_TTL, WIPE_SCAN_COUNT,
 };
 use crate::metrics::{self, Operation};
-use crate::validate::{validate_block, validate_receipts};
-use crate::{InvalidBlockReason, RedisConfig, StorageError, Store, UnsafeStore};
+use crate::validate::validate_block;
+use crate::{EventId, Events, InvalidBlockReason, RedisConfig, StorageError, Store, UnsafeStore};
+
+/// Entries of the event stream as `XRANGE` and `XREAD` return them: id and fields.
+type StreamEntries = Vec<(String, HashMap<String, String>)>;
 
 static INSERT: LazyLock<Script> = LazyLock::new(|| script(include_str!("../scripts/insert.lua")));
 static SET_RECEIPTS: LazyLock<Script> =
@@ -37,12 +40,15 @@ static SET_RECEIPTS: LazyLock<Script> =
 static PRUNE: LazyLock<Script> = LazyLock::new(|| script(include_str!("../scripts/prune.lua")));
 
 /// The unsafe store of one chain. Cheap to clone: clones share one multiplexed connection, which
-/// reconnects on its own.
+/// reconnects on its own, and a second one for [`UnsafeStore::events`], whose waits would hold
+/// up every other call on the first (Redis answers one connection's commands in order).
 ///
 /// The redis client's `Debug` redacts the password, so deriving it here is safe.
 #[derive(Debug, Clone)]
 pub struct RedisStore {
     connection: ConnectionManager,
+    /// For blocking reads of the event stream only.
+    events: ConnectionManager,
     keys: Arc<Keys>,
 }
 
@@ -66,11 +72,17 @@ impl RedisStore {
                 .set_response_timeout(None);
             let connection = request(
                 "connect",
+                ConnectionManager::new_with_config(client.clone(), manager_config.clone()),
+            )
+            .await?;
+            let events = request(
+                "connect",
                 ConnectionManager::new_with_config(client, manager_config),
             )
             .await?;
             let store = Self {
                 connection,
+                events,
                 keys: Arc::new(Keys::new(chain_id)),
             };
             store.ping().await?;
@@ -273,7 +285,6 @@ impl UnsafeStore for RedisStore {
         receipts: &[OpReceiptEnvelope],
     ) -> Result<bool, StorageError> {
         metrics::timed(Store::Unsafe, Operation::SetReceipts, async {
-            validate_receipts(block.number, receipts)?;
             let encoded = codec::encode_receipts(receipts)?;
             let mut connection = self.connection.clone();
             let mut invocation = self.invoke(&SET_RECEIPTS);
@@ -426,6 +437,94 @@ impl UnsafeStore for RedisStore {
         })
         .await
     }
+
+    async fn last_event_id(&self) -> Result<EventId, StorageError> {
+        metrics::timed(Store::Unsafe, Operation::LastEventId, async {
+            let mut connection = self.connection.clone();
+            let newest: StreamEntries = request(
+                "last_event_id",
+                redis::cmd("XREVRANGE")
+                    .arg(self.keys.events())
+                    .arg("+")
+                    .arg("-")
+                    .arg("COUNT")
+                    .arg(1)
+                    .query_async(&mut connection),
+            )
+            .await?;
+            newest
+                .first()
+                .map_or(Ok(EventId::START), |(id, _)| parse_event_id(id))
+        })
+        .await
+    }
+
+    async fn events(
+        &self,
+        after: EventId,
+        count: usize,
+        block_for: Duration,
+    ) -> Result<Events, StorageError> {
+        metrics::timed(Store::Unsafe, Operation::Events, async {
+            const READ: &str = "events";
+            let key = self.keys.events();
+            let mut connection = self.events.clone();
+            let mut command = redis::cmd("XREAD");
+            command.arg("COUNT").arg(count.max(1));
+            if !block_for.is_zero() {
+                let millis = u64::try_from(block_for.as_millis()).unwrap_or(u64::MAX);
+                command.arg("BLOCK").arg(millis.max(1));
+            }
+            command.arg("STREAMS").arg(&key).arg(after.to_string());
+            // A nil reply (nothing came within the wait) is `None`.
+            let reply: Option<Vec<(String, StreamEntries)>> = match timeout(
+                block_for.saturating_add(REQUEST_TIMEOUT),
+                command.query_async(&mut connection),
+            )
+            .await
+            {
+                Ok(result) => result.map_err(|source| StorageError::Redis {
+                    operation: READ,
+                    source,
+                })?,
+                Err(_elapsed) => {
+                    return Err(StorageError::Timeout {
+                        store: Store::Unsafe,
+                        operation: READ,
+                    });
+                }
+            };
+            let events = reply
+                .into_iter()
+                .flatten()
+                .flat_map(|(_stream, entries)| entries)
+                .map(|(id, fields)| Ok((parse_event_id(&id)?, codec::decode_event(&fields)?)))
+                .collect::<Result<Vec<_>, StorageError>>()?;
+            // Checked after the read, so a trim before it shows: entries after `after` were
+            // removed exactly when the oldest one left is above it.
+            let missed = if after == EventId::START {
+                false
+            } else {
+                let oldest: StreamEntries = request(
+                    READ,
+                    redis::cmd("XRANGE")
+                        .arg(&key)
+                        .arg("-")
+                        .arg("+")
+                        .arg("COUNT")
+                        .arg(1)
+                        .query_async(&mut connection),
+                )
+                .await?;
+                match oldest.first() {
+                    Some((id, _)) => after < parse_event_id(id)?,
+                    None => false,
+                }
+            };
+            Ok(Events { events, missed })
+        })
+        .await
+    }
 }
 
 /// The overall limit of an operation that makes several requests.
@@ -465,6 +564,16 @@ fn script(body: &str) -> Script {
         UNSAFE_TTL.as_secs(),
     );
     Script::new(&[&constants, include_str!("../scripts/lib.lua"), body].concat())
+}
+
+/// A stream entry id as Redis writes it, `millis-seq`.
+fn parse_event_id(id: &str) -> Result<EventId, StorageError> {
+    id.parse().map_err(|err| StorageError::InvalidData {
+        store: Store::Unsafe,
+        what: "event id",
+        block: None,
+        source: Some(crate::ParseError::from(err)),
+    })
 }
 
 /// A script replied with a status this binary does not know.

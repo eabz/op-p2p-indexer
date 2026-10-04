@@ -3,7 +3,8 @@
 A Rust indexer for the OP Stack peer-to-peer network. It joins the libp2p gossip network,
 validates and decodes payloads with alloy / op-alloy types, and indexes them. It is a
 **standalone, lightweight binary with no external services**: no L1 or L2 RPC and no embedded
-node. Receipts and logs come from L2 execution peers, verified against the block header.
+node. Receipts and logs come from L2 execution peers, verified against the block header. The
+node is a source of data: consumers subscribe to it over gRPC (the `stream` crate).
 
 Scope, decisions and the order of work are in [`docs/roadmap.md`](docs/roadmap.md); each crate's
 spec is linked from there (storage: [`docs/storage.md`](docs/storage.md)). Read the roadmap
@@ -13,19 +14,20 @@ before proposing a design, and record new decisions there.
 
 | Path | Package | Role | Internal deps |
 |---|---|---|---|
-| `bin/op-indexer` | `op-indexer` | Thin binary: config, tracing, wiring, shutdown | chainspec, p2p, el, l1, storage, pipeline, primitives |
-| `bin/op-indexer-import` | `op-indexer-import` | Command-line importer, a separate process: downloads a block range from an external archive (Envio HyperSync), verifies it, loads it into the block archive (and optionally ClickHouse) | chainspec, primitives, storage |
+| `bin/op-indexer` | `op-indexer` | Thin binary: config, tracing, wiring, shutdown | chainspec, p2p, el, l1, storage, pipeline, stream, primitives |
+| `bin/op-indexer-import` | `op-indexer-import` | Command-line importer, a separate process: downloads a block range from an external archive (Envio HyperSync), verifies it, loads it into the block archive | chainspec, primitives, storage |
 | `crates/primitives` | `op-indexer-primitives` | Shared domain types (alloy and op-alloy only) | none |
 | `crates/chainspec` | `op-indexer-chainspec` | Every per-chain value, for each supported chain (OP Mainnet, Unichain): chain id, sequencer signer, bootnodes, genesis, fork blocks and times, block time, dispute game factory. The one exception is the importer's HyperSync endpoint, which stays in the importer | none |
 | `crates/p2p` | `op-indexer-p2p` | discv5 discovery, gossipsub block gossip (scoring, connection limits), unsafe-block validation, fjall node state (identity, saved peers and sync progress, for `el` and `l1` too) | primitives, chainspec |
-| `crates/storage` | `op-indexer-storage` | Unsafe store (Redis, fork choice) / committed store (ClickHouse, migrations) / local block archive (fjall), their traits and metrics; the retry policy | primitives |
-| `crates/pipeline` | `op-indexer-pipeline` | Unsafe blocks → unsafe store; promote safe/finalized → committed store and archive | primitives, storage |
-| `crates/el` | `op-indexer-el` | Execution p2p (devp2p): discovery, sessions, receipts of new blocks, serving the archive to peers, range sync | primitives, chainspec |
+| `crates/storage` | `op-indexer-storage` | Unsafe store (Redis, fork choice) and the block archive (fjall), which is the committed store: committed blocks with their senders and the committed L1 heads; their traits and metrics; the retry policy | primitives |
+| `crates/pipeline` | `op-indexer-pipeline` | Unsafe blocks → unsafe store; promote safe/finalized → archive | primitives, storage |
+| `crates/el` | `op-indexer-el` | Execution p2p (devp2p): discovery, sessions, receipts of new blocks, serving the archive to peers, range sync; pre-Bedrock blocks shared only with other op-p2p-indexers | primitives, chainspec |
 | `crates/l1` | `op-indexer-l1` | L1 commitment without an RPC: from L1 block hashes a beacon light client vouches for, finds and verifies the dispute games created for the chain, giving the L2 blocks claimed on L1 | el, chainspec, primitives |
+| `crates/stream` | `op-indexer-stream` | gRPC server (tonic, prost): subscriptions to history from the archive then the live chain from the unsafe store, decoded or raw, with block status and reorgs; heads and block lookups | primitives, storage |
 
 - Keep these edges: `p2p` and `storage` never depend on each other, and `pipeline` doesn't depend
   on `p2p`. `el` depends on none of `p2p`, `storage` and `pipeline`, and `l1` on none of `storage`,
-  `pipeline` and the importer. Nothing about an external API
+  `pipeline` and the importer; `stream` on none of `p2p`, `el`, `l1` and `pipeline`. Nothing about an external API
   (HyperSync or any other) may appear outside `bin/op-indexer-import`. `p2p` depends on `chainspec` (it is chain-specific); the binary parses overrides (e.g.
   bootnodes) at the edge. The binary wires them together with channels.
 - Safe/finalized status comes from the `l1` crate (off by default), not from reth or an RPC (see `docs/l1.md`).
@@ -35,13 +37,13 @@ before proposing a design, and record new decisions there.
 ## Storage
 
 - **Redis**: the unsafe store. Blocks received over gossip and not yet committed to L1, with fork choice.
-- **ClickHouse**: the committed store. Safe/finalized blocks, whose batches are on L1, and backfill.
-- **fjall** (`archive/` in the data dir): a window of committed blocks, or optionally all of them,
-  in their consensus encoding, for serving peers later. Embedded; needs no service.
+- **fjall** (`archive/` in the data dir): the committed store. Every committed block by default (a
+  window is optional), in its consensus encoding, with its transaction senders and the committed
+  L1 heads. It is what the node serves to peers and streams to consumers. Embedded; needs no service.
 
-`docker compose up -d redis clickhouse` starts both locally; `docker compose up --build` also runs
-the indexer image. The binary needs both stores to start: it connects, checks the Redis key-layout
-version and runs the ClickHouse migrations, and exits if either store is unreachable. Every
+There is no ClickHouse any more. `docker compose up -d redis` starts Redis locally; `docker compose
+up --build` also runs the indexer image. The binary needs Redis to start: it opens the archive,
+connects to Redis and checks its key-layout version, and exits if either fails. Every
 `OP_INDEXER_*` variable it reads is documented on `Config::from_env` in
 `bin/op-indexer/src/config.rs`.
 
