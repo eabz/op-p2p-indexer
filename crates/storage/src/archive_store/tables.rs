@@ -8,6 +8,7 @@
 //! operation in its errors: [`Failure::into_storage_error`] attaches it.
 
 mod append;
+mod bulk;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -23,6 +24,7 @@ use tokio::sync::{Mutex, MutexGuard};
 use tracing::debug;
 
 pub(super) use self::append::{Entry, append_batch};
+pub(super) use self::bulk::{Prepared, bulk_append};
 use crate::{InvalidBlockReason, ParseError, StorageError, Store, metrics};
 
 /// Block cache shared by the keyspaces. It holds the index and filter blocks of the trees and

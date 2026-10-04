@@ -262,17 +262,35 @@ No per-row status column: a block is finalized if `number <= finalized head`, el
 
 Exceptions to the conventions: `schema_migrations` has no `chain_id` (it describes the schema,
 not a chain) and is created before the numbered migrations; `blocks.base_fee_per_gas` is
-`Nullable(UInt64)`, the width alloy's header uses. The database itself must already exist.
+`Nullable(UInt64)`, the width alloy's header uses. `migrate` creates the configured database
+if it is missing (`CREATE DATABASE IF NOT EXISTS`, before `schema_migrations`); that statement
+is configuration, not a migration, and is not recorded or checksummed. A ClickHouse Cloud
+service starts with only `default`, so this is what makes a first run there work.
 
-**Codecs.** Every column has an explicit codec, chosen by the kind of data. These are the
-standard choices and have not been measured on real data; revisit them with
-`system.columns` compressed sizes once blocks are flowing.
+**Codecs.** Every column has an explicit codec, chosen by the kind of data. The 32-byte
+columns were measured on 2,000 real OP Mainnet blocks after Isthmus (50,368 transactions,
+424,398 logs, merged): only a value that is unique per row is left uncompressed. A hash
+repeated on every row of its block or transaction, and a nullable hash that is usually empty
+(stored as 32 zero bytes) or an address padded with zeros, compress well:
+
+| Column | `NONE` | `ZSTD(1)` |
+|---|---|---|
+| `logs.block_hash` | 13.6 MB | 0.08 MB |
+| `logs.tx_hash` | 13.6 MB | 0.83 MB |
+| `logs.topic1` / `topic2` / `topic3` | 14.0 MB each | 0.90 / 0.66 / 2.96 MB |
+| `transactions.block_hash` | 1.61 MB | 0.07 MB |
+| `transactions.source_hash` | 1.66 MB | 0.08 MB |
+| `transactions.hash` (kept `NONE`) | 1.61 MB | 1.61 MB |
+
+The four tables went from 2,048 to 690 bytes per transaction on disk, `logs` from 1,460 to
+194.
 
 | Kind of column | Columns | Codec |
 |---|---|---|
 | Steadily increasing | `number`, `block_number`, `timestamp`, `block_timestamp`, `version`, `updated_at` | `DoubleDelta, ZSTD(1)` for block numbers and timestamps; `Delta, ZSTD(1)` for `version` |
 | Small or slowly changing integers | `tx_index`, `log_index`, `tx_count`, `logs_count`, `gas_limit`, `gas_used`, `base_fee_per_gas`, `nonce`, `cumulative_gas_used`, gas prices, `blob_gas_used`, `excess_blob_gas`, `tx_type`, `status` | `T64, ZSTD(1)`. ClickHouse 25.8 rejects `T64` on `UInt128`, so the three gas-price columns use `ZSTD(1)`; `T64` under `Nullable(UInt64)` is accepted. |
-| Random 32-byte hashes | `hash`, `parent_hash`, `block_hash`, `tx_hash`, the header roots, `prev_randao`, `source_hash`, `topic1` to `topic3` | `NONE`: they do not compress |
+| A row's own random 32-byte hash | `blocks.hash`, `parent_hash`, the header roots, `prev_randao`, `transactions.hash`, `receipts.tx_hash` | `NONE`: unique per row, they do not compress |
+| Hashes repeated across rows, or mostly empty | `block_hash` (transactions, receipts, logs), `logs.tx_hash`, `source_hash`, `topic1` to `topic3` | `ZSTD(1)` |
 | Repeating addresses and signatures | `fee_recipient`, `from`, `to`, `address`, `topic0` | `ZSTD(1)` |
 | Sparse or mostly zero bytes | `value`, `mint`, `logs_bloom`, `extra_data` | `ZSTD(1)` |
 | Large byte strings | `input`, `raw`, `data` | `ZSTD(3)` |

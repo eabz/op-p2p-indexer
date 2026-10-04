@@ -87,9 +87,13 @@ impl Migration {
 ///
 /// # Errors
 ///
-/// Returns [`StorageError::MigrationChecksum`] if an applied migration was edited since, and
+/// Returns [`StorageError::MigrationChecksum`] if an applied migration of `database` was
+/// edited since, and
 /// [`StorageError::UnknownMigration`] if one is not embedded in this binary.
-pub(super) fn pending(applied: &[MigrationRow]) -> Result<Vec<&'static Migration>, StorageError> {
+pub(super) fn pending(
+    applied: &[MigrationRow],
+    database: &str,
+) -> Result<Vec<&'static Migration>, StorageError> {
     for row in applied {
         let migration = MIGRATIONS
             .iter()
@@ -101,6 +105,7 @@ pub(super) fn pending(applied: &[MigrationRow]) -> Result<Vec<&'static Migration
             return Err(StorageError::MigrationChecksum {
                 version: row.version,
                 name: row.name.clone(),
+                database: database.to_owned(),
             });
         }
     }

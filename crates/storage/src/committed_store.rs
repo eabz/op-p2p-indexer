@@ -14,4 +14,4 @@ mod client;
 mod migrations;
 mod rows;
 
-pub use client::ClickHouseStore;
+pub use client::{BulkRows, ClickHouseStore};

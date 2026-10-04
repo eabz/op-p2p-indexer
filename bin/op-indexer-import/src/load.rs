@@ -38,11 +38,11 @@ use clap::Args;
 use eyre::{WrapErr, ensure, eyre};
 use op_indexer_primitives::{BlockSource, DecodedBlock, EncodedBlock, decode_block};
 use op_indexer_storage::archive_store::FjallArchive;
-use op_indexer_storage::committed_store::ClickHouseStore;
+use op_indexer_storage::committed_store::{BulkRows, ClickHouseStore};
 use op_indexer_storage::{
-    ArchiveStore, ClickHouseConfig, CommittedStore, RetryError, Severity, StorageError, Store,
+    ArchiveStore, ClickHouseConfig, RetryError, Severity, StorageError, Store,
 };
-use tokio::task::{JoinHandle, spawn_blocking};
+use tokio::task::{JoinHandle, JoinSet, spawn_blocking};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
@@ -57,8 +57,13 @@ const READ_AHEAD: usize = 4;
 /// Bytes of blocks collected before they are appended to the archive in one call. The archive
 /// commits at most this much at once, so more would not save a synced write.
 const APPEND_BYTES: usize = 16 * 1024 * 1024;
-/// Blocks per insert into ClickHouse.
-const INSERT_BLOCKS: usize = 1000;
+/// Rows (of every table together) per bulk insert into ClickHouse: large enough that the
+/// server writes few, large parts and a round trip is small next to the data, small enough
+/// that a batch takes a few hundred megabytes in memory at most.
+const BULK_ROWS: usize = 500_000;
+/// Batches written at once by default: each waits on the network and the server, not on this
+/// machine, so a few overlap well; a remote service benefits most.
+const DEFAULT_INSERTS: u64 = 4;
 /// How long a store call is retried before `load` gives up. A store that is down for longer
 /// needs an operator; `load` continues where it stopped when it is run again.
 const RETRY_BUDGET: Duration = Duration::from_mins(5);
@@ -96,6 +101,16 @@ pub(crate) struct LoadArgs {
     /// process list; the environment variable is not. It is never logged.
     #[arg(long, env = "OP_INDEXER_CLICKHOUSE_PASSWORD", hide_env_values = true)]
     pub(crate) clickhouse_password: Option<Secret>,
+    /// ClickHouse inserts in flight at once, each a batch of about half a million rows on its
+    /// own connection. Only used with `--clickhouse-url`. More helps a remote service (4 to 8
+    /// for ClickHouse Cloud); a local server is busy with 2.
+    #[arg(
+        long,
+        env = "OP_INDEXER_IMPORT_CLICKHOUSE_INSERTS",
+        default_value_t = DEFAULT_INSERTS,
+        value_parser = clap::value_parser!(u64).range(1..=64)
+    )]
+    pub(crate) clickhouse_inserts: u64,
 }
 
 /// Loads the verified range of `plan` into the archive, then into ClickHouse when it is asked
@@ -144,7 +159,10 @@ pub(crate) async fn run(
     let held_to = archive_tip(&archive, &args.archive_dir, state, plan).await?;
     let stopped_at = fill_archive(&archive, held_to, state, plan, cancel).await?;
     let stopped_at = match (stopped_at, &committed) {
-        (None, Some(committed)) => fill_clickhouse(committed, state, plan, cancel).await?,
+        (None, Some(committed)) => {
+            let inserts = usize::try_from(args.clickhouse_inserts).unwrap_or(1);
+            fill_clickhouse(committed, state, plan, inserts, cancel).await?
+        }
         (stopped_at, _) => stopped_at,
     };
     match stopped_at {
@@ -235,61 +253,192 @@ async fn fill_archive(
         .filter(|next| *next <= plan.last))
 }
 
-/// Writes every chunk of the range that has no ClickHouse marker yet, in block order, and
-/// marks it. Returns the first block of the chunk `cancel` stopped it at, `None` when
+/// Writes every chunk of the range that has no ClickHouse marker yet, and marks it. Returns
+/// the first block of the earliest chunk not written when `cancel` stopped it, `None` when
 /// ClickHouse holds the whole range.
+///
+/// Chunks are read and turned into rows on blocking threads, joined into batches of about
+/// [`BULK_ROWS`] rows, and written by up to `inserts` batches at once, each in one synchronous
+/// insert per table (`ClickHouseStore::bulk_insert`, child tables before `blocks`). A chunk's
+/// marker is written only once its batch is in every table, so a stop leaves no marker for a
+/// chunk ClickHouse does not fully hold; a chunk written twice is harmless, the tables keep one
+/// row per position. Memory is bounded by the batches in flight and the chunks being read.
 async fn fill_clickhouse(
     committed: &ClickHouseStore,
     state: &State,
     plan: &Plan,
+    inserts: usize,
     cancel: &CancellationToken,
 ) -> eyre::Result<Option<u64>> {
-    info!(first = plan.first, last = plan.last, "loading ClickHouse");
-    let (mut loaded, mut logged) = (0_u64, Instant::now());
-    for chunk in plan.chunks() {
-        let marker = state.clickhouse_loaded_path(chunk);
-        if exists(&marker)? {
+    let mut queue = unloaded_chunks(state, plan).await?.into_iter();
+    let readers = std::thread::available_parallelism().map_or(1, usize::from);
+    info!(
+        first = plan.first,
+        last = plan.last,
+        chunks = queue.len(),
+        inserts,
+        readers,
+        "loading ClickHouse"
+    );
+    let mut tally = Tally::new();
+    let mut reading: JoinSet<eyre::Result<(Chunk, BulkRows)>> = JoinSet::new();
+    let mut writing: JoinSet<eyre::Result<Result<Batch, u64>>> = JoinSet::new();
+    let mut batch = Batch::default();
+    // The first block of a chunk whose insert was abandoned on a stop.
+    let mut abandoned: Option<u64> = None;
+    loop {
+        let stopping = cancel.is_cancelled();
+        // Read ahead until the batch being built is full: the batches in flight, that one and
+        // the chunks being read are what the pass holds in memory.
+        while !stopping
+            && reading.len() < readers
+            && batch.rows.rows() < BULK_ROWS
+            && let Some(chunk) = queue.next()
+        {
+            let (committed, path) = (committed.clone(), state.verified_path(chunk));
+            reading.spawn_blocking(move || {
+                let blocks = read(&path, chunk)?
+                    .into_iter()
+                    .map(decode)
+                    .collect::<eyre::Result<Vec<DecodedBlock>>>()
+                    .wrap_err_with(|| format!("{} does not decode", path.display()))?;
+                Ok((chunk, committed.bulk_rows(&blocks)?))
+            });
+        }
+        let due = batch.rows.rows() >= BULK_ROWS || reading.is_empty() || stopping;
+        if due && !batch.chunks.is_empty() && writing.len() < inserts {
+            let (batch, committed, cancel) = (
+                std::mem::take(&mut batch),
+                committed.clone(),
+                cancel.clone(),
+            );
+            writing.spawn(async move {
+                let insert = retry(&cancel, Store::Committed, "ClickHouse insert", || {
+                    committed.bulk_insert(&batch.rows)
+                });
+                // On a stop, the first block of the batch, whose chunks stay unmarked.
+                let first = batch.chunks.first().map_or(u64::MAX, |chunk| chunk.from);
+                Ok(insert.await?.map(|()| batch).ok_or(first))
+            });
             continue;
         }
-        if cancel.is_cancelled() {
-            return Ok(Some(chunk.from));
+        if reading.is_empty() && writing.is_empty() {
+            break;
         }
-        let path = state.verified_path(chunk);
-        // One signature of work per block is already done by `verify`; decoding is still CPU
-        // work, so it runs off the runtime.
-        let blocks = spawn_blocking(move || {
-            read(&path, chunk)?
-                .into_iter()
-                .map(decode)
-                .collect::<eyre::Result<Vec<DecodedBlock>>>()
-                .wrap_err_with(|| format!("{} does not decode", path.display()))
-        })
-        .await
-        .wrap_err("reading a chunk panicked")??;
-        for batch in blocks.chunks(INSERT_BLOCKS) {
-            let insert = retry(cancel, Store::Committed, "ClickHouse insert", || {
-                committed.insert(batch)
-            });
-            if insert.await?.is_none() {
-                return Ok(Some(chunk.from));
+        tokio::select! {
+            Some(read) = reading.join_next() => {
+                let (chunk, rows) = read.wrap_err("reading a chunk panicked")??;
+                batch.chunks.push(chunk);
+                batch.rows.append(rows);
+            }
+            Some(written) = writing.join_next() => {
+                match written.wrap_err("an insert panicked")?? {
+                    Ok(written) => {
+                        mark_loaded(state, &written.chunks).await?;
+                        tally.add(&written.rows, writing.len());
+                    }
+                    // Cancelled while retrying: those chunks stay unmarked.
+                    Err(first) => abandoned = Some(abandoned.map_or(first, |a| a.min(first))),
+                }
             }
         }
-        spawn_blocking(move || write_atomic(&marker, |_file| Ok(())))
-            .await
-            .wrap_err("writing a marker panicked")?
-            .wrap_err("failed to mark a chunk as loaded")?;
-        loaded = loaded.saturating_add(chunk.blocks());
-        if logged.elapsed() >= progress::INTERVAL {
-            logged = Instant::now();
+    }
+    tally.summary();
+    // A stop leaves unmarked chunks, which the next run writes; nothing is skipped. The run
+    // is complete only if no chunk is left unread and no insert was abandoned.
+    let unread = queue.as_slice().first().map(|chunk| chunk.from);
+    Ok(match (unread, abandoned) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (first, None) | (None, first) => first,
+    })
+}
+
+/// Chunks whose rows are being joined into one bulk insert, and those rows.
+#[derive(Debug, Default)]
+struct Batch {
+    chunks: Vec<Chunk>,
+    rows: BulkRows,
+}
+
+/// What the ClickHouse pass has written, for its progress lines.
+struct Tally {
+    started: Instant,
+    logged: Instant,
+    rate: Rate,
+    blocks: u64,
+    transactions: u64,
+}
+
+impl Tally {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            logged: Instant::now(),
+            rate: Rate::new(),
+            blocks: 0,
+            transactions: 0,
+        }
+    }
+
+    /// Records a written batch and logs a progress line when one is due.
+    fn add(&mut self, rows: &BulkRows, in_flight: usize) {
+        let count = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+        self.blocks = self.blocks.saturating_add(count(rows.blocks()));
+        self.transactions = self.transactions.saturating_add(count(rows.transactions()));
+        if self.logged.elapsed() >= progress::INTERVAL {
+            self.logged = Instant::now();
             info!(
-                blocks = loaded,
-                up_to = chunk.to.saturating_sub(1),
+                blocks = self.blocks,
+                transactions = self.transactions,
+                transactions_per_sec = self.rate.per_sec(self.transactions),
+                in_flight,
                 "loading ClickHouse"
             );
         }
     }
-    info!(blocks = loaded, "ClickHouse holds the range");
-    Ok(None)
+
+    fn summary(&self) {
+        let secs = self.started.elapsed().as_secs().max(1);
+        info!(
+            blocks = self.blocks,
+            transactions = self.transactions,
+            transactions_per_sec = self.transactions / secs,
+            secs,
+            "ClickHouse pass ended"
+        );
+    }
+}
+
+/// The chunks of the plan that have no ClickHouse marker, in block order.
+async fn unloaded_chunks(state: &State, plan: &Plan) -> eyre::Result<Vec<Chunk>> {
+    let (state, plan) = (state.clone(), *plan);
+    spawn_blocking(move || -> eyre::Result<Vec<Chunk>> {
+        let mut todo = Vec::new();
+        for chunk in plan.chunks() {
+            if !exists(&state.clickhouse_loaded_path(chunk))? {
+                todo.push(chunk);
+            }
+        }
+        Ok(todo)
+    })
+    .await
+    .wrap_err("listing the chunks panicked")?
+}
+
+/// Writes the markers that ClickHouse holds `chunks`.
+async fn mark_loaded(state: &State, chunks: &[Chunk]) -> eyre::Result<()> {
+    let markers: Vec<PathBuf> = chunks
+        .iter()
+        .map(|chunk| state.clickhouse_loaded_path(*chunk))
+        .collect();
+    spawn_blocking(move || {
+        markers
+            .iter()
+            .try_for_each(|marker| write_atomic(marker, |_file| Ok(())))
+    })
+    .await
+    .wrap_err("writing markers panicked")?
+    .wrap_err("failed to mark a chunk as loaded")
 }
 
 /// What the archive pass has done, for its progress lines.

@@ -35,6 +35,12 @@ const MAX_INSERT_BLOCKS: usize = 256;
 /// one part, and still acknowledges only after the data is written.
 const ASYNC_INSERT: [(&str, &str); 2] = [("async_insert", "1"), ("wait_for_async_insert", "1")];
 
+/// Limit for writing one table's rows of a bulk insert, which can be hundreds of thousands.
+const BULK_INSERT_TIMEOUT: Duration = Duration::from_secs(300);
+/// Settings of a bulk insert: synchronous, so the statement ends when the data is written and
+/// one large insert makes one part per partition, not one per small insert.
+const BULK_INSERT: [(&str, &str); 1] = [("async_insert", "0")];
+
 /// Reads the applied migrations, oldest first, in the column order of `MigrationRow`.
 const APPLIED_MIGRATIONS: &str =
     "SELECT version, name, checksum, applied_at FROM schema_migrations ORDER BY version";
@@ -48,6 +54,48 @@ const BLOCK_TABLES: [(&str, &str); 4] = [
     ("receipts", "block_number"),
     ("logs", "block_number"),
 ];
+
+/// The rows of a set of blocks, built by [`ClickHouseStore::bulk_rows`] and written by
+/// [`ClickHouseStore::bulk_insert`]. Several sets can be joined into one insert.
+#[derive(Debug, Default)]
+pub struct BulkRows {
+    rows: Rows,
+    blocks: usize,
+}
+
+impl BulkRows {
+    /// Adds the rows of `other`.
+    pub fn append(&mut self, mut other: Self) {
+        self.rows.blocks.append(&mut other.rows.blocks);
+        self.rows.transactions.append(&mut other.rows.transactions);
+        self.rows.receipts.append(&mut other.rows.receipts);
+        self.rows.logs.append(&mut other.rows.logs);
+        self.blocks = self.blocks.saturating_add(other.blocks);
+    }
+
+    /// Rows in every table together.
+    #[must_use]
+    pub const fn rows(&self) -> usize {
+        self.rows
+            .blocks
+            .len()
+            .saturating_add(self.rows.transactions.len())
+            .saturating_add(self.rows.receipts.len())
+            .saturating_add(self.rows.logs.len())
+    }
+
+    /// Blocks the rows are of.
+    #[must_use]
+    pub const fn blocks(&self) -> usize {
+        self.blocks
+    }
+
+    /// Transactions the rows hold.
+    #[must_use]
+    pub const fn transactions(&self) -> usize {
+        self.rows.transactions.len()
+    }
+}
 
 /// The committed store on ClickHouse. Cheap to clone: clones share the HTTP connection pool.
 ///
@@ -63,6 +111,8 @@ pub struct ClickHouseStore {
     queries: Client,
     /// Inserts: async, acknowledged once written, limited to [`INSERT_TIMEOUT`] on the server.
     inserts: Client,
+    /// Bulk inserts: synchronous, limited to [`BULK_INSERT_TIMEOUT`] on the server.
+    bulk: Client,
     chain_id: ChainId,
 }
 
@@ -82,6 +132,13 @@ impl ClickHouseStore {
         let queries = client
             .clone()
             .with_setting(MAX_EXECUTION_TIME, QUERY_TIMEOUT.as_secs().to_string());
+        let mut bulk = client.clone().with_setting(
+            MAX_EXECUTION_TIME,
+            BULK_INSERT_TIMEOUT.as_secs().to_string(),
+        );
+        for (name, value) in BULK_INSERT {
+            bulk = bulk.with_setting(name, value);
+        }
         let mut inserts =
             client.with_setting(MAX_EXECUTION_TIME, INSERT_TIMEOUT.as_secs().to_string());
         for (name, value) in ASYNC_INSERT {
@@ -92,6 +149,7 @@ impl ClickHouseStore {
             server,
             queries,
             inserts,
+            bulk,
             chain_id,
         }
     }
@@ -158,7 +216,7 @@ impl ClickHouseStore {
                 self.queries.query(APPLIED_MIGRATIONS).fetch_all(),
             )
             .await?;
-            for migration in migrations::pending(&applied)? {
+            for migration in migrations::pending(&applied, &self.database)? {
                 within(
                     QUERY_TIMEOUT,
                     "migrate",
@@ -206,6 +264,81 @@ impl ClickHouseStore {
             insert.end().await
         })
         .await
+    }
+
+    /// Builds the rows of `blocks` for [`Self::bulk_insert`], stamped with the current time as
+    /// their version. CPU work proportional to the blocks: call it from a blocking thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::InvalidBlock`] or [`StorageError::UnsupportedTransaction`] for
+    /// a block that does not fit the schema.
+    pub fn bulk_rows(&self, blocks: &[DecodedBlock]) -> Result<BulkRows, StorageError> {
+        let version_micros = now_micros();
+        let mut rows = Rows::default();
+        for block in blocks {
+            validate_block(block)?;
+            rows.push(self.chain_id, block, version_micros)?;
+        }
+        Ok(BulkRows {
+            rows,
+            blocks: blocks.len(),
+        })
+    }
+
+    /// Writes `rows` in one synchronous insert per table, the three child tables at once and
+    /// `blocks` after them, so a `blocks` row means its transactions, receipts and logs are stored, as
+    /// [`CommittedStore::insert`] guarantees. For loading history in large batches, several at
+    /// once on separate connections; the live path stays [`CommittedStore::insert`].
+    ///
+    /// Writing the same rows again is harmless: the tables keep one row per position. A retry
+    /// sends identical rows (same version), which a replicated server also recognises as a
+    /// repeated insert.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the server cannot be reached, refuses the rows or does not
+    /// answer in time; [`StorageError::severity`] says whether to retry.
+    ///
+    /// # Cancel safety
+    ///
+    /// Dropping it part-way may leave some tables with the rows and `blocks` without them;
+    /// writing the same rows again completes it.
+    pub async fn bulk_insert(&self, rows: &BulkRows) -> Result<(), StorageError> {
+        metrics::timed(Store::Committed, Operation::Insert, async {
+            let rows_of = &rows.rows;
+            // The child tables at once, each on its own connection; `blocks` once they hold
+            // their rows.
+            tokio::try_join!(
+                self.bulk_table(Table::Transactions, "transactions", &rows_of.transactions),
+                self.bulk_table(Table::Receipts, "receipts", &rows_of.receipts),
+                self.bulk_table(Table::Logs, "logs", &rows_of.logs),
+            )?;
+            self.bulk_table(Table::Blocks, "blocks", &rows_of.blocks)
+                .await?;
+            metrics::blocks_inserted(Store::Committed, rows.blocks);
+            Ok(())
+        })
+        .await
+    }
+
+    async fn bulk_table<T>(&self, table: Table, name: &str, rows: &[T]) -> Result<(), StorageError>
+    where
+        T: RowOwned + RowWrite,
+    {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        within(BULK_INSERT_TIMEOUT, "bulk insert", async {
+            let mut insert = self.bulk.insert::<T>(name).await?;
+            for row in rows {
+                insert.write(row).await?;
+            }
+            insert.end().await
+        })
+        .await?;
+        metrics::rows_inserted(table, rows.len());
+        Ok(())
     }
 
     /// Writes `rows` to a block-data table and counts them.

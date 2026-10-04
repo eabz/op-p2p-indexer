@@ -38,7 +38,7 @@ use op_indexer_primitives::{
     BlockRead, BlockRef, EncodedBlock, ItemConvert, ReadLimits, encode_receipts,
 };
 
-use self::tables::{Entry, Failure, Tables};
+use self::tables::{Entry, Failure, Prepared, Tables};
 use crate::metrics::{self, Operation};
 use crate::validate::validate_receipts;
 use crate::{ArchiveStore, InvalidBlockReason, StorageError, Store};
@@ -107,6 +107,73 @@ impl FjallArchive {
                 .map_err(|failure| failure.into_storage_error(name))
         })
         .await
+    }
+}
+
+impl FjallArchive {
+    /// Appends blocks the importer prepared, for its bulk load only: written straight into
+    /// new table and blob files, all keyspaces at once, without the journal. Several times
+    /// faster than [`ArchiveStore::append_batch`] for long lists, and as durable when it
+    /// returns; each call writes new files, so it is for lists of hundreds of megabytes, not
+    /// a few blocks. A crash during a call leaves the archive as it was before it (see
+    /// `tables::bulk`).
+    ///
+    /// `blocks` must be consecutive, oldest first, and extend the archive's last block (or
+    /// the archive is empty). No other write may run at the same time; the writer lock
+    /// ensures it in this process.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::NotContiguous`] if `blocks` do not extend the archive, and
+    /// [`StorageError::Fjall`] if writing fails.
+    pub async fn bulk_append(&self, blocks: Vec<PreparedBlock>) -> Result<(), StorageError> {
+        self.blocking(Operation::AppendBatch, "bulk_append", move |tables| {
+            let blocks: Vec<Prepared> = blocks.into_iter().map(|block| block.0).collect();
+            tables::bulk_append(tables, &blocks)
+        })
+        .await
+    }
+}
+
+/// A block checked and compressed for [`FjallArchive::bulk_append`], off the writer: its
+/// header hashes to its hash, and its number and parent are read from it.
+#[derive(Debug)]
+pub struct PreparedBlock(Prepared);
+
+impl PreparedBlock {
+    /// Prepares `block`. CPU work only (decoding the header, hashing it, compressing the
+    /// values): call it on a blocking thread, as many in parallel as there are cores.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::InvalidData`] if the header does not decode,
+    /// [`StorageError::InvalidBlock`] if it does not hash to the block's hash, and
+    /// [`StorageError::Oversized`] if a value is too large to compress.
+    pub fn new(block: &EncodedBlock) -> Result<Self, StorageError> {
+        let checked = checked_header(block.hash, &block.header)?;
+        let prepared = Prepared::new(
+            BlockRef {
+                number: checked.number,
+                hash: block.hash,
+            },
+            checked.parent_hash,
+            &block.header,
+            &block.body,
+            block.receipts.as_ref().map(|receipts| &receipts[..]),
+        )?;
+        Ok(Self(prepared))
+    }
+
+    /// The block's number.
+    #[must_use]
+    pub const fn number(&self) -> BlockNumber {
+        self.0.block.number
+    }
+
+    /// The compressed bytes the block adds to the archive.
+    #[must_use]
+    pub fn stored_len(&self) -> usize {
+        self.0.stored_len()
     }
 }
 
@@ -185,27 +252,32 @@ fn entry(block: EncodedBlock) -> Result<Entry, StorageError> {
         body,
         receipts,
     } = block;
-    let decoded =
-        Header::decode(&mut header.as_ref()).map_err(|source| StorageError::InvalidData {
-            store: Store::Archive,
-            what: "header to append",
-            block: Some(hash),
-            source: Some(source.into()),
-        })?;
-    if keccak256(&header) != hash {
+    let checked = checked_header(hash, &header)?;
+    Ok(Entry {
+        block: BlockRef {
+            number: checked.number,
+            hash,
+        },
+        parent_hash: checked.parent_hash,
+        header,
+        body,
+        receipts,
+    })
+}
+
+/// The decoded `header`, which must hash to `hash`.
+fn checked_header(hash: BlockHash, header: &[u8]) -> Result<Header, StorageError> {
+    let decoded = Header::decode(&mut &header[..]).map_err(|source| StorageError::InvalidData {
+        store: Store::Archive,
+        what: "header to append",
+        block: Some(hash),
+        source: Some(source.into()),
+    })?;
+    if keccak256(header) != hash {
         return Err(StorageError::InvalidBlock {
             number: decoded.number,
             reason: InvalidBlockReason::HeaderHash,
         });
     }
-    Ok(Entry {
-        block: BlockRef {
-            number: decoded.number,
-            hash,
-        },
-        parent_hash: decoded.parent_hash,
-        header,
-        body,
-        receipts,
-    })
+    Ok(decoded)
 }

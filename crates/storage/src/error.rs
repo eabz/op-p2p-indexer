@@ -21,10 +21,13 @@ const REDIS_BUSY_CODES: [&str; 6] = [
     "CLUSTERDOWN",
     "MASTERDOWN",
 ];
-/// ClickHouse error codes of a server under load, from its `ErrorCodes.cpp`: 159
-/// `TIMEOUT_EXCEEDED`, 202 `TOO_MANY_SIMULTANEOUS_QUERIES`, 241 `MEMORY_LIMIT_EXCEEDED`,
-/// 252 `TOO_MANY_PARTS`.
-const CLICKHOUSE_BUSY_CODES: [u32; 4] = [159, 202, 241, 252];
+/// ClickHouse error codes of a server that is busy or briefly unavailable, from its
+/// `ErrorCodes.cpp`: 159 `TIMEOUT_EXCEEDED`, 202 `TOO_MANY_SIMULTANEOUS_QUERIES`, 209
+/// `SOCKET_TIMEOUT`, 210 `NETWORK_ERROR`, 241 `MEMORY_LIMIT_EXCEEDED`, 242
+/// `TABLE_IS_READ_ONLY` and 999 `KEEPER_EXCEPTION` (a replicated or cloud service changing
+/// replicas), 252 `TOO_MANY_PARTS`, 319 `UNKNOWN_STATUS_OF_INSERT` (the connection broke
+/// mid-insert: repeating it is safe, inserts are idempotent here).
+const CLICKHOUSE_BUSY_CODES: [u32; 9] = [159, 202, 209, 210, 241, 242, 252, 319, 999];
 /// What a ClickHouse error response starts with, before the numeric code.
 const CLICKHOUSE_CODE_PREFIX: &str = "Code: ";
 
@@ -251,13 +254,21 @@ pub enum StorageError {
         /// EIP-2718 type of the transaction.
         tx_type: u8,
     },
-    /// An applied ClickHouse migration differs from the one embedded in this binary.
-    #[error("migration {version} ({name}) was edited after it was applied")]
+    /// An applied ClickHouse migration differs from the one embedded in this binary: the
+    /// schema changed before the first release, after this database was created.
+    #[error(
+        "migration {version} ({name}) in ClickHouse database `{database}` differs from this \
+         build's: the schema changed after the database was created. If the database holds no \
+         data yet, drop it (`DROP DATABASE {database}`) and run again, which creates it with \
+         the new schema; if it holds data you want, keep using the build that created it"
+    )]
     MigrationChecksum {
         /// Version of the migration.
         version: u32,
         /// Name of the migration.
         name: String,
+        /// The database holding it.
+        database: String,
     },
     /// ClickHouse has a migration this binary does not know: the binary is older than the schema.
     #[error("applied migration {version} is unknown to this binary")]
