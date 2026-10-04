@@ -5,14 +5,23 @@
 //! was asked by (or to its child's parent hash), the transactions must hash to the header's
 //! transactions root, the receipts to its receipts root. A peer whose answer fails that is
 //! reported and another one is asked. Does not decide which blocks to read (`watch`).
+//!
+//! Sessions with L1 peers are scarce: almost every peer is full, and a dial-only node was
+//! measured to get about one session per 700 dials. So a session is only given up for a
+//! reason: an answer that fails verification bans the peer and [`MAX_TIMEOUTS`] requests in a
+//! row without an answer drop it, but one slow answer or a block the peer does not hold costs
+//! it nothing, and a peer that gave a verified answer is reported so it is saved for the next
+//! start. Every read works with a single session.
 
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use alloy_consensus::proofs::calculate_receipt_root;
 use alloy_consensus::{EthereumReceipt, Header, ReceiptEnvelope, Sealed};
 use alloy_primitives::{B256, Bytes, keccak256};
 use alloy_rlp::{Decodable, EMPTY_LIST_CODE};
-use op_indexer_el::{Peers, Report, RequestError, SessionHandle};
+use op_indexer_el::{PeerId, Peers, Report, RequestError, SessionHandle};
 use op_indexer_primitives::{rlp_list_items, transactions_root};
 use tokio::task::spawn_blocking;
 use tokio_util::sync::CancellationToken;
@@ -24,6 +33,14 @@ const RETRY: Duration = Duration::from_secs(5);
 /// Rounds over the open sessions after which a block nobody served is given up: the hash may
 /// be of a block that was replaced, which no peer keeps.
 const MAX_ROUNDS: u32 = 6;
+
+/// Requests in a row a peer may leave unanswered (each waits the session's request timeout)
+/// before it is dropped as unresponsive: a session that answers nothing only delays the
+/// others.
+const MAX_TIMEOUTS: u32 = 3;
+/// Most peers remembered as reported for serving; past it the set starts over, which only
+/// costs a repeated report.
+const MAX_REPORTED_PEERS: usize = 256;
 
 /// Why a read ended without the data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,11 +73,24 @@ impl From<RequestError> for Unusable {
 #[derive(Debug)]
 pub(crate) struct Fetcher {
     peers: Peers,
+    /// What is remembered about peers between requests.
+    notes: Mutex<Notes>,
+}
+
+#[derive(Debug, Default)]
+struct Notes {
+    /// Peers already reported as having served a verified answer.
+    served: HashSet<PeerId>,
+    /// Requests in a row each peer left unanswered.
+    timeouts: HashMap<PeerId, u32>,
 }
 
 impl Fetcher {
-    pub(crate) const fn new(peers: Peers) -> Self {
-        Self { peers }
+    pub(crate) fn new(peers: Peers) -> Self {
+        Self {
+            peers,
+            notes: Mutex::default(),
+        }
     }
 
     /// Fetches up to `limit` headers going down from the block with hash `start`, inclusive,
@@ -139,7 +169,10 @@ impl Fetcher {
             }
             for session in sessions {
                 match request(session.clone()).await {
-                    Ok(answer) => return Ok(answer),
+                    Ok(answer) => {
+                        self.served(session.peer_id());
+                        return Ok(answer);
+                    }
                     Err(unusable) => self.note(&session, what, &unusable),
                 }
             }
@@ -156,6 +189,34 @@ impl Fetcher {
         }
     }
 
+    /// Notes a verified answer from `peer`: its timeouts are forgotten, and it is reported as
+    /// worth saving for the next start, once.
+    fn served(&self, peer: PeerId) {
+        let mut notes = self.notes.lock().unwrap_or_else(PoisonError::into_inner);
+        notes.timeouts.remove(&peer);
+        if notes.served.len() >= MAX_REPORTED_PEERS {
+            notes.served.clear();
+        }
+        if notes.served.insert(peer) {
+            self.peers.report(Report::Served(peer));
+        }
+    }
+
+    /// Notes a request `peer` left unanswered. Returns whether it is now unresponsive.
+    fn timed_out(&self, peer: PeerId) -> bool {
+        let mut notes = self.notes.lock().unwrap_or_else(PoisonError::into_inner);
+        if notes.timeouts.len() >= MAX_REPORTED_PEERS {
+            notes.timeouts.clear();
+        }
+        let timeouts = notes.timeouts.entry(peer).or_default();
+        *timeouts = timeouts.saturating_add(1);
+        let unresponsive = *timeouts >= MAX_TIMEOUTS;
+        if unresponsive {
+            notes.timeouts.remove(&peer);
+        }
+        unresponsive
+    }
+
     /// Logs why `session`'s answer was not used and reports the peer if it is at fault.
     fn note(&self, session: &SessionHandle, what: &'static str, unusable: &Unusable) {
         let peer = session.peer_id();
@@ -170,7 +231,14 @@ impl Fetcher {
             Unusable::Undecodable | Unusable::Request(RequestError::Malformed(_)) => {
                 Report::Undecodable(peer)
             }
-            Unusable::Request(RequestError::Timeout) => Report::Unresponsive(peer),
+            // A session is too hard to get to drop it for one slow answer.
+            Unusable::Request(RequestError::Timeout) => {
+                if !self.timed_out(peer) {
+                    debug!(%peer, what, "L1 peer did not answer in time");
+                    return;
+                }
+                Report::Unresponsive(peer)
+            }
             // The session is gone already.
             Unusable::Request(RequestError::SessionClosed) => return,
         };

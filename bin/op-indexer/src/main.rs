@@ -18,8 +18,8 @@ use alloy_primitives::BlockNumber;
 use eyre::WrapErr;
 use op_indexer_chainspec::ChainSpec;
 use op_indexer_el::{ExecutionNetwork, RangeSync, SyncPlan};
-use op_indexer_l1::{L1Config, L1Network, TrustedL1Block};
-use op_indexer_p2p::{Network, NodeStore};
+use op_indexer_l1::{BeaconConfig, L1Config, L1Network, LightClient};
+use op_indexer_p2p::{Network, NodeStore, StoreError};
 use op_indexer_pipeline::{Pipeline, ReceiptsChannels};
 use op_indexer_primitives::{BlockRef, EncodedBlock, ExecutionPeer, L1Games, L1Heads, SyncRange};
 use op_indexer_storage::archive_store::FjallArchive;
@@ -156,69 +156,85 @@ async fn main() -> eyre::Result<()> {
         caught_up_rx,
         l1_heads_tx,
     )));
-    // The L1 side, which turns dispute games into the heads; without it nothing writes them
-    // and the sender is only kept alive, so promotion sees a quiet source, not a closed one.
+    // The L1 side, whose games the pipeline turns into the heads; without it nothing writes
+    // them and the sender is only kept alive, so promotion sees a quiet source, not a closed
+    // one.
     let (l1, pipeline, _idle) = match config.l1 {
         Some(settings) => {
-            let (l1, games, idle) = l1_network(settings, config.network.chain, &store)?;
-            saves.push(idle.served);
-            let pipeline = pipeline.with_l1_games(games, l1_source_tx);
-            (Some(l1), pipeline, (Some(idle.trusted), None))
+            let l1 = l1_side(settings, config.network.chain, &store)?;
+            saves.push(l1.served);
+            let pipeline = pipeline.with_l1_games(l1.games, l1_source_tx);
+            (Some((l1.network, l1.light_client)), pipeline, None)
         }
-        None => (None, pipeline, (None, Some(l1_source_tx))),
+        None => (None, pipeline, Some(l1_source_tx)),
     };
     let network = Network::new(config.network, keypair, store, blocks_tx, safe_number_rx);
     run(network, execution, l1, pipeline, saves).await
 }
 
-/// What the L1 side leaves in the binary's hands until its inputs exist.
-struct L1Idle {
-    /// Where the beacon light client will send the L1 blocks it vouches for. Kept open: the
-    /// L1 network stops when it closes.
-    trusted: mpsc::Sender<TrustedL1Block>,
-    /// Drains the L1 peers worth saving, which are not stored yet.
+/// The L1 side: the two components and what connects them to the rest.
+struct L1Side {
+    /// Reads the chain's dispute games from the L1 blocks it is told to trust.
+    network: L1Network,
+    /// Tells it which L1 blocks to trust: verified beacon headers, from the checkpoint on.
+    light_client: LightClient,
+    /// The games, for the pipeline to check against our blocks.
+    games: watch::Receiver<L1Games>,
+    /// Saves the L1 peers that served us.
     served: JoinHandle<()>,
 }
 
-/// Builds the L1 network: an execution p2p node on Ethereum L1 that reads the chain's
-/// dispute games from L1 blocks it is told to trust, and publishes them for the pipeline.
-fn l1_network(
+/// Builds the L1 side: a beacon light client that follows Ethereum's finality from the
+/// configured checkpoint, and an execution p2p node on L1 that reads the chain's dispute
+/// games from the blocks the light client vouches for.
+fn l1_side(
     settings: L1Settings,
     chain: &'static ChainSpec,
-    store: &NodeStore,
-) -> eyre::Result<(L1Network, watch::Receiver<L1Games>, L1Idle)> {
+    store: &Arc<NodeStore>,
+) -> eyre::Result<L1Side> {
     // A key of its own, like the execution network's.
     let key = store
         .l1_key()
         .wrap_err("failed to load the L1 network key")?;
     let (trusted_tx, trusted_rx) = mpsc::channel(TRUSTED_L1_BLOCKS_CAPACITY);
-    let (games_tx, games_rx) = watch::channel(L1Games::default());
-    let (served_tx, mut served_rx) = mpsc::channel(SERVED_PEERS_CAPACITY);
+    let (games_tx, games) = watch::channel(L1Games::default());
+    let (served_tx, served_rx) = mpsc::channel(SERVED_PEERS_CAPACITY);
     let config = L1Config {
         chain,
         listen_addr: settings.listen_addr,
-        advertised_addr: None,
+        advertised_addr: settings.advertised_addr,
         bootnodes: Vec::new(),
-        saved_peers: Vec::new(),
+        // L1 peers have few free slots: the ones that served before are dialed first.
+        saved_peers: store
+            .l1_peers()
+            .wrap_err("failed to load the saved L1 peers")?,
     };
-    let l1 = L1Network::new(config, key, trusted_rx, games_tx, served_tx)
+    let network = L1Network::new(config, key, trusted_rx, games_tx, served_tx)
         .wrap_err("failed to create the L1 network")?;
-    // TODO: start the beacon light client from this checkpoint and give it `trusted_tx`
-    // (docs/l1.md part 1); it is not built yet, so no L1 block is trusted and no head moves.
-    warn!(
-        checkpoint = %settings.checkpoint,
-        "the L1 side is enabled but its beacon light client is not built yet: no L1 block is \
-         trusted, so no safe or finalized head is published"
-    );
-    let served = tokio::spawn(async move { while served_rx.recv().await.is_some() {} });
-    Ok((
-        l1,
-        games_rx,
-        L1Idle {
-            trusted: trusted_tx,
-            served,
+    let light_client = LightClient::new(
+        BeaconConfig {
+            checkpoint: settings.checkpoint,
+            listen_addr: settings.beacon_listen_addr,
+            // Beacon nodes share the discovery network of the chain's bootnodes.
+            bootnodes: chain
+                .bootnodes
+                .iter()
+                .map(|bootnode| (*bootnode).to_owned())
+                .collect(),
         },
-    ))
+        trusted_tx,
+    );
+    let served = tokio::spawn(save_peers(
+        Arc::clone(store),
+        served_rx,
+        NodeStore::save_l1_peer,
+    ));
+    Ok(L1Side {
+        network,
+        light_client,
+        games,
+        served,
+    })
 }
 
 /// Runs the components until one stops or a signal arrives, then stops the others in order:
@@ -227,7 +243,7 @@ fn l1_network(
 async fn run(
     network: Network,
     execution: Option<ExecutionNetwork<ArchiveProvider>>,
-    l1: Option<L1Network>,
+    l1: Option<(L1Network, LightClient)>,
     pipeline: Pipeline<RedisStore, ClickHouseStore, FjallArchive>,
     saves: Vec<JoinHandle<()>>,
 ) -> eyre::Result<()> {
@@ -236,7 +252,10 @@ async fn run(
     let mut network = Some(tokio::spawn(network.run(networks_cancel.clone())));
     let mut execution =
         execution.map(|execution| tokio::spawn(execution.run(networks_cancel.clone())));
+    let (l1, light_client) = l1.unzip();
     let mut l1 = l1.map(|l1| tokio::spawn(l1.run(networks_cancel.clone())));
+    let mut light_client =
+        light_client.map(|light_client| tokio::spawn(light_client.run(networks_cancel.clone())));
     let mut pipeline = Some(tokio::spawn(pipeline.run(cancel.clone())));
 
     // Any component stopping ends the process; the others are stopped and waited for.
@@ -254,6 +273,10 @@ async fn run(
             warn!("L1 network stopped unexpectedly");
             result.wrap_err("L1 network failed")
         }
+        result = finished(&mut light_client) => {
+            warn!("beacon light client stopped");
+            result.wrap_err("beacon light client failed")
+        }
         result = finished(&mut pipeline) => {
             warn!("pipeline stopped unexpectedly");
             result.wrap_err("pipeline failed")
@@ -264,6 +287,9 @@ async fn run(
     let network = join(network).await.wrap_err("network failed");
     let execution = join(execution).await.wrap_err("execution network failed");
     let l1 = join(l1).await.wrap_err("L1 network failed");
+    let light_client = join(light_client)
+        .await
+        .wrap_err("beacon light client failed");
     cancel.cancel();
     let pipeline = join(pipeline).await.wrap_err("pipeline failed");
     // Their senders are gone with the execution network, so they end.
@@ -273,7 +299,12 @@ async fn run(
         }
     }
     // The reason the process stopped comes first, then whatever failed while shutting down.
-    stopped.and(network).and(execution).and(l1).and(pipeline)
+    stopped
+        .and(network)
+        .and(execution)
+        .and(l1)
+        .and(light_client)
+        .and(pipeline)
 }
 
 /// Waits for `task` to finish and clears it, so it is not awaited again. Never resolves when
@@ -347,9 +378,10 @@ fn execution_network(
         provider,
     )
     .wrap_err("failed to create the execution network")?;
-    let mut saves = vec![tokio::spawn(save_execution_peers(
+    let mut saves = vec![tokio::spawn(save_peers(
         Arc::clone(store),
         served_rx,
+        NodeStore::save_execution_peer,
     ))];
 
     let (network, range) = match sync {
@@ -537,12 +569,16 @@ async fn archive_next(archive: &FjallArchive) -> Option<BlockNumber> {
     }
 }
 
-/// Saves the execution peers that served us, so the next run dials them first. Ends when the
-/// execution network drops its sender.
-async fn save_execution_peers(store: Arc<NodeStore>, mut served: mpsc::Receiver<ExecutionPeer>) {
+/// Saves the peers of one execution network that served us, with `save`, so the next run
+/// dials them first. Ends when that network drops its sender.
+async fn save_peers(
+    store: Arc<NodeStore>,
+    mut served: mpsc::Receiver<ExecutionPeer>,
+    save: fn(&NodeStore, &ExecutionPeer) -> Result<(), StoreError>,
+) {
     while let Some(peer) = served.recv().await {
         let store = Arc::clone(&store);
-        match tokio::task::spawn_blocking(move || store.save_execution_peer(&peer)).await {
+        match tokio::task::spawn_blocking(move || save(&store, &peer)).await {
             Ok(Ok(())) => {}
             Ok(Err(err)) => warn!(%err, "failed to save execution peer"),
             Err(err) => warn!(%err, "execution peer save task failed"),

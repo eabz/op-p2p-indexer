@@ -47,6 +47,10 @@ const LOG_TIME_FORMAT: &str = "%H:%M:%S%.3f";
 /// Blocks per chunk unless the first `download` says otherwise.
 const DEFAULT_CHUNK_BLOCKS: u64 = 1000;
 
+/// The allocator of this binary: see the workspace manifest for what it buys.
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     let cli = Cli::parse();

@@ -3,10 +3,14 @@
 //!
 //! A trusted L1 block (its number and hash, from the beacon light client) is the only thing
 //! taken on trust. From it the watcher walks the headers down, each one the parent named by
-//! its child, until it reaches a block it already knows. For each new header it tests the
-//! logs bloom for the factory's `DisputeGameCreated` event; only when the bloom may hold it
-//! does it fetch the block's transactions and receipts (both checked against the header) and
-//! read the game from the event and the `create` call that emitted it.
+//! its child, until it reaches a block it already knows. A block holds a game only if (1) its
+//! header's logs bloom may contain the factory's `DisputeGameCreated` event, and (2) one of
+//! its transactions was sent to the factory. The bloom is tested first because it costs
+//! nothing, but on mainnet it is a weak filter: blooms are about three quarters full, and
+//! about one header in six passes (measured 2026-10-04). So the transactions are fetched next
+//! (checked against the header), and only a block with a transaction to the factory has its
+//! receipts fetched (checked too); the game is read from the event and that `create` call.
+//! A game created through another contract is not found: it would be refused anyway.
 //!
 //! It publishes the newest game on the chain it has walked and the newest game in a
 //! finalized block. It does not check a game's claim against our own blocks: that is done
@@ -195,6 +199,9 @@ impl Watcher {
                         "dispute game found on L1"
                     );
                     self.found.insert(at, game);
+                    // The walk goes down, so the first game found is the newest: it is
+                    // published at once, not when the walk ends.
+                    self.publish();
                     // After a start: enough is known once a game old enough to be finalized
                     // has been found.
                     if first_walk && at.saturating_add(FINALITY_MARGIN_BLOCKS) <= number {
@@ -226,11 +233,20 @@ impl Watcher {
         block: &Sealed<Header>,
         cancel: &CancellationToken,
     ) -> Result<Option<VerifiedGame>, Stop> {
-        // The bloom has no false negatives: most blocks end here.
+        // The bloom has no false negatives; on mainnet about five blocks in six end here.
         if !block.logs_bloom.contains(&self.needle) {
             return Ok(None);
         }
         let transactions = self.fetcher.transactions(block, cancel).await?;
+        // Most of the rest end here: no transaction was sent to the factory.
+        let factory = self.chain.dispute_game_factory;
+        let to_factory = |transaction: &Bytes| {
+            TxEnvelope::decode_2718(&mut transaction.as_ref())
+                .is_ok_and(|transaction| transaction.to() == Some(factory))
+        };
+        if !transactions.iter().any(to_factory) {
+            return Ok(None);
+        }
         let receipts = self
             .fetcher
             .receipts(block, transactions.len(), cancel)
@@ -239,7 +255,6 @@ impl Watcher {
             number: block.number,
             hash: block.hash(),
         };
-        let factory = self.chain.dispute_game_factory;
         let mut newest = None;
         for (transaction, receipt) in transactions.iter().zip(&receipts) {
             let created = receipt

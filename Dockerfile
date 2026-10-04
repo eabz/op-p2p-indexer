@@ -44,6 +44,6 @@ VOLUME /data
 
 # OP Stack p2p (libp2p TCP + discv5 UDP), and execution p2p (RLPx TCP + discv5 UDP), which
 # is only used when OP_INDEXER_EL_ENABLED=true.
-EXPOSE 9222/tcp 9222/udp 30303/tcp 30303/udp 30304/tcp 30304/udp
+EXPOSE 9222/tcp 9222/udp 30303/tcp 30303/udp 30304/tcp 30304/udp 9000/tcp 9000/udp
 
 ENTRYPOINT ["/usr/local/bin/op-indexer"]

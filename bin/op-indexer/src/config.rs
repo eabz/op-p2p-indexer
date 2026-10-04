@@ -29,6 +29,9 @@ const ARCHIVE_DIR: &str = "archive";
 const ARCHIVE_RETENTION_VAR: &str = "OP_INDEXER_ARCHIVE_RETENTION_BLOCKS";
 const SYNC_VAR: &str = "OP_INDEXER_EL_SYNC";
 const L1_CHECKPOINT_VAR: &str = "OP_INDEXER_L1_CHECKPOINT";
+/// The usual beacon p2p port.
+const DEFAULT_L1_BEACON_LISTEN_ADDR: SocketAddr =
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9000);
 /// The port next to the execution network's.
 const DEFAULT_L1_LISTEN_ADDR: SocketAddr =
     SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 30304);
@@ -63,6 +66,10 @@ impl ElSettings {
 pub(crate) struct L1Settings {
     /// Listen address of the L1 execution p2p node, UDP and TCP.
     pub(crate) listen_addr: SocketAddr,
+    /// Listen address of the beacon light client, UDP and TCP.
+    pub(crate) beacon_listen_addr: SocketAddr,
+    /// The public socket announced in the L1 node record, when the operator knows it.
+    pub(crate) advertised_addr: Option<SocketAddr>,
     /// The finalized beacon block root the light client starts from.
     pub(crate) checkpoint: B256,
 }
@@ -124,14 +131,23 @@ impl Config {
     ///   (`OP_INDEXER_ARCHIVE_RETENTION_BLOCKS=all`).
     /// - `OP_INDEXER_L1_ENABLED`: `true` to follow Ethereum L1 for what it commits to
     ///   (default `false`: no safe or finalized head, nothing is promoted). The node then
-    ///   joins L1's execution p2p network to read the dispute games of the chain, checks
-    ///   each claim against its own block, and promotes on a match. Needs
-    ///   `OP_INDEXER_L1_CHECKPOINT`.
+    ///   runs a beacon light client, which follows Ethereum's finality from the checkpoint,
+    ///   and joins L1's execution p2p network to read the dispute games of the chain from
+    ///   the L1 blocks the light client vouches for; it checks each claim against its own
+    ///   block and promotes on a match. Needs `OP_INDEXER_L1_CHECKPOINT`; if no peer serves
+    ///   that checkpoint any more the node stops and asks for a newer one.
     /// - `OP_INDEXER_L1_CHECKPOINT`: root of a recent finalized beacon block, from a source
     ///   you trust: the one value the L1 side takes on trust, everything after it is
     ///   verified.
     /// - `OP_INDEXER_L1_LISTEN_ADDR`: L1 execution p2p listen socket, TCP and UDP (default
     ///   `0.0.0.0:30304`; it must differ from `OP_INDEXER_EL_LISTEN_ADDR`).
+    /// - `OP_INDEXER_L1_BEACON_LISTEN_ADDR`: listen socket of the beacon light client, TCP
+    ///   and UDP (default `0.0.0.0:9000`; it must differ from the other listen addresses).
+    /// - `OP_INDEXER_L1_ADVERTISED_ADDR`: public socket (IP and port, the same for TCP and
+    ///   UDP) announced in the L1 node record, as `OP_INDEXER_EL_ADVERTISED_ADDR` is for the
+    ///   execution network (default: unset, the address other peers observe). Worth setting
+    ///   on a server with a public address: L1 peers have few free slots, and a node they
+    ///   can dial gets sessions it would not get by dialing.
     pub(crate) fn from_env() -> eyre::Result<Self> {
         let chain_id = parse_var("OP_INDEXER_CHAIN_ID")?.unwrap_or(DEFAULT_CHAIN_ID);
         let chain = ChainSpec::by_chain_id(chain_id)
@@ -233,6 +249,9 @@ fn l1_settings() -> eyre::Result<Option<L1Settings>> {
     })?;
     Ok(Some(L1Settings {
         listen_addr: parse_var("OP_INDEXER_L1_LISTEN_ADDR")?.unwrap_or(DEFAULT_L1_LISTEN_ADDR),
+        beacon_listen_addr: parse_var("OP_INDEXER_L1_BEACON_LISTEN_ADDR")?
+            .unwrap_or(DEFAULT_L1_BEACON_LISTEN_ADDR),
+        advertised_addr: parse_var("OP_INDEXER_L1_ADVERTISED_ADDR")?,
         checkpoint,
     }))
 }

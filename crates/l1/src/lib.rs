@@ -19,6 +19,7 @@
 //! root inside a header that does. What a game claims is not checked here: the consumer
 //! compares it with our own block. Uses no RPC. See `docs/l1.md`.
 
+mod beacon;
 mod fetch;
 mod spec;
 mod watch;
@@ -32,6 +33,7 @@ use op_indexer_primitives::{ExecutionPeer, L1Games};
 use tokio::sync::{mpsc, watch as watch_channel};
 use tokio_util::sync::CancellationToken;
 
+pub use crate::beacon::{BeaconConfig, BeaconError, LightClient};
 use crate::fetch::Fetcher;
 use crate::watch::Watcher;
 

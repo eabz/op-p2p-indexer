@@ -22,6 +22,7 @@ use op_indexer_primitives::{
     EncodedBlock, encode_body, encode_receipts, receipts_root, transactions_root,
 };
 
+use super::receipt::BloomHashes;
 use super::{Check, ChunkError, Forks, Stats, receipt, transaction};
 use crate::chunk::{self, Link, VerifiedBlock};
 use crate::rows::{self, BlockRow, LogRow, TransactionRow};
@@ -44,6 +45,7 @@ pub(super) fn verify_chunk(
     let mut logs = rows.logs.as_slice();
 
     let mut stats = Stats::default();
+    let mut hashes = BloomHashes::default();
     let mut blocks = Vec::new();
     let mut link: Option<Link> = None;
     for number in chunk.from..chunk.to {
@@ -59,7 +61,8 @@ pub(super) fn verify_chunk(
         let block_logs = take_while(&mut logs, |log| log.block_number == number);
 
         let (block, zero_signatures) =
-            verify_block(forks, row, block_transactions, block_logs).map_err(failed)?;
+            verify_block(forks, row, block_transactions, block_logs, &mut hashes)
+                .map_err(failed)?;
         if let Some(link) = &link
             && link.last_hash != row.parent_hash
         {
@@ -93,6 +96,7 @@ fn verify_block(
     row: &BlockRow,
     transactions: &[TransactionRow],
     mut logs: &[LogRow],
+    hashes: &mut BloomHashes,
 ) -> Result<(VerifiedBlock, u64), Check> {
     let timestamp: u64 = row.timestamp.to();
     let mut encodings = Vec::with_capacity(transactions.len());
@@ -116,7 +120,7 @@ fn verify_block(
 
         let _before = take_while(&mut logs, |log| log.transaction_index < index);
         let tx_logs = take_while(&mut logs, |log| log.transaction_index == index);
-        let receipt = receipt::rebuild(index, tx, tx_logs, timestamp >= forks.canyon)?;
+        let receipt = receipt::rebuild(index, tx, tx_logs, timestamp >= forks.canyon, hashes)?;
         logs_bloom.accrue_bloom(receipt.logs_bloom());
         receipts.push(receipt);
     }

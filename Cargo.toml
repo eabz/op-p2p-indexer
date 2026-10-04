@@ -73,6 +73,14 @@ op-alloy-rpc-types-engine = { version = "2", default-features = false, features 
 alloy-rpc-types-engine = { version = "2", default-features = false, features = ["ssz"] }
 # The `Decode` trait and error for the payload SSZ types (same version op-alloy uses).
 ethereum_ssz = { version = "0.10", default-features = false }
+# Beacon light client (`crates/l1`): derived SSZ decoding, hash tree roots and the fixed-size
+# SSZ collections of the consensus types (all sigp's, as `ethereum_ssz`).
+ethereum_ssz_derive = "0.10"
+tree_hash = "0.12"
+tree_hash_derive = "0.12"
+ssz_types = { version = "0.14", default-features = false }
+# BLS12-381 signatures of the sync committee (already in the tree through alloy's KZG).
+blst = { version = "0.3", default-features = false }
 # Gossip payloads and archived blocks are snappy block-compressed; message IDs and ClickHouse
 # migration checksums are SHA-256 (0.10, as op-alloy).
 sha2 = "0.10"
@@ -122,6 +130,9 @@ flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 rustix = { version = "1", default-features = false, features = ["std", "fs", "process"] }
 # Compression of the downloaded and verified chunks on disk (already in the tree).
 zstd = { version = "0.13", default-features = false }
+# The importer's allocator: `verify` builds rows and receipts on every core at once, and is
+# about 9% faster with it at eight threads than with the system allocator.
+mimalloc = { version = "0.1", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

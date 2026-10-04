@@ -14,6 +14,9 @@ use serde::Deserialize;
 
 use crate::source::Encoding;
 
+/// Bytes of text reserved per stored byte of a compressed chunk.
+const TEXT_PER_STORED_BYTE: usize = 16;
+
 /// One answer of the service.
 #[derive(Debug, Deserialize)]
 struct Response {
@@ -152,16 +155,18 @@ pub(crate) fn read(path: &Path) -> Result<Rows, RowsError> {
     let mut rows = Rows::default();
     {
         // The text is dropped before the rows are sorted: both are large.
-        let mut file = BufReader::new(File::open(path)?);
+        let file = File::open(path)?;
+        // Room for the whole text at once: growing the buffer step by step copies it again
+        // and again. The service's JSON compresses about tenfold.
+        let stored = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
+        let mut file = BufReader::new(file);
         let mut tag = [0_u8];
         file.read_exact(&mut tag)?;
         let [tag] = tag;
-        let mut data = Vec::new();
-        match Encoding::from_tag(tag) {
-            Some(Encoding::Identity) => file.read_to_end(&mut data)?,
-            Some(Encoding::Gzip) => MultiGzDecoder::new(file).read_to_end(&mut data)?,
-            Some(Encoding::Zstd) => {
-                zstd::stream::Decoder::with_buffer(file)?.read_to_end(&mut data)?
+        let mut data = match Encoding::from_tag(tag) {
+            Some(Encoding::Identity) => Vec::with_capacity(stored),
+            Some(Encoding::Gzip | Encoding::Zstd) => {
+                Vec::with_capacity(stored.saturating_mul(TEXT_PER_STORED_BYTE))
             }
             None => {
                 return Err(io::Error::new(
@@ -171,7 +176,17 @@ pub(crate) fn read(path: &Path) -> Result<Rows, RowsError> {
                 .into());
             }
         };
-        for response in serde_json::Deserializer::from_slice(&data).into_iter::<Response>() {
+        match Encoding::from_tag(tag) {
+            Some(Encoding::Gzip) => io::copy(&mut MultiGzDecoder::new(file), &mut data)?,
+            Some(Encoding::Zstd) => {
+                io::copy(&mut zstd::stream::Decoder::with_buffer(file)?, &mut data)?
+            }
+            Some(Encoding::Identity) | None => io::copy(&mut file, &mut data)?,
+        };
+        // Checked as text once, so the parser does not check every string again.
+        let text = String::from_utf8(data)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.utf8_error()))?;
+        for response in serde_json::Deserializer::from_str(&text).into_iter::<Response>() {
             for batch in response?.data {
                 rows.blocks.extend(batch.blocks);
                 rows.transactions.extend(batch.transactions);

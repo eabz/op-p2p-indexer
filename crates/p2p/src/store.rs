@@ -39,7 +39,9 @@ const MAX_KNOWN_PEERS: usize = 64;
 /// Execution peers that served us: node id (64 bytes) -> last time they served a request
 /// (Unix seconds, big-endian) followed by their TCP address as text.
 const EXECUTION_PEERS: &str = "execution_peers";
-/// Execution peers kept; the least recently served is evicted beyond this.
+/// Peers of L1's execution network that served us, in the shape of [`EXECUTION_PEERS`].
+const L1_PEERS: &str = "l1_execution_peers";
+/// Execution peers kept per network; the least recently served is evicted beyond this.
 const MAX_EXECUTION_PEERS: usize = 32;
 /// The verified checkpoints of a range sync, and the anchor they were verified from.
 const SYNC: &str = "sync";
@@ -90,6 +92,7 @@ pub struct NodeStore {
     node: Keyspace,
     peers: Keyspace,
     execution_peers: Keyspace,
+    l1_peers: Keyspace,
     sync: Keyspace,
     /// Serializes the read-then-write of the keys, both peer tables and the sync progress.
     write: Mutex<()>,
@@ -128,6 +131,7 @@ impl NodeStore {
             node: db.keyspace(NODE, KeyspaceCreateOptions::default)?,
             peers: db.keyspace(PEERS, KeyspaceCreateOptions::default)?,
             execution_peers: db.keyspace(EXECUTION_PEERS, KeyspaceCreateOptions::default)?,
+            l1_peers: db.keyspace(L1_PEERS, KeyspaceCreateOptions::default)?,
             sync: db.keyspace(SYNC, KeyspaceCreateOptions::default)?,
             db,
             write: Mutex::new(()),
@@ -234,14 +238,7 @@ impl NodeStore {
     ///
     /// Returns [`StoreError::Database`] if reading fails.
     pub fn execution_peers(&self) -> Result<Vec<ExecutionPeer>, StoreError> {
-        let mut peers = Vec::new();
-        for entry in self.execution_peers.iter() {
-            let (id, value) = entry.into_inner()?;
-            // An entry of another shape was not written by this code; skip it.
-            peers.extend(decode_execution_peer(&id, &value));
-        }
-        peers.sort_unstable_by_key(|peer| Reverse(peer.last_served_secs));
-        Ok(peers)
+        Self::read_execution_peers(&self.execution_peers)
     }
 
     /// Records an execution peer that served a request, replacing what was saved for its node
@@ -251,14 +248,48 @@ impl NodeStore {
     ///
     /// Returns [`StoreError::Database`] if writing fails.
     pub fn save_execution_peer(&self, peer: &ExecutionPeer) -> Result<(), StoreError> {
+        self.write_execution_peer(&self.execution_peers, peer)
+    }
+
+    /// Returns the saved peers of L1's execution network, most recently served first. A
+    /// table of its own: the two networks do not share peers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Database`] if reading fails.
+    pub fn l1_peers(&self) -> Result<Vec<ExecutionPeer>, StoreError> {
+        Self::read_execution_peers(&self.l1_peers)
+    }
+
+    /// Records a peer of L1's execution network that served a request, as
+    /// [`Self::save_execution_peer`] does for the chain's own.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Database`] if writing fails.
+    pub fn save_l1_peer(&self, peer: &ExecutionPeer) -> Result<(), StoreError> {
+        self.write_execution_peer(&self.l1_peers, peer)
+    }
+
+    fn read_execution_peers(table: &Keyspace) -> Result<Vec<ExecutionPeer>, StoreError> {
+        let mut peers = Vec::new();
+        for entry in table.iter() {
+            let (id, value) = entry.into_inner()?;
+            // An entry of another shape was not written by this code; skip it.
+            peers.extend(decode_execution_peer(&id, &value));
+        }
+        peers.sort_unstable_by_key(|peer| Reverse(peer.last_served_secs));
+        Ok(peers)
+    }
+
+    fn write_execution_peer(
+        &self,
+        table: &Keyspace,
+        peer: &ExecutionPeer,
+    ) -> Result<(), StoreError> {
         let mut value = peer.last_served_secs.to_be_bytes().to_vec();
         value.extend_from_slice(peer.addr.to_string().as_bytes());
-        self.save_evicting(
-            &self.execution_peers,
-            MAX_EXECUTION_PEERS,
-            peer.id.as_slice(),
-            &value,
-        )
+        self.save_evicting(table, MAX_EXECUTION_PEERS, peer.id.as_slice(), &value)
     }
 
     /// Writes `key -> value` to a peer table, whose values start with a time (Unix seconds,
