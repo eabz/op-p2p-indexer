@@ -57,8 +57,10 @@ target="$remote:$bucket/archive"
 marker="$remote:$bucket/archive.complete"
 # `lock` is fjall's lock file, held by whichever process has the archive open. It is not
 # synced; fjall needs it to exist when it opens an existing archive, so a pull creates it.
+# `--s3-no-head`: rclone checks each upload with a HEAD request for that object version, which
+# R2 answers 501 Not Implemented; the `rclone check` after the sync verifies the copy instead.
 flags=(--exclude /lock --transfers "$transfers" --checkers "$transfers" --fast-list
-  --s3-no-check-bucket --stats 10s --stats-one-line --stats-log-level NOTICE)
+  --s3-no-check-bucket --s3-no-head --stats 10s --stats-one-line --stats-log-level NOTICE)
 
 # Refuses to touch an archive another process has open.
 ensure_closed() {
