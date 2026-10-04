@@ -172,6 +172,15 @@ and its default. Range flags (`--state-dir`, `--first-block`, `--last-block`, `-
   answers as received), `verified/` one file per verified chunk (the consensus encodings that
   passed), `loaded/` one marker per loaded chunk. A file exists only when its chunk is
   complete; `*.tmp` files are leftovers of an interrupted write and are overwritten.
+- **Stopping and restarting**: Ctrl-C or SIGTERM stops a step within a fraction of a second
+  and exits with status 1 and a summary; `run` does not start the next step. Run the same
+  command again: it continues with exactly the chunks that are missing. A killed process
+  (SIGKILL, power loss) is as safe: a chunk file is written under a `.tmp` name and renamed,
+  so a file with a final name is always complete, and leftover `.tmp` files are removed at
+  the next start.
+- **One process per state directory**: the directory is locked while a process runs; a second
+  one exits with "another op-indexer-import process is using this state directory". The lock
+  is released by the system when the process ends, however it ends.
 - **Resuming**: when the request window closes, `download` stops with a summary of how many
   chunks are missing. Reset the window and run the same command again: only missing chunks are
   fetched. Ctrl-C stops any step cleanly; run it again to continue.

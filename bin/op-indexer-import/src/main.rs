@@ -61,7 +61,7 @@ async fn main() -> eyre::Result<()> {
         .init();
 
     // Startup-only blocking I/O, before any task runs.
-    let state = State::open(&cli.range.state_dir).wrap_err("failed to create the state dir")?;
+    let state = State::open(&cli.range.state_dir).wrap_err("failed to open the state directory")?;
     let (last, anchor) = top(&cli, &state).await?;
     eyre::ensure!(
         cli.range.first_block <= last,

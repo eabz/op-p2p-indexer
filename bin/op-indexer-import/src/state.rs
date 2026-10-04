@@ -6,15 +6,18 @@
 //! <state>/verified/<from>-<to>.blk    verified chunk: consensus encodings, see `chunk`
 //! <state>/loaded/<from>-<to>.archive     empty marker: the block archive holds the chunk
 //! <state>/loaded/<from>-<to>.clickhouse  empty marker: ClickHouse holds the chunk
+//! <state>/lock                        held by the one process working on the directory
 //! ```
 //!
-//! A file that exists is complete: files are written under a temporary name and renamed.
+//! A file that exists is complete: files are written under a temporary name (`*.tmp`) and
+//! renamed; temporary files left by a killed run are removed when the directory is opened.
 //! Holds no credentials. Does not know what the files contain.
 
 use std::fmt;
-use std::fs::{self, File};
+use std::fs::{self, File, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use alloy_primitives::B256;
 
@@ -119,24 +122,50 @@ pub(crate) struct State {
     raw: PathBuf,
     verified: PathBuf,
     loaded: PathBuf,
+    /// Held so that only one process works on the directory.
+    _lock: Arc<File>,
 }
 
 impl State {
-    /// Creates the state directory and its subdirectories if they are missing.
+    /// Creates the state directory and its subdirectories if they are missing, takes the
+    /// directory's lock for the life of the process, and removes the temporary files an
+    /// interrupted run left behind.
     ///
     /// # Errors
     ///
-    /// Returns the I/O error if a directory cannot be created.
+    /// Returns `ResourceBusy` if another process holds the lock, and the I/O error if a
+    /// directory cannot be created or read.
     pub(crate) fn open(root: &Path) -> io::Result<Self> {
+        fs::create_dir_all(root)?;
+        // An advisory lock on an open file: the system drops it when the process ends, however
+        // it ends, so a killed run never leaves the directory locked.
+        let lock = File::create(root.join("lock"))?;
+        lock.try_lock().map_err(|err| match err {
+            TryLockError::WouldBlock => io::Error::new(
+                io::ErrorKind::ResourceBusy,
+                "another op-indexer-import process is using this state directory",
+            ),
+            TryLockError::Error(err) => err,
+        })?;
         let state = Self {
             anchor: root.join("anchor.json"),
             raw: root.join("raw"),
             verified: root.join("verified"),
             loaded: root.join("loaded"),
+            _lock: Arc::new(lock),
         };
         fs::create_dir_all(&state.raw)?;
         fs::create_dir_all(&state.verified)?;
         fs::create_dir_all(&state.loaded)?;
+        // Temporary files of a run that was killed mid-write; nobody else writes here now.
+        for directory in [root, &state.raw, &state.verified, &state.loaded] {
+            for entry in fs::read_dir(directory)? {
+                let path = entry?.path();
+                if path.extension().is_some_and(|extension| extension == "tmp") {
+                    fs::remove_file(path)?;
+                }
+            }
+        }
         Ok(state)
     }
 
