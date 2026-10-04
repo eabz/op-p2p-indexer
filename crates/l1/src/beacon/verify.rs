@@ -58,7 +58,7 @@ const SYNC_COMMITTEE_SIZE: usize = 512;
 const BLS_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 
 /// Why light-client data was refused. Every variant is the sending peer's fault except
-/// [`Self::UnknownPeriod`] and [`Self::NotYetValid`], which an honest peer can cause.
+/// those [`VerifyError::is_peer_fault`] names, which an honest peer can cause.
 #[derive(Debug, thiserror::Error)]
 pub(super) enum VerifyError {
     #[error("the data does not decode: {0}")]
@@ -90,10 +90,14 @@ pub(super) enum VerifyError {
 }
 
 impl VerifyError {
-    /// Whether the peer that sent the data misbehaved, as opposed to being ahead of us or of
-    /// our clock.
+    /// Whether the peer that sent the data misbehaved. It did not if the data is only ahead
+    /// of the committees we know or of our clock, or is an update few members signed: the
+    /// network passes those on, and this client merely holds its heads to a higher bar.
     pub(super) const fn is_peer_fault(&self) -> bool {
-        !matches!(self, Self::UnknownPeriod { .. } | Self::NotYetValid { .. })
+        !matches!(
+            self,
+            Self::UnknownPeriod { .. } | Self::NotYetValid { .. } | Self::Participation(_)
+        )
     }
 }
 
@@ -465,7 +469,8 @@ fn check_signature(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_invalid| VerifyError::Point)?;
     if keys.is_empty() {
-        return Err(VerifyError::Participation(0));
+        // The specification's minimum is one signer: no signer is no signature.
+        return Err(VerifyError::Signature);
     }
     let signature = Signature::from_bytes(update.aggregate.sync_committee_signature.as_slice())
         .map_err(|_invalid| VerifyError::Point)?;

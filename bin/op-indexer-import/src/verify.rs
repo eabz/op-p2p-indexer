@@ -42,7 +42,7 @@ use crate::state::{Anchor, Chunk, LOW_SPACE_BYTES, MIN_SPACE_BYTES, Plan, State,
 
 /// Threads reading chunk links per verify thread: the work is waiting for the disk to open
 /// files, not computing.
-const LINK_READERS_PER_THREAD: usize = 4;
+const LINK_READERS_PER_THREAD: usize = 2;
 /// How often the linking pass looks whether its readers are done.
 const LINK_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
