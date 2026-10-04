@@ -70,9 +70,10 @@ where
         };
         if let Start::Number(number) = start {
             self.source
-                .ensure_held(number)
+                .holdings()
                 .await
-                .map_err(|err| read_status(&err))??;
+                .map_err(|err| read_status(&err))?
+                .ensure_held(number)?;
         }
         let permit = Arc::clone(&self.subscriptions)
             .try_acquire_owned()

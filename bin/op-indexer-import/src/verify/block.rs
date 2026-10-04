@@ -11,6 +11,9 @@
 //! 4. its parent hash must be the previous block's hash.
 //!
 //! The bytes that passed are what is written (see `chunk`): nothing is encoded again later.
+//!
+//! `fields` lists what this rebuild needs from a row, for `download`'s one-pass report: a field
+//! the rebuild starts to need, or to default, goes there too.
 
 use std::io;
 use std::path::Path;
@@ -27,16 +30,18 @@ use tracing::info;
 use super::receipt::BloomHashes;
 use super::{Check, ChunkError, Forks, Stats, receipt, transaction};
 use crate::chunk::{self, Link, VerifiedBlock};
-use crate::fill;
+use crate::fill::{self, Fill};
 use crate::rows::{self, BlockRow, LogRow, TransactionRow};
 use crate::state::Chunk;
+use crate::state::read_json;
 
 /// Verifies the downloaded chunk at `raw`, with what its fill at `fill` holds, and writes it
 /// to `verified`. Blocking, CPU-bound.
 pub(super) fn verify_chunk(
     forks: &Forks,
     chunk: Chunk,
-    (raw, fill): (&Path, &Path),
+    raw: &Path,
+    fill: &Path,
     verified: &Path,
 ) -> Result<Stats, ChunkError> {
     let mut rows = rows::read(raw).map_err(|source| ChunkError::Rows {
@@ -45,7 +50,7 @@ pub(super) fn verify_chunk(
         source,
     })?;
     let mut stats = Stats::default();
-    if let Some(fill) = fill::read(fill).map_err(ChunkError::Fill)? {
+    if let Some(fill) = read_json::<Fill>(fill).map_err(ChunkError::Fill)? {
         stats.rpc_filled_transactions = fill::apply(&mut rows, fill);
     }
     let mut block_rows = rows.blocks.iter().peekable();
@@ -120,6 +125,11 @@ fn verify_block(
     hashes: &mut BloomHashes,
     stats: &mut Stats,
 ) -> Result<VerifiedBlock, Check> {
+    // Every block after the Bedrock block has the L1-attributes deposit: none is a block whose
+    // rows the service left out, which the fill brings.
+    if transactions.is_empty() && row.number > forks.bedrock_block {
+        return Err(Check::Hole);
+    }
     let timestamp: u64 = row.timestamp.to();
     // Every legacy header has a zero `mix_hash`; the header hash below proves the guess. From
     // Bedrock on it is the L1 block's randomness and cannot be rebuilt.

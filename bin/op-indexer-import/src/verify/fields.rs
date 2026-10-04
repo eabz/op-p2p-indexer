@@ -20,10 +20,27 @@ pub(crate) struct Missing {
     pub(crate) field: &'static str,
 }
 
-/// Calls `found` with every field a row of `rows` lacks, and the row's block.
+/// The blocks of `rows` the service sent without transactions: every block after the Bedrock
+/// block has at least one, the L1-attributes deposit.
+pub(crate) fn holes<'a>(forks: &Forks, rows: &'a Rows) -> impl Iterator<Item = &'a BlockRow> {
+    let bedrock = forks.bedrock_block;
+    rows.blocks
+        .iter()
+        .filter(move |block| block.number > bedrock && !rows.has_transactions(block.number))
+}
+
+/// Calls `found` with every field a row of `rows` lacks, and the row's block; a block without
+/// its transactions lacks `transactions`.
 pub(crate) fn missing(forks: &Forks, rows: &Rows, mut found: impl FnMut(Missing, u64)) {
+    for block in holes(forks, rows) {
+        let hole = Missing {
+            row: "block",
+            field: "transactions",
+        };
+        found(hole, block.number);
+    }
     for block in &rows.blocks {
-        for field in header(forks, block) {
+        header(forks, block, |field| {
             found(
                 Missing {
                     row: "header",
@@ -31,29 +48,24 @@ pub(crate) fn missing(forks: &Forks, rows: &Rows, mut found: impl FnMut(Missing,
                 },
                 block.number,
             );
-        }
+        });
     }
     for tx in &rows.transactions {
-        let timestamp = rows
-            .blocks
-            .binary_search_by_key(&tx.block_number, |block| block.number)
-            .ok()
-            .and_then(|at| rows.blocks.get(at))
-            .map(|block| block.timestamp.to::<u64>());
-        let canyon = timestamp.is_some_and(|timestamp| timestamp >= forks.canyon);
-        let (row, fields) = transaction(tx, canyon);
-        for field in fields {
+        let block = rows.block(tx.block_number);
+        let canyon = block.is_some_and(|block| block.timestamp.to::<u64>() >= forks.canyon);
+        transaction(tx, canyon, |row, field| {
             found(Missing { row, field }, tx.block_number);
-        }
+        });
     }
 }
 
-/// The header fields of `block`'s forks that its row lacks.
-fn header(forks: &Forks, block: &BlockRow) -> Vec<&'static str> {
+/// Calls `found` with each header field of `block`'s forks that its row lacks.
+fn header(forks: &Forks, block: &BlockRow, mut found: impl FnMut(&'static str)) {
     let timestamp: u64 = block.timestamp.to();
     let bedrock = block.number >= forks.bedrock_block;
+    let canyon = timestamp >= forks.canyon;
     let ecotone = timestamp >= forks.ecotone;
-    [
+    let fields = [
         ("mix_hash", bedrock && block.mix_hash.is_none()),
         (
             "base_fee_per_gas",
@@ -61,7 +73,7 @@ fn header(forks: &Forks, block: &BlockRow) -> Vec<&'static str> {
         ),
         (
             "withdrawals_root",
-            timestamp >= forks.canyon && block.withdrawals_root.is_none(),
+            canyon && block.withdrawals_root.is_none(),
         ),
         ("blob_gas_used", ecotone && block.blob_gas_used.is_none()),
         (
@@ -72,85 +84,99 @@ fn header(forks: &Forks, block: &BlockRow) -> Vec<&'static str> {
             "parent_beacon_block_root",
             ecotone && block.parent_beacon_block_root.is_none(),
         ),
-    ]
-    .into_iter()
-    .filter_map(|(field, missing)| missing.then_some(field))
-    .collect()
+    ];
+    for (field, lacks) in fields {
+        if lacks {
+            found(field);
+        }
+    }
 }
 
-/// The transaction type of `tx` and the fields its row lacks, as `transaction::encode` and
-/// `receipt::rebuild` read them. `canyon` is whether its block is at or after Canyon.
-fn transaction(tx: &TransactionRow, canyon: bool) -> (Row, Vec<&'static str>) {
-    let signature = [("r", tx.r.is_none()), ("s", tx.s.is_none())];
+/// Calls `found` with the transaction type of `tx` and each field its row lacks, as
+/// `transaction::encode` and `receipt::rebuild` read them. `canyon` is whether its block is at
+/// or after Canyon.
+fn transaction(tx: &TransactionRow, canyon: bool, mut found: impl FnMut(Row, &'static str)) {
+    let r = ("r", tx.r.is_none());
+    let s = ("s", tx.s.is_none());
     let typed_v = ("v", tx.y_parity.is_none() && tx.v.is_none());
     let from = ("from", tx.from.is_none());
     let chain_id = ("chain_id", tx.chain_id.is_none());
     let gas_price = ("gas_price", tx.gas_price.is_none());
-    let fees = [
-        ("max_fee_per_gas", tx.max_fee_per_gas.is_none()),
-        (
-            "max_priority_fee_per_gas",
-            tx.max_priority_fee_per_gas.is_none(),
-        ),
-    ];
+    let max_fee = ("max_fee_per_gas", tx.max_fee_per_gas.is_none());
+    let max_priority_fee = (
+        "max_priority_fee_per_gas",
+        tx.max_priority_fee_per_gas.is_none(),
+    );
     // A receipt from before Byzantium has a state root in place of the status.
     let status = ("status", tx.status.is_none() && tx.root.is_none());
-    let (row, fields): (Row, Vec<(&'static str, bool)>) = match tx.kind.unwrap_or_default() {
+    let pad = ("", false);
+    let (row, fields): (Row, [(&'static str, bool); 8]) = match tx.kind.unwrap_or_default() {
         0 => {
+            // A legacy transaction signed with all zeros has no sender.
             let zero_signature = [tx.v, tx.r, tx.s]
                 .iter()
                 .all(|value| value.is_some_and(|value| value.is_zero()));
             let from = ("from", from.1 && !zero_signature);
-            let mut fields = vec![("v", tx.v.is_none()), gas_price, from];
-            fields.extend(signature);
-            ("legacy", fields)
+            let v = ("v", tx.v.is_none());
+            ("legacy", [v, r, s, gas_price, from, status, pad, pad])
         }
-        1 => {
-            let mut fields = vec![chain_id, gas_price, typed_v, from];
-            fields.extend(signature);
-            ("eip2930", fields)
-        }
-        2 => {
-            let mut fields = vec![chain_id, typed_v, from];
-            fields.extend(signature.into_iter().chain(fees));
-            ("eip1559", fields)
-        }
-        4 => {
-            // EIP-7702 refuses an empty list, so none at all is one the service left out.
-            let authorizations = tx.filled_authorization_list.is_none()
-                && tx
-                    .authorization_list
-                    .as_ref()
-                    .is_none_or(|list| list.is_empty());
-            let mut fields = vec![
+        1 => (
+            "eip2930",
+            [chain_id, typed_v, r, s, gas_price, from, status, pad],
+        ),
+        2 => (
+            "eip1559",
+            [
                 chain_id,
                 typed_v,
+                r,
+                s,
+                max_fee,
+                max_priority_fee,
                 from,
-                ("to", tx.to.is_none()),
-                ("authorization_list", authorizations),
-            ];
-            fields.extend(signature.into_iter().chain(fees));
-            ("eip7702", fields)
-        }
-        op_alloy_consensus::DEPOSIT_TX_TYPE_ID => (
-            "deposit",
-            vec![
-                ("source_hash", tx.source_hash.is_none()),
-                from,
-                ("deposit_nonce", canyon && tx.deposit_nonce.is_none()),
-                (
-                    "deposit_receipt_version",
-                    canyon && tx.deposit_receipt_version.is_none(),
-                ),
+                status,
             ],
         ),
+        4 => {
+            let to = ("to", tx.to.is_none());
+            let authorizations = ("authorization_list", tx.lacks_authorization_list());
+            for (field, lacks) in [to, authorizations] {
+                if lacks {
+                    found("eip7702", field);
+                }
+            }
+            (
+                "eip7702",
+                [
+                    chain_id,
+                    typed_v,
+                    r,
+                    s,
+                    max_fee,
+                    max_priority_fee,
+                    from,
+                    status,
+                ],
+            )
+        }
+        op_alloy_consensus::DEPOSIT_TX_TYPE_ID => {
+            let source_hash = ("source_hash", tx.source_hash.is_none());
+            let nonce = ("deposit_nonce", canyon && tx.deposit_nonce.is_none());
+            let version = (
+                "deposit_receipt_version",
+                canyon && tx.deposit_receipt_version.is_none(),
+            );
+            (
+                "deposit",
+                [source_hash, from, nonce, version, status, pad, pad, pad],
+            )
+        }
         // `verify` names the type itself.
-        _ => ("unknown type", Vec::new()),
+        _ => return,
     };
-    let fields = fields
-        .into_iter()
-        .chain([status])
-        .filter_map(|(field, missing)| missing.then_some(field))
-        .collect();
-    (row, fields)
+    for (field, lacks) in fields {
+        if lacks {
+            found(row, field);
+        }
+    }
 }

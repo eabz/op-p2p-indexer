@@ -127,7 +127,6 @@ impl Schedule {
                 let candidate = Candidate {
                     peer_id: peer.id,
                     addr: peer.addr,
-                    indexer: peer.indexer,
                 };
                 let known = Known {
                     candidate,
@@ -189,13 +188,13 @@ impl Schedule {
 
     /// Picks up to `wanted` peers to dial now, fewer if [`MAX_DIALS_PER_MINUTE`] is used up,
     /// and counts them as dialed: none of them is due again before [`FULL_PEER_RETRY`].
-    /// `in_use` says whether a peer has a session or a dial in progress; with
-    /// `indexers_only`, only op-p2p-indexers are picked.
+    /// `in_use` says whether a peer has a session or a dial in progress; only peers
+    /// `wanted_peer` accepts are picked.
     pub(super) fn take_due(
         &mut self,
         wanted: usize,
         in_use: impl Fn(&PeerId) -> bool,
-        indexers_only: bool,
+        wanted_peer: impl Fn(&PeerId) -> bool,
     ) -> Vec<Candidate> {
         let now = Instant::now();
         while self
@@ -213,10 +212,7 @@ impl Schedule {
             .known
             .iter()
             .filter(|(id, known)| {
-                known.next_dial <= now
-                    && (known.candidate.indexer || !indexers_only)
-                    && !in_use(id)
-                    && !self.is_banned(id)
+                known.next_dial <= now && wanted_peer(id) && !in_use(id) && !self.is_banned(id)
             })
             .map(|(id, known)| {
                 let key = (!known.proven, known.failures, known.attempts);

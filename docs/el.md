@@ -108,9 +108,9 @@ network it joins (the OP Stack chain's and, with the L1 side, Ethereum's):
 
 | | Policy | Where |
 |---|---|---|
-| Sessions | 4 dialed and 4 accepted (`OP_INDEXER_EL_MAX_SESSIONS`; the L1 side uses the default); on the OP Stack network one more each way, for an op-p2p-indexer only (section 13) | `PeerConfig::max_sessions` |
-| Inbound connections | at most 8 handshakes at once, 2 from one host (an IPv4 address or an IPv6 /64), with 5 s for the encrypted handshake and 5 s for the hello; further connections are closed, counted (`op_indexer_el_inbound_dropped_total`) and warned about once a minute; one established inbound session per host | `session/listener.rs`, `peers.rs` |
-| Unused sessions | an outbound session we have not sent a request on for 10 minutes is closed ("disconnect requested"), keeping the 2 used most recently (the receipts of new blocks) and the indexer used most recently; the outbound target then drops to 2, so no other peer is dialed in their place, and goes back up only after every kept session has been busy (used within a minute) for 5 minutes in a row; a released peer is not dialed again for 30 minutes; sessions peers opened are theirs and stay | `peers.rs` `IDLE_RELEASE`, `KEEP_IDLE`, `BUSY`, `BUSY_TICKS`, `RELEASED_REDIAL` |
+| Sessions | 4 dialed and 4 accepted (`OP_INDEXER_EL_MAX_SESSIONS`; the L1 side uses the default); on the OP Stack network one more each way, not counted against these, for an op-p2p-indexer with blocks before Bedrock (section 13) | `PeerConfig::max_sessions` |
+| Inbound connections | at most 8 handshakes at once, 2 from one host (an IPv4 address or an IPv6 /64), with 5 s each for the encrypted handshake, the hello and the status; further connections are closed, counted (`op_indexer_el_inbound_dropped_total`) and warned about once a minute; one established inbound session per host | `session/listener.rs`, `peers.rs` |
+| Unused sessions | an outbound session we have not sent a request on for 10 minutes is closed ("disconnect requested"), keeping the 2 used most recently (the receipts of new blocks) and the session in the indexer slot; the outbound target then drops to 2, so no other peer is dialed in their place, and goes back up only after every kept session has been busy (used within a minute) for 5 minutes in a row; a released peer is not dialed again for 30 minutes; sessions peers opened are theirs and stay | `peers.rs` `IDLE_RELEASE`, `KEEP_IDLE`, `BUSY`, `BUSY_TICKS`, `RELEASED_REDIAL` |
 | Dials | at most 8 at once, 30 a minute, no peer more often than once a minute | `peers.rs`, `peers/schedule.rs` |
 | A full peer | a dial refused with "too many peers" (or a dropped handshake): again after 60 to 90 s, doubling with each refusal in a row, up to 8 to 12 minutes; a session the peer ended with "too many peers": again after 60 to 90 s | `FULL_PEER_RETRY` |
 | Other failed dials | 5 to 7.5 minutes, doubling, up to 40 to 60 minutes; another fork or no shared protocol: 1 hour; bad data: banned 6 hours | `peers/schedule.rs` |
@@ -271,9 +271,10 @@ The node answers peers from its own stores, so that another node can sync from i
   dialed for an hour. What the peer sends is read last in the session's loop, so a peer
   flooding messages cannot keep its own answers or the flush from running.
 - A failed provider read is warned about at most once a minute per kind (headers, bodies,
-  receipts, the held range). After 8 failed reads in a row, requests are answered empty
-  without reading and the advertised range stays where it was, until a read of the held
-  range succeeds again.
+  receipts, the held range). After 8 failed reads of the held range in a row (about 80 s),
+  requests are answered empty without reading and the advertised range stays where it was,
+  until a read of the held range succeeds again. A failed request read does not count: one
+  corrupt stored block that peers keep asking for fails their requests only.
 - Metrics: `op_indexer_el_served_requests_total{kind,outcome}`,
   `op_indexer_el_served_items_total{kind}`, `op_indexer_el_served_bytes_total{kind}`.
 - Serving itself has not run live.
@@ -366,9 +367,8 @@ find each other without a protocol of their own.
 
 - **The flag.** On the OP Stack network our node record carries `opidx` (version byte 1)
   next to the fork id. Discovery remembers which peers carry it; a session knows whether its
-  peer is one from the record discovery saw in this run. Saved peers keep the flag, but it
-  only picks which saved peer to dial for the indexer slot: it never makes a peer an indexer
-  for serving or for counting slots, so a restart learns indexers from discovery again. At
+  peer is one from the record discovery saw in this run. The flag is not saved: a restart
+  learns indexers from discovery again. At
   most 4,096 peers are remembered as indexers; when full, new ones are ignored and the known
   ones stay. Ethereum's
   network (the L1 side) has no indexers: no flag, nothing held back.
@@ -380,10 +380,15 @@ find each other without a protocol of their own.
   waits for one; other peers are not asked for them. On a chain without a legacy chain
   (Unichain) the Bedrock block is 0 and none of this changes anything.
 - **Finding each other.** Indexers are few: one outbound and one inbound slot beyond
-  `OP_INDEXER_EL_MAX_SESSIONS` is kept for an indexer alone. Beyond that slot indexers
-  compete for the ordinary slots like any peer, and only the indexer used most recently is
-  exempt from the release of unused sessions; an indexer that answers nothing useful is
-  dropped like any useless peer.
+  `OP_INDEXER_EL_MAX_SESSIONS` is kept for an indexer that says it holds blocks before
+  Bedrock (its advertised `earliest` is below Bedrock), and its session is not counted
+  against the ordinary slots. Only an indexer discovery saw in this run is dialed for it.
+  The session in the outbound slot is exempt from the release of unused sessions, and is
+  left out of the "every kept session busy" check. Beyond the slot indexers compete for the
+  ordinary slots like any peer. An indexer that answers "not held" three times in a row for
+  blocks before Bedrock is dropped (`not_holding`) and not dialed for a long while, so
+  another can take the slot; one that answers nothing useful otherwise is dropped like any
+  useless peer. On a chain with nothing before Bedrock (Unichain) there is no slot.
 - **Spoofing is accepted.** The flag is self-declared: any node can carry `opidx`, take the
   indexer slot and be served blocks before Bedrock. That costs bandwidth only: those blocks
   are public history, and the slot is one each way.

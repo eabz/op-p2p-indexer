@@ -400,13 +400,18 @@ impl Run {
     }
 }
 
-/// The number of the archived block with `hash`.
+/// The number of the archived block with `hash`, on one snapshot.
 pub(super) fn number_of(tables: &Tables, hash: BlockHash) -> Result<Option<BlockNumber>, Failure> {
-    Ok(tables
-        .numbers
-        .get(hash.0)?
-        .map(|number| decode_number(&number))
-        .transpose()?)
+    let snapshot = tables.db.snapshot();
+    let Some(number) = snapshot.get(&tables.numbers, hash.0)? else {
+        return Ok(None);
+    };
+    let number = decode_number(&number)?;
+    // Only a block whose header is held: a bulk load's leftovers above the tip are not.
+    let held = snapshot
+        .get(&tables.headers, number.to_be_bytes())?
+        .is_some();
+    Ok(held.then_some(number))
 }
 
 /// Reads whole blocks from `from` upwards on one snapshot, decompressed: header, body,

@@ -85,16 +85,25 @@ again; a completed chunk is never redone.
   times the blocks left in it, over the speed on the wire. It is absent until an era with
   blocks left has been sampled, and within the second era it still grows as blocks do.
 
-### 3.1a Fields the service leaves out, from the chain's RPC
+### 3.1a What the service leaves out, from the chain's RPC
 
-On Unichain HyperSync sends EIP-7702 transactions (type 4) without their
-`authorization_list`; every other field is there. Found at block 16,068,511: its type-4
-transaction rebuilt with an empty list hashes the header to another value. OP Mainnet's rows
-carry the list (its whole chain verified). The list is not optional (EIP-7702 refuses an
-empty one), so such a row cannot be rebuilt from the download alone.
+Two gaps are known, both on Unichain; OP Mainnet's whole chain verified without either.
+
+- **Authorization lists.** HyperSync sends EIP-7702 transactions (type 4) without their
+  `authorization_list`; every other field is there. Found at block 16,068,511: its type-4
+  transaction rebuilt with an empty list hashes the header to another value. The list is not
+  optional (EIP-7702 refuses an empty one), so such a row cannot be rebuilt from the download
+  alone.
+- **Holes: whole blocks without their rows.** At 55,142,810 to 55,142,819 the answer has the
+  ten header rows, matching the chain field for field, but no transaction and no log rows,
+  while the chunk's other 90 blocks have theirs and the answer was not cut short (its cursor
+  is the chunk's end). The chain has 8 transactions in 55,142,810. Every block after the
+  Bedrock block has at least the L1-attributes deposit, so a block from there on without
+  transaction rows is a hole: the whole block is fetched.
 
 - **Checked after every download.** Once the chunks are on disk, `download` reads every chunk
-  not verified yet (one per core at a time) and lists every field its rows lack that the
+  not verified yet (one per core at a time, within `verify`'s 256 MiB of downloaded bytes in
+  flight) and lists every field its rows lack that the
   rebuild needs, or fills with a default the header hash must then prove: header fields of
   the block's forks (`mix_hash` and `base_fee_per_gas` from Bedrock, `withdrawals_root` from
   Canyon, the blob gas fields and the parent beacon block root from Ecotone), the fields of
@@ -102,32 +111,58 @@ empty one), so such a row cannot be rebuilt from the download alone.
   Canyon. Each is logged once, at warn, with its count and its first block: one pass shows
   them all, where `verify` would stop at the first. Progress is logged every 10 seconds
   (chunks per second, time left). The pass costs about what reading the rows costs `verify`
-  (decompress and parse, no hashing, nothing written); it runs again on every `download`
-  over the chunks still not verified, and skips the verified ones.
-- **Fetched** for the authorization lists only: one `eth_getBlockByNumber` with full
-  transactions per block that needs it (Unichain's public endpoint does not allow
-  `eth_getTransactionByBlockNumberAndIndex`), four requests at a time, each retried up to six
-  times with capped, jittered backoff on a busy endpoint (429, 408, 5xx) or a broken
-  connection. A refused call, a block the endpoint does not have, or a block hash that is not
+  (decompress and parse, no hashing, nothing written): by section 6's measurements about a
+  third of a `verify` pass over the same chunks. It runs again on every `download` over the
+  chunks still not verified, and skips the verified ones.
+- **Left out** means: a type-4 row with no `authorization_list`, no bytes, or a list of zero
+  entries (the service writes an empty list as a count of zero, as it does `access_list`), and
+  no fill. The scan and `verify` use the same rule (`TransactionRow::lacks_authorization_list`).
+- **Fetched**: `eth_getBlockByNumber` with full transactions for each block that needs it
+  (Unichain's public endpoint does not allow `eth_getTransactionByBlockNumberAndIndex`), and
+  for a hole its receipts too, with `eth_getBlockReceipts` (else `eth_getTransactionReceipt`
+  per transaction, for an endpoint without it), up to 10 calls per request as one JSON-RPC
+  batch (the endpoint refuses larger batches, with one error for the whole batch, which is
+  reported as a refusal with its message), four chunks' requests at a time. A request is
+  retried up to six times with `download`'s capped, jittered backoff on a busy endpoint (408,
+  5xx), a broken connection or a malformed answer; on a rate limit (429) it waits what
+  `Retry-After` asks (up to 10 minutes), else 15 s doubling to 2 minutes, minutes in all.
+  Ctrl-C drops the requests in flight at once. A refused call, a block the endpoint does not have, or a block hash that is not
   the downloaded one (an endpoint of another chain) fails at once, naming the endpoint.
 - **Kept apart.** What is fetched goes to the chunk's fill, `raw/<from>-<to>.fill.json`,
-  written atomically; the downloaded chunk stays as received. `verify` stays offline: it puts
-  the fill into the rows before rebuilding. A type-4 row with no list and no fill fails
-  `verify` with a message to run `download`, not the generic hash mismatch.
-- **Trust unchanged.** The list goes into the rebuilt transaction; the transactions root, so
-  the header hash, proves it. A wrong fill fails `verify` like a wrong row (checked: one
+  written atomically and durably, in the RPC's JSON form (a list per transaction; a hole's
+  transactions and receipts with their logs); the downloaded chunk stays as received. A
+  chunk downloaded again loses its old fill first. `verify` stays offline: it puts the fill
+  into the rows before rebuilding, a list into its transaction, a hole's transactions and
+  logs as rows like the service's (the receipt's fields with the transaction's, the access
+  list in the service's layout). A type-4 row with no list, or a block after Bedrock with no
+  transactions, and no fill, fails `verify` with a message to run `download`, not the generic
+  hash mismatch.
+- **Trust unchanged.** What is filled goes into the rebuilt block; the transactions and
+  receipts roots, so the header hash, prove it. A hole's senders are the endpoint's `from`,
+  which `load` recovers from the signatures and checks like every other. A wrong fill fails `verify` like a wrong row (checked: one
   changed signature byte gives a header hash mismatch).
 - **Endpoint**: `--rpc-endpoint` (`OP_INDEXER_IMPORT_RPC_ENDPOINT`), by default
   `https://mainnet.unichain.org` for Unichain and none for OP Mainnet, whose rows need none so
-  far; without one, `download` stops with a message when a list is missing.
-- **Counted**: `authorization_lists_to_fetch` and `rpc_filled_transactions` in `download`'s
-  summary, `rpc_filled_transactions` in `verify`'s.
+  far; without one, `download` stops with a message when something is missing.
+- **Counted**: `authorization_lists_to_fetch`, `holes_to_fetch` and `rpc_filled_transactions`
+  in `download`'s summary, `rpc_filled_transactions` (lists filled and hole transactions
+  added) in `verify`'s; each hole is also a `block`/`transactions` line of the missing-field
+  report.
+- Not done: asking HyperSync again for a hole's chunk before using the RPC; the RPC answer is
+  proven the same way.
 
 Checked on 2026-10-04, offline but for the endpoint: a chunk of block 16,068,511 built from
 the endpoint's block and receipts in HyperSync's row format, without `authorization_list`.
 `verify` failed with the message to run `download`; `download` fetched the list and wrote the
 fill; `verify` then rebuilt the header to the block's hash 0xb8a5…c3e6 and accepted the range.
-A second `download` fetched nothing. Not checked against HyperSync's own Unichain answers.
+A second `download` fetched nothing. The same with the row's list written as a count of zero.
+Holes, the same way: block 55,142,810 with its header row only (no transaction or log rows)
+failed `verify` with the message to run `download`; `download` fetched the block and its
+receipts in one batch (8 transactions, 6 logs) and `verify` rebuilt the header to its hash
+0x8f43…ca26. Block 16,068,511 as a hole (its type-4 transaction, with its authorization list
+and access list, coming from the endpoint) verified too. The receipt-by-receipt fallback has
+not run: Unichain's endpoint has `eth_getBlockReceipts`. Not checked against HyperSync's own
+Unichain answers.
 
 ### 3.2 `verify`
 

@@ -37,7 +37,8 @@ use tokio::time::{MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-pub(crate) use self::fields::{Missing, missing};
+pub(crate) use self::fields::{Missing, holes, missing};
+pub(crate) use self::lists::encode_access_list;
 use crate::chunk::{self, ChunkFile, Link};
 use crate::progress::{self, Rate};
 use crate::rows::RowsError;
@@ -70,6 +71,12 @@ enum Check {
          `download`, which fetches it from the chain's RPC endpoint"
     )]
     Unfilled { index: u64, field: &'static str },
+    #[error(
+        "the download has no transactions for this block, which every block after Bedrock has \
+         (the L1-attributes deposit): the archive service left them out; run `download`, which \
+         fetches the block from the chain's RPC endpoint"
+    )]
+    Hole,
     #[error("transaction {index}: the field `{field}` is not in the expected form: {reason}")]
     Field {
         index: u64,
@@ -244,7 +251,10 @@ pub(crate) async fn run(
                     // A row left without a field says itself what to run.
                     let hint = if matches!(
                         err,
-                        ChunkError::Block { check: Check::Unfilled { .. }, .. }
+                        ChunkError::Block {
+                            check: Check::Unfilled { .. } | Check::Hole,
+                            ..
+                        }
                     ) {
                         ""
                     } else {

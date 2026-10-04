@@ -39,7 +39,7 @@ mod headers;
 mod schedule;
 mod segment;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
 use alloy_primitives::{B256, BlockNumber};
@@ -56,7 +56,7 @@ use self::headers::HEADERS_PER_REQUEST;
 use self::schedule::Schedule;
 use crate::ElError;
 use crate::metrics::{self, SyncOutcome};
-use crate::peers::{Peers, closed};
+use crate::peers::{Peers, Report, closed};
 use crate::session::{RequestError, SessionHandle};
 
 /// Blocks between two checkpoints: what one session fetches as a unit and the size of a batch
@@ -74,6 +74,9 @@ const STARVED_INTERVAL: Duration = Duration::from_mins(1);
 /// every peer that says it holds the anchor's height has: a block no peer serves (one a reorg
 /// left behind, mostly) would otherwise keep the round open for ever.
 const ANCHOR_REFUSALS: usize = 3;
+/// "Not held" answers in a row for blocks before Bedrock after which an indexer is dropped:
+/// it advertises them and does not serve them, and holds the indexer slot.
+const MAX_INDEXER_MISSES: u32 = 3;
 
 /// What a range sync fetches, known once its anchor is.
 #[derive(Debug)]
@@ -198,6 +201,8 @@ struct Syncer {
     anchor_served: bool,
     /// Peers that said they do not hold the anchor, while none has served it.
     anchor_refused: HashSet<PeerId>,
+    /// "Not held" answers in a row for blocks before Bedrock, per indexer.
+    indexer_misses: HashMap<PeerId, u32>,
     /// The block the first block must name as parent; `None` for any.
     extends: Option<BlockRef>,
     /// How the round ends before it is complete, once that is known: the chain down from the
@@ -334,6 +339,7 @@ impl Syncer {
             starved_warned: None,
             anchor_served: false,
             anchor_refused: HashSet::new(),
+            indexer_misses: HashMap::new(),
             extends,
             given_up: None,
         };
@@ -382,7 +388,10 @@ impl Syncer {
                     if !alive {
                         return closed("sessions", cancel).map(|()| None);
                     }
-                    self.schedule.retain(&self.peers.sessions());
+                    let sessions = self.peers.sessions();
+                    self.schedule.retain(&sessions);
+                    self.indexer_misses
+                        .retain(|peer, _| sessions.iter().any(|session| session.peer_id() == *peer));
                 }
                 () = async {
                     match wake {
@@ -650,6 +659,15 @@ impl Syncer {
         if let Some(report) = self.schedule.finished(peer, Some(&failure)) {
             self.peers.report(report);
         }
+        // Only indexers are asked for blocks before Bedrock.
+        if first < self.indexers_only_below && matches!(failure, Failure::NotHeld) {
+            let misses = self.indexer_misses.entry(peer).or_default();
+            *misses = misses.saturating_add(1);
+            if *misses >= MAX_INDEXER_MISSES {
+                self.indexer_misses.remove(&peer);
+                self.peers.report(Report::NotHolding(peer));
+            }
+        }
         match failure {
             Failure::Unsupported(reason) => Err(ElError::Sync(reason)),
             Failure::Panicked(source) => Err(ElError::Task {
@@ -669,6 +687,7 @@ impl Syncer {
 
     fn succeeded(&mut self, peer: PeerId) {
         metrics::sync_request(SyncOutcome::Verified);
+        self.indexer_misses.remove(&peer);
         // A success is never reported to the peer set.
         let _report = self.schedule.finished(peer, None);
     }

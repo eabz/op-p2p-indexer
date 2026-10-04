@@ -174,17 +174,19 @@ impl Prepared {
                 &InvalidBlockReason::SenderCount,
             ));
         }
-        if block
-            .receipts
-            .as_ref()
-            .is_some_and(|receipts| receipts.len() != transactions)
-        {
+        self.check_receipts(block.receipts.as_deref())?;
+        Ok(block)
+    }
+
+    /// Fails unless `receipts`, if known, are one per transaction.
+    fn check_receipts(&self, receipts: Option<&[OpReceiptEnvelope]>) -> Result<(), ConvertError> {
+        if receipts.is_some_and(|receipts| receipts.len() != self.tx_count) {
             return Err(ConvertError::new(
                 self.at.hash,
                 &InvalidBlockReason::ReceiptCount,
             ));
         }
-        Ok(block)
+        Ok(())
     }
 
     fn convert(&self, payload: Payload) -> Result<proto::Block, ConvertError> {
@@ -202,7 +204,12 @@ impl Prepared {
         })
     }
 
+    /// The receipts in `payload`, checked to be one per transaction wherever they are
+    /// decoded (the archive's raw bytes were checked when it stored them).
     fn convert_receipts(&self, payload: Payload) -> Result<Option<proto::Receipts>, ConvertError> {
+        if let StoredBlock::Decoded(decoded) = &self.block {
+            self.check_receipts(decoded.receipts.as_deref())?;
+        }
         let receipts = match (payload, &self.block) {
             (Payload::Raw, StoredBlock::Archived(archived)) => archived
                 .encoded
@@ -222,9 +229,10 @@ impl Prepared {
                 .receipts
                 .as_ref()
                 .map(|receipts| {
-                    alloy_rlp::decode_exact::<Vec<OpReceiptEnvelope>>(receipts)
-                        .map(|receipts| proto::receipts::Payload::Decoded(receipt_list(&receipts)))
-                        .map_err(|err| ConvertError::new(self.at.hash, &err))
+                    let receipts = alloy_rlp::decode_exact::<Vec<OpReceiptEnvelope>>(receipts)
+                        .map_err(|err| ConvertError::new(self.at.hash, &err))?;
+                    self.check_receipts(Some(&receipts))?;
+                    Ok(proto::receipts::Payload::Decoded(receipt_list(&receipts)))
                 })
                 .transpose()?,
         };

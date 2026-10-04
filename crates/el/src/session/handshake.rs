@@ -32,8 +32,9 @@ const ECIES_TIMEOUT: Duration = Duration::from_secs(5);
 /// Limit for the hello exchange.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Limit for the status exchange.
-const STATUS_TIMEOUT: Duration = Duration::from_secs(15);
+/// Limit for the status exchange, short like the others: an inbound connection holds a
+/// pending place until it ends.
+const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What this node calls itself in the hello.
 const CLIENT_VERSION: &str = concat!("op-indexer/", env!("CARGO_PKG_VERSION"));

@@ -69,6 +69,65 @@ pub(crate) struct Source<U, A> {
     pub(crate) archive: A,
     /// The node's shutdown: ends a call waiting to be retried.
     pub(crate) cancel: CancellationToken,
+    /// Whether range sync fills the archive from its tip up, so the heights between it and the
+    /// unsafe store will be held.
+    pub(crate) fills_gaps: bool,
+}
+
+/// What the stores hold, as [`Source::holdings`] read it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Holdings {
+    /// The archive's first and last block. Its first block does not rise: it keeps all it has.
+    pub(crate) archive: Option<(BlockRef, BlockRef)>,
+    lowest_unsafe: Option<BlockNumber>,
+    fills_gaps: bool,
+}
+
+impl Holdings {
+    /// The heights between the archive's tip (block 0 when it is empty) and the unsafe
+    /// store's lowest block, none of them held, as `start..end`. The unsafe store expires
+    /// blocks nothing promoted; range sync, when on, fills them into the archive.
+    pub(crate) fn gap(&self) -> Option<(BlockNumber, BlockNumber)> {
+        let start = self
+            .archive
+            .map_or(0, |(_, tip)| tip.number.saturating_add(1));
+        let end = self.lowest_unsafe?;
+        (start < end).then_some((start, end))
+    }
+
+    /// The [gap](Self::gap), if `number` is in it.
+    pub(crate) fn gap_at(&self, number: BlockNumber) -> Option<(BlockNumber, BlockNumber)> {
+        self.gap()
+            .filter(|(start, end)| (*start..*end).contains(&number))
+    }
+
+    /// `OUT_OF_RANGE` if the stores do not hold `number` and never will (see
+    /// [`Self::held_from`]).
+    pub(crate) fn ensure_held(&self, number: BlockNumber) -> Result<(), tonic::Status> {
+        let held = self.held_from(number);
+        if held > number {
+            return Err(tonic::Status::out_of_range(format!(
+                "block {number} is not held; the node holds blocks from {held} on"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Where blocks from `number` up are held, or will be: `number` itself, unless it is below
+    /// the archive's first block, or in the [gap](Self::gap) with range sync off. Neither store
+    /// ever gets those heights back, so a read from `number` would wait forever; this is the
+    /// height held above them.
+    pub(crate) fn held_from(&self, number: BlockNumber) -> BlockNumber {
+        if let Some((first, _)) = self.archive
+            && number < first.number
+        {
+            return first.number;
+        }
+        match self.gap_at(number) {
+            Some((_, end)) if !self.fills_gaps => end,
+            _ => number,
+        }
+    }
 }
 
 impl<U: UnsafeStore, A: ArchiveStore> Source<U, A> {
@@ -252,45 +311,18 @@ impl<U: UnsafeStore, A: ArchiveStore> Source<U, A> {
             .find(|block| block.at == at && block.has_receipts()))
     }
 
-    /// Where blocks from `number` up are held, or will be: `number` itself, unless it is below
-    /// the archive's first block, or above the archive's tip and below the unsafe store's
-    /// lowest block (expired from it before being promoted). Neither store ever gets those
-    /// heights back, so a read from `number` would wait forever; this is the height held above
-    /// them. The archive's first block does not rise: it keeps all it has. With the archive's range, read on the
-    /// way.
-    pub(crate) async fn held_from(
-        &self,
-        number: BlockNumber,
-    ) -> Result<(BlockNumber, Option<(BlockRef, BlockRef)>), ReadError> {
-        // The unsafe store first: a block pruned from it was archived before, so a promotion
-        // between the two reads cannot open a false gap.
-        let lowest = self
+    /// What the stores hold. The unsafe store is read first: a block pruned from it was
+    /// archived before, so a promotion between the two reads cannot open a false gap.
+    pub(crate) async fn holdings(&self) -> Result<Holdings, ReadError> {
+        let lowest_unsafe = self
             .call(Store::Unsafe, "unsafe lowest", || {
                 self.unsafe_store.lowest()
             })
             .await?;
-        let range = self.archive_range().await?;
-        let held = match range {
-            Some((first, _)) if number < first.number => first.number,
-            Some((_, tip)) if number <= tip.number => number,
-            _ => lowest.map_or(number, |lowest| number.max(lowest)),
-        };
-        Ok((held, range))
-    }
-
-    /// `OUT_OF_RANGE` (the `Err` inside) if the stores do not hold `number` and never will
-    /// (see [`Self::held_from`]).
-    pub(crate) async fn ensure_held(
-        &self,
-        number: BlockNumber,
-    ) -> Result<Result<(), tonic::Status>, ReadError> {
-        let (held, _) = self.held_from(number).await?;
-        Ok(if held > number {
-            Err(tonic::Status::out_of_range(format!(
-                "block {number} is not held; the node holds blocks from {held} on"
-            )))
-        } else {
-            Ok(())
+        Ok(Holdings {
+            archive: self.archive_range().await?,
+            lowest_unsafe,
+            fills_gaps: self.fills_gaps,
         })
     }
 

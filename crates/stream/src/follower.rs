@@ -28,6 +28,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use alloy_primitives::BlockNumber;
 use op_indexer_primitives::{BlockRef, L1Heads, UnsafeEvent};
 use op_indexer_storage::{ArchiveStore, EventId, Store, UnsafeStore};
 use tokio::sync::watch;
@@ -210,6 +211,9 @@ struct State {
     heads: Option<L1Heads>,
     /// The published blocks without receipts, oldest first.
     without_receipts: Vec<BlockRef>,
+    /// After a reorg removed every block remembered: the height to publish from again, so the
+    /// chain published has no gap.
+    resume_at: Option<BlockNumber>,
 }
 
 impl<U: UnsafeStore, A: ArchiveStore> Follower<U, A> {
@@ -251,11 +255,25 @@ impl<U: UnsafeStore, A: ArchiveStore> Follower<U, A> {
             // The position first: what happens while the state is read is read again.
             let position = self.last_event_id().await?;
             let (unsafe_head, heads) = self.source.heads().await?;
+            let tracked = state.without_receipts.clone();
+            // A head at or below the last block published, and not it: the store went back
+            // (a reorg to a shorter chain, or Redis lost its state) under the published tail.
+            let went_back = match (state.chain.back(), unsafe_head) {
+                (Some(last), Some(head)) => last.number >= head.number && *last != head,
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            if went_back {
+                let removed = self.source.rewind(&mut state.chain).await?;
+                self.publish_reorg(state, removed);
+            }
             if let Some(head) = unsafe_head {
                 state.target = Some(head);
                 self.extend(state, head).await?;
             }
             self.publish_heads(state, heads);
+            // Receipts events may have been missed while the state was lost.
+            self.recheck_missed_receipts(state, tracked).await?;
             return Ok(Some(position));
         };
         let batch = self
@@ -321,11 +339,35 @@ impl<U: UnsafeStore, A: ArchiveStore> Follower<U, A> {
             .await?;
         for at in archived.into_iter().filter(|at| !pending.contains(at)) {
             if let Some(block) = self.source.archived_with_receipts(at).await? {
-                state.without_receipts.retain(|pending| *pending != at);
-                self.live.publish(ChainEvent::Receipts(Arc::new(block)));
+                self.publish_receipts(state, block);
             }
         }
         Ok(())
+    }
+
+    /// Publishes the receipts either store has for `tracked` (blocks tracked before the state
+    /// was read again, whose events may have been missed), looked up one by one.
+    async fn recheck_missed_receipts(
+        &self,
+        state: &mut State,
+        tracked: Vec<BlockRef>,
+    ) -> Result<(), ReadError> {
+        for at in tracked {
+            if state.chain.contains(&at)
+                && let Some(block) = self.source.with_receipts(at).await?
+            {
+                self.publish_receipts(state, block);
+            }
+        }
+        Ok(())
+    }
+
+    /// Publishes `block`'s receipts, and stops tracking it.
+    fn publish_receipts(&self, state: &mut State, block: Prepared) {
+        state
+            .without_receipts
+            .retain(|pending| *pending != block.at);
+        self.live.publish(ChainEvent::Receipts(Arc::new(block)));
     }
 
     async fn last_event_id(&self) -> Result<EventId, ReadError> {
@@ -361,11 +403,10 @@ impl<U: UnsafeStore, A: ArchiveStore> Follower<U, A> {
                 Ok(())
             }
             UnsafeEvent::Receipts(at) => {
-                if let Some(index) = state.without_receipts.iter().position(|block| *block == at)
+                if state.without_receipts.contains(&at)
                     && let Some(block) = self.source.with_receipts(at).await?
                 {
-                    state.without_receipts.remove(index);
-                    self.live.publish(ChainEvent::Receipts(Arc::new(block)));
+                    self.publish_receipts(state, block);
                 }
                 Ok(())
             }
@@ -377,12 +418,20 @@ impl<U: UnsafeStore, A: ArchiveStore> Follower<U, A> {
     async fn extend(&self, state: &mut State, head: BlockRef) -> Result<(), ReadError> {
         for _ in 0..MAX_STEPS {
             let Some(last) = state.chain.back().copied() else {
-                // A start, or a reorg deeper than the blocks remembered: the head is the first
-                // block; subscriptions read what is below it from the stores.
-                if let Some(block) = self.source.block_at(head.number).await? {
-                    self.publish_block(state, block);
-                }
-                return Ok(());
+                // A start: the head is the first block, and subscriptions read what is below
+                // it from the stores. After a reorg that removed every block remembered: from
+                // the first removed height on, so nothing is skipped.
+                let first = state.resume_at.unwrap_or(head.number).min(head.number);
+                let Some(block) = self.source.block_at(first).await? else {
+                    debug!(
+                        number = first,
+                        "the stream's follower waits for a block it lacks"
+                    );
+                    return Ok(());
+                };
+                state.resume_at = None;
+                self.publish_block(state, block);
+                continue;
             };
             if last.number >= head.number {
                 return Ok(());
@@ -417,10 +466,13 @@ impl<U: UnsafeStore, A: ArchiveStore> Follower<U, A> {
         self.live.publish(ChainEvent::Block(Arc::new(block)));
     }
 
-    fn publish_reorg(&self, state: &State, removed: Vec<BlockRef>) {
+    fn publish_reorg(&self, state: &mut State, removed: Vec<BlockRef>) {
         let Some(first) = removed.first() else {
             return;
         };
+        if state.chain.is_empty() {
+            state.resume_at = Some(first.number);
+        }
         warn!(
             from = first.number,
             depth = removed.len(),

@@ -21,7 +21,7 @@
 //! | `op_indexer_el_sessions_opened_total` | counter | `network`, `direction` | Sessions kept after the handshake: `outbound` or `inbound`. |
 //! | `op_indexer_el_sessions_ended_total` | counter | `network`, `reason` | Sessions that ended: `cancelled`, `too_many_peers`, `useless_peer`, `disconnected`, `closed`, `io`, `protocol` or `stalled` (did not read what it asked for). |
 //! | `op_indexer_el_session_duration_seconds` | histogram | `network` | How long a session lasted. |
-//! | `op_indexer_el_peers_dropped_total` | counter | `network`, `reason` | Peers this node disconnected: `bad_data` (also banned), `undecodable` or `unresponsive`. |
+//! | `op_indexer_el_peers_dropped_total` | counter | `network`, `reason` | Peers this node disconnected: `bad_data` (also banned), `undecodable`, `unresponsive` or `not_holding` (an indexer without its blocks before Bedrock). |
 //! | `op_indexer_el_requests_total` | counter | `outcome` | Receipts requests sent to a peer: `verified`, `empty`, `timeout`, `closed`, `malformed` or `invalid`. |
 //! | `op_indexer_el_verification_failures_total` | counter | `kind` | Answers that failed verification: `count` or `root`. |
 //! | `op_indexer_el_receipts_delivered_total` | counter | | Receipts in those blocks. |
@@ -116,6 +116,8 @@ pub(crate) enum DropReason {
     Undecodable,
     /// It stopped answering requests.
     Unresponsive,
+    /// An indexer that answered "not held" for the blocks before Bedrock it says it holds.
+    NotHolding,
 }
 
 /// How an answer failed verification, the `kind` label.
@@ -163,6 +165,7 @@ impl DropReason {
             Self::BadData => "bad_data",
             Self::Undecodable => "undecodable",
             Self::Unresponsive => "unresponsive",
+            Self::NotHolding => "not_holding",
         }
     }
 }

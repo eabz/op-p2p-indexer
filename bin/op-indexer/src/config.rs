@@ -2,7 +2,7 @@
 
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use alloy_primitives::B256;
@@ -20,6 +20,10 @@ const DEFAULT_MAX_PEERS: u32 = 30;
 const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:6379";
 /// Directory of the local block archive, inside the data directory.
 const ARCHIVE_DIR: &str = "archive";
+/// Directory of the node store (identity and known peers), inside the data directory.
+pub(crate) const NODE_DIR: &str = "node";
+/// The data directory's default before it was named after the chain.
+const OLD_DATA_DIR: &str = "data";
 const SYNC_VAR: &str = "OP_INDEXER_EL_SYNC";
 const L1_ENABLED_VAR: &str = "OP_INDEXER_L1_ENABLED";
 const L1_CHECKPOINT_VAR: &str = "OP_INDEXER_L1_CHECKPOINT";
@@ -106,7 +110,9 @@ impl Config {
     ///   peers observe). Set it behind NAT or in a container, with the port forwarded.
     /// - `OP_INDEXER_MAX_PEERS`: maximum connections, inbound and outbound (default 30).
     /// - `OP_INDEXER_DATA_DIR`: node state directory (default `data-<chain>`: `data-op` or
-    ///   `data-unichain`, so two chains on one host never share one by default).
+    ///   `data-unichain`, so two chains on one host never share one by default). Without it,
+    ///   the node refuses to start while `data`, an earlier build's default, holds an archive
+    ///   or a node store and `data-<chain>` does not exist.
     /// - `OP_INDEXER_REDIS_URL`: unsafe store (default `redis://127.0.0.1:6379`).
     /// - `OP_INDEXER_EL_ENABLED`: `true` to join the execution p2p network (devp2p) and fetch
     ///   the receipts gossip does not carry (default `false`: blocks stay without receipts).
@@ -171,8 +177,10 @@ impl Config {
             None => chain.bootnodes().map(parse_bootnode).collect(),
         }?;
 
-        let data_dir =
-            PathBuf::from(var("OP_INDEXER_DATA_DIR").unwrap_or_else(|| chain.default_data_dir()));
+        let data_dir = match var("OP_INDEXER_DATA_DIR") {
+            Some(dir) => PathBuf::from(dir),
+            None => default_data_dir(chain)?,
+        };
         let archive = ArchiveConfig {
             path: data_dir.join(ARCHIVE_DIR),
         };
@@ -201,6 +209,7 @@ impl Config {
                 .unwrap_or(DEFAULT_STREAM_MAX_FLIGHTS),
             block_time: Duration::from_secs(chain.block_time_secs),
             receipts: el.is_some(),
+            sync,
         };
         Ok(Self {
             l1,
@@ -228,6 +237,34 @@ impl Config {
             data_dir,
         })
     }
+}
+
+/// The default data directory, `data-<chain>`. Earlier builds defaulted to `data`: a node that
+/// ran with it would start on an empty directory with a new identity, so that is refused while
+/// `data` holds an archive or a node store and `data-<chain>` does not exist.
+fn default_data_dir(chain: &ChainSpec) -> eyre::Result<PathBuf> {
+    let dir = PathBuf::from(chain.default_data_dir());
+    let exists = dir
+        .try_exists()
+        .wrap_err_with(|| format!("failed to look for {}", dir.display()))?;
+    if exists {
+        return Ok(dir);
+    }
+    let old = Path::new(OLD_DATA_DIR);
+    let mut old_used = false;
+    for held in [ARCHIVE_DIR, NODE_DIR] {
+        old_used |= old
+            .join(held)
+            .try_exists()
+            .wrap_err_with(|| format!("failed to look into {OLD_DATA_DIR}"))?;
+    }
+    ensure!(
+        !old_used,
+        "{OLD_DATA_DIR} holds a node's state from an earlier build, whose default data \
+         directory it was: move {OLD_DATA_DIR} to {} (or set OP_INDEXER_DATA_DIR={OLD_DATA_DIR})",
+        dir.display()
+    );
+    Ok(dir)
 }
 
 /// Reads the execution network's settings; `None` unless it is enabled.

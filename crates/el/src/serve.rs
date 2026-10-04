@@ -75,8 +75,10 @@ const MAX_CONCURRENT: usize = 4;
 const HEAD_REFRESH: Duration = Duration::from_secs(2);
 /// How often the held range is read from the provider.
 const RANGE_REFRESH: Duration = Duration::from_secs(10);
-/// Provider reads failed in a row after which requests are answered empty without reading,
-/// until a read of the held range succeeds again.
+/// Reads of the held range failed in a row after which requests are answered empty without
+/// reading, until one succeeds again: about 80 s of a provider that cannot be read. Only that
+/// read counts: it touches no particular block, so one corrupt stored item that peers keep
+/// asking for fails their requests, not serving as a whole.
 const MAX_FAILURES: u32 = 8;
 /// Shortest time between two warnings about the same kind of failed read.
 const FAILURE_WARN_INTERVAL: Duration = Duration::from_mins(1);
@@ -84,7 +86,7 @@ const FAILURE_WARN_INTERVAL: Duration = Duration::from_mins(1);
 /// How the provider has been doing, shared by the server and the reads it spawns.
 #[derive(Debug, Default)]
 struct Health {
-    /// Reads failed in a row.
+    /// Reads of the held range failed in a row.
     failures: AtomicU32,
     /// One warning limit per kind of request.
     warned: [WarnLimit; 3],
@@ -93,7 +95,7 @@ struct Health {
 }
 
 impl Health {
-    /// Whether the provider failed [`MAX_FAILURES`] times in a row.
+    /// Whether the held range could not be read [`MAX_FAILURES`] times in a row.
     fn is_failing(&self) -> bool {
         self.failures.load(Ordering::Relaxed) >= MAX_FAILURES
     }
@@ -102,16 +104,17 @@ impl Health {
         self.failures.store(0, Ordering::Relaxed);
     }
 
-    /// Counts a failed read and warns about it, at most once a minute per cause (`kind`, or
-    /// `None` for the held range).
+    /// Warns about a failed read, at most once a minute per cause (`kind`, or `None` for the
+    /// held range, which is also counted towards [`MAX_FAILURES`]).
     fn failed(&self, kind: Option<ServeKind>, err: &dyn std::fmt::Display) {
-        let failures = self
-            .failures
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1);
-        let warned = match kind {
-            Some(kind) => self.warned.get(kind as usize),
-            None => Some(&self.range_warned),
+        let (warned, failures) = if let Some(kind) = kind {
+            (
+                self.warned.get(kind as usize),
+                self.failures.load(Ordering::Relaxed),
+            )
+        } else {
+            let failures = self.failures.fetch_add(1, Ordering::Relaxed);
+            (Some(&self.range_warned), failures.saturating_add(1))
         };
         if let Some(held_back) = warned.and_then(|warned| warned.allow(FAILURE_WARN_INTERVAL)) {
             let what = kind.map_or("the range of blocks held", ServeKind::as_str);
@@ -119,8 +122,8 @@ impl Health {
                 %err,
                 held_back,
                 failures,
-                "could not read {what} to serve; after {MAX_FAILURES} failures in a row, peers \
-                 are answered empty until the provider recovers"
+                "could not read {what} to serve; after {MAX_FAILURES} failed reads of the held \
+                 range in a row, peers are answered empty until the provider recovers"
             );
         }
     }
@@ -303,10 +306,7 @@ async fn answer<P: BlockProvider>(provider: Arc<P>, health: Arc<Health>, request
     };
     let (items, outcome) = match items {
         Ok(items) if items.is_empty() => (items, ServeOutcome::Empty),
-        Ok(items) => {
-            health.succeeded();
-            (items, ServeOutcome::Answered)
-        }
+        Ok(items) => (items, ServeOutcome::Answered),
         Err(Fault::Malformed(err)) => {
             debug!(?kind, %err, "malformed request from an execution peer");
             (Vec::new(), ServeOutcome::Malformed)

@@ -223,14 +223,20 @@ impl State {
                 peer,
                 message:
                     request_response::Message::Request {
-                        request, channel, ..
+                        request_id,
+                        request,
+                        channel,
                     },
                 ..
             })) => {
-                if let Some(channel) = self.server.on_request(peer, request, channel) {
+                if let Some(channel) = self.server.on_request(peer, request_id, request, channel) {
                     answer(swarm, channel, crate::sync::throttled());
                 }
             }
+            SwarmEvent::Behaviour(BehaviourEvent::Payloads(
+                request_response::Event::ResponseSent { request_id, .. }
+                | request_response::Event::InboundFailure { request_id, .. },
+            )) => self.server.written(request_id),
             SwarmEvent::NewListenAddr { address, .. } => info!(addr = %address, "listening"),
             other => trace!(event = ?other, "swarm event"),
         }

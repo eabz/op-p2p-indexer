@@ -362,7 +362,6 @@ impl NodeStore {
         peer: &ExecutionPeer,
     ) -> Result<(), StoreError> {
         let mut value = peer.last_served_secs.to_be_bytes().to_vec();
-        value.push(u8::from(peer.indexer));
         value.extend_from_slice(peer.addr.to_string().as_bytes());
         self.save_evicting(table, MAX_EXECUTION_PEERS, peer.id.as_slice(), &value)
     }
@@ -514,20 +513,14 @@ fn decode_checkpoint(key: &[u8], hash: &[u8]) -> Option<BlockRef> {
     })
 }
 
-/// Decodes one entry of the execution peers table: the time it last served (8 bytes), whether
-/// it is an indexer (1 byte) and its address; `None` if it has another shape, such as an entry
-/// of an earlier build, which is then forgotten.
+/// Decodes one entry of the execution peers table: the time it last served (8 bytes) and its
+/// address; `None` if it has another shape, such as an entry of an earlier build, which is
+/// then forgotten.
 fn decode_execution_peer(id: &[u8], value: &[u8]) -> Option<ExecutionPeer> {
-    let (served, rest) = value.split_first_chunk::<8>()?;
-    let (indexer, addr) = rest.split_first()?;
+    let (served, addr) = value.split_first_chunk::<8>()?;
     Some(ExecutionPeer {
         id: B512::try_from(id).ok()?,
         addr: std::str::from_utf8(addr).ok()?.parse::<SocketAddr>().ok()?,
         last_served_secs: u64::from_be_bytes(*served),
-        indexer: match indexer {
-            0 => false,
-            1 => true,
-            _ => return None,
-        },
     })
 }

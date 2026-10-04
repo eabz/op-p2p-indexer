@@ -119,6 +119,9 @@ pub enum Report {
     Served(PeerId),
     /// The peer stopped answering requests: drop it, it may be dialed again later.
     Unresponsive(PeerId),
+    /// The indexer says it holds blocks before Bedrock but answers "not held" for them again
+    /// and again: drop it for a long while, so another indexer can take the slot.
+    NotHolding(PeerId),
 }
 
 /// The peer set. [`PeerSet::run`] is its task.
@@ -143,6 +146,8 @@ pub(crate) struct PeerSet {
     /// Sessions kept in each direction (`PeerConfig::max_sessions`); one more is dialed for an
     /// op-p2p-indexer on a network they share.
     max_sessions: usize,
+    /// The dial for the indexer slot, while it is in [`Self::dialing`].
+    slot_dial: Option<PeerId>,
     /// Outbound sessions dialed for (the indexer slot aside): `max_sessions`, or [`KEEP_IDLE`]
     /// after a session was released unused, until the kept ones are busy for a while.
     outbound_target: usize,
@@ -242,6 +247,7 @@ impl PeerSet {
             max_sessions: config.max_sessions,
             outbound_target: config.max_sessions,
             busy_ticks: 0,
+            slot_dial: None,
         }
     }
 
@@ -338,32 +344,43 @@ impl PeerSet {
 
     /// Dials peers that are due: at most as many as outbound sessions are missing from
     /// `max_sessions`, counting the dials in flight, so no more than that many sessions are
-    /// ever opened by dialing. On a network op-p2p-indexers share, indexers are dialed first
-    /// and one more slot is kept for them alone. Dials nothing until a tip is known.
+    /// ever opened by dialing. On a network op-p2p-indexers share, one more slot is kept for an
+    /// indexer (see [`Self::holds_slot`]). Dials nothing until a tip is known.
     fn start_dials(&mut self, cancel: &CancellationToken) {
         if !self.ctx.has_tip() {
             return;
         }
+        let below = self.ctx.spec().indexers_only_below;
+        // The indexer slot is extra: its session, or the dial for it, is not counted against
+        // the ordinary slots.
+        let slot_held = self.slot_holder(Direction::Outbound).is_some();
+        let slot_dialing = self
+            .slot_dial
+            .is_some_and(|peer| self.dialing.contains(&peer));
         let outbound = self
             .count(Direction::Outbound)
-            .saturating_add(self.dialing.len());
+            .saturating_add(self.dialing.len())
+            .saturating_sub(usize::from(slot_held) + usize::from(slot_dialing));
         let in_flight = MAX_DIALS_IN_FLIGHT.saturating_sub(self.dialing.len());
-        let (sessions, dialing) = (&self.sessions, &self.dialing);
+        let (sessions, dialing, ctx) = (&self.sessions, &self.dialing, &self.ctx);
         let in_use = |peer: &PeerId| sessions.contains_key(peer) || dialing.contains(peer);
-        // Indexers compete for the ordinary slots like anyone else; one slot beyond them is
-        // kept for an indexer alone, so a peer calling itself one can take that slot at most.
         let for_anyone = self.outbound_target.saturating_sub(outbound).min(in_flight);
-        let mut due = self.schedule.take_due(for_anyone, in_use, false);
-        let has_indexer = self.sessions.values().any(|live| {
-            let status = live.handle.status();
-            status.direction == Direction::Outbound && status.indexer
-        });
-        let reserved = self.ctx.spec().indexers_only_below.is_some()
-            && !has_indexer
-            && outbound.saturating_add(due.len()) <= self.max_sessions
-            && due.len() < in_flight;
-        if reserved {
-            due.extend(self.schedule.take_due(1, in_use, true));
+        let mut due = self.schedule.take_due(for_anyone, in_use, |_| true);
+        // One slot beyond the ordinary ones is kept for an indexer, only one discovery saw
+        // carrying the flag in this run: a peer calling itself one takes that slot at most.
+        // Not on a chain with nothing before Bedrock, and not past the ordinary slots: an
+        // indexer that turned out to hold nothing before Bedrock counts as an ordinary peer.
+        if below.is_some_and(|bedrock| bedrock > 0)
+            && !slot_held
+            && !slot_dialing
+            && outbound <= self.max_sessions
+            && due.len() < in_flight
+        {
+            let indexer = self
+                .schedule
+                .take_due(1, in_use, |peer| ctx.is_indexer(peer));
+            self.slot_dial = indexer.first().map(|candidate| candidate.peer_id);
+            due.extend(indexer);
         }
         for candidate in due {
             let peer = candidate.peer_id;
@@ -411,16 +428,20 @@ impl PeerSet {
     fn accept(&mut self, accepted: Accepted, cancel: &CancellationToken) {
         let Accepted { handle, driver } = accepted;
         let peer = handle.status().peer_id;
-        // An indexer may take the one slot beyond the ordinary ones, where indexers share.
-        let reserved = self.ctx.spec().indexers_only_below.is_some() && handle.status().indexer;
-        let room = self.max_sessions.saturating_add(usize::from(reserved));
+        // The indexer slot is extra: its session is not counted against the ordinary slots,
+        // and an indexer with blocks before Bedrock may take it when it is free.
+        let slot_held = self.slot_holder(Direction::Inbound).is_some();
+        let ordinary = self
+            .count(Direction::Inbound)
+            .saturating_sub(usize::from(slot_held));
+        let takes_slot = !slot_held && self.holds_slot(&handle);
         // One session per address (a /64 for IPv6): one host cannot take every slot.
         let from = host(handle.status().addr.ip());
         let same_host = self.sessions.values().any(|live| {
             let status = live.handle.status();
             status.direction == Direction::Inbound && host(status.addr.ip()) == from
         });
-        let full = self.count(Direction::Inbound) >= room || same_host;
+        let full = (ordinary >= self.max_sessions && !takes_slot) || same_host;
         // Without a tip the handshake advertised genesis: the peer would leave.
         if !self.ctx.has_tip()
             || full
@@ -529,6 +550,10 @@ impl PeerSet {
                 let tell = DisconnectReason::UselessPeer;
                 (peer, DropReason::Undecodable, tell, LONG_BACKOFF)
             }
+            Report::NotHolding(peer) => {
+                let tell = DisconnectReason::UselessPeer;
+                (peer, DropReason::NotHolding, tell, LONG_BACKOFF)
+            }
             Report::Unresponsive(peer) => {
                 let tell = DisconnectReason::UselessPeer;
                 (peer, DropReason::Unresponsive, tell, REDIAL_INTERVAL)
@@ -563,7 +588,6 @@ impl PeerSet {
             id: peer,
             addr: status.addr,
             last_served_secs: unix_now(),
-            indexer: status.indexer,
         };
         // Never waits: a full or closed channel only costs this peer its place in the store.
         if let Err(err) = self.served.try_send(served) {
@@ -584,11 +608,11 @@ impl PeerSet {
             .filter(|handle| handle.status().direction == Direction::Outbound)
             .collect();
         ours.sort_unstable_by_key(|handle| handle.idle());
-        // The indexer used most recently holds the slot kept for indexers and is not released;
-        // other indexers are ordinary peers here.
+        // The indexer slot's session is not released for being unused; other indexers are
+        // ordinary peers here.
         let kept_indexer = ours
             .iter()
-            .find(|handle| handle.status().indexer)
+            .find(|handle| self.holds_slot(handle))
             .map(|handle| handle.peer_id());
         let mut released = false;
         for handle in ours
@@ -607,7 +631,11 @@ impl PeerSet {
         if released {
             self.outbound_target = KEEP_IDLE.min(self.max_sessions);
             self.busy_ticks = 0;
-        } else if ours.iter().all(|handle| handle.idle() < BUSY) {
+        } else if ours
+            .iter()
+            .filter(|handle| Some(handle.peer_id()) != kept_indexer)
+            .all(|handle| handle.idle() < BUSY)
+        {
             // Busy for a while, not one burst: only then is the target raised again.
             self.busy_ticks = self.busy_ticks.saturating_add(1);
             if self.busy_ticks >= BUSY_TICKS {
@@ -616,6 +644,26 @@ impl PeerSet {
         } else {
             self.busy_ticks = 0;
         }
+    }
+
+    /// Whether `handle`'s peer can hold the indexer slot: an op-p2p-indexer that says it holds
+    /// blocks before Bedrock, the ones only indexers share.
+    fn holds_slot(&self, handle: &SessionHandle) -> bool {
+        handle.status().indexer
+            && self
+                .ctx
+                .spec()
+                .indexers_only_below
+                .is_some_and(|bedrock| handle.range().earliest < bedrock)
+    }
+
+    /// The session holding the indexer slot in `direction`, if any: the first that can.
+    fn slot_holder(&self, direction: Direction) -> Option<PeerId> {
+        self.sessions
+            .values()
+            .map(|live| &live.handle)
+            .find(|handle| handle.status().direction == direction && self.holds_slot(handle))
+            .map(SessionHandle::peer_id)
     }
 
     /// Sessions open in one direction.

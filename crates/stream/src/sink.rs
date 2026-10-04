@@ -56,8 +56,14 @@ impl<T, E: From<Status>> Sink<T, E> {
         }
     }
 
-    /// Completes when the consumer has left.
-    pub(crate) async fn closed(&self) {
-        self.tx.closed().await;
+    /// Completes when the consumer has left. Holds none of the sink, so it can be awaited
+    /// while the sink is in use.
+    pub(crate) fn closed(&self) -> impl Future<Output = ()> + Send + 'static
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+    {
+        let tx = self.tx.clone();
+        async move { tx.closed().await }
     }
 }

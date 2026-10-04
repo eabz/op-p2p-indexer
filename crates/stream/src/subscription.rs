@@ -17,7 +17,7 @@
 //! So, per subscription, every height is sent once per canonical chain, in chain order, and no
 //! event is applied twice.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -93,10 +93,20 @@ pub(crate) struct Subscription<U, A> {
     /// The blocks sent, oldest first, at most [`CHAIN_WINDOW`].
     sent: VecDeque<BlockRef>,
     /// Blocks sent without receipts.
-    without_receipts: HashSet<BlockRef>,
+    /// With whether the window covers it: a block sent from the window while following gets
+    /// its `Receipts` event there; one sent from the stores, or left behind by the window, is
+    /// looked up again.
+    without_receipts: HashMap<BlockRef, bool>,
     heads: L1Heads,
-    /// The next height to read.
+    /// The next height to read, or to accept from the window when nothing was sent yet (or
+    /// a reorg removed all that was).
     next: BlockNumber,
+    /// Whether the window's first block is accepted whatever its height: a subscription from
+    /// the head of a node that holds nothing yet.
+    any_first: bool,
+    /// Whether `next` is in a gap range sync is filling: only the archive's tip is watched
+    /// until it reaches `next`.
+    in_gap: bool,
     /// The archive's last block, as far as the reads have seen.
     archive_tip: Option<BlockNumber>,
     /// When the blocks sent without receipts were last looked up.
@@ -120,19 +130,24 @@ impl<U: UnsafeStore, A: ArchiveStore> Subscription<U, A> {
             _permit: permit,
             receipts,
             sent: VecDeque::new(),
-            without_receipts: HashSet::new(),
+            without_receipts: HashMap::new(),
             heads: L1Heads::default(),
             next: 0,
+            any_first: false,
+            in_gap: false,
             archive_tip: None,
             receipts_checked: Instant::now(),
         }
     }
 
-    /// Runs until the consumer leaves, is too slow, or `cancel` fires.
+    /// Runs until the consumer leaves, is too slow, or `cancel` fires. A consumer that leaves
+    /// ends it at once, even while a store call is being retried.
     pub(crate) async fn run(mut self, start: Start, cancel: CancellationToken) {
+        let left = self.sink.closed();
         let stopped = tokio::select! {
             biased;
             () = cancel.cancelled() => Err(Stop::Read(ReadError::Cancelled)),
+            () = left => Err(Stop::Ended),
             stopped = self.serve(start) => stopped,
         };
         match stopped {
@@ -151,10 +166,14 @@ impl<U: UnsafeStore, A: ArchiveStore> Subscription<U, A> {
                 self.next = number;
                 Mode::Read
             }
+            // From the block after the follower's last (or the store's head): nothing sent yet,
+            // so a reorg of blocks before it is not the subscription's.
             Start::Head => {
                 let (next, last) = self.live.tail();
-                self.sent.extend(last);
-                self.next = last.map_or(0, |last| last.number.saturating_add(1));
+                match last.or(unsafe_head) {
+                    Some(last) => self.next = last.number.saturating_add(1),
+                    None => self.any_first = true,
+                }
                 Mode::Follow(next)
             }
         };
@@ -167,13 +186,9 @@ impl<U: UnsafeStore, A: ArchiveStore> Subscription<U, A> {
                 mode = next;
                 continue;
             }
-            // Nothing to send yet: the follower's next publish may change that. A consumer
-            // that leaves meanwhile ends it now, not at the next send.
-            tokio::select! {
-                changed = published.changed() => if changed.is_err() {
-                    return Ok(());
-                },
-                () = self.sink.closed() => return Err(Stop::Ended),
+            // Nothing to send yet: the follower's next publish may change that.
+            if published.changed().await.is_err() {
+                return Ok(());
             }
         }
     }
@@ -181,25 +196,30 @@ impl<U: UnsafeStore, A: ArchiveStore> Subscription<U, A> {
     /// Joins the window if it can, else reads and sends one batch. `None` when there is
     /// nothing to read yet.
     async fn read(&mut self) -> Result<Option<Mode>, Stop> {
-        if let Some((unsafe_head, heads)) = self.live.heads()
-            && heads != self.heads
-        {
-            self.heads = heads;
-            self.send_heads(unsafe_head).await?;
+        if let Some((unsafe_head, heads)) = self.live.heads() {
+            self.update_heads(unsafe_head, heads).await?;
         }
         if let Some(last) = self.sent.back()
             && let Some((cursor, receipts)) = self.live.join(*last)
         {
             for block in receipts {
-                if self.without_receipts.remove(&block.at) {
+                if self.without_receipts.remove(&block.at).is_some() {
                     self.send_receipts(block).await?;
                 }
             }
             return Ok(Some(Mode::Follow(cursor)));
         }
-        if self.receipts && self.receipts_checked.elapsed() >= RECEIPTS_RECHECK {
-            self.receipts_checked = Instant::now();
-            self.recheck_receipts().await?;
+        self.recheck_receipts().await?;
+        if self.in_gap {
+            let tip = self
+                .source
+                .archive_range()
+                .await?
+                .map(|(_, tip)| tip.number);
+            if tip.is_none_or(|tip| tip < self.next) {
+                return Ok(None);
+            }
+            self.in_gap = false;
         }
         let blocks = self
             .source
@@ -208,11 +228,14 @@ impl<U: UnsafeStore, A: ArchiveStore> Subscription<U, A> {
         if blocks.is_empty() {
             // Above the follower's last block, nothing is there yet; below it, maybe never.
             let (_, last) = self.live.tail();
-            if last.is_none_or(|last| self.next <= last.number)
-                && let Err(status) = self.source.ensure_held(self.next).await?
-            {
-                self.sink.end(status);
-                return Err(Stop::Ended);
+            if last.is_none_or(|last| self.next <= last.number) {
+                let holdings = self.source.holdings().await?;
+                if let Err(status) = holdings.ensure_held(self.next) {
+                    self.sink.end(status);
+                    return Err(Stop::Ended);
+                }
+                // Held, so in a gap only if range sync fills it, into the archive.
+                self.in_gap = holdings.gap_at(self.next).is_some();
             }
             return Ok(None);
         }
@@ -228,15 +251,25 @@ impl<U: UnsafeStore, A: ArchiveStore> Subscription<U, A> {
                 self.send_reorg(&removed).await?;
                 return Ok(Some(Mode::Read));
             }
-            self.send_block(Arc::new(block)).await?;
+            self.send_block(Arc::new(block), false).await?;
         }
         Ok(Some(Mode::Read))
     }
 
-    /// Sends the receipts the stores got for blocks it sent without them.
+    /// Every [`RECEIPTS_RECHECK`], in both modes, sends the receipts the stores got for blocks
+    /// it sent without them: the follower publishes only those of blocks it published itself.
     async fn recheck_receipts(&mut self) -> Result<(), Stop> {
-        let pending: Vec<BlockRef> = self.without_receipts.iter().copied().collect();
-        for at in pending {
+        if !self.receipts || self.receipts_checked.elapsed() < RECEIPTS_RECHECK {
+            return Ok(());
+        }
+        self.receipts_checked = Instant::now();
+        let uncovered: Vec<BlockRef> = self
+            .without_receipts
+            .iter()
+            .filter(|(_, covered)| !**covered)
+            .map(|(at, _)| *at)
+            .collect();
+        for at in uncovered {
             if let Some(block) = self.source.with_receipts(at).await? {
                 self.without_receipts.remove(&at);
                 self.send_receipts(Arc::new(block)).await?;
@@ -248,7 +281,7 @@ impl<U: UnsafeStore, A: ArchiveStore> Subscription<U, A> {
     /// Sends the window's events from `cursor` on. `None` when there are none yet.
     async fn follow(&mut self, cursor: u64) -> Result<Option<Mode>, Stop> {
         let Some(events) = self.live.after(cursor) else {
-            return Ok(Some(Mode::Read));
+            return Ok(Some(self.leave_window()));
         };
         let Some(next) = events.last().map(|(seq, _)| seq.saturating_add(1)) else {
             return Ok(None);
@@ -256,17 +289,19 @@ impl<U: UnsafeStore, A: ArchiveStore> Subscription<U, A> {
         for (_, event) in events {
             match &*event {
                 ChainEvent::Block(block) => {
-                    if self
-                        .sent
-                        .back()
-                        .is_some_and(|last| last.hash != block.parent)
-                    {
-                        return Ok(Some(Mode::Read));
+                    // On its last block, or with none, at the height it expects next: a block
+                    // past a gap is read from the stores instead.
+                    let fits = match self.sent.back() {
+                        Some(last) => last.hash == block.parent,
+                        None => self.any_first || block.at.number == self.next,
+                    };
+                    if !fits {
+                        return Ok(Some(self.leave_window()));
                     }
-                    self.send_block(Arc::clone(block)).await?;
+                    self.send_block(Arc::clone(block), true).await?;
                 }
                 ChainEvent::Receipts(block) => {
-                    if self.without_receipts.remove(&block.at) {
+                    if self.without_receipts.remove(&block.at).is_some() {
                         self.send_receipts(Arc::clone(block)).await?;
                     }
                 }
@@ -278,12 +313,25 @@ impl<U: UnsafeStore, A: ArchiveStore> Subscription<U, A> {
                     }
                 }
                 ChainEvent::Heads { unsafe_head, heads } => {
-                    self.heads = *heads;
-                    self.send_heads(*unsafe_head).await?;
+                    self.update_heads(*unsafe_head, *heads).await?;
                 }
             }
         }
+        self.recheck_receipts().await?;
         Ok(Some(Mode::Follow(next)))
+    }
+
+    /// Stops following: the window's events from here on are not seen, so its blocks without
+    /// receipts are looked up again. A subscription from the head that has sent nothing yet
+    /// goes back to the window's tail rather than to the stores.
+    fn leave_window(&mut self) -> Mode {
+        for covered in self.without_receipts.values_mut() {
+            *covered = false;
+        }
+        if self.any_first {
+            return Mode::Follow(self.live.tail().0);
+        }
+        Mode::Read
     }
 
     /// Sends a `Reorg` of `removed` (lowest first, no longer in `sent`) and reads on from the
@@ -311,18 +359,20 @@ impl<U: UnsafeStore, A: ArchiveStore> Subscription<U, A> {
         Ok(self.sink.send(event).await?)
     }
 
-    async fn send_block(&mut self, block: Arc<Prepared>) -> Result<(), Stop> {
+    /// Sends `block`; `covered` when it comes from the window, which then brings its receipts.
+    async fn send_block(&mut self, block: Arc<Prepared>, covered: bool) -> Result<(), Stop> {
         let (payload, heads, at) = (self.payload, self.heads, block.at);
         let has_receipts = block.has_receipts();
         let message = self.convert(move || block.message(payload, &heads)).await?;
         self.send(proto::event::Event::Block(message)).await?;
         if !has_receipts {
-            self.without_receipts.insert(at);
+            self.without_receipts.insert(at, covered);
         }
         if let Some(dropped) = push_bounded(&mut self.sent, at, CHAIN_WINDOW) {
             self.without_receipts.remove(&dropped);
         }
         self.next = at.number.saturating_add(1);
+        self.any_first = false;
         Ok(())
     }
 
@@ -332,6 +382,30 @@ impl<U: UnsafeStore, A: ArchiveStore> Subscription<U, A> {
             self.send(proto::event::Event::Receipts(receipts)).await?;
         }
         Ok(())
+    }
+
+    /// Sends `Heads` if `heads` move one past what was sent; never back: the stores and the
+    /// follower's window may each be a little behind the other.
+    async fn update_heads(
+        &mut self,
+        unsafe_head: Option<BlockRef>,
+        heads: L1Heads,
+    ) -> Result<(), Stop> {
+        let newest = |sent: Option<BlockRef>, new: Option<BlockRef>| {
+            [sent, new]
+                .into_iter()
+                .flatten()
+                .max_by_key(|head| head.number)
+        };
+        let merged = L1Heads {
+            safe: newest(self.heads.safe, heads.safe),
+            finalized: newest(self.heads.finalized, heads.finalized),
+        };
+        if merged == self.heads {
+            return Ok(());
+        }
+        self.heads = merged;
+        self.send_heads(unsafe_head).await
     }
 
     async fn send_heads(&mut self, unsafe_head: Option<BlockRef>) -> Result<(), Stop> {

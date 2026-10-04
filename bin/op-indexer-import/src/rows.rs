@@ -158,6 +158,16 @@ pub(crate) struct Rows {
 }
 
 impl Rows {
+    /// Whether the chunk has transaction rows for block `number`.
+    pub(crate) fn has_transactions(&self, number: u64) -> bool {
+        let at = self
+            .transactions
+            .partition_point(|tx| tx.block_number < number);
+        self.transactions
+            .get(at)
+            .is_some_and(|tx| tx.block_number == number)
+    }
+
     /// The block numbered `number`, if the chunk has it.
     pub(crate) fn block(&self, number: u64) -> Option<&BlockRow> {
         let at = self

@@ -13,11 +13,12 @@
 //! requests in flight finish and are written, and the step ends with a summary of what is
 //! missing. It never spins.
 
+use std::fs;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use bytes::Bytes;
 use eyre::WrapErr;
@@ -143,6 +144,12 @@ pub(crate) async fn run(
                 if !state.raw_path(chunk).try_exists()?
                     && chunk::check(&state.verified_path(chunk))? != ChunkFile::Present
                 {
+                    // A fill belongs to the download it was fetched for: one left from an
+                    // earlier download of the chunk goes before the new one is written.
+                    match fs::remove_file(state.fill_path(chunk)) {
+                        Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err),
+                        _ => {}
+                    }
                     missing.push(chunk);
                 }
             }

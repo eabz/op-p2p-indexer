@@ -12,7 +12,7 @@
 //! needs to: they are verified blocks of the chain the archive holds, and the next load (or
 //! append) writes them again, with the same values, and then the header. Until then reads by
 //! number stop at the tip; a read of bodies or receipts by hash serves them (verified bytes);
-//! `number_of` gives a number above the tip, which callers take as not archived yet;
+//! `number_of` does not report them (it requires the header);
 //! `set_receipts` can fill them; and `pending_receipts` lists those without receipts, which a
 //! read by number then does not find.
 //!

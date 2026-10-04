@@ -77,6 +77,23 @@ pub(crate) struct LoadArgs {
     pub(crate) archive_dir: Option<PathBuf>,
 }
 
+/// The node's default archive for the plan's chain, `data-<chain>/archive`. Earlier builds of
+/// the node defaulted to `data/archive`: while that exists and the new one does not, loading
+/// into a new archive the node would not find by itself is refused. Blocking.
+fn default_archive_dir(plan: &Plan) -> eyre::Result<PathBuf> {
+    let dir = PathBuf::from(plan.chain.default_data_dir()).join("archive");
+    let old = Path::new("data/archive");
+    eyre::ensure!(
+        dir.try_exists()? || !old.try_exists()?,
+        "{} holds an archive from an earlier build, whose default data directory was `data`: \
+         move data to {} (or give --archive-dir {})",
+        old.display(),
+        plan.chain.default_data_dir(),
+        old.display()
+    );
+    Ok(dir)
+}
+
 /// Loads the verified range of `plan` into the archive, to the end of the range.
 ///
 /// # Errors
@@ -109,10 +126,10 @@ pub(crate) async fn run(
         chain_id: plan.chain.chain_id,
         genesis_hash: plan.chain.genesis_hash,
     };
-    let archive_dir = args
-        .archive_dir
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(plan.chain.default_data_dir()).join("archive"));
+    let archive_dir = match &args.archive_dir {
+        Some(dir) => dir.clone(),
+        None => default_archive_dir(plan)?,
+    };
     let archive = FjallArchive::open(&archive_dir, identity).map_err(|err| {
         if err.is_archive_locked() {
             eyre!(

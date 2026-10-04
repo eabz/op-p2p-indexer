@@ -471,7 +471,8 @@ pub trait ArchiveStore {
         limit: usize,
     ) -> impl Future<Output = Result<(Vec<BlockRef>, u64), StorageError>> + Send;
 
-    /// Returns the number of the archived block with this hash.
+    /// Returns the number of the archived block with this hash: of a block the archive holds,
+    /// never of what an interrupted bulk load left above the tip.
     ///
     /// # Errors
     ///

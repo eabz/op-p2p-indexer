@@ -34,7 +34,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::network::{INDEXER_RECORD_KEY, INDEXER_RECORD_VERSION};
-use crate::session::SessionContext;
+use crate::session::{SessionContext, unix_now};
 use crate::{ElError, metrics};
 
 /// Time between lookup rounds after the fast phase. The viability test found about one new
@@ -76,8 +76,6 @@ pub(crate) struct Candidate {
     pub(crate) peer_id: PeerId,
     /// The peer's TCP address.
     pub(crate) addr: SocketAddr,
-    /// Whether its node record says it is an op-p2p-indexer.
-    pub(crate) indexer: bool,
 }
 
 /// A discv5 node that finds execution peers of our chain and fork.
@@ -145,6 +143,10 @@ impl Discovery {
         if ctx.spec().indexers_only_below.is_some() {
             builder.add_value(INDEXER_RECORD_KEY, &INDEXER_RECORD_VERSION);
         }
+        // A record's `seq` must grow with every change, across restarts too, or peers keep an
+        // older one: start from the Unix time in seconds (geth uses milliseconds), which is
+        // above any earlier run's (discv5 adds one per change while running).
+        builder.seq(unix_now().max(1));
         let enr = builder.build(&key).map_err(ElError::Enr)?;
 
         let mut config = ConfigBuilder::new(ListenConfig::from(listen));
@@ -392,7 +394,7 @@ impl Discovery {
             let Some(candidate) = candidate(enr) else {
                 continue;
             };
-            if candidate.indexer {
+            if enr.get_raw_rlp(INDEXER_RECORD_KEY).is_some() {
                 self.ctx.mark_indexer(candidate.peer_id);
             }
             if self.known.len() >= MAX_KNOWN_PEERS {
@@ -446,7 +448,6 @@ fn candidate(enr: &Enr) -> Option<Candidate> {
     Some(Candidate {
         peer_id: PeerId::from_slice(public.encode_uncompressed().as_ref()),
         addr: SocketAddr::V4(addr),
-        indexer: enr.get_raw_rlp(INDEXER_RECORD_KEY).is_some(),
     })
 }
 

@@ -93,6 +93,31 @@ pub(super) fn authorization_list(bytes: &[u8]) -> Result<Vec<SignedAuthorization
     Ok(list)
 }
 
+/// Encodes an access list in the service's layout: what a block filled from the chain's RPC
+/// gives its rows, so they are rebuilt like the service's. The inverse of [`access_list`].
+pub(crate) fn encode_access_list(list: &AccessList) -> Vec<u8> {
+    fn length(out: &mut Vec<u8>, length: usize) {
+        let length = u64::try_from(length).unwrap_or(u64::MAX);
+        out.extend_from_slice(&length.to_le_bytes());
+    }
+    fn text(out: &mut Vec<u8>, text: &str) {
+        length(out, text.len());
+        out.extend_from_slice(text.as_bytes());
+    }
+    let mut out = Vec::new();
+    length(&mut out, list.len());
+    for item in list.iter() {
+        out.push(1);
+        text(&mut out, &format!("{:#x}", item.address));
+        out.push(1);
+        length(&mut out, item.storage_keys.len());
+        for key in &item.storage_keys {
+            text(&mut out, &format!("{key:#x}"));
+        }
+    }
+    out
+}
+
 /// What is left of the bytes being decoded.
 struct Input<'a>(&'a [u8]);
 

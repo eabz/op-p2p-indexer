@@ -35,7 +35,7 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::time::ChronoUtc;
 
-use crate::config::{Config, ElSettings, L1Settings};
+use crate::config::{Config, ElSettings, L1Settings, NODE_DIR};
 use crate::provider::NodeProvider;
 
 /// Unsafe blocks waiting for the pipeline. Blocks arrive every 2 s on OP Mainnet and every
@@ -81,9 +81,6 @@ const ANCHOR_DEPTH: u64 = 64;
 const SYNC_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Verified checkpoints of a range sync waiting to be saved; the sync waits when it is full.
 const SYNC_CHECKPOINT_CAPACITY: usize = 16;
-
-/// Directory of the node store (identity and known peers), inside the data directory.
-const NODE_DIR: &str = "node";
 
 /// Log timestamp: UTC time of day with milliseconds, e.g. `13:04:12.345`.
 const LOG_TIME_FORMAT: &str = "%H:%M:%S%.3f";

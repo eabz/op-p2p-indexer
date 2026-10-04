@@ -35,6 +35,10 @@ pub(crate) const VERSIONS: [PayloadVersion; 4] = [
 
 /// Blocks older than this are rejected.
 const MAX_AGE_SECS: u64 = 60;
+/// A block the sequencer signed and older than [`MAX_AGE_SECS`] is only ignored up to this
+/// age, since our clock may run ahead; older, it is a replay and rejected (never a ban). Its
+/// signature is not checked then: a replay costs the validator no signature recovery.
+const MAX_IGNORED_AGE_SECS: u64 = 2 * MAX_AGE_SECS;
 /// Blocks further in the future than this are rejected.
 const MAX_FUTURE_SECS: u64 = 5;
 
@@ -78,7 +82,7 @@ pub(crate) enum BlockError {
         number: BlockNumber,
         age_secs: u64,
         /// Whether the sequencer signed it. If so the likelier cause is a local clock running
-        /// ahead (or a replay, which the seen-message cache mostly absorbs).
+        /// ahead. Not checked (`false`) past [`MAX_IGNORED_AGE_SECS`]: a replay.
         signed_by_sequencer: bool,
     },
     #[error("block {number} is {ahead_secs}s in the future")]
@@ -162,7 +166,8 @@ impl BlockError {
             // A block the sequencer signed, outside our time window: the spec (and op-node)
             // reject it, but it points at our clock, not the peer. op-node scores no topic, so
             // its rejection costs a peer nothing; ours would graylist every honest peer while
-            // our clock is off. So it is ignored.
+            // our clock is off. So it is ignored: dated in our future, or stale by at most
+            // `MAX_IGNORED_AGE_SECS` (older ones never get here signed, and are rejected).
             Self::Stale {
                 signed_by_sequencer: true,
                 ..
@@ -259,9 +264,10 @@ impl BlockValidator {
 
         let age_secs = now_secs.saturating_sub(timestamp);
         if age_secs > MAX_AGE_SECS {
-            let signed_by_sequencer = self
-                .verify_signature(number, &signature_bytes, &signed)
-                .is_ok();
+            let signed_by_sequencer = age_secs <= MAX_IGNORED_AGE_SECS
+                && self
+                    .verify_signature(number, &signature_bytes, &signed)
+                    .is_ok();
             return Err(BlockError::Stale {
                 number,
                 age_secs,

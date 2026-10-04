@@ -135,8 +135,9 @@ pub(crate) async fn listen(
 /// What sessions per host are counted by: the address, or its /64 for IPv6, where one host
 /// holds a whole /64.
 pub(crate) fn host(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V4(_) => ip,
+    // An IPv4 address mapped into IPv6 is its own host, not a /64 shared with others.
+    match ip.to_canonical() {
+        ip @ IpAddr::V4(_) => ip,
         IpAddr::V6(v6) => {
             let [a, b, c, d, ..] = v6.segments();
             IpAddr::V6(Ipv6Addr::new(a, b, c, d, 0, 0, 0, 0))

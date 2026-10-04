@@ -267,9 +267,6 @@ pub struct ExecutionPeer {
     pub addr: SocketAddr,
     /// When it last served a request, in seconds since the Unix epoch.
     pub last_served_secs: u64,
-    /// Whether its node record says it is an op-p2p-indexer: one of the peers this node shares
-    /// the blocks before Bedrock with.
-    pub indexer: bool,
 }
 
 /// A range of blocks to fetch from execution peers: from `from` up to the anchor, a block

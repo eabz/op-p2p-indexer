@@ -12,8 +12,8 @@
 //! 15), then 20 a second overall (bursts of 40). The peer's own limit is waited for first, so
 //! one peer cannot drain the shared budget; a request is answered with result 3 when both take
 //! more than 20 seconds, or at once when 4 of the peer's requests, or 512 in all, already wait.
-//! At most 32 answers are read and encoded at once, and an answer must be written within 10
-//! seconds, as op-node's write deadline. A number before the chain's Bedrock block, or past the
+//! At most 32 answers are read, encoded or being written at once (bounding the memory they
+//! hold), and an answer must be written within 10 seconds, as op-node's write deadline. A number before the chain's Bedrock block, or past the
 //! block the wall clock implies, is an invalid request (result 2).
 //!
 //! [`payload_by_number`]: https://specs.optimism.io/protocol/rollup-node-p2p.html#payload_by_number
@@ -34,14 +34,14 @@ use governor::state::keyed::HashMapStateStore;
 use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use libp2p::futures::future::BoxFuture;
 use libp2p::futures::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
-use libp2p::request_response::{self, ProtocolSupport, ResponseChannel};
+use libp2p::request_response::{self, InboundRequestId, ProtocolSupport, ResponseChannel};
 use libp2p::{PeerId, StreamProtocol};
 use op_alloy_rpc_types_engine::{OpExecutionPayload, OpExecutionPayloadEnvelope};
 use op_indexer_chainspec::ChainSpec;
 use op_indexer_primitives::{EncodedBlock, decode_block, encode_body, split_body};
 use ssz::Encode as _;
-use tokio::sync::Semaphore;
-use tokio::task::{JoinError, JoinSet};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::task::{self, JoinError, JoinSet};
 
 /// The canonical block at a height, or why it could not be read.
 pub type BlockFuture<'a> =
@@ -81,7 +81,8 @@ const PEER_RATE: (u32, u32) = (4, 15);
 const MAX_WAITING: usize = 512;
 /// Requests of one peer waiting at once, so one peer cannot fill [`MAX_WAITING`].
 const MAX_WAITING_PER_PEER: usize = 4;
-/// Answers read and encoded at once: each holds a block and its encoding, up to 10 MiB.
+/// Answers read, encoded or being written at once: each holds a block and its encoding, up to
+/// 10 MiB, until the peer has it (or the write fails), so this bounds the memory answers hold.
 const MAX_ENCODING: usize = 32;
 /// How long writing an answer may take, as op-node's write deadline.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -180,7 +181,15 @@ pub(crate) fn throttled() -> Vec<u8> {
 }
 
 /// An answer ready to send, with the channel it goes on.
-type Answer = (ResponseChannel<Vec<u8>>, Vec<u8>);
+#[derive(Debug)]
+pub(crate) struct Answer {
+    pub(crate) request_id: InboundRequestId,
+    pub(crate) channel: ResponseChannel<Vec<u8>>,
+    pub(crate) response: Vec<u8>,
+    /// Its place among [`MAX_ENCODING`]: kept until the answer is written
+    /// ([`Server::writing`]); `None` for an answer that was throttled.
+    pub(crate) permit: Option<OwnedSemaphorePermit>,
+}
 
 /// The server's state: the source, the limits, and the answers being prepared.
 pub(crate) struct Server {
@@ -189,11 +198,16 @@ pub(crate) struct Server {
     global: Arc<DefaultDirectRateLimiter>,
     peers: Arc<PeerLimiter>,
     /// Answers being read and encoded, each after its wait for the limits; at most
-    /// [`MAX_WAITING`], with the peer each is for.
-    answers: JoinSet<(PeerId, Answer)>,
+    /// [`MAX_WAITING`].
+    answers: JoinSet<Answer>,
+    /// The peer each task of [`Self::answers`] is for, so a task that panicked is counted out.
+    tasks: HashMap<task::Id, PeerId>,
     /// Requests of each peer in [`Self::answers`].
     waiting: HashMap<PeerId, usize>,
-    /// Permits to read and encode an answer; [`MAX_ENCODING`] of them.
+    /// Answers handed to the swarm and not yet written, with their places among
+    /// [`MAX_ENCODING`].
+    writing: HashMap<InboundRequestId, OwnedSemaphorePermit>,
+    /// Permits to read, encode and write an answer; [`MAX_ENCODING`] of them.
     encoding: Arc<Semaphore>,
 }
 
@@ -214,7 +228,9 @@ impl Server {
             global: Arc::new(RateLimiter::direct(quota(GLOBAL_RATE))),
             peers: Arc::new(RateLimiter::hashmap(quota(PEER_RATE))),
             answers: JoinSet::new(),
+            tasks: HashMap::new(),
             waiting: HashMap::new(),
+            writing: HashMap::new(),
             encoding: Arc::new(Semaphore::new(MAX_ENCODING)),
         }
     }
@@ -225,6 +241,7 @@ impl Server {
     pub(crate) fn on_request(
         &mut self,
         peer: PeerId,
+        request_id: InboundRequestId,
         number: BlockNumber,
         channel: ResponseChannel<Vec<u8>>,
     ) -> Option<ResponseChannel<Vec<u8>>> {
@@ -239,37 +256,55 @@ impl Server {
         let (chain, source) = (self.chain, Arc::clone(&self.source));
         let (global, peers) = (Arc::clone(&self.global), Arc::clone(&self.peers));
         let encoding = Arc::clone(&self.encoding);
-        self.answers.spawn(async move {
+        let task = self.answers.spawn(async move {
             // The peer's own limit first: a peer over it takes nothing from the others.
             let allowed = async {
                 peers.until_key_ready(&peer).await;
                 global.until_ready().await;
             };
-            let response = match tokio::time::timeout(MAX_THROTTLE_DELAY, allowed).await {
-                Ok(()) => match encoding.acquire().await {
-                    Ok(_permit) => serve(chain, &*source, number).await,
+            let (response, permit) = match tokio::time::timeout(MAX_THROTTLE_DELAY, allowed).await {
+                Ok(()) => match encoding.acquire_owned().await {
+                    Ok(permit) => (serve(chain, &*source, number).await, Some(permit)),
                     // The semaphore is never closed.
-                    Err(_closed) => throttled(),
+                    Err(_closed) => (throttled(), None),
                 },
-                Err(_elapsed) => throttled(),
+                Err(_elapsed) => (throttled(), None),
             };
-            (peer, (channel, response))
+            Answer {
+                request_id,
+                channel,
+                response,
+                permit,
+            }
         });
+        self.tasks.insert(task.id(), peer);
         None
     }
 
     /// The next answer ready; never resolves while none is being prepared.
     pub(crate) async fn next_answer(&mut self) -> Option<Result<Answer, JoinError>> {
-        let joined = self.answers.join_next().await?;
-        Some(joined.map(|(peer, answer)| {
-            if let Some(waiting) = self.waiting.get_mut(&peer) {
-                *waiting = waiting.saturating_sub(1);
-                if *waiting == 0 {
-                    self.waiting.remove(&peer);
-                }
+        let joined = self.answers.join_next_with_id().await?;
+        // A task that panicked is counted out of its peer's requests too.
+        let id = joined.as_ref().map_or_else(JoinError::id, |(id, _)| *id);
+        if let Some(peer) = self.tasks.remove(&id)
+            && let Some(waiting) = self.waiting.get_mut(&peer)
+        {
+            *waiting = waiting.saturating_sub(1);
+            if *waiting == 0 {
+                self.waiting.remove(&peer);
             }
-            answer
-        }))
+        }
+        Some(joined.map(|(_, answer)| answer))
+    }
+
+    /// Keeps an answer's place among [`MAX_ENCODING`] until [`Self::written`].
+    pub(crate) fn writing(&mut self, request_id: InboundRequestId, permit: OwnedSemaphorePermit) {
+        self.writing.insert(request_id, permit);
+    }
+
+    /// The answer to `request_id` was written, or will never be: its place is free.
+    pub(crate) fn written(&mut self, request_id: InboundRequestId) {
+        self.writing.remove(&request_id);
     }
 }
 
@@ -288,7 +323,7 @@ async fn serve(chain: &ChainSpec, source: &dyn PayloadSource, number: BlockNumbe
         }
     };
     // SSZ and snappy over a whole block: CPU work.
-    tokio::task::spawn_blocking(move || encode(&block))
+    task::spawn_blocking(move || encode(&block))
         .await
         .ok()
         .flatten()

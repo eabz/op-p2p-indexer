@@ -128,18 +128,14 @@ impl Fields<'_> {
         if let Some(filled) = &self.row.filled_authorization_list {
             return Ok(filled.clone());
         }
-        let list = self.list(
-            FIELD,
-            self.row.authorization_list.as_ref(),
-            lists::authorization_list,
-        )?;
-        if list.is_empty() {
+        if self.row.lacks_authorization_list() {
             return Err(Check::Unfilled {
                 index: self.index,
                 field: FIELD,
             });
         }
-        Ok(list)
+        let list = self.row.authorization_list.as_ref();
+        self.list(FIELD, list, lists::authorization_list)
     }
 
     /// Decodes a list field the service gives as the bytes of its binary column; absent or

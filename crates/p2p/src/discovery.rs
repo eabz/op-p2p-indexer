@@ -107,7 +107,7 @@ impl Discovery {
         }
         builder.add_value(OPSTACK_ENR_KEY, &opstack_entry(chain_id));
         // A record's `seq` must grow with every change, across restarts too, or peers keep an
-        // older one: start from the Unix time in seconds, as geth does, which is above any
+        // older one: start from the Unix time in seconds (geth uses milliseconds), which is above any
         // earlier run's (discv5 adds one per change while running).
         builder.seq(crate::network::unix_now_secs().max(1));
         let enr = builder.build(&key).map_err(DiscoveryError::Enr)?;

@@ -24,7 +24,7 @@ generated code trips, and only those.
 
 | RPC | What |
 |---|---|
-| `Subscribe(SubscribeRequest) returns (stream Event)` | From a block number, or from the head; the payload, `DECODED` or `RAW`, chosen per subscription. A number the stores do not hold and never will (below the archive's first block, or between the archive's tip and the unsafe store's lowest block) is refused with `OUT_OF_RANGE`. The archive keeps all it has; the unsafe store expires blocks nothing promoted after `UNSAFE_TTL` (24 h, e.g. with L1 off), so a subscription whose next height expired before it read it ends with `OUT_OF_RANGE` too. |
+| `Subscribe(SubscribeRequest) returns (stream Event)` | From a block number, or from the head; the payload, `DECODED` or `RAW`, chosen per subscription. A number the stores do not hold and never will is refused with `OUT_OF_RANGE`: below the archive's first block (the archive keeps all it has), or, with range sync off, between the archive's tip and the unsafe store's lowest block (the unsafe store expires blocks nothing promoted after `UNSAFE_TTL`, 24 h). A subscription whose next height becomes such ends with `OUT_OF_RANGE` too. With range sync on (`OP_INDEXER_EL_SYNC`) that gap is being filled: a subscription in it waits. |
 | `GetHeads(GetHeadsRequest) returns (Heads)` | Unsafe, safe and finalized heads, and whether receipts are fetched. |
 | `GetBlock(GetBlockRequest) returns (Block)` | One canonical block, by number or hash, in either payload. `NOT_FOUND` if not held, or a side block. |
 
@@ -75,20 +75,27 @@ Per subscription, blocks come in chain order, each height once per canonical cha
   wait that brought nothing), **across a gap** (heights not held stop the walk until a `fill`
   event), and when a block does not build on its last one (it finds the newest published block
   still canonical). A reorg event removes the published blocks from the first one it replaced:
-  blocks of the new chain an earlier event of the same read already published stay.
+  blocks of the new chain an earlier event of the same read already published stay. When it
+  reads the state again and the head is at or below its last block (and not it), the store
+  went back under it: it finds the newest published block still canonical and publishes the
+  `Reorg` of those above.
 
   It keeps the last 128 events, numbered (about two minutes of blocks at one a second), and the
-  last 256 blocks it published (the deepest reorg handled without starting over from the head).
+  last 256 blocks it published (the deepest reorg handled without starting over). A reorg that
+  removes all 256 is published, and the follower then publishes again from the first removed
+  height, not from the head, so its chain has no gap.
 - **Hand-over** (`subscription.rs`): a subscription reads (history, then the unsafe store),
   checking each block's parent against the last one it sent; one that does not match is a
   reorg, found by reading which of its blocks are still canonical. Before each batch it sends
-  `Heads` if the follower's heads moved, and tries to join the window: when the follower's last
+  `Heads` if the follower's heads moved (heads sent never go back), and tries to join the window: when the follower's last
   block is its own, the follower's chain is its own, so from the window's next event every event
   applies as it is. Receipts in the window, for blocks it sent without them, are sent at the
   join. A block in the window that does not build on its last one, or a window that moved past
   it, sends it back to reading. So each height is sent once per canonical chain, in order, and no
   event is applied twice: a subscription that found a reorg itself joins only once the follower
-  has seen it too.
+  has seen it too. A subscription from the head starts at the block after the follower's last
+  (a reorg of blocks before it is not its own), and while it has sent nothing (or a reorg
+  removed all it sent) it takes a block from the window only at the height it expects next.
 - Each block is prepared once (number, hash and parent read once) and each of its messages
   converted the first time a subscription asks for it, then shared: a live block is converted
   once per payload, not once per subscription. Conversion runs in `spawn_blocking`; archive
@@ -108,8 +115,12 @@ canonical, with its receipts if they are attached and without them otherwise. Th
   archive has them (the pipeline attaches late ones there; the archive has no events, so after
   each read of the event stream the follower reads the archive's list of blocks still without
   receipts, and reads only the blocks that left it).
-- A subscription that is reading from the stores looks its blocks without receipts up again
-  every 5 s, in both stores.
+- A subscription looks its blocks without receipts up again every 5 s, in both stores, while
+  reading and while following: those it read from the stores, and those it got from the window
+  but stopped following since (the follower publishes receipts only for blocks it published,
+  and looks those up again after it reads the state again).
+- A subscription waiting in a gap range sync is filling watches only the archive's tip until
+  the sync reaches it.
 
 What a consumer can rely on: a block sent without receipts gets one `Receipts` event when they
 arrive while it is among the last 256 blocks the subscription sent, and on the same
@@ -177,6 +188,9 @@ not remove it, and would duplicate the server's wiring.
   - A `to` above what the cap allows is lowered to it.
   - `OUT_OF_RANGE` when the stores do not hold `from` and never will (as for `Subscribe`), or
     the cap's head is below `from` (or not known yet).
+  - With range sync on, a gap between the archive's tip and the unsafe store's lowest block is
+    being filled: a range that starts below it stops below it (`to` lowered), and one that
+    starts in it is `UNAVAILABLE`, naming the gap.
 - `GetFlightInfo(descriptor)` and `ListFlights`: the descriptor is a path of one table (its
   whole range, from the lowest block held, cap `any`) or a ticket's text as the command. The info's endpoint carries the
   ticket for the range as it resolves now, `to` lowered. Total records and bytes are unknown

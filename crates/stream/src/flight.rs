@@ -182,25 +182,31 @@ where
     A: ArchiveStore + Clone + Send + Sync + 'static,
 {
     /// The range `query` covers now: `from` the lowest block held when it names none, `to`
-    /// lowered to what its cap allows and to [`MAX_FLIGHT_BLOCKS`] blocks.
+    /// lowered to what its cap allows, below a gap above `from`, and to [`MAX_FLIGHT_BLOCKS`]
+    /// blocks.
     ///
     /// # Errors
     ///
     /// `OUT_OF_RANGE` if the stores do not hold `from` and never will (see
-    /// [`Source::held_from`]), or nothing is held from `from` under the cap.
+    /// [`crate::source::Holdings::held_from`]), or nothing is held from `from` under the cap; `UNAVAILABLE`
+    /// if `from` is in a gap range sync is filling.
     async fn resolve(&self, query: Query) -> Result<Query, Status> {
         let asked = query.from.unwrap_or(0);
-        let (from, range) = self
-            .source
-            .held_from(asked)
-            .await
-            .map_err(|err| read_status(&err))?;
-        if query.from.is_some() && from > asked {
-            return Err(Status::out_of_range(format!(
-                "block {asked} is not held; the node holds blocks from {from} on"
+        let (holdings, (unsafe_head, heads)) =
+            tokio::try_join!(self.source.holdings(), self.source.heads())
+                .map_err(|err| read_status(&err))?;
+        if query.from.is_some() {
+            holdings.ensure_held(asked)?;
+        }
+        let from = holdings.held_from(asked);
+        // Only with range sync can `from` be in the gap: it is being filled.
+        if let Some((start, end)) = holdings.gap_at(from) {
+            return Err(Status::unavailable(format!(
+                "blocks {start} to {} are not held yet: range sync is filling them",
+                end.saturating_sub(1)
             )));
         }
-        let (unsafe_head, heads) = self.source.heads().await.map_err(|err| read_status(&err))?;
+        let (range, gap) = (holdings.archive, holdings.gap());
         // `None` sorts below every number: a missing head, or an empty archive, holds nothing.
         let archive_tip = range.map(|(_, tip)| tip.number);
         let reach = match query.cap {
@@ -217,9 +223,14 @@ where
                 ),
             }));
         };
+        // A range stops below the gap: what is above it is read once the gap is filled.
+        let below_gap = gap
+            .filter(|(start, _)| from < *start)
+            .map_or(BlockNumber::MAX, |(start, _)| start.saturating_sub(1));
         let to = query
             .to
             .min(reach)
+            .min(below_gap)
             .min(from.saturating_add(MAX_FLIGHT_BLOCKS - 1));
         Ok(Query {
             from: Some(from),
@@ -254,9 +265,12 @@ async fn produce<U: UnsafeStore, A: ArchiveStore>(
     mut batches: Batches,
     _permit: OwnedSemaphorePermit,
 ) {
+    // A consumer that leaves ends it at once, even while a store call is being retried.
+    let left = batches.closed();
     let read = tokio::select! {
         biased;
         () = source.cancel.cancelled() => Err(Status::unavailable("the node is shutting down").into()),
+        () = left => Ok(()),
         read = read_range(&source, query, &mut batches) => read,
     };
     if let Err(err) = read {

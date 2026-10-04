@@ -79,6 +79,9 @@ pub struct StreamConfig {
     /// Whether receipts are fetched (the execution network is enabled): without it, blocks
     /// never get receipts. Told to consumers in `Heads`.
     pub receipts: bool,
+    /// Whether range sync is on: it fills the archive from its tip up, so heights missing
+    /// between the archive and the unsafe store are waited for, not refused.
+    pub sync: bool,
 }
 
 /// Why the server stopped.
@@ -135,6 +138,7 @@ where
             unsafe_store,
             archive,
             cancel: cancel.clone(),
+            fills_gaps: config.sync,
         };
         let live = Live::new();
         let follower = Follower {

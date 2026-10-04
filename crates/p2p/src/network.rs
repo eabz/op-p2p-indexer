@@ -137,21 +137,22 @@ fn swarm(
     Ok((swarm, topics))
 }
 
-/// Sends a `payload_by_number` answer.
+/// Sends a `payload_by_number` answer; returns whether it is on its way.
 fn answer(
     swarm: &mut Swarm<Behaviour>,
     channel: libp2p::request_response::ResponseChannel<Vec<u8>>,
     response: Vec<u8>,
-) {
+) -> bool {
     // The peer may have given up waiting; its request is then gone.
-    if swarm
+    let sent = swarm
         .behaviour_mut()
         .payloads
         .send_response(channel, response)
-        .is_err()
-    {
+        .is_ok();
+    if !sent {
         debug!("payload_by_number: the peer left before its answer");
     }
+    sent
 }
 
 impl Network {
@@ -244,7 +245,13 @@ impl Network {
                 },
                 event = swarm.select_next_some() => state.on_swarm_event(&mut swarm, event),
                 Some(ready) = state.server.next_answer() => match ready {
-                    Ok((channel, response)) => answer(&mut swarm, channel, response),
+                    Ok(ready) => {
+                        if answer(&mut swarm, ready.channel, ready.response)
+                            && let Some(permit) = ready.permit
+                        {
+                            state.server.writing(ready.request_id, permit);
+                        }
+                    }
                     Err(err) => warn!(%err, "payload_by_number task failed"),
                 },
                 Some(addr) = discovered_rx.recv() => state.dial(&mut swarm, addr),

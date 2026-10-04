@@ -571,8 +571,8 @@ pub trait ArchiveStore {
   they are verified blocks of the chain the archive holds, and the next load (or append)
   writes them again with the same values and then their headers; the shadowed copies go with
   compaction and blob GC. Until then reads by number stop at the tip; a read of bodies or
-  receipts by hash serves them (verified bytes); `number_of` gives a number above the tip,
-  which callers take as not archived yet; `set_receipts` can fill them; `pending_receipts`
+  receipts by hash serves them (verified bytes); `number_of` does not report them (it
+  answers only for a block whose header is held); `set_receipts` can fill them; `pending_receipts`
   lists those without receipts, which a read by number then does not find. A failed call is not retried by the importer: unregistered files it leaves are removed
   the next time the archive is opened. Nothing else may write meanwhile (ingestion is not safe with
   concurrent writes to a keyspace): the importer holds the archive's directory lock and
