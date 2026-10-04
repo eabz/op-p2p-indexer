@@ -138,8 +138,37 @@ local block archive (`ArchiveStore`, fjall) in its consensus encoding: the store
 serves peers from. The archive holds one contiguous range, so the import builds it upward
 from block 0 and the running indexer continues it at the tip once the two meet.
 
-- The archive gets a batch append (`ArchiveStore::append_batch`): one synced write for many
-  blocks. One synced write per block would take days for a hundred million blocks.
+- The archive gets a bulk append (`FjallArchive::bulk_append`), an importer-only path next
+  to the node's `append_batch`. Chunks are read and each block prepared
+  (`PreparedBlock::new`: header decoded, its keccak checked against the block's hash,
+  values snappy-compressed) on blocking threads, one chunk per core (4 to 32). Blocks are
+  collected into appends of about 1 GiB of RLP; one append is written while the next is
+  prepared. Each append writes the four keyspaces at once, straight into new table and blob
+  files (fjall's ingestion: no journal, no memtable), each synced, with `headers` registered
+  last; see `docs/storage.md` section 9. The format on disk is the one `append_batch`
+  writes, so an archive can be filled by either and continued by the node.
+- Measured on this machine (Apple M-series, 10 cores, internal SSD), with the user's sample
+  chunks repeated into a long valid chain (2026-10-04):
+
+  | | before (`append_batch`, 16 MiB) | after (bulk, 1 GiB) |
+  |---|---|---|
+  | legacy (2.2 KB/block) | 82,000 blocks/s, 187 MB/s RLP | 650,000 blocks/s, 1.5 GB/s RLP |
+  | post-Bedrock (71 KB/block) | 5,000 blocks/s, 365 MB/s RLP | 32,000 blocks/s, 2.35 GB/s RLP |
+  | bytes written / RLP | 0.68 (post), 1.11 (legacy) | 0.31 (post), 0.55 (legacy) |
+
+  Bytes written are what the files hold (about 1.0 to 1.07 of the final directory size):
+  values are written once and the number-keyed trees are moved, not rewritten, by
+  compaction; only `numbers` (hash to number, about 40 bytes a block) is merged. On a disk
+  that writes 325 MB/s the bulk path is then limited by the disk for post-Bedrock blocks
+  (about 1 GB/s of RLP), and by preparation on the cores for legacy ones.
+- Progress lines give `secs_left` from the bytes of the verified files still to read, not
+  from blocks, and `mb_per_sec` of RLP appended.
+- A crash or a kill leaves the archive holding a contiguous prefix: `load` resumes after its
+  last block, writing again the blocks of the unfinished append. A failed append is not
+  retried within the run (it can leave files only the next open removes): running `load`
+  again resumes. On a stop (Ctrl-C), no new chunk is read; the chunks being read are
+  appended, and `load` reports where it stopped. Checked by killing the
+  load at random points (`kill -9`) and reading every block back.
 - The archive's retention must be `all` on a node that serves history.
 - Serving itself (answering header, body and receipt requests, advertising the held range)
   and the syncing side (a node fetching a range from peers and verifying it) are `el` work:

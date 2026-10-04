@@ -5,7 +5,7 @@
 use alloy_primitives::{BlockHash, Bytes};
 use op_indexer_primitives::BlockRef;
 
-use super::{Failure, Tables, compress, decode_number, end_ref, record_usage};
+use super::{Failure, Tables, compress_values, decode_number, end_ref, extends, record_usage};
 use crate::{StorageError, Store, metrics};
 
 /// Most encoded bytes written in one batch by an append of many blocks (a single larger block
@@ -28,20 +28,7 @@ pub(in crate::archive_store) struct Entry {
 impl Entry {
     /// Checks that this block is the child of `parent`.
     fn extends(&self, parent: BlockRef) -> Result<(), StorageError> {
-        // The parent the block claims. Block 0 has none, so it never extends anything; its
-        // `got` is reported at number 0.
-        let number = self.block.number.checked_sub(1);
-        let got = BlockRef {
-            number: number.unwrap_or(0),
-            hash: self.parent_hash,
-        };
-        if number.is_none() || got != parent {
-            return Err(StorageError::NotContiguous {
-                expected: parent,
-                got,
-            });
-        }
-        Ok(())
+        extends(self.block, self.parent_hash, parent)
     }
 
     /// The size of the RLP this block adds to a batch.
@@ -137,15 +124,12 @@ fn append_chunk(tables: &Tables, chunk: &[Entry]) -> Result<(), Failure> {
     // Compressed before the lock is taken.
     let mut values = Vec::with_capacity(chunk.len());
     for block in chunk {
-        let number = block.block.number;
-        let receipts = block.receipts.as_deref();
-        values.push((
-            compress(&block.header, number)?,
-            compress(&block.body, number)?,
-            receipts
-                .map(|receipts| compress(receipts, number))
-                .transpose()?,
-        ));
+        values.push(compress_values(
+            block.block.number,
+            &block.header,
+            &block.body,
+            block.receipts.as_ref().map(|receipts| &receipts[..]),
+        )?);
     }
 
     let _writer = tables.lock();

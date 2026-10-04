@@ -569,6 +569,28 @@ pub trait ArchiveStore {
   thread; the space comes back
   when fjall's background compaction runs.
 - The held range comes from the first and last keys of `headers`, never from a count.
+- **Bulk path, importer only** (`FjallArchive::bulk_append(Vec<PreparedBlock>)`). Blocks are
+  prepared off the writer (`PreparedBlock::new`: the header decoded for its number and
+  parent, its keccak checked against the block's hash, the three values compressed as
+  `append_batch` compresses them, into the buffers the ingestion takes, so the writer copies
+  nothing). Under the writer lock the list is checked to extend the
+  tip block by block (the same parent and number rule as `append_batch`; held leading
+  blocks are not skipped: the importer starts after the tip). Each keyspace then gets one
+  fjall ingestion, on its own thread: entries in ascending key order (`numbers` sorted by
+  hash) written straight into new table and blob files, without journal or memtable.
+  `bodies`, `receipts` and `numbers` are finished first; `headers` is written alongside and
+  finished only once they all are. Finishing an ingestion syncs its files and then registers
+  them in the keyspace's version atomically, so when the call returns the blocks are durable.
+  A crash before `headers` is finished leaves the held range as it was. The other
+  keyspaces may then hold blocks of the unfinished list above the tip: reads by number stop
+  at the tip, but a read of bodies or receipts by hash, `number_of` and `set_receipts` find
+  them, and `trim` / `truncate_above` (which walk `headers`) do not remove them. They are
+  verified blocks of the chain the archive holds, and the next load writes them again with
+  the same values and then their headers; the shadowed copies go with compaction and blob
+  GC. A failed call is not retried by the importer: unregistered files it leaves are removed
+  the next time the archive is opened. Nothing else may write meanwhile (ingestion is not safe with
+  concurrent writes to a keyspace): the importer holds the archive's directory lock and
+  the call holds the writer lock. Same keyspaces, same values: no format or schema change.
 - `set_receipts` counts the stored body's transactions over its RLP, without decoding them,
   so it also works for a body holding a transaction the typed decoder refuses.
 - Writers are serialized (a fjall batch has no conflict detection, so two appends must not

@@ -5,10 +5,13 @@
 //! threads. An ingestion is registered atomically, and durably, by its `finish`: its tables and
 //! blob files are synced before the keyspace's version that lists them is. `headers` is
 //! finished last, after the other three, and its last key is the archive's tip, so a crash
-//! leaves the archive holding a contiguous prefix; the other keyspaces may then hold the
-//! blocks of the unfinished list above the tip, which nothing reads (every read goes through
-//! a header or ends at one) and which the next load of the same blocks writes again with the
-//! same values.
+//! leaves the archive holding a contiguous prefix.
+//!
+//! The other keyspaces may then hold blocks of the unfinished list above the tip. Reads by
+//! number stop at the tip, but a read of bodies or receipts by hash, `number_of` and
+//! `set_receipts` find them; `trim` and `truncate_above` walk `headers` and do not remove
+//! them. They are verified blocks of the chain the archive holds, and the next load writes
+//! them again, with the same values, and then the header.
 //!
 //! Does not check what a block contains: `PreparedBlock::new` checks the header's hash, the
 //! writer checks the chain.
@@ -17,22 +20,23 @@ use std::panic::resume_unwind;
 use std::sync::mpsc;
 use std::thread;
 
-use alloy_primitives::{BlockHash, Bytes};
+use alloy_primitives::BlockHash;
 use fjall::{Keyspace, UserKey, UserValue};
 use op_indexer_primitives::BlockRef;
 
-use super::{Failure, Tables, compress, end_ref, record_usage};
+use super::{Failure, Tables, compress_values, end_ref, extends, record_usage};
 use crate::{StorageError, Store, metrics};
 
 /// A block ready for [`FjallArchive::bulk_append`](crate::archive_store::FjallArchive::bulk_append):
-/// its header's hash checked, its number and parent read, its values compressed.
-#[derive(Debug, Clone)]
+/// its header's hash checked, its number and parent read, its values compressed into the
+/// buffers the ingestion takes, so the writer copies nothing.
+#[derive(Debug)]
 pub(in crate::archive_store) struct Prepared {
-    pub(in crate::archive_store) block: BlockRef,
-    pub(in crate::archive_store) parent_hash: BlockHash,
-    header: Bytes,
-    body: Bytes,
-    receipts: Option<Bytes>,
+    block: BlockRef,
+    parent_hash: BlockHash,
+    header: UserValue,
+    body: UserValue,
+    receipts: Option<UserValue>,
 }
 
 impl Prepared {
@@ -44,22 +48,14 @@ impl Prepared {
         body: &[u8],
         receipts: Option<&[u8]>,
     ) -> Result<Self, StorageError> {
-        let number = block.number;
+        let (header, body, receipts) = compress_values(block.number, header, body, receipts)?;
         Ok(Self {
             block,
             parent_hash,
-            header: compress(header, number)?.into(),
-            body: compress(body, number)?.into(),
-            receipts: receipts
-                .map(|receipts| compress(receipts, number).map(Bytes::from))
-                .transpose()?,
+            header: UserValue::from(&header[..]),
+            body: UserValue::from(&body[..]),
+            receipts: receipts.map(|receipts| UserValue::from(&receipts[..])),
         })
-    }
-
-    /// The bytes this block adds to the archive's keyspaces, before their overhead.
-    pub(in crate::archive_store) fn stored_len(&self) -> usize {
-        let receipts = self.receipts.as_ref().map_or(0, |receipts| receipts.len());
-        self.header.len() + self.body.len() + receipts
     }
 }
 
@@ -76,58 +72,53 @@ pub(in crate::archive_store) fn bulk_append(
         return Ok(());
     }
     let _writer = tables.lock();
+    // An empty archive takes any first block.
     let mut parent = end_ref(tables.headers.last_key_value())?;
     for block in blocks {
-        // An empty archive takes any first block.
-        if let Some(expected) = parent {
-            let number = block.block.number.checked_sub(1);
-            let got = BlockRef {
-                number: number.unwrap_or(0),
-                hash: block.parent_hash,
-            };
-            if number.is_none() || got != expected {
-                return Err(StorageError::NotContiguous { expected, got }.into());
-            }
+        if let Some(parent) = parent {
+            extends(block.block, block.parent_hash, parent)?;
         }
         parent = Some(block.block);
     }
 
-    // Hash order for `numbers`. Hashes are distinct (keccak), but a duplicate must not reach
-    // the ingestion, which requires strictly ascending keys.
-    let mut numbers: Vec<([u8; 32], [u8; 8])> = blocks
-        .iter()
-        .map(|block| (block.block.hash.0, block.block.number.to_be_bytes()))
-        .collect();
-    numbers.sort_unstable();
-    numbers.dedup_by_key(|(hash, _)| *hash);
-
-    let by_number = |value: fn(&Prepared) -> Option<&[u8]>| {
-        blocks
-            .iter()
-            .filter_map(move |block| Some((block.block.number.to_be_bytes(), value(block)?)))
+    let by_number = |value: fn(&Prepared) -> Option<&UserValue>| -> Entries<'_> {
+        Box::new(blocks.iter().filter_map(move |block| {
+            let key = UserKey::from(block.block.number.to_be_bytes());
+            Some((key, value(block)?.clone()))
+        }))
     };
-    // `headers` is written alongside the others but registered only once they are: it waits
-    // for word that they all were, and is dropped unregistered otherwise.
-    let (others_done, all_done) = mpsc::sync_channel::<()>(1);
+    // `headers` is written alongside the others but finished only on word that they all
+    // were (fjall's ingestion cannot move between threads, so it waits where it is); without
+    // that word it is dropped unregistered.
+    let (others_done, go) = mpsc::sync_channel::<()>(1);
     thread::scope(|scope| {
         let headers = scope.spawn(move || {
             let mut ingestion = tables.headers.start_ingestion()?;
             for (key, value) in by_number(|block| Some(&block.header)) {
                 ingestion.write(key, value)?;
             }
-            if all_done.recv().is_ok() {
+            if go.recv().is_ok() {
                 ingestion.finish()?;
             }
             Ok::<_, Failure>(())
         });
         let others = [
             scope.spawn(|| ingest(&tables.bodies, by_number(|block| Some(&block.body)))),
+            scope.spawn(|| ingest(&tables.receipts, by_number(|block| block.receipts.as_ref()))),
             scope.spawn(|| {
-                let receipts =
-                    by_number(|block| block.receipts.as_ref().map(|receipts| &receipts[..]));
-                ingest(&tables.receipts, receipts)
+                // Hash order. Hashes are distinct (keccak), but a duplicate must not reach the
+                // ingestion, which requires strictly ascending keys.
+                let mut numbers: Vec<([u8; 32], [u8; 8])> = blocks
+                    .iter()
+                    .map(|block| (block.block.hash.0, block.block.number.to_be_bytes()))
+                    .collect();
+                numbers.sort_unstable();
+                numbers.dedup_by_key(|(hash, _)| *hash);
+                let entries = numbers
+                    .into_iter()
+                    .map(|(hash, number)| (UserKey::from(hash), UserValue::from(number)));
+                ingest(&tables.numbers, Box::new(entries))
             }),
-            scope.spawn(|| ingest(&tables.numbers, numbers.iter().copied())),
         ];
         let mut result = Ok(());
         for ingestion in others {
@@ -137,7 +128,7 @@ pub(in crate::archive_store) fn bulk_append(
             result = result.and(joined);
         }
         if result.is_ok() {
-            // The headers thread is waiting for it: the send cannot fail.
+            // Fails only if the headers thread already failed, which its result reports.
             let _sent = others_done.send(());
         }
         drop(others_done);
@@ -150,11 +141,11 @@ pub(in crate::archive_store) fn bulk_append(
     Ok(())
 }
 
-/// Writes `entries`, in ascending key order, into `keyspace` in one ingestion.
-fn ingest<K: Into<UserKey>, V: Into<UserValue>>(
-    keyspace: &Keyspace,
-    entries: impl Iterator<Item = (K, V)>,
-) -> Result<(), Failure> {
+/// Keys and values for one ingestion, in ascending key order.
+type Entries<'a> = Box<dyn Iterator<Item = (UserKey, UserValue)> + Send + 'a>;
+
+/// Writes `entries` into `keyspace` in one ingestion and registers it.
+fn ingest(keyspace: &Keyspace, entries: Entries<'_>) -> Result<(), Failure> {
     let mut ingestion = keyspace.start_ingestion()?;
     for (key, value) in entries {
         ingestion.write(key, value)?;

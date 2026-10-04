@@ -115,8 +115,9 @@ impl FjallArchive {
     /// new table and blob files, all keyspaces at once, without the journal. Several times
     /// faster than [`ArchiveStore::append_batch`] for long lists, and as durable when it
     /// returns; each call writes new files, so it is for lists of hundreds of megabytes, not
-    /// a few blocks. A crash during a call leaves the archive as it was before it (see
-    /// `tables::bulk`).
+    /// a few blocks. A crash during a call leaves the held range as it was (see
+    /// `tables::bulk`). Not retried by its caller: a failed call can leave unregistered files,
+    /// which the next open of the archive removes.
     ///
     /// `blocks` must be consecutive, oldest first, and extend the archive's last block (or
     /// the archive is empty). No other write may run at the same time; the writer lock
@@ -127,7 +128,7 @@ impl FjallArchive {
     /// Returns [`StorageError::NotContiguous`] if `blocks` do not extend the archive, and
     /// [`StorageError::Fjall`] if writing fails.
     pub async fn bulk_append(&self, blocks: Vec<PreparedBlock>) -> Result<(), StorageError> {
-        self.blocking(Operation::AppendBatch, "bulk_append", move |tables| {
+        self.blocking(Operation::BulkAppend, "bulk_append", move |tables| {
             let blocks: Vec<Prepared> = blocks.into_iter().map(|block| block.0).collect();
             tables::bulk_append(tables, &blocks)
         })
@@ -136,9 +137,8 @@ impl FjallArchive {
 }
 
 /// A block checked and compressed for [`FjallArchive::bulk_append`], off the writer: its
-/// header hashes to its hash, and its number and parent are read from it. Cheap to clone: the
-/// compressed values are shared.
-#[derive(Debug, Clone)]
+/// header hashes to its hash, and its number and parent are read from it.
+#[derive(Debug)]
 pub struct PreparedBlock(Prepared);
 
 impl PreparedBlock {
@@ -163,18 +163,6 @@ impl PreparedBlock {
             block.receipts.as_ref().map(|receipts| &receipts[..]),
         )?;
         Ok(Self(prepared))
-    }
-
-    /// The block's number.
-    #[must_use]
-    pub const fn number(&self) -> BlockNumber {
-        self.0.block.number
-    }
-
-    /// The compressed bytes the block adds to the archive.
-    #[must_use]
-    pub fn stored_len(&self) -> usize {
-        self.0.stored_len()
     }
 }
 

@@ -2,7 +2,7 @@
 //! only when asked, writes it to ClickHouse too.
 //!
 //! ```text
-//! <state>/verified/<chunk>.blk ─▶ the verified bytes ─▶ ArchiveStore::append_batch (fjall)
+//! <state>/verified/<chunk>.blk ─▶ the verified bytes ─▶ FjallArchive::bulk_append (fjall)
 //!            with --clickhouse-url ─▶ typed blocks ─▶ CommittedStore::insert (ClickHouse)
 //!                                 ─▶ <state>/loaded/<chunk>.clickhouse
 //! ```
@@ -17,10 +17,11 @@
 //! range or chain is refused. ClickHouse has no such range to ask, so it keeps one marker per
 //! chunk, written once it holds the chunk; it can be loaded on a later run.
 //!
-//! The archive is written by one writer, in block order. Chunks are read and decompressed
-//! ahead of it on blocking threads, and consecutive chunks go into one append until it is
-//! large enough: a commit is a synced write, and one per small chunk would be most of the
-//! time.
+//! The archive is written in block order by bulk appends (`FjallArchive::bulk_append`):
+//! chunks are read, decompressed and their blocks prepared (hash checked, values compressed)
+//! on blocking threads, one chunk per core, and collected into appends of about a gigabyte,
+//! one written while the next is prepared. Each append writes new files and syncs them, so a
+//! stop or a crash leaves the archive holding a contiguous prefix of the range.
 //!
 //! `load` succeeds only if it reaches the end of the range: stopping on a signal is reported
 //! as a failure that says what to run next. Both writes are idempotent, so repeating a chunk
@@ -182,7 +183,8 @@ pub(crate) async fn run(
 ///
 /// Chunks are read and prepared for the archive ([`PreparedBlock`]) on blocking threads, one
 /// per core, and collected into bulk appends of about [`APPEND_BYTES`]; one append is written
-/// while the next is collected.
+/// while the next is collected. A failed append is not retried: it can leave files the next
+/// open of the archive removes, and running `load` again resumes after the archive's tip.
 async fn fill_archive(
     archive: &FjallArchive,
     held_to: Option<u64>,
@@ -195,7 +197,8 @@ async fn fill_archive(
     // Chunks that end at or below the archive's last block are held whole. Of one that
     // straddles it, only the blocks above are taken.
     let to_load: Vec<Chunk> = plan.chunks().skip_while(|chunk| chunk.to <= next).collect();
-    let file_bytes = files_size(state, &to_load).await?;
+    let sizes = file_sizes(state, &to_load).await?;
+    let file_bytes = sizes.iter().sum();
     info!(
         archive_holds_to = held_to,
         first = plan.first,
@@ -208,132 +211,129 @@ async fn fill_archive(
     let read_ahead = std::thread::available_parallelism()
         .map_or(READ_AHEAD.0, std::num::NonZero::get)
         .clamp(READ_AHEAD.0, READ_AHEAD.1);
-    let mut chunks = to_load.into_iter();
-    let mut reads: VecDeque<JoinHandle<eyre::Result<Prepared>>> = VecDeque::new();
-    let mut pending = Prepared::default();
+    let mut chunks = to_load.into_iter().zip(sizes);
+    let mut reads: VecDeque<JoinHandle<eyre::Result<Collected>>> = VecDeque::new();
+    let mut pending = Collected::default();
     // The bulk append being written, with what it holds.
-    let mut writing: Option<(JoinHandle<eyre::Result<Option<()>>>, Written)> = None;
-    let mut appended_to = next;
+    let mut writing: Option<(JoinHandle<Result<(), StorageError>>, Amount)> = None;
     let mut stopped = false;
     loop {
-        while reads.len() < read_ahead
-            && let Some(chunk) = chunks.next()
+        // Once stopped, nothing more is read; what is being read is still appended.
+        stopped = stopped || cancel.is_cancelled();
+        while !stopped
+            && reads.len() < read_ahead
+            && let Some((chunk, file_bytes)) = chunks.next()
         {
             let path = state.verified_path(chunk);
-            reads.push_back(spawn_blocking(move || prepare(&path, chunk, next)));
+            reads.push_back(spawn_blocking(move || {
+                prepare(&path, chunk, next, file_bytes)
+            }));
         }
         if let Some(read) = reads.pop_front() {
             pending.extend(read.await.wrap_err("reading a chunk panicked")??);
         }
-        // Everything read is appended before stopping, so no read is wasted.
-        stopped = stopped || cancel.is_cancelled();
-        if pending.rlp_bytes < APPEND_BYTES && !reads.is_empty() && !stopped {
+        if pending.amount.rlp_bytes < APPEND_BYTES as u64 && !reads.is_empty() {
             continue;
         }
         // The previous append must be in before the next is written: each extends the last.
         if let Some((write, written)) = writing.take() {
-            if write
+            write
                 .await
-                .wrap_err("an archive append panicked")??
-                .is_none()
-            {
-                return Ok(Some(appended_to));
-            }
-            appended_to = progress.appended(&written, appended_to);
+                .wrap_err("an archive append panicked")?
+                .wrap_err("archive bulk_append")?;
+            progress.appended(written);
         }
         if !pending.blocks.is_empty() {
-            let Prepared {
-                blocks,
-                rlp_bytes,
-                file_bytes,
-            } = std::mem::take(&mut pending);
-            let written = Written {
-                blocks: u64::try_from(blocks.len()).unwrap_or(u64::MAX),
-                rlp_bytes: u64::try_from(rlp_bytes).unwrap_or(u64::MAX),
-                file_bytes,
-            };
-            let (archive, cancel) = (archive.clone(), cancel.clone());
-            let write = tokio::spawn(async move {
-                // The clone is of reference-counted buffers; the bytes are not copied.
-                retry(&cancel, Store::Archive, "archive bulk_append", || {
-                    archive.bulk_append(blocks.clone())
-                })
-                .await
-            });
-            writing = Some((write, written));
+            let Collected { blocks, amount } = std::mem::take(&mut pending);
+            let archive = archive.clone();
+            let write = tokio::spawn(async move { archive.bulk_append(blocks).await });
+            writing = Some((write, amount));
         }
         // With nothing more to collect, the next turn waits for the last append.
-        if (stopped || reads.is_empty()) && writing.is_none() {
+        if reads.is_empty() && writing.is_none() {
             break;
         }
     }
     let range = archive.range().await;
     let range = range.wrap_err("failed to read the block archive")?;
     progress.summary(range.map(|(first, last)| (first.number, last.number)));
-    Ok(stopped
-        .then_some(appended_to)
-        .filter(|next| *next <= plan.last))
+    let appended_to = next.saturating_add(progress.done.blocks);
+    Ok((appended_to <= plan.last).then_some(appended_to))
 }
 
-/// Blocks prepared for the archive, with what they amount to.
-#[derive(Default)]
-struct Prepared {
-    blocks: Vec<PreparedBlock>,
-    /// Bytes of their encodings (RLP), as verified.
-    rlp_bytes: usize,
+/// How much was read or appended.
+#[derive(Debug, Default, Clone, Copy)]
+struct Amount {
+    blocks: u64,
+    /// Bytes of the blocks' encodings (RLP), as verified.
+    rlp_bytes: u64,
     /// Bytes of the verified chunk files they were read from.
     file_bytes: u64,
 }
 
-/// What a bulk append holds, for the progress lines.
-struct Written {
-    blocks: u64,
-    rlp_bytes: u64,
-    file_bytes: u64,
-}
-
-impl Prepared {
-    fn extend(&mut self, other: Self) {
-        self.blocks.extend(other.blocks);
+impl Amount {
+    fn add(&mut self, other: Self) {
+        self.blocks = self.blocks.saturating_add(other.blocks);
         self.rlp_bytes = self.rlp_bytes.saturating_add(other.rlp_bytes);
         self.file_bytes = self.file_bytes.saturating_add(other.file_bytes);
     }
 }
 
-/// Reads the verified chunk at `path` and prepares its blocks from `next` on for the archive.
-/// Blocking: decompression, a hash and compression per block.
-fn prepare(path: &Path, chunk: Chunk, next: u64) -> eyre::Result<Prepared> {
-    let held =
-        usize::try_from(next.saturating_sub(chunk.from)).wrap_err("a chunk has too many blocks")?;
-    let file_bytes = std::fs::metadata(path)
-        .wrap_err_with(|| format!("failed to read verified chunk {}", path.display()))?
-        .len();
-    let mut prepared = Prepared {
-        file_bytes,
-        ..Prepared::default()
-    };
-    for block in read(path, chunk)?.into_iter().skip(held) {
-        prepared.rlp_bytes = prepared.rlp_bytes.saturating_add(size(&block.encoded));
-        let block = PreparedBlock::new(&block.encoded)
-            .wrap_err_with(|| format!("{} does not hold archivable blocks", path.display()))?;
-        prepared.blocks.push(block);
-    }
-    Ok(prepared)
+/// Blocks prepared for the archive and not appended yet.
+#[derive(Default)]
+struct Collected {
+    blocks: Vec<PreparedBlock>,
+    amount: Amount,
 }
 
-/// Bytes of the verified files of `chunks`, which progress is measured in.
-async fn files_size(state: &State, chunks: &[Chunk]) -> eyre::Result<u64> {
+impl Collected {
+    fn extend(&mut self, other: Self) {
+        self.blocks.extend(other.blocks);
+        self.amount.add(other.amount);
+    }
+}
+
+/// Reads the verified chunk at `path`, `file_bytes` long, and prepares its blocks from
+/// `next` on for the archive. Blocking: decompression, a hash and compression per block.
+fn prepare(path: &Path, chunk: Chunk, next: u64, file_bytes: u64) -> eyre::Result<Collected> {
+    let held =
+        usize::try_from(next.saturating_sub(chunk.from)).wrap_err("a chunk has too many blocks")?;
+    let mut collected = Collected {
+        amount: Amount {
+            file_bytes,
+            ..Amount::default()
+        },
+        ..Collected::default()
+    };
+    for block in read(path, chunk)?.into_iter().skip(held) {
+        let rlp_bytes = u64::try_from(size(&block.encoded)).unwrap_or(u64::MAX);
+        collected.amount.add(Amount {
+            blocks: 1,
+            rlp_bytes,
+            file_bytes: 0,
+        });
+        let block = PreparedBlock::new(&block.encoded)
+            .wrap_err_with(|| format!("{} does not hold archivable blocks", path.display()))?;
+        collected.blocks.push(block);
+    }
+    Ok(collected)
+}
+
+/// Bytes of the verified file of each of `chunks`, which progress is measured in.
+async fn file_sizes(state: &State, chunks: &[Chunk]) -> eyre::Result<Vec<u64>> {
     let paths: Vec<PathBuf> = chunks
         .iter()
         .map(|chunk| state.verified_path(*chunk))
         .collect();
     spawn_blocking(move || {
-        paths.iter().try_fold(0_u64, |total, path| {
-            let len = std::fs::metadata(path)
-                .wrap_err_with(|| format!("failed to read verified chunk {}", path.display()))?
-                .len();
-            Ok(total.saturating_add(len))
-        })
+        paths
+            .iter()
+            .map(|path| {
+                Ok(std::fs::metadata(path)
+                    .wrap_err_with(|| format!("failed to read verified chunk {}", path.display()))?
+                    .len())
+            })
+            .collect()
     })
     .await
     .wrap_err("measuring the chunks panicked")?
@@ -535,71 +535,62 @@ struct Progress {
     logged: Instant,
     rate: Rate,
     /// Blocks this run has to append.
-    total: u64,
+    total_blocks: u64,
     /// Bytes of the verified files this run reads.
     total_file_bytes: u64,
-    blocks: u64,
-    rlp_bytes: u64,
-    file_bytes: u64,
+    /// What is in the archive.
+    done: Amount,
 }
 
 impl Progress {
-    fn new(total: u64, total_file_bytes: u64) -> Self {
+    fn new(total_blocks: u64, total_file_bytes: u64) -> Self {
         let now = Instant::now();
         Self {
             started: now,
             logged: now,
             rate: Rate::new(),
-            total,
+            total_blocks,
             total_file_bytes,
-            blocks: 0,
-            rlp_bytes: 0,
-            file_bytes: 0,
+            done: Amount::default(),
         }
     }
 
-    /// Records an append of `appended`, the blocks from `from` on, logs a progress line when
-    /// one is due, and returns the block after the archive's new last block.
-    fn appended(&mut self, appended: &Written, from: u64) -> u64 {
-        self.blocks = self.blocks.saturating_add(appended.blocks);
-        self.rlp_bytes = self.rlp_bytes.saturating_add(appended.rlp_bytes);
-        self.file_bytes = self.file_bytes.saturating_add(appended.file_bytes);
-        let next = from.saturating_add(appended.blocks);
+    /// Records an append, and logs a progress line when one is due.
+    fn appended(&mut self, appended: Amount) {
+        self.done.add(appended);
         if self.logged.elapsed() < progress::INTERVAL {
-            return next;
+            return;
         }
         self.logged = Instant::now();
-        let file_bytes_per_sec = self.rate.per_sec(self.file_bytes);
+        let file_bytes_per_sec = self.rate.per_sec(self.done.file_bytes);
         let secs = self.started.elapsed().as_secs().max(1);
         info!(
-            blocks = self.blocks,
-            of = self.total,
-            archive_tip = next.saturating_sub(1),
-            blocks_per_sec = self.blocks / secs,
-            mb_per_sec = self.rlp_bytes / secs / 1_000_000,
+            blocks = self.done.blocks,
+            of = self.total_blocks,
+            blocks_per_sec = self.done.blocks / secs,
+            mb_per_sec = self.done.rlp_bytes / secs / 1_000_000,
             secs_left = self
                 .total_file_bytes
-                .saturating_sub(self.file_bytes)
+                .saturating_sub(self.done.file_bytes)
                 .checked_div(file_bytes_per_sec),
-            bytes = self.rlp_bytes,
+            bytes = self.done.rlp_bytes,
             "loading"
         );
-        next
     }
 
     fn summary(&self, archive: Option<(u64, u64)>) {
         let secs = self.started.elapsed().as_secs().max(1);
         info!(
-            blocks = self.blocks,
-            of = self.total,
-            bytes = self.rlp_bytes,
-            blocks_per_sec = self.blocks / secs,
-            mb_per_sec = self.rlp_bytes / secs / 1_000_000,
+            blocks = self.done.blocks,
+            of = self.total_blocks,
+            bytes = self.done.rlp_bytes,
+            blocks_per_sec = self.done.blocks / secs,
+            mb_per_sec = self.done.rlp_bytes / secs / 1_000_000,
             secs,
             archive_first = archive.map(|(first, _)| first),
             archive_last = archive.map(|(_, last)| last),
             "{}",
-            if self.blocks == self.total {
+            if self.done.blocks == self.total_blocks {
                 "load finished: the range is in the block archive"
             } else {
                 "load stopped before the end of the range"

@@ -514,6 +514,43 @@ fn decode_number(bytes: &[u8]) -> Result<BlockNumber, StorageError> {
         })
 }
 
+/// Checks that `block`, whose header names `parent_hash`, is the child of `parent`.
+fn extends(block: BlockRef, parent_hash: BlockHash, parent: BlockRef) -> Result<(), StorageError> {
+    // The parent the block claims. Block 0 has none, so it never extends anything; its `got`
+    // is reported at number 0.
+    let number = block.number.checked_sub(1);
+    let got = BlockRef {
+        number: number.unwrap_or(0),
+        hash: parent_hash,
+    };
+    if number.is_none() || got != parent {
+        return Err(StorageError::NotContiguous {
+            expected: parent,
+            got,
+        });
+    }
+    Ok(())
+}
+
+/// A block's header, body and receipts as stored: compressed.
+type Compressed = (Vec<u8>, Vec<u8>, Option<Vec<u8>>);
+
+/// The stored values of block `number`: its header, body and receipts (RLP), compressed.
+fn compress_values(
+    number: BlockNumber,
+    header: &[u8],
+    body: &[u8],
+    receipts: Option<&[u8]>,
+) -> Result<Compressed, StorageError> {
+    Ok((
+        compress(header, number)?,
+        compress(body, number)?,
+        receipts
+            .map(|receipts| compress(receipts, number))
+            .transpose()?,
+    ))
+}
+
 fn compress(rlp: &[u8], number: BlockNumber) -> Result<Vec<u8>, StorageError> {
     snap::raw::Encoder::new()
         .compress_vec(rlp)

@@ -58,6 +58,8 @@ pub(crate) enum Operation {
     Insert,
     /// [`ArchiveStore::append_batch`](crate::ArchiveStore::append_batch).
     AppendBatch,
+    /// [`FjallArchive::bulk_append`](crate::archive_store::FjallArchive::bulk_append).
+    BulkAppend,
     /// [`ArchiveStore::number_of`](crate::ArchiveStore::number_of).
     NumberOf,
     /// [`ArchiveStore::range`](crate::ArchiveStore::range).
@@ -107,6 +109,7 @@ impl Operation {
             Self::Insert => "insert",
             Self::Read => "read",
             Self::AppendBatch => "append_batch",
+            Self::BulkAppend => "bulk_append",
             Self::NumberOf => "number_of",
             Self::Range => "range",
             Self::TruncateAbove => "truncate_above",
