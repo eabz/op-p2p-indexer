@@ -7,8 +7,8 @@ behind [l1.md](l1.md), which stays the spec. The probes are not in the repositor
 
 **Short answer.** It works. A light client built from published crates verifies a new L1 head
 every slot and a new finalized L1 block every epoch, from a cold start in under 20 seconds,
-and kept doing so for 30 minutes. From a hash it vouched for, L1 execution peers served the
-headers, body and receipts that hold the user's dispute game, and the game decoded to the same
+and kept doing so for 32 minutes. From a hash it vouched for, L1 execution peers served the
+headers, body and receipts that hold a known dispute game, and the game decoded to the same
 L2 block and output root the importer had read through HyperSync. Two limits: L1 execution
 peers almost never have a free slot for a node that only dials out (one session per 4.5 to
 15.5 minutes, both times Geth), and only recent Lighthouse versions serve light-client data.
@@ -30,15 +30,14 @@ Runs, all times UTC:
 | L1-1 | 06:12 | 4 min | L1 execution: handshakes, peer supply |
 | L1-2 | 06:16 | 9 min | Same, 210 peers dialed once each |
 | L1-3 | 06:26 | 19 min | Redial every 150 s, a real head in our status; samples tip to 30 days |
-| L1-4 | 06:45 | 7 min | Walk down from a light-client-verified hash; find the user's game |
+| L1-4 | 06:45 | 7 min | Walk down from a light-client-verified hash; find a known game |
 | B-1, B-2 | 06:28, 06:32 | 4 and 5 min | Beacon peers: records, clients, protocols they list (identify) |
 | LC-1, LC-2 | 06:40, 06:44 | 2.5 min and 42 s | Light-client requests and full verification against peers |
 | Crate-1 | 07:09 | 2.5 min | First `TrustedL1Block`s from crate code |
 | Crate-2 | 07:38 | 32 min | The crate following the chain (after the network half's fixes) |
 | Crate-3 | 08:18 | 3.5 min | The crate after `/simplify` |
 
-Worker 1 also ran the crate's network half live (7 minutes and 200 s); its numbers are in
-[l1.md](l1.md) §7.
+Two further runs of the crate's network half (7 minutes and 200 s) are in [l1.md](l1.md) §7.
 
 Trusted values, and where each came from:
 
@@ -154,7 +153,7 @@ decompression; `BLST_SUCCESS` on 8 of 8 updates.
 ### What peers do with a light client
 
 - **They drop it fast.** In the first crate runs every Lighthouse peer closed a new
-  connection 0.2 to 1 s after it opened. Two causes, found by Worker 1 from trace logs:
+  connection 0.2 to 1 s after it opened. Two causes, found from trace logs:
   - our `MetaData` v3 answer said custody group count 0; Lighthouse closed 0.2 s after it.
     With 4 (`CUSTODY_REQUIREMENT`, the Fulu minimum) that stopped;
   - full nodes prune a peer without subnets at their next heartbeat: `Goodbye` with reason

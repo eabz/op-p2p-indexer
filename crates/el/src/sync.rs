@@ -39,17 +39,17 @@ mod headers;
 mod schedule;
 mod segment;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
 use alloy_primitives::{B256, BlockNumber};
 use op_indexer_primitives::{BlockRef, EncodedBlock, SyncRange};
 use reth_network_peers::PeerId;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinError, JoinSet};
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, warn};
 
 use self::headers::HEADERS_PER_REQUEST;
 use self::schedule::Schedule;
@@ -69,6 +69,10 @@ const MAX_SEGMENTS_AHEAD: usize = 8;
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 /// How often it is said that no connected peer serves the blocks needed.
 const STARVED_INTERVAL: Duration = Duration::from_mins(1);
+/// Peers that must say they do not hold the anchor before it is given up, and then only once
+/// every peer that says it holds the anchor's height has: a block no peer serves (one a reorg
+/// left behind, mostly) would otherwise keep the round open for ever.
+const ANCHOR_REFUSALS: usize = 3;
 
 /// What a range sync fetches, known once its anchor is.
 #[derive(Debug)]
@@ -78,6 +82,26 @@ pub struct SyncPlan {
     /// Blocks whose hash an earlier run verified from the same anchor; empty for a new sync.
     /// Fetching resumes from them without walking the chain again.
     pub checkpoints: Vec<BlockRef>,
+    /// The block the range must extend: the parent the first block has to name. `None` when
+    /// the range starts the chain (an empty archive takes any first block).
+    pub extends: Option<BlockRef>,
+    /// Told how the round ended, once it has; dropped unanswered if the node stops first.
+    pub ended: oneshot::Sender<RoundEnd>,
+}
+
+/// How a round of the range sync ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoundEnd {
+    /// Every block up to the anchor was handed on.
+    Complete,
+    /// At least three peers, and every peer that says it holds the anchor's height, said
+    /// they do not hold the anchor and none served it: the round was given up, with nothing
+    /// handed on (no block is verified before the anchor is).
+    AnchorUnavailable,
+    /// The chain down from the anchor does not reach [`SyncPlan::extends`]: the anchor is not
+    /// a descendant of the block the range must extend. Given up before anything was handed
+    /// on.
+    NotLinked,
 }
 
 /// A range sync to run: where its plan comes from and where its output goes.
@@ -123,7 +147,8 @@ pub(crate) async fn run(
             plan = plans.recv() => plan,
         };
         // No more plans: nothing left to sync.
-        let Some(plan) = plan else { break };
+        let Some(mut plan) = plan else { break };
+        let ended = std::mem::replace(&mut plan.ended, oneshot::channel().0);
         let syncer = Syncer::new(
             canyon_time,
             peers.clone(),
@@ -131,9 +156,11 @@ pub(crate) async fn run(
             blocks.clone(),
             verified.clone(),
         );
-        if !syncer.run(&cancel).await? {
+        let Some(end) = syncer.run(&cancel).await? else {
             break;
-        }
+        };
+        // The planner may have stopped waiting: nothing to tell.
+        let _told = ended.send(end);
     }
     cancel.cancelled().await;
     Ok(())
@@ -170,6 +197,15 @@ struct Syncer {
     jobs: JoinSet<Done>,
     /// When it was last said that no peer serves what is needed.
     starved_warned: Option<Instant>,
+    /// Whether a page of headers from the anchor down has verified: some peer serves it.
+    anchor_served: bool,
+    /// Peers that said they do not hold the anchor, while none has served it.
+    anchor_refused: HashSet<PeerId>,
+    /// The block the first block must name as parent; `None` for any.
+    extends: Option<BlockRef>,
+    /// How the round ends before it is complete, once that is known: the chain down from the
+    /// anchor turned out not to reach `extends`.
+    given_up: Option<RoundEnd>,
 }
 
 /// Consecutive blocks ending at a checkpoint.
@@ -196,8 +232,9 @@ struct Done {
 
 #[derive(Debug)]
 enum JobResult {
-    /// A page of the walk from this block, with the checkpoints it verified.
-    Walk(BlockRef, Result<Vec<BlockRef>, Failure>),
+    /// A page of the walk from this block, with the checkpoints it verified and, once it
+    /// reaches the first block, that block's parent.
+    Walk(BlockRef, Result<(Vec<BlockRef>, Option<BlockRef>), Failure>),
     Segment(Segment, Result<Vec<EncodedBlock>, Failure>),
 }
 
@@ -270,6 +307,8 @@ impl Syncer {
                 anchor,
             },
             checkpoints,
+            extends,
+            ended: _,
         } = plan;
         let mut checkpoints: BTreeMap<BlockNumber, B256> = checkpoints
             .into_iter()
@@ -295,21 +334,28 @@ impl Syncer {
             outstanding: 0,
             jobs: JoinSet::new(),
             starved_warned: None,
+            anchor_served: false,
+            anchor_refused: HashSet::new(),
+            extends,
+            given_up: None,
         };
         syncer.walked = syncer.walk_from().is_none();
+        // Checkpoints below the anchor were verified from it: a peer served it. A range short
+        // enough to need no walk has none, and learns it from its first verified segment.
+        syncer.anchor_served = syncer.checkpoints.len() > 1;
         syncer
     }
 
-    /// Fetches the plan's range. Returns `true` once it is complete, and `false` if it
-    /// stopped before: the node is shutting down or nothing takes its output.
-    async fn run(mut self, cancel: &CancellationToken) -> Result<bool, ElError> {
+    /// Fetches the plan's range. Returns how the round ended, or `None` if it stopped before:
+    /// the node is shutting down or nothing takes its output.
+    async fn run(mut self, cancel: &CancellationToken) -> Result<Option<RoundEnd>, ElError> {
         if self.is_complete() {
             info!(
                 first = self.first,
                 anchor = self.anchor.number,
                 "range sync has nothing to fetch"
             );
-            return Ok(true);
+            return Ok(Some(RoundEnd::Complete));
         }
         info!(
             first = self.first,
@@ -325,18 +371,18 @@ impl Syncer {
             let wake = self.schedule.next_wake(Instant::now());
             tokio::select! {
                 biased;
-                () = cancel.cancelled() => return Ok(false),
+                () = cancel.cancelled() => return Ok(None),
                 Some(joined) = self.jobs.join_next() => {
                     let done = joined.map_err(|source| {
                         ElError::Task { task: "range sync", source }
                     })?;
                     if !self.finished(done, cancel).await? {
-                        break false;
+                        break None;
                     }
                 }
                 alive = self.peers.changed() => {
                     if !alive {
-                        return closed("sessions", cancel).map(|()| false);
+                        return closed("sessions", cancel).map(|()| None);
                     }
                     self.schedule.retain(&self.peers.sessions());
                 }
@@ -354,13 +400,57 @@ impl Syncer {
                     anchor = self.anchor.number,
                     "range sync complete"
                 );
-                break true;
+                break Some(RoundEnd::Complete);
+            }
+            if let Some(end) = self.given_up {
+                break Some(end);
+            }
+            if self.anchor_unavailable() {
+                warn!(
+                    anchor = self.anchor.number,
+                    hash = %self.anchor.hash,
+                    peers = self.anchor_refused.len(),
+                    "range sync gives up its anchor: no peer serves it"
+                );
+                break Some(RoundEnd::AnchorUnavailable);
             }
             self.dispatch();
         };
         // In-flight jobs have nowhere to deliver.
         self.jobs.shutdown().await;
         Ok(complete)
+    }
+
+    /// Whether the anchor is to be given up: [`ANCHOR_REFUSALS`] peers said they do not hold
+    /// it, none served it, and every open session whose peer says it holds its height has been
+    /// asked.
+    fn anchor_unavailable(&self) -> bool {
+        if self.anchor_served || self.anchor_refused.len() < ANCHOR_REFUSALS {
+            return false;
+        }
+        let number = self.anchor.number;
+        self.peers.sessions().iter().all(|session| {
+            let range = session.range();
+            !(range.earliest <= number && number <= range.latest)
+                || self.anchor_refused.contains(&session.status().peer_id)
+        })
+    }
+
+    /// Records the header chain reaching the first block, whose parent is `below`: it must be
+    /// the block the range extends. Returns `false` if it is not.
+    fn linked(&mut self, below: BlockRef) -> bool {
+        if self.extends.is_none_or(|extends| extends == below) {
+            return true;
+        }
+        warn!(
+            first = self.first,
+            names = %below.hash,
+            expected = ?self.extends,
+            anchor = self.anchor.number,
+            "range sync gives up its anchor: its chain does not reach the archive's last block"
+        );
+        self.given_up = Some(RoundEnd::NotLinked);
+        false
     }
 
     const fn is_complete(&self) -> bool {
@@ -394,7 +484,7 @@ impl Syncer {
             };
             self.schedule.started(peer);
             let (session, first, canyon_time) = (session.clone(), self.first, self.canyon_time);
-            self.jobs.spawn(async move {
+            let job = async move {
                 let result = match job {
                     Job::Walk(start) => {
                         JobResult::Walk(start, headers::walk(&session, start, first).await)
@@ -405,7 +495,8 @@ impl Syncer {
                     ),
                 };
                 Done { peer, result }
-            });
+            };
+            self.jobs.spawn(job.in_current_span());
         }
         self.warn_if_starved(sessions.len(), now);
     }
@@ -487,8 +578,12 @@ impl Syncer {
     async fn finished(&mut self, done: Done, cancel: &CancellationToken) -> Result<bool, ElError> {
         let Done { peer, result } = done;
         let (first, last, failure) = match result {
-            JobResult::Walk(start, Ok(checkpoints)) => {
+            JobResult::Walk(start, Ok((checkpoints, below))) => {
                 self.walking = false;
+                self.anchor_served = true;
+                if below.is_some_and(|below| !self.linked(below)) {
+                    return Ok(true);
+                }
                 self.succeeded(peer);
                 debug!(%peer, from = start.number, checkpoints = checkpoints.len(), "headers verified");
                 for checkpoint in &checkpoints {
@@ -505,14 +600,42 @@ impl Syncer {
             }
             JobResult::Segment(segment, Ok(blocks)) => {
                 self.succeeded(peer);
+                self.anchor_served = true;
+                // The lowest segment's first block names the block the range extends: checked
+                // here too, for a range with no walk.
+                if segment.first == self.first
+                    && let Some(block) = blocks.first()
+                {
+                    let header: Option<alloy_consensus::Header> =
+                        alloy_rlp::decode_exact(&block.header).ok();
+                    let below = header.map(|header| BlockRef {
+                        number: header.number.saturating_sub(1),
+                        hash: header.parent_hash,
+                    });
+                    if below.is_some_and(|below| !self.linked(below)) {
+                        return Ok(true);
+                    }
+                }
                 self.ready.insert(segment.first, (segment, blocks));
                 return Ok(self.hand_on(cancel).await);
             }
             JobResult::Walk(start, Err(failure)) => {
                 self.walking = false;
+                if start == self.anchor
+                    && !self.anchor_served
+                    && matches!(failure, Failure::NotHeld)
+                {
+                    self.anchor_refused.insert(peer);
+                }
                 (start.number, start.number, failure)
             }
             JobResult::Segment(segment, Err(failure)) => {
+                if segment.top == self.anchor
+                    && !self.anchor_served
+                    && matches!(failure, Failure::NotHeld)
+                {
+                    self.anchor_refused.insert(peer);
+                }
                 self.waiting.insert(segment.first, segment);
                 (segment.first, segment.top.number, failure)
             }
@@ -562,10 +685,30 @@ impl Syncer {
 
     fn log_progress(&self) {
         if let Some(lowest) = self.walk_from() {
+            // Sessions whose peer says it holds the next page of the walk.
+            let page_first = lowest
+                .number
+                .saturating_sub(HEADERS_PER_REQUEST - 1)
+                .max(self.first);
+            let sessions = self.peers.sessions();
+            let usable = sessions
+                .iter()
+                .filter(|session| {
+                    let range = session.range();
+                    range.earliest <= page_first && lowest.number <= range.latest
+                })
+                .count();
+            let waiting = match (usable, lowest == self.anchor) {
+                (0, true) => "range sync: waiting for a peer that holds the anchor",
+                (0, false) => "range sync: waiting for a peer that holds these headers",
+                _ => "range sync: verifying the header chain",
+            };
             info!(
                 verified_down_to = lowest.number,
                 first = self.first,
-                "range sync: verifying the header chain"
+                peers = usable,
+                sessions = sessions.len(),
+                "{waiting}"
             );
         } else {
             info!(

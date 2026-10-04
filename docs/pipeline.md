@@ -1,11 +1,11 @@
 # Pipeline spec (`crates/pipeline`)
 
-Status: **agreed 2026-10-03, being built** on `feat/pipeline`.
-
-The pipeline is the connection between `p2p` and `storage`. It takes the unsafe blocks the
-network emits, writes them to the unsafe store, and, when L1 commits them, moves them to the
-committed store and the local archive. It owns the retry policy that storage deliberately
-does not have.
+The pipeline is the connection between the networks and `storage`. It takes the unsafe blocks
+the network emits, writes them to the unsafe store, and, when L1 commits them, moves them to
+the committed store and the local archive. It also attaches the receipts the execution network
+fetches, stores the blocks a range sync fetches, and turns the dispute games the L1 side
+verifies into the safe and finalized heads. Store calls go through storage's retry helper
+(`op_indexer_storage::retry`), without a time limit.
 
 It does not depend on `p2p`: the binary hands it a channel. It is generic over the three store
 traits, so it does not know about Redis, ClickHouse or fjall.
@@ -15,14 +15,19 @@ traits, so it does not know about Redis, ClickHouse or fjall.
 | Direction | What | Type | From / to |
 |---|---|---|---|
 | in | unsafe blocks | `mpsc::Receiver<UnsafeBlock>` | `p2p`, through the binary |
-| in | L1 heads (safe, finalized) | `watch::Receiver<L1Heads>` | the future `l1` crate; nothing sends until it exists |
-| in | receipts for a block | not in this PR | the future `el` crate |
+| in | L1 heads (safe, finalized) | `watch::Receiver<L1Heads>` | the binary: the commitment task's heads, held back while a range sync is still closing the archive's gap; nothing moves without the L1 side |
+| in | verified dispute games | `watch::Receiver<L1Games>` | `l1`, through `Pipeline::with_l1_games` |
+| in / out | receipts | `ReceiptsChannels`: requests out, `VerifiedReceipts` in | `el` |
+| in | range-sync batches | `mpsc::Receiver<Vec<EncodedBlock>>` | `el`, through `Pipeline::with_range` |
+| out | unsafe head | `watch::Sender<Option<BlockRef>>` | the execution network's advertised head, through `Pipeline::with_head` |
 | out | safe block number | `watch::Sender<BlockNumber>` | `p2p` (its gap detection ignores heights at or below it) |
 | out | the three stores | `UnsafeStore`, `CommittedStore`, `ArchiveStore` | `storage` |
 
-## 2. Two tasks
+## 2. Tasks
 
-Ingestion and promotion are separate tasks, so a slow ClickHouse never delays a gossip block.
+Five tasks, each its own, so a slow ClickHouse never delays a gossip block: ingest and
+promotion always run; the receipts task, the range task and the commitment task run when
+their input is given (section 4b).
 
 ```text
 p2p ─▶ [ingest]  decode ─▶ recover senders ─▶ UnsafeStore::insert
@@ -30,7 +35,7 @@ l1  ─▶ [promote] UnsafeStore::ancestry ─▶ CommittedStore::insert ─▶ 
                  ─▶ CommittedStore::set_l1_heads ─▶ UnsafeStore::prune ─▶ safe number to p2p
 ```
 
-Both stop on the cancellation token after finishing the write in progress. Every store write
+All stop on the cancellation token after finishing the write in progress. Every store write
 is idempotent, so a write cut short is repeated on the next start.
 
 ## 3. Ingest
@@ -47,8 +52,9 @@ is idempotent, so a write cut short is repeated on the next start.
    whose sender cannot be recovered makes the block invalid: it is dropped with a warning and a
    counter (the sequencer signed it, so this should not happen).
 3. **Insert** into the unsafe store as `DecodedBlock { receipts: None, source: Gossip }`. The
-   returned events (`NewHead`, `Reorg`, `Filled`) are logged and counted; nothing else consumes
-   them in this PR.
+   returned events (`NewHead`, `Reorg`, `Filled`) are logged and counted, and a new head is
+   published on the head output when there is one (`with_head`). Ingest then asks for the
+   block's receipts when the execution network runs.
 4. **Order.** Blocks are inserted in arrival order, one at a time. Fork choice in the store
    handles out-of-order and competing blocks.
 
@@ -57,9 +63,14 @@ is idempotent, so a write cut short is repeated on the next start.
 Runs whenever the L1 heads change. `C` is the safe head recorded in the committed store
 (`CommittedStore::l1_heads`), `S` the new safe head.
 
-1. **L1 reorg** (`S` is below `C`, or at `C`'s height with another hash):
-   `CommittedStore::rollback_to(S)`; `ArchiveStore::truncate_above(S.number)` if the archive
-   ends at or below `C` (so at most `C - S` blocks go); then continue.
+1. **`S` at or below `C`.** A rollback is destructive, so it needs evidence that the block
+   at `S.number` changed: `S` at `C`'s height with another hash, or `S` below `C` where the
+   archive covers `S.number` and holds another block there (`ArchiveStore::number_of(S.hash)`
+   is not `S.number`). Then it is an **L1 reorg**: `CommittedStore::rollback_to(S)`;
+   `ArchiveStore::truncate_above(S.number)` if the archive ends at or below `C` (so at most
+   `C - S` blocks go); then continue. Otherwise (`S` is on the committed chain, or cannot be
+   checked: no archive, or outside it, with a warning) the head is behind and nothing is
+   done.
 2. `UnsafeStore::set_l1_heads(heads)`, so the unsafe store stops accepting blocks at or below
    `S` and fork choice respects it.
 3. `UnsafeStore::ancestry(S, C.number)`: the blocks above `C` up to `S`, oldest first. The
@@ -73,10 +84,10 @@ Runs whenever the L1 heads change. `C` is the safe head recorded in the committe
 
 A change of the finalized head alone only records the heads (steps 2 and 5).
 
-**Receipts.** Blocks are promoted whether or not they have receipts. Until the
-`el` crate exists nothing has receipts, and waiting would mean nothing is ever committed. The
-committed store's insert is idempotent with a version, so `el` can insert the same block again
-with its receipts later.
+**Receipts.** Blocks are promoted whether or not they have receipts: waiting would hold
+promotion on the execution network. Receipts that arrive after a block was promoted are
+attached in the archive (section 4b); the committed store keeps the row without them, and its
+insert is idempotent with a version, so the block can be inserted again with its receipts.
 
 **When the range cannot be read**, the pipeline promotes now and backfills later: it promotes
 the part of the range next to `S` that it can read and leaves the rest as a hole, because
@@ -122,7 +133,7 @@ everything else, including the gap below a promoted range that did not connect.
   `C`, other writers put blocks there and it is left alone, with a warning.
 - Startup removes nothing (section 5).
 
-**Known limits, to be closed with the `l1` crate:**
+**Known limits:**
 
 - *A safe head that jumps more than 1024 blocks at once* (an L1 source catching up after
   downtime): only the newest 1024 are promoted, even when the unsafe store has every block.
@@ -159,19 +170,33 @@ stops with the error (`PipelineError::RangeBlock` for a block this build cannot 
 contiguous range and a sync that cannot continue must not look like it is running.
 
 **Commitment** (`commit.rs`, when the L1 side is connected: `Pipeline::with_l1_games`). The
-L1 side publishes the dispute games it has verified on L1 (`L1Games`: the newest one seen and
-the newest one in a finalized L1 block). A game is a claim about an L2 block's output root;
-verified on L1 does not mean it is about our chain. The task reads our own block at the game's
-height (the unsafe store's canonical block at that number, else the archive's header),
-computes its output root (`VerifiedGame::check`: state root, the message passer's storage root
-the header carries from Isthmus on, block hash; the timestamp too for super games) and
-compares. Equal: that block, number and hash, becomes the safe head, and the finalized head
-when the game's L1 block is finalized; a head only moves up. Different: an error log with the
-game and both values, counted (`op_indexer_pipeline_l1_games_total{outcome="mismatch"}`), and
-the head does not advance. A block before Isthmus cannot be checked from its header: warning,
-counted, no advance. A game about a block we do not hold yet is checked again every 12 s.
-The heads go to promotion through the binary, which holds them back while a range sync is
-still bringing the archive up to the chain.
+L1 side publishes the dispute games it has verified on L1 (`L1Games`: the 64 most recent on
+the walked L1 chain, and the highest finalized L1 block on it). A game is a bonded claim
+about an L2 block's output root that anyone can make, of any game type (the respected type is
+not checked, `docs/l1.md` §3); verified on L1 does not mean it is about our chain. So "safe"
+means "a bonded claim on L1 equals our block", not "the batch is on L1". The task judges the
+games highest L2 block first, and stops once no game left can raise a head. For each it reads
+our own block at the game's height (the unsafe store's canonical block at that number, else
+the archive's header), computes its output root (`VerifiedGame::check`: state root, the
+message passer's storage root the header carries from Isthmus on, block hash; the timestamp
+too for super games) and compares. The highest match becomes the safe head, and the highest
+match in a finalized L1 block the finalized head; both are published in one update.
+Different: an error log with the game and both values, counted
+(`op_indexer_pipeline_l1_games_total{outcome="mismatch"}`), and that game moves no head. A
+block before Isthmus cannot be checked from its header: warning, counted, no advance. Each
+game and block pair is logged once. Every 12 s the games are judged again, so a game about a
+block we did not hold yet, or one whose block at that height has since changed, counts once
+it matches. A game that matched is remembered (the whole game, with our hash) while it is recent and is
+not read again: when its L1 block finalizes, minutes later, promotion has usually pruned the
+block from the unsafe store. After a restart that memory is empty, so a finalized game at or
+below the committed safe head needs the archive to raise the finalized head.
+
+The heads only move up, across restarts too: the task starts from the committed store's
+heads (`CommittedStore::l1_heads`, read at startup) and never publishes one below them, so a
+restart does not hand promotion an older head. A recorded finalized head above the safe one
+(left by a rollback, which does not touch the finalized row) is not taken over: the
+finalized head starts unknown and the next finalized match sets it. The heads go to promotion through the binary,
+which holds them back while a range sync is still bringing the archive up to the chain.
 
 Ingest also publishes the unsafe head on a `watch` (`Pipeline::with_head`), which the binary
 gives to the execution network as the newest block the node knows.
@@ -200,7 +225,9 @@ buffers what arrives until ingest starts.
 
 ## 6. Errors and retries
 
-Storage never retries; the pipeline decides by `StorageError::severity()`.
+The stores do not retry; every store call goes through `op_indexer_storage::retry` without a
+time limit, and the task decides what a non-transient error means by
+`StorageError::severity()`.
 
 | Severity | Ingest | Promotion |
 |---|---|---|
@@ -228,31 +255,37 @@ Through the `metrics` facade, like storage: blocks ingested, blocks dropped (by 
 and their depth, fills, retries (by store), blocks promoted, promotion holes (blocks missing),
 ingest lag (now minus block timestamp), channel depth.
 
-## 9. What can be verified in this PR
+## 9. What has been verified
 
 - **Ingest**: live, on mainnet gossip. Blocks, transactions and senders appear in Redis; reorg
   and fill events show in the log and the event stream.
-- **Promotion**: no L1 source exists, so it cannot run live. It is verified with a throwaway
-  driver outside the repo that feeds safe heads trailing the unsafe head, including a step
-  back (L1 reorg), a missing block, and a kill between each pair of steps.
+- **Promotion**: with a throwaway driver outside the repo that feeds safe heads trailing the
+  unsafe head, including a step back (L1 reorg), a missing block, and a kill between each pair
+  of steps. Not run on heads from the L1 side.
+- **Receipts, range and commitment tasks**: compiled and reviewed; not run end to end.
 
-## 10. Not in this PR
+## 10. Not done
 
-Receipts and backfill (`el`), the source of the L1 heads and the unsafe store's reconciliation
-when the safe head contradicts it (`l1`), reading data back (`query`), a metrics exporter.
+The unsafe store's reconciliation when the safe head contradicts it (`docs/storage.md`, the
+safe-head gap), reading data back (`query`), a metrics exporter.
 
 ## 11. Modules and API
 
 | File | Holds |
 |---|---|
-| `lib.rs` | `Pipeline<U, C, A>`: `new(...)` and `run(self, cancel) -> Result<(), PipelineError>`. Runs startup (section 5), then both tasks; returns when both have stopped, or with the first fatal error after cancelling the other. |
+| `lib.rs` | `Pipeline<U, C, A>`: `new(...)`, the builders `with_head`, `with_l1_games`, `with_range`, and `run(self, cancel) -> Result<(), PipelineError>`. Runs startup (section 5), then the tasks; returns when they have stopped, or with the first fatal error after cancelling the others. |
 | `ingest.rs` | The ingest task (section 3). |
 | `recover.rs` | Sender recovery on a blocking thread. |
 | `promote.rs` | Startup reconciliation and the promotion task (sections 4 and 5). |
-| `retry.rs` | One helper used by both tasks: runs a store call, retries it with capped exponential backoff and jitter while its error is `Transient`, returns any other result, and stops waiting when cancelled. |
+| `receipts.rs` | The receipts task and `ReceiptsChannels` (section 4b). |
+| `range.rs` | The range task: range-sync batches into the committed store and the archive (section 4b). |
+| `commit.rs` | The commitment task: verified dispute games checked against our blocks, into L1 heads (section 4b). |
+| `retry.rs` | Storage's `retry` without a time limit, and `settle`, which ends a task on what it returns. |
 | `error.rs` | `PipelineError`. |
 | `metrics.rs` | Names, descriptions and recording functions (section 8), like `storage::metrics`. |
 
 `Pipeline::new` takes the unsafe store, the committed store, the archive with its retention
-(`Option`, `None` when disabled), the block receiver, the L1 heads receiver and the safe-number
-sender. The stores are `Clone + Send + Sync + 'static`.
+(`Option`, `None` when disabled), the block receiver, the L1 heads receiver, the safe-number
+sender and the receipts channels (`Option`, `None` without an execution network). The
+builders add the head output (`with_head`), the dispute games and the L1 heads sender they
+feed (`with_l1_games`), and the range-sync batches (`with_range`). The stores are `Clone + Send + Sync + 'static`.

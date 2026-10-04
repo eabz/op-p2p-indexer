@@ -242,8 +242,8 @@ pub trait CommittedStore {
 /// does not stop it: `append_batch` and `set_receipts` still run to completion.
 /// The returned futures are `Send`, so a store can be driven from any task.
 pub trait ArchiveStore {
-    /// Appends consecutive blocks, oldest first, in their original encoding: the only way
-    /// blocks enter the archive. The bytes are stored unchanged, so they must be bytes the
+    /// Appends consecutive blocks, oldest first, in their original encoding. (For bulk loads
+    /// the fjall archive also has `FjallArchive::bulk_append`.) The bytes are stored unchanged, so they must be bytes the
     /// caller has verified (import, range sync) or encoded from a verified block that
     /// survives the round trip (promoted gossip blocks). A block with receipts stores them at
     /// once.

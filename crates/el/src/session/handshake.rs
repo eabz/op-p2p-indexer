@@ -177,7 +177,7 @@ async fn handshake(
     }
 
     let fork_filter = ctx.fork_filter();
-    // What is advertised: the held range when it ends near the tip, else the tip alone (see
+    // What is advertised: the held range as it is, else the tip alone (see
     // `AdvertisedRange`). Sessions open only once a tip is known.
     let (serving, answers) = ctx.session_serving();
     let advertised = serving.advertised();

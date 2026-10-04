@@ -5,7 +5,6 @@
 //! <state>/verified.json               written by `verify` once the whole range is accepted
 //! <state>/raw/<from>-<to>.raw         downloaded chunk: the service's answers as they travelled
 //! <state>/verified/<from>-<to>.blk    verified chunk: consensus encodings, see `chunk`
-//! <state>/loaded/<from>-<to>.clickhouse  empty marker: ClickHouse holds the chunk
 //! <state>/lock                        held by the one process working on the directory
 //! ```
 //!
@@ -154,7 +153,6 @@ pub(crate) struct State {
     root: PathBuf,
     raw: PathBuf,
     verified: PathBuf,
-    loaded: PathBuf,
     /// Held so that only one process works on the directory.
     _lock: Arc<File>,
 }
@@ -184,14 +182,12 @@ impl State {
             root: root.to_owned(),
             raw: root.join("raw"),
             verified: root.join("verified"),
-            loaded: root.join("loaded"),
             _lock: Arc::new(lock),
         };
         fs::create_dir_all(&state.raw)?;
         fs::create_dir_all(&state.verified)?;
-        fs::create_dir_all(&state.loaded)?;
         // Temporary files of a run that was killed mid-write; nobody else writes here now.
-        for directory in [root, &state.raw, &state.verified, &state.loaded] {
+        for directory in [root, &state.raw, &state.verified] {
             for entry in fs::read_dir(directory)? {
                 let path = entry?.path();
                 if path.extension().is_some_and(|extension| extension == "tmp") {
@@ -323,12 +319,6 @@ impl State {
     pub(crate) fn verified_path(&self, chunk: Chunk) -> PathBuf {
         self.verified
             .join(format!("{:012}-{:012}.blk", chunk.from, chunk.to))
-    }
-
-    /// Marker that ClickHouse holds the chunk: an empty file, written by `load` once it does.
-    pub(crate) fn clickhouse_loaded_path(&self, chunk: Chunk) -> PathBuf {
-        self.loaded
-            .join(format!("{:012}-{:012}.clickhouse", chunk.from, chunk.to))
     }
 }
 

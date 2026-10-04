@@ -31,8 +31,8 @@ pub enum RetryError {
 ///
 /// Waits between attempts with exponential backoff from 200 ms to 30 s, each wait shortened
 /// at random by up to half so that tasks do not retry in step. With `budget`, a call that has
-/// been failing for that long is given up with its last error; without, a store that is down
-/// is waited for.
+/// been failing for that long since its first failure, and has been retried at least once, is
+/// given up with its last error; without, a store that is down is waited for.
 ///
 /// The first attempt always runs to its end, even if `cancel` has already fired, so a write
 /// that is due is neither skipped nor cut short. After a failure, cancellation ends the retry
@@ -55,7 +55,9 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, StorageError>>,
 {
-    let started = Instant::now();
+    // The budget runs from the first failure, so a call that failed by timing out still gets
+    // retried: a budget no longer than the call's own timeout would otherwise allow none.
+    let mut failing_since: Option<Instant> = None;
     let mut backoff = INITIAL_BACKOFF;
     let mut attempt = 0_u32;
     loop {
@@ -73,7 +75,8 @@ where
             Err(err) if err.severity() == Severity::Transient => err,
             Err(err) => return Err(RetryError::Storage(err)),
         };
-        if budget.is_some_and(|budget| started.elapsed() >= budget) {
+        let since = *failing_since.get_or_insert_with(Instant::now);
+        if budget.is_some_and(|budget| attempt > 0 && since.elapsed() >= budget) {
             return Err(RetryError::Storage(err));
         }
         attempt = attempt.saturating_add(1);

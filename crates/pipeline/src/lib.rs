@@ -2,24 +2,28 @@
 //!
 //! ```text
 //! network ─▶ [ingest]  recover senders ─▶ UnsafeStore::insert
-//! L1      ─▶ [promote] UnsafeStore::ancestry ─▶ CommittedStore::insert ─▶ ArchiveStore::append
-//!                      ─▶ CommittedStore::set_l1_heads ─▶ UnsafeStore::prune ─▶ safe number
+//! L1      ─▶ [promote] UnsafeStore::ancestry ─▶ CommittedStore::insert
+//!                      ─▶ ArchiveStore::append_batch ─▶ CommittedStore::set_l1_heads
+//!                      ─▶ UnsafeStore::prune ─▶ safe number
 //! peers   ─▶ [range]   recover senders ─▶ CommittedStore::insert ─▶ ArchiveStore::append_batch
+//! peers   ─▶ [receipts] UnsafeStore / ArchiveStore::set_receipts
+//! L1      ─▶ [commit]  dispute games checked against our blocks ─▶ L1 heads
 //! ```
 //!
 //! - [`Pipeline`] owns separate tasks, so a slow committed store never delays a gossiped
 //!   block: ingest (`ingest`, `recover`), promotion (`promote`) and, when something fetches
 //!   receipts, the task that attaches them (`receipts`); and, when a range of blocks is
-//!   fetched from peers, the task that stores it (`range`).
+//!   fetched from peers, the task that stores it (`range`); and, when the L1 side runs, the
+//!   task that turns its dispute games into heads (`commit`).
 //! - `retry` is how store calls are made: transient store errors are retried with backoff
 //!   (storage's helper, without a time limit), everything else is decided by the task that
 //!   made the call.
-//! - [`metrics`] names and records what both tasks do.
+//! - [`metrics`] names and records what the tasks do.
 //!
 //! Generic over the three store traits, so it does not know about Redis, ClickHouse or fjall,
 //! and it talks to the networks through channels, so it depends on neither. It does not fetch
 //! or verify receipts, it asks for them and stores the answers; it does not fetch missing
-//! blocks; and nothing produces the L1 heads yet. The design is in `docs/pipeline.md`.
+//! blocks. The design is in `docs/pipeline.md`.
 
 mod commit;
 mod error;
@@ -58,7 +62,8 @@ pub struct Pipeline<U, C, A> {
     receipts: Option<ReceiptsChannels>,
     range: Option<mpsc::Receiver<Vec<EncodedBlock>>>,
     head: Option<watch::Sender<Option<BlockRef>>>,
-    games: Option<(watch::Receiver<L1Games>, watch::Sender<L1Heads>)>,
+    /// The dispute games, the chain's Isthmus time, and where the heads they give go.
+    games: Option<(watch::Receiver<L1Games>, u64, watch::Sender<L1Heads>)>,
 }
 
 /// One of the pipeline's tasks.
@@ -124,18 +129,21 @@ where
         self
     }
 
-    /// Adds the dispute games verified on L1 (the newest one seen and the newest one in a
-    /// finalized L1 block): each is checked against our own block at its height, and a match
-    /// is published on `heads` as the safe or the finalized head. `heads`
-    /// is what feeds the `l1_heads` given to [`Self::new`], directly or through whatever
-    /// decides when promotion may act on them.
+    /// Adds the dispute games verified on L1 (the recent ones, and how far L1 is finalized):
+    /// each is checked against our own block at its height, and the highest match is published
+    /// on `heads` as the safe head, the highest in a finalized L1 block as the finalized head.
+    /// The heads start at what the committed store recorded and never go below it. `heads` is
+    /// what feeds the `l1_heads` given to [`Self::new`], directly or through whatever decides
+    /// when promotion may act on them. `isthmus_time` is the chain's Isthmus activation: a
+    /// claim about a block before it cannot be checked.
     #[must_use]
     pub fn with_l1_games(
         mut self,
         games: watch::Receiver<L1Games>,
         heads: watch::Sender<L1Heads>,
+        isthmus_time: u64,
     ) -> Self {
-        self.games = Some((games, heads));
+        self.games = Some((games, isthmus_time, heads));
         self
     }
 
@@ -184,12 +192,14 @@ where
             stop.clone(),
         );
         tasks.spawn(async move { (Task::Ingest, ingest.await) });
-        if let Some((games, heads)) = self.games {
+        if let Some((games, isthmus_time, heads)) = self.games {
             let commit = commit::run(
                 self.unsafe_store.clone(),
                 self.archive.clone(),
                 games,
+                isthmus_time,
                 heads,
+                self.promoter.committed_heads(),
                 stop.clone(),
             );
             tasks.spawn(async move { (Task::Commit, commit.await) });

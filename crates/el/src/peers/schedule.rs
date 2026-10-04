@@ -45,6 +45,34 @@ pub(super) const LONG_BACKOFF: Duration = Duration::from_hours(1);
 /// Failures in a row double the wait this many times at most (so up to 8 times the base).
 const MAX_BACKOFF_DOUBLINGS: u32 = 3;
 
+/// What the dials since the last status line came to.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct DialTally {
+    /// Dials started.
+    pub(super) tried: u32,
+    /// Refused with "too many peers", or dropped in the handshake as a full reth node does.
+    pub(super) full: u32,
+    /// A step of the handshake timed out.
+    pub(super) timed_out: u32,
+    /// Failed in another way: unreachable, another fork, another protocol version.
+    pub(super) other: u32,
+}
+
+impl DialTally {
+    fn failed(&mut self, outcome: DialOutcome) {
+        let counter = match outcome {
+            DialOutcome::TooManyPeers | DialOutcome::HandshakeDropped => &mut self.full,
+            DialOutcome::Timeout => &mut self.timed_out,
+            DialOutcome::Connected
+            | DialOutcome::Unreachable
+            | DialOutcome::WrongFork
+            | DialOutcome::Incompatible
+            | DialOutcome::Failed => &mut self.other,
+        };
+        *counter = counter.saturating_add(1);
+    }
+}
+
 /// Whom to dial and when.
 #[derive(Debug)]
 pub(super) struct Schedule {
@@ -56,6 +84,8 @@ pub(super) struct Schedule {
     banned: HashMap<PeerId, Instant>,
     /// When the dials of the last [`DIAL_WINDOW`] started, oldest first.
     recent_dials: VecDeque<Instant>,
+    /// Dials since the last status line.
+    tally: DialTally,
 }
 
 /// A peer that can be dialed.
@@ -76,6 +106,16 @@ struct Known {
 }
 
 impl Schedule {
+    /// Peers known to dial.
+    pub(super) fn known(&self) -> usize {
+        self.known.len()
+    }
+
+    /// The dials since the last call.
+    pub(super) fn take_tally(&mut self) -> DialTally {
+        std::mem::take(&mut self.tally)
+    }
+
     /// A schedule that knows the peers `saved` from an earlier run, due at once: they are
     /// dialed as soon as a tip is known, before discovery has found anyone.
     pub(super) fn new(network: &'static str, saved: &[ExecutionPeer]) -> Self {
@@ -105,6 +145,7 @@ impl Schedule {
             known,
             banned: HashMap::new(),
             recent_dials: VecDeque::new(),
+            tally: DialTally::default(),
         }
     }
 
@@ -198,6 +239,7 @@ impl Schedule {
             // Set before the dial ends, so no path can dial a peer twice within the floor.
             known.next_dial = now + jittered(FULL_PEER_RETRY);
             known.attempts = known.attempts.saturating_add(1);
+            self.tally.tried = self.tally.tried.saturating_add(1);
             self.recent_dials.push_back(now);
             candidates.push(known.candidate.clone());
         }
@@ -226,6 +268,7 @@ impl Schedule {
             SessionError::NoSharedEth => (DialOutcome::Incompatible, LONG_BACKOFF, false),
         };
         metrics::dial(self.network, outcome);
+        self.tally.failed(outcome);
         debug!(%peer, %err, "dial failed");
         let Some(known) = self.known.get_mut(&peer) else {
             return;

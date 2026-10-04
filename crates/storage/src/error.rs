@@ -23,10 +23,15 @@ const REDIS_BUSY_CODES: [&str; 6] = [
 ];
 /// ClickHouse error codes of a server that is busy or briefly unavailable, from its
 /// `ErrorCodes.cpp`: 159 `TIMEOUT_EXCEEDED`, 202 `TOO_MANY_SIMULTANEOUS_QUERIES`, 209
-/// `SOCKET_TIMEOUT`, 210 `NETWORK_ERROR`, 241 `MEMORY_LIMIT_EXCEEDED`, 242
-/// `TABLE_IS_READ_ONLY` and 999 `KEEPER_EXCEPTION` (a replicated or cloud service changing
-/// replicas), 252 `TOO_MANY_PARTS`, 319 `UNKNOWN_STATUS_OF_INSERT` (the connection broke
-/// mid-insert: repeating it is safe, inserts are idempotent here).
+/// `SOCKET_TIMEOUT`, 210 `NETWORK_ERROR`, 241 `MEMORY_LIMIT_EXCEEDED` (usually the server's
+/// total memory, under merges or other queries, not our statement), 242 `TABLE_IS_READ_ONLY`
+/// and 999 `KEEPER_EXCEPTION` (a replicated or cloud service changing replicas: the store is
+/// briefly unavailable, like a lost connection), 252 `TOO_MANY_PARTS`, 319
+/// `UNKNOWN_STATUS_OF_INSERT` (the connection broke mid-insert: repeating it is safe, inserts
+/// are idempotent here).
+///
+/// A caller that retries without a time limit (the pipeline) repeats a statement that can
+/// never fit in the server's memory forever, with a warning on each attempt.
 const CLICKHOUSE_BUSY_CODES: [u32; 9] = [159, 202, 209, 210, 241, 242, 252, 319, 999];
 /// What a ClickHouse error response starts with, before the numeric code.
 const CLICKHOUSE_CODE_PREFIX: &str = "Code: ";

@@ -36,7 +36,7 @@ use tokio::sync::mpsc;
 use tokio::task::{JoinError, JoinSet, spawn_blocking};
 use tokio::time::{Instant, MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{Instrument, debug, warn};
 
 use crate::ElError;
 use crate::metrics;
@@ -295,7 +295,7 @@ impl Fetcher {
             state.pacing.started();
             let (key, request) = (*key, pending.request);
             self.in_flight
-                .spawn(ask(session, key, request, canyon_time));
+                .spawn(ask(session, key, request, canyon_time).in_current_span());
         }
     }
 

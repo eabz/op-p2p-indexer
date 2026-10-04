@@ -28,7 +28,7 @@ use libp2p::PeerId;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::BeaconError;
 use super::network::{Gossip, NetworkHandle, Request, RequestError, Response, Topic, Verdict};
@@ -53,6 +53,17 @@ const CATCH_UP_RETRY: Duration = Duration::from_secs(20);
 /// Peers that must say they do not hold the checkpoint's bootstrap before the checkpoint is
 /// given up as too old.
 const BOOTSTRAP_REFUSALS: usize = 12;
+/// The response code of a peer that does not hold what was asked: `ResourceUnavailable`
+/// ([response codes]). Only it says the checkpoint is too old; other codes and empty answers
+/// say nothing about it.
+///
+/// [response codes]: https://github.com/ethereum/consensus-specs/blob/master/specs/phase0/p2p-interface.md#responding-side
+const RESOURCE_UNAVAILABLE: u8 = 3;
+/// How long the verified head may stay where it is before it is logged that it stopped
+/// advancing, and the shortest time between two such warnings. Measured from when the head
+/// last moved, not from the wall clock: the checkpoint's slot is old by the time it is
+/// bootstrapped.
+const HEAD_STALL: Duration = Duration::from_secs(300);
 
 /// The answer to the request in flight, once it comes.
 type Answer = Pin<Box<dyn Future<Output = Result<Response, RequestError>> + Send>>;
@@ -84,6 +95,12 @@ pub(super) struct Client {
     next_committee_attempt: Instant,
     /// Epoch of the last poll for a finality update.
     finality_epoch: u64,
+    /// The verified head's slot and when it was first seen there, or when it was last logged
+    /// that it stopped advancing.
+    head_since: Option<(u64, Instant)>,
+    /// The newest finalized block and the newest head verified and not yet handed to the
+    /// watcher, whose channel was full.
+    unsent: [Option<TrustedL1Block>; 2],
 }
 
 impl Client {
@@ -108,6 +125,8 @@ impl Client {
             next_poll: now,
             next_committee_attempt: now,
             finality_epoch: 0,
+            head_since: None,
+            unsent: [None, None],
         }
     }
 
@@ -147,6 +166,10 @@ impl Client {
                     }
                 }
                 _ = tick.tick(), if pending.is_none() => {
+                    self.warn_if_behind();
+                    if !self.flush() {
+                        return Ok(());
+                    }
                     if let Some((kind, request)) = self.due()? {
                         let network = self.network.clone();
                         let answer = async move { network.request(request).await };
@@ -182,10 +205,40 @@ impl Client {
                 };
                 self.network.report_gossip(id, peer, verdict);
             }
-            if !self.on_verified(peer, kind, result, &cancel).await {
+            if !self.on_verified(peer, kind, result) {
                 return Ok(());
             }
         }
+    }
+
+    /// Logs, every [`HEAD_STALL`] while it lasts, that the verified head has not moved for
+    /// [`HEAD_STALL`]: no peer serves updates, finality has stalled for more than a period, or
+    /// the build is behind a fork.
+    fn warn_if_behind(&mut self) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        let head = store.status().head_slot;
+        if let Some((slot, since)) = self.head_since
+            && slot == head
+            && since.elapsed() < HEAD_STALL
+        {
+            return;
+        }
+        // The head did not move: the stall has lasted [`HEAD_STALL`] since it was first seen
+        // there or last logged.
+        let stalled = self.head_since.is_some_and(|(slot, _)| slot == head);
+        self.head_since = Some((head, Instant::now()));
+        if !stalled {
+            return;
+        }
+        let now = self.spec.now_slot();
+        warn!(
+            head_slot = head,
+            wall_clock_slot = now,
+            behind_slots = now.saturating_sub(head),
+            "the light client's head has stopped advancing"
+        );
     }
 
     /// What to ask for now, if anything.
@@ -241,7 +294,7 @@ impl Client {
         let response = match answer {
             Ok(response) => response,
             Err(err) => {
-                if let RequestError::Refused(peer, _) = err
+                if let RequestError::Refused(peer, RESOURCE_UNAVAILABLE) = err
                     && kind == Kind::Bootstrap
                 {
                     self.refused.insert(peer);
@@ -256,9 +309,6 @@ impl Client {
             }
         };
         let peer = response.peer;
-        if response.chunks.is_empty() && kind == Kind::Bootstrap {
-            self.refused.insert(peer);
-        }
         let payloads: Vec<Bytes> = response
             .chunks
             .into_iter()
@@ -268,14 +318,13 @@ impl Client {
         (!payloads.is_empty()).then_some((peer, payloads))
     }
 
-    /// Takes over a verified answer and passes on the blocks it vouches for. Returns `false`
-    /// when their consumer is gone.
-    async fn on_verified(
+    /// Takes over a verified answer and hands the blocks it vouches for to the watcher.
+    /// Returns `false` when the watcher is gone.
+    fn on_verified(
         &mut self,
         peer: PeerId,
         kind: Kind,
         result: Result<(Store, Accepted), VerifyError>,
-        cancel: &CancellationToken,
     ) -> bool {
         let (store, accepted) = match result {
             Ok(verified) => verified,
@@ -312,14 +361,26 @@ impl Client {
         self.store = Some(store);
         for block in [accepted.finalized, accepted.head].into_iter().flatten() {
             debug!(number = block.number, hash = %block.hash, finalized = block.finalized, "trusted L1 block");
-            tokio::select! {
-                biased;
-                () = cancel.cancelled() => return false,
-                sent = self.trusted.send(block) => {
-                    if sent.is_err() {
-                        return false;
-                    }
-                }
+            // A newer block of the same kind replaces one still waiting: only the newest
+            // matters to the watcher.
+            let slot = usize::from(!block.finalized);
+            if let Some(waiting) = self.unsent.get_mut(slot) {
+                *waiting = Some(block);
+            }
+        }
+        self.flush()
+    }
+
+    /// Hands the blocks waiting to the watcher, the finalized one first, as far as its
+    /// channel has room; the rest wait for the next call. Never waits, so a watcher busy with
+    /// a long walk does not stop the light client. Returns `false` when the watcher is gone.
+    fn flush(&mut self) -> bool {
+        for waiting in &mut self.unsent {
+            let Some(block) = *waiting else { continue };
+            match self.trusted.try_send(block) {
+                Ok(()) => *waiting = None,
+                Err(mpsc::error::TrySendError::Full(_)) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => return false,
             }
         }
         true

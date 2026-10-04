@@ -12,7 +12,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
+use tracing::{Instrument, debug};
 
 use super::context::SessionContext;
 use super::driver::{SessionDriver, SessionHandle};
@@ -110,7 +110,7 @@ pub(crate) async fn listen(
                         }
                     }
                     ip
-                });
+                }.in_current_span());
             }
         }
     }

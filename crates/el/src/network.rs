@@ -18,6 +18,7 @@ use secp256k1::SecretKey;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use tracing::{Instrument, info_span};
 
 use crate::discovery::Discovery;
 use crate::peers::{PeerSet, Peers, Report};
@@ -218,20 +219,24 @@ impl PeerNetwork {
             published,
         );
 
+        // Every line of this network names it: with L1 on, two of them run.
+        let span = info_span!("el", network = ctx.spec().label);
         // Stopping any part stops the rest.
         let stop = cancel.child_token();
         let mut tasks: JoinSet<Result<(), ElError>> = JoinSet::new();
         {
             let stop = stop.clone();
-            tasks.spawn(async move { discovery.run(candidates_tx, stop).await });
+            let run = async move { discovery.run(candidates_tx, stop).await };
+            tasks.spawn(run.instrument(span.clone()));
         }
         {
             let (stop, addr) = (stop.clone(), config.listen_addr);
-            tasks.spawn(async move { session::listen(ctx, addr, accepted_tx, stop).await });
+            let run = async move { session::listen(ctx, addr, accepted_tx, stop).await };
+            tasks.spawn(run.instrument(span.clone()));
         }
         {
             let stop = stop.clone();
-            tasks.spawn(async move { peer_set.run(stop).await });
+            tasks.spawn(async move { peer_set.run(stop).await }.instrument(span));
         }
         join_all(tasks, &stop).await
     }

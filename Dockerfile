@@ -6,8 +6,8 @@ ARG DEBIAN_RELEASE=trixie
 # ---- Chef: toolchain + cargo-chef --------------------------------------------
 FROM lukemathwalker/cargo-chef:latest-rust-${RUST_VERSION}-slim-${DEBIAN_RELEASE} AS chef
 
-# No extra build packages: the only native build in the dependency graph is `ring`, which uses
-# the image's cc.
+# No extra build packages: the native builds in the indexer's dependency graph (`ring`, `blst`,
+# `secp256k1-sys`) use the image's cc.
 WORKDIR /app
 
 # ---- Planner: compute the dependency recipe ----------------------------------
@@ -42,8 +42,9 @@ USER indexer
 ENV OP_INDEXER_DATA_DIR=/data
 VOLUME /data
 
-# OP Stack p2p (libp2p TCP + discv5 UDP), and execution p2p (RLPx TCP + discv5 UDP), which
-# is only used when OP_INDEXER_EL_ENABLED=true.
+# OP Stack p2p (libp2p TCP + discv5 UDP) on 9222; the chain's execution p2p (RLPx TCP + discv5
+# UDP) on 30303, used only when OP_INDEXER_EL_ENABLED=true; L1's execution p2p on 30304 and
+# the beacon light client on 9001, used only when OP_INDEXER_L1_ENABLED=true.
 EXPOSE 9222/tcp 9222/udp 30303/tcp 30303/udp 30304/tcp 30304/udp 9001/tcp 9001/udp
 
 ENTRYPOINT ["/usr/local/bin/op-indexer"]

@@ -6,7 +6,10 @@
 //!
 //! The output root is `keccak256(version ‖ state_root ‖ withdrawal_storage_root ‖ block_hash)`
 //! with version `bytes32(0)` ([L2 output commitment construction]); from Isthmus on the
-//! withdrawal storage root is the header's withdrawals root ([storage root in header]).
+//! withdrawal storage root is the header's withdrawals root ([storage root in header]). Before
+//! Isthmus the header does not carry it: from Canyon to Isthmus its withdrawals root is the
+//! root of an empty withdrawals list, which is not the storage root, so such a block's output
+//! root cannot be computed from the header and its claims are not checked.
 //!
 //! [L2 output commitment construction]: https://specs.optimism.io/protocol/proposals.html#l2-output-commitment-construction
 //! [storage root in header]: https://specs.optimism.io/protocol/isthmus/exec-engine.html#l2tol1messagepasser-storage-root-in-header
@@ -21,7 +24,7 @@ use crate::BlockRef;
 /// "Verified" is about L1, not about the claim: whether the claim is the output root of our
 /// block is what [`VerifiedGame::check`] tells. A game is a bonded claim, not a proof: it can
 /// still be challenged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VerifiedGame {
     /// The L1 block that created the game.
     pub l1_block: BlockRef,
@@ -39,21 +42,28 @@ pub struct VerifiedGame {
 }
 
 /// The dispute games L1 currently carries for the chain, as far as they have been read.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// Every recent game is kept, not only the newest: anyone who posts the bond can create a
+/// game, so the newest can claim a block that is not ours, and the honest ones below it must
+/// still count.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct L1Games {
-    /// The newest game created in a block of the L1 chain that is trusted as the head's. Its
-    /// L1 block can still be replaced by an L1 reorg, after which this is an older game.
-    pub newest: Option<VerifiedGame>,
-    /// The newest game created in a finalized L1 block. Only moves forward.
-    pub finalized: Option<VerifiedGame>,
+    /// The most recent games created in blocks of the L1 chain that is trusted as the head's,
+    /// oldest L1 block first. An L1 reorg can remove the newest of them.
+    pub recent: Vec<VerifiedGame>,
+    /// The highest finalized L1 block: the games created at or below it are final. Only
+    /// moves forward.
+    pub finalized_l1_block: Option<BlockNumber>,
 }
 
 /// Why a block is not the one a game claims.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ClaimMismatch {
-    /// The header has no withdrawals root (a block before Isthmus), so its output root
-    /// cannot be computed from the header.
-    #[error("block {block} has no withdrawals root in its header, so its output root is unknown")]
+    /// The block is before Isthmus: its header does not carry the message passer's storage
+    /// root, so its output root cannot be computed from the header.
+    #[error(
+        "block {block} is before Isthmus, so its output root cannot be computed from its header"
+    )]
     NoStorageRoot {
         /// The L2 block.
         block: BlockNumber,
@@ -89,17 +99,20 @@ pub fn output_root(state_root: B256, storage_root: B256, hash: B256) -> B256 {
 
 /// Checks that the block `block`, given by its hash and three fields of its header, has the
 /// output root `claimed`, and the timestamp `claimed_timestamp` when the claim names one.
+/// `isthmus_time` is the chain's Isthmus activation, from which the header's withdrawals root
+/// is the message passer's storage root.
 ///
 /// # Errors
 ///
 /// Returns [`ClaimMismatch::Timestamp`] if the claim names another time,
-/// [`ClaimMismatch::NoStorageRoot`] if the header has no withdrawals root, and
-/// [`ClaimMismatch::OutputRoot`], with both roots, if the output roots differ.
+/// [`ClaimMismatch::NoStorageRoot`] if the block is before Isthmus or its header has no
+/// withdrawals root, and [`ClaimMismatch::OutputRoot`], with both roots, if the output roots
+/// differ.
 pub fn check_claim(
     block: BlockNumber,
     (claimed, claimed_timestamp): (B256, Option<u64>),
     hash: B256,
-    timestamp: u64,
+    (timestamp, isthmus_time): (u64, u64),
     (state_root, withdrawals_root): (B256, Option<B256>),
 ) -> Result<(), ClaimMismatch> {
     if let Some(claimed) = claimed_timestamp
@@ -111,7 +124,9 @@ pub fn check_claim(
             found: timestamp,
         });
     }
-    let storage_root = withdrawals_root.ok_or(ClaimMismatch::NoStorageRoot { block })?;
+    let storage_root = withdrawals_root
+        .filter(|_| timestamp >= isthmus_time)
+        .ok_or(ClaimMismatch::NoStorageRoot { block })?;
     let computed = output_root(state_root, storage_root, hash);
     if computed != claimed {
         return Err(ClaimMismatch::OutputRoot {
@@ -125,7 +140,8 @@ pub fn check_claim(
 
 impl VerifiedGame {
     /// Checks that our block [`Self::l2_block`], given by its hash and three fields of its
-    /// header, is the block the game claims. `withdrawals_root` is the header's.
+    /// header, is the block the game claims. `withdrawals_root` is the header's; `isthmus_time`
+    /// the chain's Isthmus activation.
     ///
     /// # Errors
     ///
@@ -133,7 +149,7 @@ impl VerifiedGame {
     pub fn check(
         &self,
         hash: B256,
-        timestamp: u64,
+        (timestamp, isthmus_time): (u64, u64),
         state_root: B256,
         withdrawals_root: Option<B256>,
     ) -> Result<(), ClaimMismatch> {
@@ -141,7 +157,7 @@ impl VerifiedGame {
             self.l2_block,
             (self.output_root, self.timestamp),
             hash,
-            timestamp,
+            (timestamp, isthmus_time),
             (state_root, withdrawals_root),
         )
     }

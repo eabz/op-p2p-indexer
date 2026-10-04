@@ -45,7 +45,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::{MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, warn};
 
 pub use self::provider::BlockProvider;
 use self::provider::HeldRange;
@@ -146,7 +146,7 @@ impl<P: BlockProvider> Server<P> {
                 request = self.requests.recv(), if answering.len() < MAX_CONCURRENT => {
                     // Closed: every session and the context are gone.
                     let Some(request) = request else { return Ok(()) };
-                    answering.spawn(answer(self.provider.clone(), request));
+                    answering.spawn(answer(self.provider.clone(), request).in_current_span());
                 }
             }
         }

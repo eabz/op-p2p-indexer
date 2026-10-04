@@ -8,8 +8,8 @@
 //!   the archive service ([`source`]) and keeps each answer as received. It does nothing else, so a limited request window is spent
 //!   on the transfer only.
 //! - `verify` ([`mod@verify`]) rebuilds every block's consensus encoding from the downloaded rows
-//!   and checks it: header hash, parent links up to a trusted hash, transaction hashes and
-//!   root, receipts root, senders. What passes is written as the exact verified bytes
+//!   and checks it: header hash, parent links up to a trusted anchor, transactions root and
+//!   receipts root (senders are not checked). What passes is written as the exact verified bytes
 //!   ([`chunk`]).
 //! - `load` ([`load`]) appends verified chunks to the local block archive the node serves
 //!   from; ClickHouse is written too only when asked.
@@ -68,12 +68,15 @@ async fn main() -> eyre::Result<()> {
     let signal = tokio::spawn(cancel_on_signal(cancel.clone()));
     let result = match cli.command {
         Command::Download(args) => download(&args, &state, &cancel).await.map(|_plan| ()),
-        Command::Verify(args) => verify(&args, &state, &recorded_plan(&state)?, &cancel).await,
+        Command::Verify(args) => {
+            let plan = recorded_plan(&state)?;
+            verify(&args.verify, args.from_block, &state, &plan, &cancel).await
+        }
         Command::Load(args) => load::run(&args, &state, &recorded_plan(&state)?, &cancel).await,
         Command::Run(args) => {
             let steps = async {
                 let plan = download(&args.download, &state, &cancel).await?;
-                verify(&args.verify, &state, &plan, &cancel).await?;
+                verify(&args.verify, None, &state, &plan, &cancel).await?;
                 load::run(&args.load, &state, &plan, &cancel).await
             };
             steps.await
@@ -217,6 +220,7 @@ async fn download(
 
 async fn verify(
     args: &VerifyArgs,
+    from_block: Option<u64>,
     state: &State,
     plan: &Plan,
     cancel: &CancellationToken,
@@ -226,7 +230,7 @@ async fn verify(
         .or_else(|| std::thread::available_parallelism().ok().map(usize::from))
         .unwrap_or(1)
         .max(1);
-    verify::run(state, plan, threads, args.from_block, cancel).await
+    verify::run(state, plan, threads, from_block, cancel).await
 }
 
 /// Cancels `cancel` on Ctrl-C or, on Unix, SIGTERM, so the running step stops between chunks.

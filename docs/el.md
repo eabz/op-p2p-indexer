@@ -1,38 +1,40 @@
 # Execution p2p spec (`crates/el`)
 
-Status: **agreed 2026-10-04, being built** on `feat/el`. The user decided to build while the
-six-hour viability run is still going; peer access is the open risk (section 1).
+Status: **built**, off by default (`OP_INDEXER_EL_ENABLED`). Receipts at the tip have run
+live; serving (section 11) and range sync (section 12) have not. Peer access is the open
+risk (section 1).
 
 The `el` crate connects to OP Mainnet execution peers over devp2p and fetches what gossip does
 not carry: receipts for every block, and headers and bodies for blocks missed on gossip. All of
 it is verified against data we already trust before it is handed on. It is a second p2p stack
 next to `p2p` (libp2p); the two never depend on each other.
 
-This PR is the fetching side only. Serving peers (roadmap row 6) comes after it.
+It fetches receipts at the tip (sections 2 to 10), serves its own blocks to peers (section 11)
+and syncs a range of blocks from peers (section 12).
 
-## 1. What the viability test has established so far
+## 1. What the viability test established
 
-From Worker 3's probe (a throwaway program outside the repo): a one-hour run on 2026-10-04
-with the current fork id. A six-hour run follows; its numbers replace this section.
+From a viability probe (a program outside the repo), 2026-10-04; the full account, with
+numbers and sources, is [el-viability.md](el-viability.md).
 
-- **The protocol works.** Handshake over eth/69, then headers (155–340 ms), bodies
-  (160–220 ms) and receipts (175–870 ms) from an op-reth peer at the tip. 1,024 headers per
-  request in 0.5–1.1 s, parent links intact.
-- **Verification works.** Transactions roots matched for every sample. Receipts roots matched
-  for blocks from the tip back to one year old (legacy, EIP-1559, EIP-7702 and deposit
-  receipts), and, against op-geth in earlier runs, back to Bedrock.
-- **Peers are scarce and full.** 28 nodes with OP Mainnet's current fork id in an hour, all
-  op-reth, arriving about one every two minutes. 26 of 34 dial attempts were dropped during
-  the encrypted handshake with no reason given; every reason that was given was "too many
-  peers". Three completed the handshake, all at the tip; **one served us**.
-- **Receipt depth is not advertised.** The serving peer held headers and bodies back to block
-  105,000,000 but returned empty answers for receipts older than its window.
-- **Anchoring old headers** by hash chain from a gossip-verified block runs at roughly
-  1,000–2,000 headers per second per peer: minutes for a week, hours for a year.
-- **Not measured yet:** whether retrying wins a slot, how long a session lasts, and whether
-  peers drop a node that only asks.
+- **The protocol works.** Handshake over eth/69, then headers, bodies and receipts from
+  op-reth and reth peers at the tip, a few hundred milliseconds each. 1,024 headers per
+  request in 0.4 to 1.1 s, parent links intact.
+- **Verification works.** Transactions roots matched for every body. Receipts roots matched
+  for every receipt answer at the tip (167 of 167) and for samples back to Bedrock (legacy,
+  EIP-1559, EIP-7702 and deposit receipts).
+- **Peers are scarce and full.** About 25 nodes with OP Mainnet's current fork id in an hour,
+  arriving about one every two minutes. Most dials end in the encrypted handshake with no
+  reason given; every reason that was given was "too many peers".
+- **Sessions last.** Two sessions with a node that only asks were still open after 46 and 42
+  minutes; beyond an hour nothing is known.
+- **Receipt depth is not advertised.** A peer's advertised range covers headers and bodies;
+  many peers keep receipts for hours, a few for up to a year.
+- **No peer serves blocks before Bedrock.**
+- **Anchoring old headers** by hash chain from a gossip-verified block costs minutes for a
+  week and hours for a year, per peer.
 
-Rules observed, to cite and verify when the spec is finalised:
+Rules observed:
 
 - *Fork id* (EIP-2124): block forks 3,950,000 and 105,235,063; time forks Canyon 1704992401,
   Ecotone 1710374401, Fjord 1720627201, Granite 1726070401, Holocene 1736445601, Isthmus
@@ -44,7 +46,7 @@ Rules observed, to cite and verify when the spec is finalised:
 - *eth/69 receipts* (EIP-7642): no bloom on the wire; it is rebuilt from the logs. Deposit
   receipts carry the deposit nonce and version after the logs when present.
 - *Open:* an erigon peer on eth/68 returned receipts whose root did not match for 3 of 5
-  blocks; not yet known whether the probe's decoding or erigon is at fault.
+  blocks; not diagnosed. The crate speaks eth/69 only, so it does not meet this case.
 
 ## 2. Inputs and outputs
 
@@ -57,8 +59,8 @@ Rules observed, to cite and verify when the spec is finalised:
 channels, and never depends on `p2p`, `storage` or `pipeline`.
 
 A request that cannot be served (no peer, or no peer has the receipts) stays queued and is
-tried again; the queue is bounded and drops its oldest entries first, counted. Backfill of
-headers and bodies for holes uses the same stack and comes in a later PR.
+tried again; the queue is bounded and drops its oldest entries first, counted. Headers and
+bodies of a range come from the same stack: range sync, section 12.
 
 ## 3. Parts
 
@@ -87,20 +89,19 @@ configuration this project keeps current (in `chainspec`), not something taken f
 alone. The node should also notice when most peers reject its fork id or announce a `next`
 fork it does not know, and say so loudly: that is the sign the build is behind.
 
-## 6. Being a polite peer before serving exists
+## 6. Being a polite peer
 
-Until serving is built, the node only asks. It answers requests with empty responses,
-advertises honestly, and keeps its request rate low. Whether peers tolerate this over days is
-part of the viability result.
+The node asks at a low rate, advertises honestly (section 11) and answers peers' requests from
+what it holds; with nothing held it answers them empty.
 
-## 7. Not in this PR
+## 7. Not done
 
-Backfill of headers and bodies for holes; serving headers, bodies and receipts (roadmap
-row 6); snap sync; transaction gossip; state.
+Snap sync, transaction gossip, state.
 
 Known limit: receipts that arrive after their block was promoted are attached in the archive
-but not in the committed store, which has no call for it yet; they are counted. Nothing is
-promoted until the `l1` crate exists, and the committed-store call comes with it.
+but not in the committed store, which has no call for it yet; they are counted
+(`op_indexer_pipeline_blocks_promoted_without_receipts_total`). Promotion runs when the `l1`
+side is enabled, so this can happen now.
 
 Known limit: at startup the pipeline reads up to 1024 stored blocks in full to learn which
 lack receipts, because the unsafe store has no lighter call. It runs in its own task and does
@@ -113,34 +114,37 @@ not delay ingest; a small storage call (parent hash plus has-receipts) would rem
    sources exception. No usable published alternative exists, and hand-writing the encrypted
    transport (about 2,500–3,000 lines) goes against preferring maintained crates. OP's
    receipts are decoded on the raw stream, since reth's typed stream is for Ethereum types.
-2. **Receipts for new blocks first**; backfill follows on the same stack.
-3. **Built before peer access is proven.** If the six-hour run shows sessions cannot be held,
-   the options are a second test from a public server, a configurable list of trusted peers,
-   or the roadmap's execution fallback.
+2. **Receipts for new blocks first**; range sync runs on the same sessions.
+3. **Built before peer access is proven.** If sessions cannot be held in practice, the
+   options are a test from a public server, a configurable list of trusted peers, or the
+   roadmap's execution fallback.
 
-## 9. Modules and ownership
+## 9. Modules
 
-| File (`crates/el/src`) | Holds | Owner |
-|---|---|---|
-| `lib.rs`, `config.rs`, `error.rs` | `ExecutionNetwork::new(...)` / `run(cancel)`, plain-data config, the crate's error | Worker 3 |
-| `discovery.rs` | discv5 in the global DHT, filtered by the current fork id (`opel` and `eth` keys) | Worker 3 |
-| `session.rs` | One RLPx session, dialled or accepted: ECIES, hello, eth/69 status (eth/69 only: a peer that speaks only eth/68 is refused at hello), ping/pong, disconnect reasons; requests as async calls; answers peers' requests with empty responses | Worker 3 |
-| `wire.rs` | The message types used and OP's eth/69 receipt decoding, including the bloom rebuilt from the logs | Worker 3 |
-| `peers.rs` | The peer set: who to dial, polite retry and backoff, how many sessions to keep (inbound ones are handed over by `session.rs` and kept or refused here), dropping peers that fail verification | Worker 1 |
-| `fetch.rs` | The request queue: newest blocks first, one peer per request, timeout, another peer on failure | Worker 1 |
-| `verify.rs` | The receipt count and the receipts root against the header, with the per-fork rules. The root check is what proves the logs; nothing it does not cover is trusted | Worker 1 |
-| `metrics.rs` | Names and recording functions, like the other crates | Worker 1 |
+| File (`crates/el/src`) | Holds |
+|---|---|
+| `lib.rs`, `config.rs`, `error.rs` | `ExecutionNetwork::new(...)` / `run(cancel)`, plain-data config, the crate's error |
+| `network.rs` | `NetworkSpec` (network id, genesis, fork schedule, bootnodes, record keys) and `PeerNetwork`: discovery, sessions and the peer set for one devp2p network, reused by `l1` for Ethereum L1 |
+| `discovery.rs` | discv5 in the global DHT, filtered by the current fork id (`opel` and `eth` keys) |
+| `session.rs`, `session/{context,driver,handshake,listener}.rs` | One RLPx session, dialed or accepted: ECIES, hello, eth/69 status (a peer that speaks only eth/68 is refused at hello), ping/pong, disconnect reasons; requests as async calls; peers' requests passed to the server |
+| `wire.rs` | The message types used and OP's eth/69 receipt decoding, including the bloom rebuilt from the logs |
+| `peers.rs`, `peers/schedule.rs` | The peer set: who to dial and when, polite retry and backoff, how many sessions to keep in each direction, banning peers that fail verification |
+| `pacing.rs` | Request pacing per session |
+| `fetch.rs` | The receipt request queue: newest blocks first, one peer per request, timeout, another peer on failure |
+| `verify.rs` | The receipt count and the receipts root against the header, with the per-fork rules |
+| `serve.rs`, `serve/{provider,session}.rs` | Serving: the `BlockProvider` trait, the server task, per-session answering and limits (section 11) |
+| `sync.rs`, `sync/{headers,schedule,segment}.rs` | Range sync: the header walk, the per-segment fetch, scheduling across sessions (section 12) |
+| `metrics.rs` | Names and recording functions, like the other crates |
 
-Elsewhere: `chainspec` gets the genesis hash, the fork activations and the fork id (Worker 3);
-`primitives` gets the two channel types; the pipeline gets a receipts task and sends requests;
-the binary gets configuration and wiring (all Worker 2). Worker 3 owns the root manifest and
-`deny.toml` for this PR.
+Elsewhere: `chainspec` holds the genesis hash, the fork activations and the fork id;
+`primitives` the channel types; the pipeline has a receipts task and sends requests; the
+binary has the configuration, the provider over the archive and the wiring.
 
 ## 10. Configuration and identity
 
 - `OP_INDEXER_EL_ENABLED` (default `false` while peer access is unproven),
   `OP_INDEXER_EL_LISTEN_ADDR` (default `0.0.0.0:30303`, TCP and UDP),
-  `OP_INDEXER_EL_BOOTNODES`. The session limit is a constant (8 for each direction).
+  `OP_INDEXER_EL_BOOTNODES`. The session limit is a constant (8 in each direction).
   `OP_INDEXER_EL_ADVERTISED_ADDR` (optional `ip:port`): the public address the node record
   carries for TCP and UDP, for a server or a forwarded port. Unset, discovery fills in the
   address it learns from other nodes, and withdraws it again if nothing reaches the node
@@ -156,7 +160,7 @@ the binary gets configuration and wiring (all Worker 2). Worker 3 owns the root 
   its status: peers end a session at once with a node whose status says genesis.
 - Shutdown: both networks stop first, then the pipeline.
 
-## 11. Serving (built, not yet run live)
+## 11. Serving (not run live)
 
 The node answers peers from its own stores, so that another node can sync from it.
 
@@ -197,8 +201,8 @@ The node answers peers from its own stores, so that another node can sync from i
     sync) know to ask for them: making an imported history available is why it is held. The
     node then looks like one that is behind. Earlier runs suggest peers accept that (a stale
     but real head kept sessions; only genesis as the head ended them), but **a status hours or
-    days behind is not confirmed live. First thing to check in the next run:** do peers keep
-    sessions with such a node, and do they still answer its requests for the tip's receipts.
+    days behind is not confirmed live:** whether peers keep sessions with such a node, and
+    still answer its requests for the tip's receipts, is unmeasured.
   - Nothing is held: the tip alone, `earliest` = `latest` = the tip.
   What is advertised is logged at info at startup and when its kind or its first block
   changes.
@@ -211,10 +215,7 @@ The node answers peers from its own stores, so that another node can sync from i
   flooding messages cannot keep its own answers or the flush from running.
 - Metrics: `op_indexer_el_served_requests_total{kind,outcome}`,
   `op_indexer_el_served_items_total{kind}`, `op_indexer_el_served_bytes_total{kind}`.
-- Not shown live: serving itself (built without a live run).
-
-Owner: Worker 1 (`serve.rs`, the provider trait, the hooks in the session driver). The
-binary's provider over `ArchiveStore`: Worker 2.
+- Serving itself has not run live.
 
 ## 12. Range sync
 
@@ -234,20 +235,64 @@ history can get it from one that has it.
   received (`EncodedBlock`). The pipeline decodes them on blocking threads for the committed
   store, recovers senders in parallel, and appends the bytes to the archive
   (`ArchiveStore::append_batch`). A zero-signature legacy transaction gets the zero address.
-- No progress is stored: the archive's last block is the resume point.
+- Progress: the archive's last block is where the fetch resumes, and the anchor of an
+  unfinished sync with its walk's checkpoints is saved in the node store, so a restart
+  continues the walk instead of starting it again.
 - One sync request per session, next to the tip fetcher's own; neither waits for the other.
 - It needs an archive that keeps every block and whose range the sync continues; otherwise
   the binary refuses to start it. A store that refuses a batch stops the process.
-- Off by default; `OP_INDEXER_EL_SYNC=true` starts one sync from the block after the archive's
-  last one (block 0 on an empty archive) up to the first block gossip delivers after start,
-  whose sequencer-signed hash is the anchor. A node filled by the importer therefore continues
-  from the import's last block, with no range to configure. An unfinished sync is resumed to
-  its saved anchor on restart. On an empty archive the range begins before Bedrock, which no
-  public peer serves: the header walk reaches as far down as peers hold and then waits,
-  warning once a minute.
+- Off by default; `OP_INDEXER_EL_SYNC=true` runs it in rounds, for as long as the node runs.
+  It only closes the gaps gossip cannot; otherwise promotion extends the archive from the
+  unsafe store, and no block is fetched twice. Each round goes from the block after the
+  archive's last one (block 0 on an empty archive) to an anchor whose hash is trusted; the
+  saved anchor of an unfinished round is resumed first.
+  - **With the L1 side**, a round is planned while the archive's last block is 1,024 blocks
+    or more (`CAUGHT_UP_BLOCKS`, the unsafe store's read limit) below the safe head, or below
+    the committed safe block, and it is anchored on the safe head only (its batch is on L1:
+    no reorg replaces it). Everything the sync writes is then committed on L1.
+  - **Without it**, a round is planned while the archive is that far below the gossiped head,
+    anchored on the gossiped block 64 below the unsafe head (`ANCHOR_DEPTH`), whose hash the
+    sequencer signed, looked up in the unsafe store (right after a start the sync waits until
+    gossip has delivered that many blocks). An unsafe reorg deeper than 64 blocks would leave
+    the archive on a dead branch: such an archive has to be rebuilt.
+- **The chain must reach the archive.** The plan carries the archive's last block, and the
+  parent the first fetched block names is checked against it as soon as the header walk
+  reaches it (or, for a range shorter than one segment, from the first segment), before
+  anything is handed on. A mismatch ends the round as `RoundEnd::NotLinked`.
+- **An anchor no peer serves is given up**, as `RoundEnd::AnchorUnavailable`: once at least
+  three peers, and every open session whose peer says it holds the anchor's height, have
+  answered that they do not hold it and none has served it (a walk page or, for a short
+  range, a segment from it). After a round is given up, for any reason, the next waits a
+  minute, doubling for each round given up in a row, up to 30 minutes; the next anchor
+  chosen replaces the saved one.
+- **Promotion extends the archive.** Promotion reads the range above the archive's last block
+  when that block is above the committed safe head and below the new safe head, so a first
+  safe head above the archive's last block promotes everything from it on, not the safe block
+  alone, and blocks the archive holds are not read again (no hole is reported for them). The
+  binary holds an L1 head back from promotion while the archive is more than 1,024 blocks
+  below its safe block, or below the committed safe block; the finalized head is held with it
+  (promotion takes the two together). The hold is looked at again every 2 s against the
+  growing archive, so a head is released as soon as a round has stored enough, often with the
+  round still storing: promotion and the range task then both append, and each leaves out
+  what the other already wrote. A failing read of the archive or of the node store is
+  retried, warned about once a minute; the head forwarder treats an unreadable archive as no
+  reason to hold a head.
+- **The range task and promotion share the archive.** For each batch the pipeline leaves out
+  the blocks the archive already holds and requires the first block left to name the
+  archive's last one as its parent, before it writes anything. If promotion appends between
+  that check and the archive append, the append is checked once more against the new tip. A
+  batch that does not extend the archive is left out with a warning and nothing written; the
+  round then never reaches its anchor, and the planner gives it up two minutes after it was
+  fetched (`ROUND_STORE_TIMEOUT`). The pipeline does not stop for it. A node filled by the importer therefore continues
+  from the import's last block, with no range to configure. On an empty archive the range
+  begins before Bedrock, which no public peer serves: the header walk reaches as far down as
+  peers hold and then waits, warning once a minute.
+- Logs: every line of the execution network carries `el{network=op}` or `el{network=l1}`;
+  the range sync's progress line says how many peers hold the next headers, and waits "for a
+  peer that holds the anchor" when none does.
 
-**State (2026-10-04): written, never run.** It compiles; nothing has executed it, because it
-needs execution sessions with a peer that serves the range. Known inefficiencies: bodies and
+**State: never run.** Nothing has executed it, because it needs execution sessions with a
+peer that serves the range. Known inefficiencies: bodies and
 receipts of a segment are fetched one after the other, and headers are downloaded twice (once
 by the walk, once per segment). Before Bedrock no public peer serves blocks, so a sync from
 genesis only works against another instance of this node.

@@ -17,7 +17,8 @@ pub(super) const SCHEMA_MIGRATIONS: &str =
     include_str!("../../migrations/clickhouse/schema_migrations.sql");
 
 /// Every migration, in the order it must be applied. Until the first release the initial ones
-/// may be edited in place (drop the local tables afterwards); after it, never: add a new one.
+/// may be edited in place (a database that recorded them is then refused with the checksum
+/// error, and must be dropped with `DROP DATABASE`); after it, never: add a new one.
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -43,6 +44,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 5,
         name: "chain_state",
         sql: include_str!("../../migrations/clickhouse/0005_chain_state.sql"),
+    },
+    Migration {
+        version: 6,
+        name: "imported_ranges",
+        sql: include_str!("../../migrations/clickhouse/0006_imported_ranges.sql"),
     },
 ];
 

@@ -5,10 +5,11 @@
 
 use std::time::{Duration, UNIX_EPOCH};
 
-use alloy_primitives::ChainId;
+use alloy_primitives::{BlockNumber, ChainId};
 use clickhouse::sql::Identifier;
-use clickhouse::{Client, RowOwned, RowWrite};
+use clickhouse::{Client, Row, RowOwned, RowWrite};
 use op_indexer_primitives::{BlockRef, DecodedBlock, L1Heads};
+use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 use tracing::info;
 
@@ -54,6 +55,17 @@ const BLOCK_TABLES: [(&str, &str); 4] = [
     ("receipts", "block_number"),
     ("logs", "block_number"),
 ];
+
+/// A row of `imported_ranges`.
+#[derive(Debug, Row, Serialize, Deserialize)]
+struct ImportedRange {
+    chain_id: ChainId,
+    first: BlockNumber,
+    last: BlockNumber,
+    /// Seconds since the Unix epoch.
+    #[serde(rename = "loaded_at")]
+    loaded_at_secs: u32,
+}
 
 /// The rows of a set of blocks, built by [`ClickHouseStore::bulk_rows`] and written by
 /// [`ClickHouseStore::bulk_insert`]. Several sets can be joined into one insert.
@@ -322,6 +334,63 @@ impl ClickHouseStore {
         .await
     }
 
+    /// Returns the block ranges recorded by [`Self::record_imported`] for this chain, as
+    /// `(first, last)` pairs, in no particular order. The database is the record of what a
+    /// bulk load has written: a dropped or different database has none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the server cannot be reached or the query fails.
+    pub async fn imported_ranges(&self) -> Result<Vec<(BlockNumber, BlockNumber)>, StorageError> {
+        let ranges: Vec<ImportedRange> = within(
+            QUERY_TIMEOUT,
+            "imported_ranges",
+            self.queries
+                .query("SELECT ?fields FROM imported_ranges FINAL WHERE chain_id = ?")
+                .bind(self.chain_id)
+                .fetch_all(),
+        )
+        .await?;
+        Ok(ranges
+            .into_iter()
+            .map(|range| (range.first, range.last))
+            .collect())
+    }
+
+    /// Records that every block of each `(first, last)` range is in all four block tables.
+    /// Call it only after [`Self::bulk_insert`] of those blocks has returned. Recording a
+    /// range again is harmless.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the server cannot be reached or refuses the rows.
+    pub async fn record_imported(
+        &self,
+        ranges: &[(BlockNumber, BlockNumber)],
+    ) -> Result<(), StorageError> {
+        let loaded_at_secs = u32::try_from(now_micros() / 1_000_000).unwrap_or(u32::MAX);
+        let rows: Vec<ImportedRange> = ranges
+            .iter()
+            .map(|&(first, last)| ImportedRange {
+                chain_id: self.chain_id,
+                first,
+                last,
+                loaded_at_secs,
+            })
+            .collect();
+        if rows.is_empty() {
+            return Ok(());
+        }
+        within(QUERY_TIMEOUT, "record_imported", async {
+            let mut insert = self.bulk.insert::<ImportedRange>("imported_ranges").await?;
+            for row in &rows {
+                insert.write(row).await?;
+            }
+            insert.end().await
+        })
+        .await
+    }
+
     async fn bulk_table<T>(&self, table: Table, name: &str, rows: &[T]) -> Result<(), StorageError>
     where
         T: RowOwned + RowWrite,
@@ -425,10 +494,12 @@ impl CommittedStore for ClickHouseStore {
         .await
     }
 
-    /// Records `safe` as the safe head, then deletes every row above it: `blocks` first, then
-    /// transactions, receipts and logs. Writing the head first means an interrupted rollback
-    /// never leaves the recorded safe head on a deleted block; calling it again finishes the
-    /// deletes. The finalized head is not touched.
+    /// Records `safe` as the safe head, then deletes every row above it: first the recorded
+    /// imported ranges that reach above it, then `blocks`, transactions, receipts and logs.
+    /// Writing the head first means an interrupted rollback never leaves the recorded safe
+    /// head on a deleted block; deleting the ranges before the rows means a bulk load never
+    /// skips a range whose rows are gone. Calling it again finishes the deletes. The finalized
+    /// head is not touched.
     async fn rollback_to(&self, safe: BlockRef) -> Result<(), StorageError> {
         metrics::timed(Store::Committed, Operation::RollbackTo, async {
             let heads = L1Heads {
@@ -436,6 +507,18 @@ impl CommittedStore for ClickHouseStore {
                 finalized: None,
             };
             self.write_heads("rollback_to", heads).await?;
+            // A range reaching above `safe` loses some of its rows: a later bulk load must
+            // write it again.
+            within(
+                QUERY_TIMEOUT,
+                "rollback_to",
+                self.queries
+                    .query("DELETE FROM imported_ranges WHERE chain_id = ? AND last > ?")
+                    .bind(self.chain_id)
+                    .bind(safe.number)
+                    .execute(),
+            )
+            .await?;
             for (table, column) in BLOCK_TABLES {
                 let delete = format!("DELETE FROM {table} WHERE chain_id = ? AND {column} > ?");
                 within(

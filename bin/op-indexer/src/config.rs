@@ -119,16 +119,17 @@ impl Config {
     /// - `OP_INDEXER_EL_ADVERTISED_ADDR`: public socket (IP and port, the same for TCP and
     ///   UDP) announced in the execution node record, for a node behind NAT or in a container
     ///   (default: unset, the address other peers observe).
-    /// - `OP_INDEXER_EL_SYNC`: `true` to fetch from execution peers every block between the
-    ///   archive's last block and the chain's head, once, into the committed store and the
-    ///   archive (default `false`). It starts after the archive's last block (at block 0 on
-    ///   an empty archive) and goes to the unsafe head gossip delivers, whose
-    ///   sequencer-signed hash every fetched block is verified against; if the head has moved
-    ///   far ahead by then, it goes again, until the archive has caught up. Blocks are only
-    ///   promoted on L1's word after that, so promotion continues the archive where the sync
-    ///   left it. A restart continues after the archive's last block. Needs the
-    ///   execution network and an archive that keeps every block
-    ///   (`OP_INDEXER_ARCHIVE_RETENTION_BLOCKS=all`).
+    /// - `OP_INDEXER_EL_SYNC`: `true` to fetch from execution peers the blocks between the
+    ///   archive's last block and the chain that gossip cannot fill, into the committed store
+    ///   and the archive (default `false`), in rounds from the block after the archive's last
+    ///   one (block 0 on an empty archive) to a trusted anchor that every fetched block is
+    ///   verified against. With the L1 side a round runs while the archive is 1,024 blocks or
+    ///   more below the safe head (the unsafe store's read limit) and is anchored on the safe
+    ///   head; without it, while the archive is that far below the gossiped head, anchored on
+    ///   the sequencer-signed block 64 below it (a deeper unsafe reorg would need the archive
+    ///   rebuilt). Promotion extends the archive otherwise. A restart continues after the
+    ///   archive's last block. Needs the execution network and an archive that keeps every
+    ///   block (`OP_INDEXER_ARCHIVE_RETENTION_BLOCKS=all`).
     /// - `OP_INDEXER_L1_ENABLED`: `true` to follow Ethereum L1 for what it commits to
     ///   (default `false`: no safe or finalized head, nothing is promoted). The node then
     ///   runs a beacon light client, which follows Ethereum's finality from the checkpoint,

@@ -48,8 +48,8 @@ pub(crate) enum Command {
     /// disk is nearly full.
     Download(DownloadArgs),
     /// Check every downloaded chunk offline: header hashes and parent links up to the anchor,
-    /// transaction hashes and roots, receipts roots, senders.
-    Verify(VerifyArgs),
+    /// transactions roots and receipts roots. Senders are not checked.
+    Verify(VerifyCommand),
     /// Append the verified range to the local block archive the node serves from. Needs the
     /// whole range accepted by `verify`, and no database: ClickHouse is written too only with
     /// `--clickhouse-url`. The indexer must not be running.
@@ -128,9 +128,17 @@ pub(crate) struct VerifyArgs {
     /// Chunks verified at once (default: one per CPU).
     #[arg(long, env = "OP_INDEXER_IMPORT_VERIFY_THREADS")]
     pub(crate) verify_threads: Option<usize>,
+}
+
+/// Settings of the `verify` step on its own.
+#[derive(Debug, Clone, Args)]
+pub(crate) struct VerifyCommand {
+    #[command(flatten)]
+    pub(crate) verify: VerifyArgs,
     /// Verify only the chunks from this block on, and do not link or accept the range: a
     /// quick check of one part of the chain. The chunks it verifies are kept; `verify`
-    /// without this flag must still run before `load`.
+    /// without this flag must still run before `load`. Not taken by `run`, whose `load`
+    /// needs the whole range accepted.
     #[arg(long, env = "OP_INDEXER_IMPORT_VERIFY_FROM_BLOCK")]
     pub(crate) from_block: Option<u64>,
 }

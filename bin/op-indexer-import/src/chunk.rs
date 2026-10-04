@@ -54,6 +54,9 @@ pub(crate) fn write(path: &Path, link: Link, blocks: &[VerifiedBlock]) -> io::Re
         file.write_all(link.first_parent.as_slice())?;
         file.write_all(link.last_hash.as_slice())?;
         let mut out = zstd::stream::Encoder::new(file, COMPRESSION_LEVEL)?;
+        // A damaged file then fails to decompress instead of passing on wrong bytes. Files
+        // written without it still read: the flag is per frame.
+        out.include_checksum(true)?;
         for block in blocks {
             out.write_all(block.encoded.hash.as_slice())?;
             out.write_all(&length(block.senders.len())?)?;

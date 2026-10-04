@@ -596,7 +596,7 @@ fn check_top(state: &State, plan: &Plan, chunk: Chunk, link: Link) -> io::Result
     Ok(game
         .check(
             link.last_hash,
-            header.timestamp,
+            (header.timestamp, plan.chain.isthmus_time),
             header.state_root,
             header.withdrawals_root,
         )

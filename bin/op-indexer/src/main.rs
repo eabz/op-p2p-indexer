@@ -4,9 +4,12 @@
 //! ClickHouse are reachable and their schemas current, opens the local block archive when it is
 //! enabled, and runs the p2p network next to the pipeline that stores the blocks it emits. When
 //! the execution network is enabled it runs too: it fetches the receipts the pipeline asks
-//! for and serves the archive's blocks to peers, and, when a range sync is configured,
-//! fetches that range from peers for the pipeline to store. Shuts down cleanly on Ctrl-C or SIGTERM: the networks first, then the pipeline, which
-//! stores what they had already delivered.
+//! for and serves the archive's blocks to peers, and, when the range sync is on, fetches
+//! the blocks between the archive's last one and the chain from peers for the pipeline to
+//! store, round after round. When the L1 side is enabled, a
+//! beacon light client and an L1 execution p2p node read the chain's dispute games, and the
+//! pipeline promotes the blocks they commit to. Shuts down cleanly on Ctrl-C or SIGTERM: the
+//! networks first, then the pipeline, which stores what they had already delivered.
 
 mod config;
 mod provider;
@@ -17,7 +20,7 @@ use std::time::Duration;
 use alloy_primitives::BlockNumber;
 use eyre::WrapErr;
 use op_indexer_chainspec::ChainSpec;
-use op_indexer_el::{ExecutionNetwork, RangeSync, SyncPlan};
+use op_indexer_el::{ExecutionNetwork, RangeSync, RoundEnd, SyncPlan};
 use op_indexer_l1::{BeaconConfig, L1Config, L1Network, LightClient};
 use op_indexer_p2p::{Network, NodeStore, StoreError};
 use op_indexer_pipeline::{Pipeline, ReceiptsChannels};
@@ -25,11 +28,11 @@ use op_indexer_primitives::{BlockRef, EncodedBlock, ExecutionPeer, L1Games, L1He
 use op_indexer_storage::archive_store::FjallArchive;
 use op_indexer_storage::committed_store::ClickHouseStore;
 use op_indexer_storage::unsafe_store::RedisStore;
-use op_indexer_storage::{ArchiveRetention, ArchiveStore, StorageConfig};
-use tokio::sync::{mpsc, watch};
+use op_indexer_storage::{ArchiveRetention, ArchiveStore, StorageConfig, UnsafeStore};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::time::ChronoUtc;
 
@@ -55,12 +58,26 @@ const TRUSTED_L1_BLOCKS_CAPACITY: usize = 16;
 /// Batches of a range sync waiting for the pipeline. A batch is up to 256 blocks, so this is
 /// kept small; the sync waits when it is full.
 const SYNC_BATCH_CAPACITY: usize = 2;
-/// How close to the unsafe head a round of the range sync has to end for the archive to
-/// count as caught up. Promotion reads at most 4,096 blocks back from a safe head, and the
-/// first one it appends must be at or below the archive's last block: this leaves room for
-/// the safe head to be a few thousand blocks further on when it arrives.
+/// How far below the head the archive may be and still be extended by promotion: the most
+/// blocks the unsafe store returns in one read back from a head. A range sync round is planned
+/// only for a larger gap.
 const CAUGHT_UP_BLOCKS: u64 = 1024;
-/// How often the archive is asked whether a round of the range sync has reached its end.
+/// Rest after a round is given up before the next starts, doubled for each round given up in
+/// a row.
+const ABANDONED_ANCHOR_WAIT: Duration = Duration::from_mins(1);
+/// The longest rest after a round is given up.
+const ABANDONED_ANCHOR_MAX_WAIT: Duration = Duration::from_mins(30);
+/// How long the archive may take to reach the anchor of a round the execution network has
+/// fetched completely. Longer, the round's blocks were left out (they did not extend the
+/// archive), and the round is given up.
+const ROUND_STORE_TIMEOUT: Duration = Duration::from_mins(2);
+/// How often a failing read of the archive or the node store is warned about while retried.
+const RETRY_WARN_INTERVAL: Duration = Duration::from_mins(1);
+/// How far below the gossiped head a round anchors when no safe head is known: the anchor is
+/// a block an unsafe reorg will not replace in practice (they are a few blocks deep).
+const ANCHOR_DEPTH: u64 = 64;
+/// How often the archive is asked whether a round of the range sync has reached its end, and
+/// whether it holds the safe block of the L1 heads promotion waits for.
 const SYNC_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Verified checkpoints of a range sync waiting to be saved; the sync waits when it is full.
 const SYNC_CHECKPOINT_CAPACITY: usize = 16;
@@ -91,8 +108,9 @@ async fn main() -> eyre::Result<()> {
     let store = Arc::new(store);
 
     let (blocks_tx, blocks_rx) = mpsc::channel(BLOCK_CHANNEL_CAPACITY);
-    // Nothing produces the L1 heads until the L1 crate exists (docs/roadmap.md); the sender is
-    // kept so the pipeline sees a quiet source, not a closed one.
+    // The heads the commitment task derives from the L1 side's dispute games. Without the L1
+    // side nothing writes them, and the sender is kept so promotion sees a quiet source, not a
+    // closed one.
     let (l1_source_tx, l1_source_rx) = watch::channel(L1Heads::default());
     // What promotion acts on: the L1 heads, once the archive is ready to be extended by it.
     let (l1_heads_tx, l1_heads_rx) = watch::channel(L1Heads::default());
@@ -104,23 +122,26 @@ async fn main() -> eyre::Result<()> {
     let (head_tx, head_rx) = watch::channel(stores.archive_range.map(|(_, tip)| tip));
     // Taken before anything is published, so its first change is the first gossiped head.
     let gossip_head = head_rx.clone();
-    // Whether promotion may act: at once, unless a range sync has to bring the archive up to
-    // the chain first. Promotion only appends blocks that extend the archive's last one, so
-    // if it ran ahead of the sync the archive would stop where the sync ends.
+    // With the range sync on, it closes the gaps gossip cannot: promotion extends the archive
+    // from the unsafe store, which reaches only so far back, so an L1 head is held while the
+    // archive is further than that below its safe block, and a sync round closes the gap.
     let sync_archive = stores
         .archive
         .as_ref()
         .filter(|_| config.sync)
         .map(|(archive, _)| archive.clone());
-    let (caught_up_tx, caught_up_rx) = watch::channel(sync_archive.is_none());
+    let gate_archive = sync_archive.clone();
 
     let execution = config
         .el
         .map(|el| {
             let sync = sync_archive.map(|archive| SyncInputs {
                 archive,
+                unsafe_store: stores.unsafe_store.clone(),
                 gossip_head,
-                caught_up: caught_up_tx,
+                l1_heads: l1_source_rx.clone(),
+                committed: safe_number_rx.clone(),
+                l1: config.l1.is_some(),
             });
             execution_network(el, sync, &store, &stores, head_rx)
         })
@@ -153,8 +174,8 @@ async fn main() -> eyre::Result<()> {
     };
     saves.push(tokio::spawn(forward_l1_heads(
         l1_source_rx,
-        caught_up_rx,
         l1_heads_tx,
+        gate_archive.map(|archive| (archive, safe_number_rx.clone())),
     )));
     // The L1 side, whose games the pipeline turns into the heads; without it nothing writes
     // them and the sender is only kept alive, so promotion sees a quiet source, not a closed
@@ -163,7 +184,8 @@ async fn main() -> eyre::Result<()> {
         Some(settings) => {
             let l1 = l1_side(settings, config.network.chain, &store)?;
             saves.push(l1.served);
-            let pipeline = pipeline.with_l1_games(l1.games, l1_source_tx);
+            let isthmus_time = config.network.chain.isthmus_time;
+            let pipeline = pipeline.with_l1_games(l1.games, l1_source_tx, isthmus_time);
             (Some((l1.network, l1.light_client)), pipeline, None)
         }
         None => (None, pipeline, Some(l1_source_tx)),
@@ -418,134 +440,273 @@ fn execution_network(
 struct SyncInputs {
     /// The archive the sync fills: its last block is where each round starts.
     archive: FjallArchive,
-    /// The unsafe head; its first change is the first head gossip delivers in this run.
+    /// Where a block [`ANCHOR_DEPTH`] below the gossiped head is looked up.
+    unsafe_store: RedisStore,
+    /// The unsafe head gossip delivers.
     gossip_head: watch::Receiver<Option<BlockRef>>,
-    /// Set once the archive has caught up with the chain: promotion may then act.
-    caught_up: watch::Sender<bool>,
+    /// The L1 heads, before promotion sees them: the safe block is the preferred anchor.
+    l1_heads: watch::Receiver<L1Heads>,
+    /// The committed safe block's number, which the pipeline publishes.
+    committed: watch::Receiver<BlockNumber>,
+    /// Whether the L1 side runs: rounds are then anchored on safe heads only.
+    l1: bool,
 }
 
-/// Plans the range sync, round by round, and hands each plan to the execution network: from
-/// the block after the archive's last one up to an anchor, a block whose hash is trusted
-/// because the sequencer signed it.
+/// How a round ended, as the planner sees it.
+enum RoundOutcome {
+    /// The archive holds the anchor.
+    Stored,
+    /// The anchor was given up: no peer served it, or its chain does not reach the archive.
+    Abandoned,
+    /// The node is stopping.
+    Stop,
+}
+
+/// The rest after a round was given up: when the next one may start, and how long the
+/// rest was, doubled if the next is given up too.
+struct Rest {
+    until: tokio::time::Instant,
+    wait: Duration,
+}
+
+/// Plans the range sync, round by round, for as long as the node runs, and hands each plan to
+/// the execution network: from the block after the archive's last one up to an anchor whose
+/// hash is trusted.
 ///
-/// The first anchor is the one an unfinished sync of an earlier run was working towards, so
-/// its verified checkpoints are kept; otherwise it is the unsafe head gossip delivered. A
-/// round that ends more than [`CAUGHT_UP_BLOCKS`] behind the head is followed by another to
-/// the head of that moment; rounds get shorter each time. `caught_up` is set when a round to
-/// a head of this run ends within that distance: from that block on the unsafe store holds
-/// the chain, so promotion can extend the archive.
-///
-/// Ends, and with it the sync, when it has caught up or the node stops.
-async fn plan_sync(store: Arc<NodeStore>, inputs: SyncInputs, plans: mpsc::Sender<SyncPlan>) {
-    let SyncInputs {
-        archive,
-        mut gossip_head,
-        caught_up,
-    } = inputs;
+/// The sync only closes the gaps gossip cannot (see [`next_anchor`] for when a round is
+/// planned and what it is anchored on); promotion extends the archive otherwise. The first
+/// anchor is the one an unfinished round of an earlier run was working towards, so its
+/// verified checkpoints are kept. After a round is given up the next waits
+/// [`ABANDONED_ANCHOR_WAIT`], doubled for each round given up in a row. Reads of the archive
+/// and the node store that fail are retried; the planner ends only when the node stops.
+async fn plan_sync(store: Arc<NodeStore>, mut inputs: SyncInputs, plans: mpsc::Sender<SyncPlan>) {
     let mut resume = {
         let store = Arc::clone(&store);
-        match tokio::task::spawn_blocking(move || store.sync_anchor()).await {
-            Ok(Ok(anchor)) => anchor,
-            Ok(Err(err)) => return warn!(%err, "range sync not started: cannot read its anchor"),
-            Err(err) => return warn!(%err, "range sync not started: reading its anchor failed"),
+        let read = retried(&plans, "its saved anchor", move || store.sync_anchor());
+        match read.await {
+            Some(anchor) => anchor,
+            None => return,
         }
     };
-    let mut gossip_seen = false;
+    let mut rest: Option<Rest> = None;
     loop {
-        let Some(from) = archive_next(&archive).await else {
+        let Some(tip) = archive_tip(&inputs.archive, &plans).await else {
             return;
         };
-        // An unfinished sync is finished first; its anchor is not a head of this run.
-        let unfinished = resume.take().filter(|anchor| anchor.number >= from);
-        let anchor = if let Some(anchor) = unfinished {
-            anchor
-        } else {
-            // A closed channel is the pipeline stopping: the node is shutting down.
-            if !gossip_seen && gossip_head.changed().await.is_err() {
-                return;
-            }
-            gossip_seen = true;
-            let Some(head) = *gossip_head.borrow_and_update() else {
-                continue;
-            };
-            head
-        };
-        if anchor.number >= from {
-            let checkpoints = {
-                let store = Arc::clone(&store);
-                tokio::task::spawn_blocking(move || store.sync_checkpoints(anchor)).await
-            };
-            let checkpoints = match checkpoints {
-                Ok(Ok(checkpoints)) => checkpoints,
-                Ok(Err(err)) => return warn!(%err, "range sync stopped: cannot read checkpoints"),
-                Err(err) => return warn!(%err, "range sync stopped: reading checkpoints failed"),
-            };
-            info!(
-                from,
-                to = anchor.number,
-                anchor = %anchor.hash,
-                resumed = unfinished.is_some(),
-                "range sync planned: fetching these blocks from execution peers"
-            );
-            let plan = SyncPlan {
-                range: SyncRange { from, anchor },
-                checkpoints,
-            };
-            // The execution network is gone if this fails: the node is shutting down.
-            if plans.send(plan).await.is_err() {
-                return;
-            }
-            // The round is over when the archive holds its last block.
-            while archive_next(&archive)
-                .await
-                .is_some_and(|next| next <= anchor.number)
-            {
-                tokio::select! {
-                    () = plans.closed() => return,
-                    () = tokio::time::sleep(SYNC_POLL_INTERVAL) => {}
+        let from = tip.map_or(0, |tip| tip.number.saturating_add(1));
+        // An unfinished round is finished first.
+        let resumed = resume.take().filter(|anchor| anchor.number >= from);
+        let anchor = match resumed {
+            Some(anchor) => anchor,
+            None => {
+                match next_anchor(&mut inputs, from, rest.as_ref(), &plans).await {
+                    Some(Some(anchor)) => anchor,
+                    // Something moved, or a wait ended: look again.
+                    Some(None) => continue,
+                    None => return,
                 }
             }
-        }
-        // Only a round to a head of this run leaves the archive at a block the unsafe store
-        // holds the chain from.
-        if unfinished.is_some() {
-            continue;
-        }
-        let head = gossip_head
-            .borrow()
-            .map_or(anchor.number, |head| head.number);
-        let behind = head.saturating_sub(anchor.number);
-        if behind <= CAUGHT_UP_BLOCKS {
-            info!(
-                archive_tip = anchor.number.max(from.saturating_sub(1)),
-                head, "range sync done: the archive has caught up with the chain"
-            );
-            caught_up.send_replace(true);
+        };
+        let checkpoints = {
+            let store = Arc::clone(&store);
+            let read = retried(&plans, "its checkpoints", move || {
+                store.sync_checkpoints(anchor)
+            });
+            match read.await {
+                Some(checkpoints) => checkpoints,
+                None => return,
+            }
+        };
+        info!(
+            from,
+            to = anchor.number,
+            anchor = %anchor.hash,
+            resumed = resumed.is_some(),
+            "range sync planned: fetching these blocks from execution peers"
+        );
+        let (ended, end) = oneshot::channel();
+        let plan = SyncPlan {
+            range: SyncRange { from, anchor },
+            checkpoints,
+            extends: tip,
+            ended,
+        };
+        // The execution network is gone if this fails: the node is shutting down.
+        if plans.send(plan).await.is_err() {
             return;
+        }
+        match round(&inputs.archive, anchor, end, &plans).await {
+            RoundOutcome::Stored => rest = None,
+            RoundOutcome::Abandoned => {
+                let wait = rest.as_ref().map_or(ABANDONED_ANCHOR_WAIT, |earlier| {
+                    earlier
+                        .wait
+                        .saturating_mul(2)
+                        .min(ABANDONED_ANCHOR_MAX_WAIT)
+                });
+                rest = Some(Rest {
+                    until: tokio::time::Instant::now() + wait,
+                    wait,
+                });
+            }
+            RoundOutcome::Stop => return,
         }
     }
 }
 
-/// Hands the L1 heads to promotion, from the moment the archive has caught up with the chain
-/// (`caught_up`; at once when no range sync runs). Until then promotion sees no heads and
-/// promotes nothing, so the unsafe store keeps the blocks the archive still has to connect
-/// to. Ends when the pipeline or the L1 source is gone, or the sync ended without catching
-/// up.
-async fn forward_l1_heads(
-    mut heads: watch::Receiver<L1Heads>,
-    mut caught_up: watch::Receiver<bool>,
-    promotion: watch::Sender<L1Heads>,
-) {
+/// The anchor of a round from `from`, if one is needed now (see [`plan_sync`]); otherwise
+/// waits for the heads to move or the rest after a round given up to end, and returns
+/// `Some(None)` so the archive is looked at again. `None` when the node stops.
+///
+/// With the L1 side a round is needed while the archive is [`CAUGHT_UP_BLOCKS`] or more below
+/// the safe head, or below the committed safe block, and is anchored on the safe head only:
+/// everything the sync writes is then committed on L1, so no reorg can leave it behind.
+/// Without it a round is needed while the archive is that far below the gossiped head, and is
+/// anchored on the block [`ANCHOR_DEPTH`] below it: an unsafe reorg deeper than that would
+/// leave the archive on a dead branch, which only rebuilding the archive repairs.
+async fn next_anchor(
+    inputs: &mut SyncInputs,
+    from: BlockNumber,
+    rest: Option<&Rest>,
+    plans: &mpsc::Sender<SyncPlan>,
+) -> Option<Option<BlockRef>> {
+    let tip = from.checked_sub(1);
+    let safe = inputs.l1_heads.borrow_and_update().safe;
+    let head = *inputs.gossip_head.borrow_and_update();
+    let committed = *inputs.committed.borrow_and_update();
+    let far = |number: BlockNumber| number.saturating_sub(from) >= CAUGHT_UP_BLOCKS;
+    let resting = rest
+        .map(|rest| rest.until)
+        .filter(|until| *until > tokio::time::Instant::now());
+    let anchor = if resting.is_some() {
+        None
+    } else if inputs.l1 {
+        let behind_committed = tip.is_some_and(|tip| tip < committed);
+        safe.filter(|safe| safe.number >= from && (far(safe.number) || behind_committed))
+    } else {
+        match head.filter(|head| far(head.number)) {
+            Some(head) => below_head(&inputs.unsafe_store, head).await,
+            None => None,
+        }
+    };
+    if anchor.is_some() {
+        return Some(anchor);
+    }
+    let rest = async {
+        match resting {
+            Some(until) => tokio::time::sleep_until(until).await,
+            None => std::future::pending().await,
+        }
+    };
+    // A closed channel is the node stopping.
     tokio::select! {
-        () = promotion.closed() => return,
-        opened = caught_up.wait_for(|caught_up| *caught_up) => {
-            if opened.is_err() {
-                return;
-            }
+        () = plans.closed() => return None,
+        changed = inputs.l1_heads.changed() => changed.ok()?,
+        changed = inputs.gossip_head.changed() => changed.ok()?,
+        changed = inputs.committed.changed() => changed.ok()?,
+        () = rest => {}
+    }
+    Some(None)
+}
+
+/// The gossiped block [`ANCHOR_DEPTH`] below `head`, if the unsafe store holds the chain that
+/// far down (it does not right after a start: then the next head is tried).
+async fn below_head(unsafe_store: &RedisStore, head: BlockRef) -> Option<BlockRef> {
+    let stop_at = head.number.checked_sub(ANCHOR_DEPTH.saturating_add(1))?;
+    match unsafe_store.ancestry(head, stop_at).await {
+        Ok(blocks) => blocks.first().map(|block| BlockRef {
+            number: block.block.header.number,
+            hash: block.hash,
+        }),
+        Err(err) => {
+            debug!(%err, head = head.number, "no range sync anchor below this head yet");
+            None
         }
     }
+}
+
+/// Waits until the archive holds `anchor`, or the execution network gives the round up
+/// (`end`).
+async fn round(
+    archive: &FjallArchive,
+    anchor: BlockRef,
+    mut end: oneshot::Receiver<RoundEnd>,
+    plans: &mpsc::Sender<SyncPlan>,
+) -> RoundOutcome {
+    let mut fetching = true;
+    // Set once the round is fetched: the pipeline has that long to store it.
+    let mut fetched_at: Option<tokio::time::Instant> = None;
     loop {
-        promotion.send_replace(*heads.borrow_and_update());
+        let Some(tip) = archive_tip(archive, plans).await else {
+            return RoundOutcome::Stop;
+        };
+        if tip.is_some_and(|tip| tip.number >= anchor.number) {
+            return RoundOutcome::Stored;
+        }
+        if fetched_at.is_some_and(|at| at.elapsed() >= ROUND_STORE_TIMEOUT) {
+            warn!(
+                anchor = anchor.number,
+                archive_tip = ?tip,
+                "range sync round fetched but not stored: its blocks do not extend the archive"
+            );
+            return RoundOutcome::Abandoned;
+        }
+        tokio::select! {
+            () = plans.closed() => return RoundOutcome::Stop,
+            ended = &mut end, if fetching => {
+                fetching = false;
+                match ended {
+                    Ok(RoundEnd::AnchorUnavailable | RoundEnd::NotLinked) => {
+                        return RoundOutcome::Abandoned;
+                    }
+                    // The pipeline is storing the last batches.
+                    Ok(RoundEnd::Complete) => fetched_at = Some(tokio::time::Instant::now()),
+                    // The network is stopping, which `plans.closed()` shows.
+                    Err(_) => {}
+                }
+            }
+            () = tokio::time::sleep(SYNC_POLL_INTERVAL) => {}
+        }
+    }
+}
+
+/// Hands the L1 heads to promotion. With the range sync on (`gate`: the archive and the
+/// committed safe block's number), a head is held while the archive is more than
+/// [`CAUGHT_UP_BLOCKS`] below its safe block, or below the committed safe block: promotion
+/// could not read the gap from the unsafe store, and with the L1 side a sync round closes it.
+/// The hold is looked at again every [`SYNC_POLL_INTERVAL`] against the archive as it grows,
+/// so a head can be released while a round is still storing: the range task then leaves out
+/// the blocks promotion appended first. Otherwise, or if
+/// the archive cannot be read, heads go straight to promotion. The finalized head is held
+/// with the safe one: promotion takes them together. Ends when the pipeline or the L1 source
+/// is gone.
+async fn forward_l1_heads(
+    mut heads: watch::Receiver<L1Heads>,
+    promotion: watch::Sender<L1Heads>,
+    gate: Option<(FjallArchive, watch::Receiver<BlockNumber>)>,
+) {
+    loop {
+        let current = *heads.borrow_and_update();
+        let held = match (&gate, current.safe) {
+            (Some((archive, committed)), Some(safe)) => match archive.range().await {
+                Ok(range) => {
+                    let tip = range.map_or(0, |(_, tip)| tip.number);
+                    tip.saturating_add(CAUGHT_UP_BLOCKS) < safe.number || tip < *committed.borrow()
+                }
+                Err(err) => {
+                    debug!(%err, "cannot read the archive; the L1 heads go to promotion");
+                    false
+                }
+            },
+            _ => false,
+        };
+        if !held {
+            promotion.send_if_modified(|sent| {
+                let changed = *sent != current;
+                *sent = current;
+                changed
+            });
+        }
         tokio::select! {
             () = promotion.closed() => return,
             changed = heads.changed() => {
@@ -553,18 +714,58 @@ async fn forward_l1_heads(
                     return;
                 }
             }
+            () = tokio::time::sleep(SYNC_POLL_INTERVAL), if held => {}
         }
     }
 }
 
-/// The block after the archive's last one, 0 for an empty archive; `None`, logged, if the
-/// archive cannot be read.
-async fn archive_next(archive: &FjallArchive) -> Option<BlockNumber> {
-    match archive.range().await {
-        Ok(range) => Some(range.map_or(0, |(_, tip)| tip.number.saturating_add(1))),
-        Err(err) => {
-            warn!(%err, "range sync stopped: the block archive cannot be read");
-            None
+/// The archive's last block, `Some(None)` for an empty archive. A failing read is retried
+/// every [`SYNC_POLL_INTERVAL`] and warned about once per [`RETRY_WARN_INTERVAL`]. `None`
+/// when the node stops (`plans` closes).
+async fn archive_tip(
+    archive: &FjallArchive,
+    plans: &mpsc::Sender<SyncPlan>,
+) -> Option<Option<BlockRef>> {
+    let mut warned: Option<tokio::time::Instant> = None;
+    loop {
+        match archive.range().await {
+            Ok(range) => return Some(range.map(|(_, tip)| tip)),
+            Err(err) => {
+                if warned.is_none_or(|at| at.elapsed() >= RETRY_WARN_INTERVAL) {
+                    warned = Some(tokio::time::Instant::now());
+                    warn!(%err, "range sync: the block archive cannot be read; retrying");
+                }
+            }
+        }
+        tokio::select! {
+            () = plans.closed() => return None,
+            () = tokio::time::sleep(SYNC_POLL_INTERVAL) => {}
+        }
+    }
+}
+
+/// Runs the node-store read `read` on a blocking thread until it succeeds, retried like
+/// [`archive_tip`]. `None` when the node stops.
+async fn retried<T, F>(plans: &mpsc::Sender<SyncPlan>, what: &'static str, read: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: Fn() -> Result<T, StoreError> + Clone + Send + 'static,
+{
+    let mut warned: Option<tokio::time::Instant> = None;
+    loop {
+        let attempt = tokio::task::spawn_blocking(read.clone()).await;
+        let err = match attempt {
+            Ok(Ok(value)) => return Some(value),
+            Ok(Err(err)) => err.to_string(),
+            Err(err) => err.to_string(),
+        };
+        if warned.is_none_or(|at| at.elapsed() >= RETRY_WARN_INTERVAL) {
+            warned = Some(tokio::time::Instant::now());
+            warn!(%err, what, "range sync: cannot read the node store; retrying");
+        }
+        tokio::select! {
+            () = plans.closed() => return None,
+            () = tokio::time::sleep(SYNC_POLL_INTERVAL) => {}
         }
     }
 }

@@ -1,7 +1,8 @@
 # Import spec (`bin/op-indexer-import`)
 
-Status: **built on `feat/el`; the legacy range has been downloaded once on the real service
-(2026-10-03); everything from the Bedrock block on is untested against real data.**
+Status: **built on `feat/el`; the whole OP Mainnet chain (blocks 0 to 157,745,023) has been
+downloaded and verified on the real service, and its load into the block archive was running
+when this was written (section 6). The ClickHouse load has run only against a local server.**
 
 **Goal (user, 2026-10-04): sync the whole chain from HyperSync as a separate process, usable
 for any chain, into a local store that the node serves over p2p; then test a normal p2p sync
@@ -31,8 +32,8 @@ The HTTP client and the compression crates belong to this package only.
 
 ## 2. The constraint that shapes the design
 
-The API token allows unlimited requests for **30 minutes from first use**; the user can reset
-the window. So nothing but downloading happens during the window, as few bytes as possible
+The API token allows unlimited requests for **30 minutes from first use**; the window can be
+reset. So nothing but downloading happens during the window, as few bytes as possible
 travel, as little work as possible is done per byte, and the download resumes: one window is
 not enough for the whole chain.
 
@@ -119,17 +120,31 @@ the anchor (section 11). The bytes that passed are written as verified chunks.
 - `--from-block N` verifies only the chunks from that block on and neither links nor accepts
   the range: a quick check of one part of the chain (for example the first blocks after
   Bedrock) without waiting for everything before it. The chunks it verifies are kept;
-  `verify` without the flag must still run before `load`.
+  `verify` without the flag must still run before `load`. `run` does not take it.
 
 ### 3.3 `load`
 
 - **By default `load` writes to the local archive only** (section 4): the fjall store the
   node serves peers from. It needs no database.
 - Loading the committed store (ClickHouse) is optional and happens only when its settings are
-  given: verified chunks become `DecodedBlock`s with `BlockSource::Import` and go through
-  `CommittedStore::insert`, in batches. It can be done later from the same chunks, without
-  HyperSync and without touching the archive again.
-- It loads only the range `verify` accepted (`verified.json`).
+  given: verified chunks become `DecodedBlock`s with `BlockSource::Import`, are turned into
+  rows (`ClickHouseStore::bulk_rows`) in batches of about half a million rows, and are written
+  by `ClickHouseStore::bulk_insert`, `--clickhouse-inserts` batches at once (default 4). It
+  can be done later from the same chunks, without HyperSync and without touching the archive
+  again. It has run only against a local ClickHouse server.
+- **A database created by an older build is refused.** The ClickHouse migrations were edited
+  in place before the first release, so `load --clickhouse-url` against a database an older
+  build migrated fails with the migration checksum error, which names the database. Drop it
+  (`DROP DATABASE <name>`) and load again; the archive is not affected.
+- It loads only the range `verify` accepted (`verified.json`), and once the archive holds the
+  range it checks that the archive's block at the top of the range is the one `verify`
+  accepted (`last_hash`), so what was loaded is bound to what was verified.
+- **What `load` trusts:** the verified chunk files on disk, as `verify` wrote them. It
+  checks each header's hash and the chain's links again, but does not recompute the
+  transactions and receipts roots, so a body or receipts value changed on disk after
+  `verify` would be loaded. Verified chunks are written with zstd's frame checksum, so a
+  damaged file fails to decompress (files written before the checksum was added still read,
+  without that check).
 
 ## 4. The local history store, for serving
 
@@ -147,8 +162,9 @@ from block 0 and the running indexer continues it at the tip once the two meet.
   files (fjall's ingestion: no journal, no memtable), each synced, with `headers` registered
   last; see `docs/storage.md` section 9. The format on disk is the one `append_batch`
   writes, so an archive can be filled by either and continued by the node.
-- Measured on this machine (Apple M-series, 10 cores, internal SSD), with the user's sample
-  chunks repeated into a long valid chain (2026-10-04):
+- Measured on an Apple M-series laptop (10 cores, internal SSD), with 20 real post-Bedrock
+  chunks and 10 legacy ones repeated into a long valid chain (headers renumbered and
+  re-linked; 2026-10-04):
 
   | | before (`append_batch`, 16 MiB) | after (bulk, 1 GiB) |
   |---|---|---|
@@ -160,7 +176,8 @@ from block 0 and the running indexer continues it at the tip once the two meet.
   values are written once and the number-keyed trees are moved, not rewritten, by
   compaction; only `numbers` (hash to number, about 40 bytes a block) is merged. On a disk
   that writes 325 MB/s the bulk path is then limited by the disk for post-Bedrock blocks
-  (about 1 GB/s of RLP), and by preparation on the cores for legacy ones.
+  (about 1 GB/s of RLP), and by preparation on the cores for legacy ones. On the full chain
+  (section 6) it ran at 190,000 to 235,000 blocks/s, 580 to 665 MB/s of RLP.
 - Progress lines give `secs_left` from the bytes of the verified files still to read, not
   from blocks, and `mb_per_sec` of RLP appended.
 - A crash or a kill leaves the archive holding a contiguous prefix: `load` resumes after its
@@ -184,20 +201,30 @@ machine: `cargo build --release -p op-indexer-import` produces one file to copy.
   the fallback. A flag is visible in the process list and the shell history, the variable is
   not. The token is never logged and never written to the state directory.
 - Every other setting is a flag with an environment fallback and a default: the state
-  directory, the chain, the endpoint, the block range, chunk size, requests in flight, and for
-  `load` the ClickHouse settings and the archive directory.
+  directory (`OP_INDEXER_IMPORT_STATE_DIR`), the chain (`OP_INDEXER_IMPORT_CHAIN`), the
+  endpoints (`OP_INDEXER_IMPORT_ENDPOINT`, `OP_INDEXER_IMPORT_L1_ENDPOINT`), the range
+  (`OP_INDEXER_IMPORT_FIRST_BLOCK`, `_LAST_BLOCK`, `_ANCHOR_HASH`, `_LEGACY_ONLY`), the chunk
+  size (`OP_INDEXER_IMPORT_CHUNK_BLOCKS`), requests in flight (`OP_INDEXER_IMPORT_REQUESTS`),
+  `verify`'s threads and start (`OP_INDEXER_IMPORT_VERIFY_THREADS`,
+  `OP_INDEXER_IMPORT_VERIFY_FROM_BLOCK`), and for `load` the archive directory
+  (`OP_INDEXER_IMPORT_ARCHIVE_DIR`) and the ClickHouse settings below.
 - **By default the importer fills the local block archive the node serves from, and needs no
   database.** `load` appends the verified bytes to the archive directory (`--archive-dir`,
   default `data/archive`) and contacts nothing else.
 - **ClickHouse is optional.** It is written only when `--clickhouse-url` is given
-  (`OP_INDEXER_IMPORT_CLICKHOUSE_URL`); its migrations are then applied if missing, and
-  `--clickhouse-database`, `--clickhouse-user` and `--clickhouse-password` apply. Redis is
-  never needed.
+  (`OP_INDEXER_IMPORT_CLICKHOUSE_URL`); its database is then created and its migrations
+  applied if missing, and `--clickhouse-database` (`OP_INDEXER_CLICKHOUSE_DATABASE`, default
+  `op_indexer`), `--clickhouse-user` (`OP_INDEXER_CLICKHOUSE_USER`, default `indexer`),
+  `--clickhouse-password` (`OP_INDEXER_CLICKHOUSE_PASSWORD`) and `--clickhouse-inserts`
+  (`OP_INDEXER_IMPORT_CLICKHOUSE_INSERTS`, batches in flight, 1 to 16, default 4) apply.
+  Redis is never needed.
 - `load` needs the range accepted by `verify` (`verified.json`) and refuses anything else.
   What the archive holds is asked of the archive: `load` continues after its last block, and
   refuses an archive that does not start at the range's first block or holds another chain.
-  ClickHouse keeps one marker per chunk (`<state>/loaded/<chunk>.clickhouse`), so it can be
-  loaded on a later run from the same verified chunks without touching the archive.
+  ClickHouse records each chunk it holds in its own table (`imported_ranges`, written after
+  the chunk's rows), and `load` loads the chunks it has no record of, so it can be loaded on a
+  later run from the same verified chunks without touching the archive. The record lives in
+  the database: a dropped or different database gets every chunk again.
 - `load` exits with an error if it stops before the end of the range, and says what to run.
 
 ### How to run it
@@ -250,8 +277,10 @@ and its default. Only `--state-dir` is shared by the steps: the range is decided
   that file from `raw/` and run `download` again.
 - **Disk**: a downloaded legacy chunk is 0.7 to 1.0 KB per block (zstd or gzip, as the
   service sends it) and a verified one about 0.5 KB per block: roughly 75 to 105 GB and 52 GB
-  for the legacy range if the sample of section 6 is typical. Blocks from Bedrock on are many
-  times larger and have not been measured. `raw/` can be deleted once `load` has finished.
+  for the legacy range if the sample of section 6 is typical. The whole OP Mainnet chain was
+  589 GB downloaded (section 6). `raw/` can be deleted once `verify` has accepted the range:
+  `download` counts a chunk with a verified file as done, so a later `download` or `run` on
+  the same state directory does not fetch it again.
 
 ## 6. Measured
 
@@ -259,16 +288,22 @@ Offline, on 1,000 saved blocks (50,000,000 to 50,000,999, one transaction each),
 
 - Size: 4.7 MB of JSON with the fields requested; 0.75 MB as zstd, 1.0 MB as gzip.
 - `verify`, one thread: 0.17 s of processor time per 1,000 blocks with sender recovery, about
-  0.06 s without (the build described here): reading and decoding 6 to 8 ms, parsing 10 to
+  0.06 s without (what `verify` does now): reading and decoding 6 to 8 ms, parsing 10 to
   13 ms, receipts and their blooms 8 ms, the two tries 9 ms, header, body and receipts
   encoding 5 ms, transactions 1 ms, writing the verified chunk with its sync 17 to 22 ms (on
   macOS; a sync is cheaper on Linux).
-- Projection, not a measurement: 105 million legacy blocks at 0.05 s per 1,000 are about 90
-  core-minutes, 11 minutes on 8 cores if the disk keeps up.
+- Projection, not a measurement: 105 million legacy blocks at 0.06 s per 1,000 are about 105
+  core-minutes, 13 minutes on 8 cores if the disk keeps up.
 
-On the real service (the user's run, 2026-10-03, 8 cores, 1 Gbit, the build before this one):
-the legacy range downloaded at about 185,000 blocks per second with 64 requests in flight.
-Nothing from the Bedrock block on has been measured.
+On the real service:
+
+- 2026-10-03, 8 cores, 1 Gbit, an earlier build: the legacy range downloaded at about
+  185,000 blocks per second with 64 requests in flight.
+- The whole chain, a 32-core server: `download` of blocks 0 to 157,745,023 (157,745,024
+  blocks, 589 GB) in about 25 minutes at 300 to 380 MB/s; `verify` accepted the whole chain
+  (630,336 chunks, linking 58 s), its top block matching the claim of the newest dispute game
+  (a type 9 super game); the bulk load into the archive ran at 190,000 to 235,000 blocks/s,
+  580 to 665 MB/s of RLP, on a volume `dd` measured at 325 MB/s of sequential writes.
 
 ## 7. The state directory
 
@@ -277,7 +312,6 @@ Nothing from the Bedrock block on has been measured.
 <state>/verified.json             the range `verify` accepted; `load` requires it
 <state>/raw/<from>-<to>.raw       downloaded chunk: the service's answers as they travelled
 <state>/verified/<from>-<to>.blk  verified chunk: the consensus encodings that passed
-<state>/loaded/<from>-<to>.clickhouse   marker: ClickHouse holds the chunk
 <state>/lock                      held by the one process working on the directory
 ```
 
@@ -305,19 +339,19 @@ the hash of an empty requests list, which has no column in HyperSync).
 
 - **Deposits are rebuilt from HyperSync's `source_hash` and `mint` columns.** A deposit
   without a reported source hash fails `verify` with a named check: the source hash comes from
-  the deposit's event on L1, which this tool does not read. Whether the OP Mainnet endpoint
-  fills these columns for every deposit is **not known**: no block from Bedrock on has been
-  verified against real data.
+  the deposit's event on L1, which this tool does not read. On OP Mainnet the endpoint fills
+  them for every deposit: the whole chain verified (section 6).
 - The system-transaction flag, which has no column, follows the protocol's rule: only the
   L1-attributes deposit before Regolith has it.
 - A deposit receipt carries the sender's nonce and the receipt version from Canyon on, when
   they became part of the hashed receipt; before Canyon nothing the root does not cover is
   stored.
 - Fork times and the Bedrock block come from `op-indexer-chainspec`.
-- Verified offline on blocks 105,235,062 to 105,235,064 with an earlier build only. Not
-  verified on any sample: typed transactions (the JSON form of `access_list` and
-  `authorization_list` is assumed to be the Ethereum RPC's), user deposits, blocks from Canyon
-  on. A block that cannot be rebuilt and verified is not imported.
+- `access_list` and `authorization_list` arrive as the bytes of the service's binary column
+  (a hex string in the JSON), decoded when the transaction is rebuilt (`verify/lists.rs`).
+- Verified on real data: the whole OP Mainnet chain, so every transaction type, user deposits
+  and every fork up to the newest dispute game (section 6). A block that cannot be rebuilt and
+  verified is not imported.
 
 ## 10. Any chain
 

@@ -45,9 +45,11 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::{MissedTickBehavior, interval, timeout};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, warn};
 
-use self::schedule::{BAN_DURATION, FULL_PEER_RETRY, LONG_BACKOFF, REDIAL_INTERVAL, Schedule};
+use self::schedule::{
+    BAN_DURATION, DialTally, FULL_PEER_RETRY, LONG_BACKOFF, REDIAL_INTERVAL, Schedule,
+};
 use crate::ElError;
 use crate::discovery::Candidate;
 use crate::metrics::{self, DialOutcome, DropReason, EndLabel};
@@ -70,6 +72,8 @@ const MAX_DIALS_IN_FLIGHT: usize = 8;
 const REPORTS_CAPACITY: usize = 64;
 /// How long shutdown waits for sessions to say goodbye before dropping them.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+/// How often the peer set says how it is doing, when something changed since the last line.
+const STATUS_INTERVAL: Duration = Duration::from_mins(1);
 
 /// The open sessions, as a requester (the tip fetcher, range sync) sees them, and its way to
 /// report a peer. A clone has its own view of what changed.
@@ -214,6 +218,9 @@ impl PeerSet {
     pub(crate) async fn run(mut self, cancel: CancellationToken) -> Result<(), ElError> {
         let mut dial_tick = interval(DIAL_TICK);
         dial_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut status_tick = interval(STATUS_INTERVAL);
+        status_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut last_status = None;
         let outcome = loop {
             tokio::select! {
                 biased;
@@ -238,12 +245,34 @@ impl PeerSet {
                 },
                 Some(report) = self.reports.recv() => self.reported(report),
                 _ = dial_tick.tick() => {}
+                _ = status_tick.tick() => self.log_status(&mut last_status),
             }
             // After every event: a new candidate or a finished dial may allow another dial.
             self.start_dials(&cancel);
         };
         self.shutdown().await;
         outcome
+    }
+
+    /// Says how many sessions are open, how many peers are known and what the dials since
+    /// the last line came to; only when that changed, so an idle node stays quiet.
+    fn log_status(&mut self, last: &mut Option<(usize, usize)>) {
+        let tally = self.schedule.take_tally();
+        let now = (self.sessions.len(), self.schedule.known());
+        if tally == DialTally::default() && *last == Some(now) {
+            return;
+        }
+        *last = Some(now);
+        info!(
+            sessions = now.0,
+            inbound = self.count(Direction::Inbound),
+            known_peers = now.1,
+            dials = tally.tried,
+            full = tally.full,
+            timed_out = tally.timed_out,
+            failed = tally.other,
+            "execution peers"
+        );
     }
 
     /// Lets running sessions end on the cancelled token, then drops whatever is left.
@@ -288,16 +317,19 @@ impl PeerSet {
             let peer = candidate.peer_id;
             self.dialing.insert(peer);
             let (ctx, cancel) = (Arc::clone(&self.ctx), cancel.clone());
-            self.tasks.spawn(async move {
-                tokio::select! {
-                    biased;
-                    () = cancel.cancelled() => None,
-                    result = session::connect(&ctx, &candidate) => Some(Done::Dialed {
-                        peer,
-                        result: Box::new(result),
-                    }),
+            self.tasks.spawn(
+                async move {
+                    tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => None,
+                        result = session::connect(&ctx, &candidate) => Some(Done::Dialed {
+                            peer,
+                            result: Box::new(result),
+                        }),
+                    }
                 }
-            });
+                .in_current_span(),
+            );
         }
     }
 
@@ -359,23 +391,29 @@ impl PeerSet {
         self.next_generation = self.next_generation.wrapping_add(1);
         self.sessions.insert(peer, Live { handle, generation });
         let cancel = cancel.clone();
-        self.tasks.spawn(async move {
-            Some(Done::Ended {
-                // The driver's future is large; keep it off the task's stack frame.
-                end: Box::pin(driver.run(cancel)).await,
-                generation,
-            })
-        });
+        self.tasks.spawn(
+            async move {
+                Some(Done::Ended {
+                    // The driver's future is large; keep it off the task's stack frame.
+                    end: Box::pin(driver.run(cancel)).await,
+                    generation,
+                })
+            }
+            .in_current_span(),
+        );
         metrics::session_opened(self.ctx.spec().label, direction);
         self.publish();
     }
 
     /// Tells a peer why its session is not kept, without blocking the peer set.
     fn refuse(&mut self, driver: SessionDriver, reason: DisconnectReason) {
-        self.tasks.spawn(async move {
-            driver.reject(reason).await;
-            None
-        });
+        self.tasks.spawn(
+            async move {
+                driver.reject(reason).await;
+                None
+            }
+            .in_current_span(),
+        );
     }
 
     /// Removes an ended session and decides when its peer may be dialed again.

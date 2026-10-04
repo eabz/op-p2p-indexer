@@ -12,19 +12,44 @@
 //! receipts fetched (checked too); the game is read from the event and that `create` call.
 //! A game created through another contract is not found: it would be refused anyway.
 //!
-//! It publishes the newest game on the chain it has walked and the newest game in a
-//! finalized block. It does not check a game's claim against our own blocks: that is done
-//! where those blocks are.
+//! It publishes the most recent games ([`MAX_RECENT_GAMES`]) on the chain linked by parent
+//! hashes down from the newest block walked, and the highest finalized L1 block on that
+//! chain. A game in a block below a break in that chain (a block not walked yet, or one of
+//! another chain) is held back until the break is walked, and dropped if its block is dropped
+//! first: so every game at or below the finalized block is on the finalized chain. Every
+//! recent game is kept, not only the newest: anyone who posts the bond can create a game, so
+//! the newest may claim a block that is not ours. It does not check a game's claim against
+//! our own blocks: that is done where those blocks are.
+//!
+//! **Junk games.** The bound of [`MAX_RECENT_GAMES`] is a liveness lever: 64 games created
+//! within the finality lag (64 bonds) push an honest game out before its L1 block is
+//! finalized, so the finalized head waits for the next honest one. Heads never go down. The
+//! first walk after a start likewise ends at the first game old enough to be finalized, even
+//! if that game is junk.
+//!
+//! A block counts as walked only once it has been scanned, so a block whose transactions or
+//! receipts could not be read is read again by a later walk. A walk that stops part-way is
+//! resumed from where it stopped when the next trusted block arrives, until a reorg or
+//! another walk has linked the hole.
 //!
 //! **Reorgs.** A trusted head is not final. When a new trusted head does not build on the
 //! blocks walked before, the blocks it replaces are forgotten with their games, so the newest
-//! game can become an older one. Finalized blocks are never replaced.
+//! game can become an older one. A finalized block the walked chain does not hold replaces
+//! it the same way. Finalized blocks are never replaced.
 //!
-//! **Start.** Nothing is stored between runs. The first trusted head is walked down until a
-//! game old enough to be finalized has been found, or [`MAX_BACKFILL_BLOCKS`] have been
-//! walked: after a start both games are known again without waiting for new ones.
+//! **Start.** Nothing is stored between runs. The first trusted block is the light client's
+//! checkpoint, a finalized block; the first heads follow within seconds. The first walk goes
+//! down until a game old enough to be finalized has been found, or [`MAX_BACKFILL_BLOCKS`]
+//! have been walked, so after a start recent games are known again without waiting for new
+//! ones. A head more than [`MAX_BACKFILL_BLOCKS`] above the checkpoint does not connect to it:
+//! the games in between are not seen.
+//!
+//! **Trusted blocks are coalesced.** A walk can take a while; the blocks told meanwhile wait
+//! in the channel, and only the last head and the newest finalized block of what waited are
+//! followed.
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 
 use alloy_consensus::{Header, Sealed, Transaction, TxEnvelope};
 use alloy_eips::eip2718::Decodable2718;
@@ -50,6 +75,9 @@ const FINALITY_MARGIN_BLOCKS: u64 = 128;
 /// Most L1 blocks remembered above the finalized one. Finality normally trails by about a
 /// hundred blocks; this only bounds memory while L1 does not finalize.
 const MAX_TRACKED_BLOCKS: u64 = 16_384;
+/// Most games published: about a day of a proposer's games, plus room for games others
+/// created.
+const MAX_RECENT_GAMES: usize = 64;
 
 /// Follows trusted L1 blocks and publishes the games found.
 #[derive(Debug)]
@@ -63,12 +91,37 @@ pub(crate) struct Watcher {
     /// The newest trusted block, which the L1 sessions advertise as their head.
     head: watch::Sender<Option<BlockRef>>,
     games: watch::Sender<L1Games>,
-    /// The L1 blocks walked, by number: the canonical chain as far as it is known.
-    blocks: BTreeMap<BlockNumber, B256>,
-    /// The games found, by the number of the L1 block that created them.
-    found: BTreeMap<BlockNumber, VerifiedGame>,
-    /// The highest finalized L1 block number told.
+    /// The L1 blocks walked and scanned, by number: the canonical chain as far as it is known.
+    blocks: BTreeMap<BlockNumber, Walked>,
+    /// The games found, by the number of the L1 block that created them, in block order.
+    found: BTreeMap<BlockNumber, Vec<VerifiedGame>>,
+    /// The highest finalized L1 block number told whose hash is on the linked chain.
     finalized: Option<BlockNumber>,
+    /// Walks that stopped part-way, below blocks they recorded: where each continues.
+    resumes: Vec<Resume>,
+}
+
+/// A block walked and scanned.
+#[derive(Debug, Clone, Copy)]
+struct Walked {
+    hash: B256,
+    parent: B256,
+}
+
+/// Where a walk starts, or continues after it stopped: the block not yet scanned, and what
+/// the walk is for.
+#[derive(Debug, Clone, Copy)]
+struct Resume {
+    number: BlockNumber,
+    hash: B256,
+    /// The block above, the child of `hash`, once the walk has recorded it. A stopped walk is
+    /// kept only then (before, it left no hole), and continues only while that block is still
+    /// walked and the block at `number` is not `hash`.
+    child: Option<B256>,
+    /// The trusted block the walk began at.
+    head: BlockNumber,
+    /// Whether it was the first walk, which ends at a game old enough to be finalized.
+    first: bool,
 }
 
 impl Watcher {
@@ -92,6 +145,7 @@ impl Watcher {
             blocks: BTreeMap::new(),
             found: BTreeMap::new(),
             finalized: None,
+            resumes: Vec::new(),
         }
     }
 
@@ -105,21 +159,37 @@ impl Watcher {
             };
             // A closed channel is the light client shutting down.
             let Some(block) = block else { return };
-            match self.follow(block, &cancel).await {
-                Ok(()) => {}
-                Err(Stop::Cancelled) => return,
-                // A head that was replaced before any peer was asked: the next one follows.
-                Err(Stop::NotHeld) => warn!(
-                    number = block.number,
-                    hash = %block.hash,
-                    "no L1 peer serves a trusted block; waiting for the next one"
-                ),
+            // What waited meanwhile: only the newest head and the newest finalized block count.
+            let (mut head, mut finalized) = (None, None);
+            for block in
+                std::iter::once(block).chain(std::iter::from_fn(|| self.trusted.try_recv().ok()))
+            {
+                let slot = if block.finalized {
+                    &mut finalized
+                } else {
+                    &mut head
+                };
+                // The last told is the light client's newest view, even when a reorg lowered it.
+                *slot = Some(block);
+            }
+            // The head first: its walk covers the finalized block, which is then linked.
+            for block in [head, finalized].into_iter().flatten() {
+                match self.follow(block, &cancel).await {
+                    Ok(()) => {}
+                    Err(Stop::Cancelled) => return,
+                    // A head that was replaced before any peer was asked: the next one follows.
+                    Err(Stop::NotHeld) => warn!(
+                        number = block.number,
+                        hash = %block.hash,
+                        "no L1 peer serves a trusted block; waiting for the next one"
+                    ),
+                }
             }
         }
     }
 
-    /// Takes one trusted block into account: walks down from it, scans what is new, and
-    /// publishes the games.
+    /// Takes one trusted block into account: walks down from it, continues a walk that
+    /// stopped, scans what is new, and publishes the games.
     async fn follow(
         &mut self,
         block: TrustedL1Block,
@@ -138,86 +208,131 @@ impl Watcher {
             }
             newer
         });
-        if finalized {
-            self.finalized = self.finalized.max(Some(number));
-        } else {
-            // A head below blocks walked before: what is above it was replaced.
+        // A head below blocks walked before, or a finalized block the walked chain does not
+        // hold: what is above it was replaced.
+        if !finalized || self.hash_at(number).is_some_and(|known| known != hash) {
             self.forget_above(number);
         }
         // Walked already (a finalized block was a head earlier), or below everything kept
         // (an old block told late): nothing to read.
-        let known = self.blocks.get(&number) == Some(&hash);
+        let known = self.hash_at(number) == Some(hash);
         let below = self
             .blocks
             .first_key_value()
             .is_some_and(|(first, _)| number < *first);
-        if !known && !below {
-            let walked = self.walk(number, hash, cancel).await;
-            // What was walked before a stop stays: the next trusted block connects to it.
-            self.prune();
-            self.publish();
-            return walked;
+        let mut walked = if known || below {
+            Ok(())
+        } else {
+            let start = Resume {
+                number,
+                hash,
+                child: None,
+                head: number,
+                first: self.blocks.is_empty(),
+            };
+            self.walk(start, cancel).await
+        };
+        // Walks that stopped earlier continue, below what was just walked. One that stops
+        // again is kept, from where it stopped.
+        while walked.is_ok()
+            && let Some(resume) = self.resumes.pop()
+        {
+            if is_open(&self.blocks, &resume) {
+                walked = self.walk(resume, cancel).await;
+            }
         }
+        // A finalized block counts only once its hash is on the linked chain: then every
+        // block below it on that chain is its ancestor.
+        if finalized && self.hash_at(number) == Some(hash) && number >= self.unlinked().end {
+            self.finalized = self.finalized.max(Some(number));
+        }
+        // What was walked before a stop stays: the next trusted block connects to it.
         self.prune();
         self.publish();
-        Ok(())
+        walked
     }
 
-    /// Walks the headers down from the block `number` with hash `from` until a known block is
-    /// reached, scanning each new one for games.
-    async fn walk(
-        &mut self,
-        number: BlockNumber,
-        from: B256,
-        cancel: &CancellationToken,
-    ) -> Result<(), Stop> {
-        let first_walk = self.blocks.is_empty();
+    /// Walks the headers down from `start` until a known block is reached, scanning each new
+    /// one for games. A `first` walk ends at a game old enough to be finalized. If it stops
+    /// below a block it (or the walk it continues) recorded, where it stopped is kept so a
+    /// later call continues it; one that recorded nothing leaves no hole, and the next trusted
+    /// block walks it again.
+    async fn walk(&mut self, start: Resume, cancel: &CancellationToken) -> Result<(), Stop> {
+        let Resume {
+            number,
+            head,
+            first,
+            ..
+        } = start;
         // The headers down to the newest block known, if the head builds on it.
         let gap = self
             .blocks
-            .last_key_value()
+            .range(..number)
+            .next_back()
             .map(|(top, _)| number.saturating_sub(*top));
-        let mut limit = gap.unwrap_or(HEADER_BATCH).clamp(1, HEADER_BATCH);
-        let (mut next, mut walked) = (from, 0_usize);
+        let mut limit = gap.map_or(HEADER_BATCH, |gap| gap.min(HEADER_BATCH));
+        let mut walked = 0_usize;
+        // Where the walk continues if it stops: `resume.hash` is the next block to read.
+        let mut resume = start;
         while walked < MAX_BACKFILL_BLOCKS {
-            let headers = self.fetcher.headers(next, limit, cancel).await?;
+            let headers = self
+                .fetcher
+                .headers(resume.hash, limit, cancel)
+                .await
+                .inspect_err(|_| self.resumes.extend(resume.child.map(|_| resume)))?;
             limit = HEADER_BATCH;
             for block in headers {
                 let at = block.number;
-                // Another block was known at this height: it was replaced, with its game.
-                if self.blocks.insert(at, block.hash()).is_some() {
+                let games = self
+                    .scan(&block, cancel)
+                    .await
+                    .inspect_err(|_| self.resumes.extend(resume.child.map(|_| resume)))?;
+                // Recorded only now that it is scanned. Another block known at this height
+                // was replaced, with its games.
+                let walked_block = Walked {
+                    hash: block.hash(),
+                    parent: block.parent_hash,
+                };
+                if self.blocks.insert(at, walked_block).is_some() {
                     self.found.remove(&at);
                 }
-                next = block.parent_hash;
+                resume = Resume {
+                    number: at.saturating_sub(1),
+                    hash: block.parent_hash,
+                    child: Some(block.hash()),
+                    ..resume
+                };
                 walked = walked.saturating_add(1);
-                if let Some(game) = self.scan(&block, cancel).await? {
-                    info!(
-                        l1_block = at,
-                        game = %game.game,
-                        game_type = game.game_type,
-                        l2_block = game.l2_block,
-                        "dispute game found on L1"
-                    );
-                    self.found.insert(at, game);
-                    // The walk goes down, so the first game found is the newest: it is
-                    // published at once, not when the walk ends.
-                    self.publish();
+                if !games.is_empty() {
+                    for game in &games {
+                        info!(
+                            l1_block = at,
+                            game = %game.game,
+                            game_type = game.game_type,
+                            l2_block = game.l2_block,
+                            "dispute game found on L1"
+                        );
+                    }
+                    // Published when the walk ends or stops: mid-walk, the blocks below the
+                    // one not yet connected are unlinked, and the games would shrink to those
+                    // above it.
+                    self.found.insert(at, games);
                     // After a start: enough is known once a game old enough to be finalized
                     // has been found.
-                    if first_walk && at.saturating_add(FINALITY_MARGIN_BLOCKS) <= number {
+                    if first && at.saturating_add(FINALITY_MARGIN_BLOCKS) <= head {
                         return Ok(());
                     }
                 }
                 // The parent is known: the walk has reached the chain walked before.
                 let connected = at
                     .checked_sub(1)
-                    .is_none_or(|parent| self.blocks.get(&parent) == Some(&next));
+                    .is_none_or(|parent| self.hash_at(parent) == Some(resume.hash));
                 if connected {
                     return Ok(());
                 }
             }
         }
-        if !first_walk {
+        if !first {
             warn!(
                 walked,
                 "an L1 head does not connect to the blocks known within the walk limit; \
@@ -227,15 +342,15 @@ impl Watcher {
         Ok(())
     }
 
-    /// Looks for the newest game the factory created in `block`.
+    /// Looks for the games the factory created in `block`, in the order they were created.
     async fn scan(
-        &self,
+        &mut self,
         block: &Sealed<Header>,
         cancel: &CancellationToken,
-    ) -> Result<Option<VerifiedGame>, Stop> {
-        // The bloom has no false negatives; on mainnet about five blocks in six end here.
+    ) -> Result<Vec<VerifiedGame>, Stop> {
+        // The bloom has no false negatives; on mainnet about four blocks in five end here.
         if !block.logs_bloom.contains(&self.needle) {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         let transactions = self.fetcher.transactions(block, cancel).await?;
         // Most of the rest end here: no transaction was sent to the factory.
@@ -245,7 +360,7 @@ impl Watcher {
                 .is_ok_and(|transaction| transaction.to() == Some(factory))
         };
         if !transactions.iter().any(to_factory) {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         let receipts = self
             .fetcher
@@ -255,7 +370,7 @@ impl Watcher {
             number: block.number,
             hash: block.hash(),
         };
-        let mut newest = None;
+        let mut games = Vec::new();
         for (transaction, receipt) in transactions.iter().zip(&receipts) {
             let created = receipt
                 .logs()
@@ -264,7 +379,7 @@ impl Watcher {
                 .filter_map(|log| CreatedGame::from_topics(log.topics()));
             for created in created {
                 match self.game(l1_block, transaction, &created) {
-                    Ok(game) => newest = Some(game),
+                    Ok(game) => games.push(game),
                     Err(reason) => warn!(
                         l1_block = l1_block.number,
                         game = %created.game,
@@ -275,13 +390,13 @@ impl Watcher {
                 }
             }
         }
-        if newest.is_none() {
+        if games.is_empty() {
             debug!(
                 l1_block = l1_block.number,
                 "the bloom matched, but the block has no game"
             );
         }
-        Ok(newest)
+        Ok(games)
     }
 
     /// Reads what `created` claims from the transaction that emitted its event.
@@ -307,6 +422,33 @@ impl Watcher {
         })
     }
 
+    /// The hash of the block walked at `number`.
+    fn hash_at(&self, number: BlockNumber) -> Option<B256> {
+        self.blocks.get(&number).map(|block| block.hash)
+    }
+
+    /// The blocks kept that are not on the chain linked by parent hashes down from the newest
+    /// block walked: from the lowest block kept up to that chain's lowest block, where a
+    /// block not walked yet or one of another chain breaks it. Empty when all are linked.
+    fn unlinked(&self) -> Range<BlockNumber> {
+        let mut blocks = self.blocks.iter().rev();
+        let Some((&top, newest)) = blocks.next() else {
+            return 0..0;
+        };
+        let (mut floor, mut parent) = (top, newest.parent);
+        for (&number, block) in blocks {
+            if number.saturating_add(1) != floor || block.hash != parent {
+                break;
+            }
+            (floor, parent) = (number, block.parent);
+        }
+        let first = self
+            .blocks
+            .first_key_value()
+            .map_or(floor, |(first, _)| *first);
+        first..floor
+    }
+
     /// Forgets the blocks above `number` and their games.
     fn forget_above(&mut self, number: BlockNumber) {
         let above = number.saturating_add(1);
@@ -315,7 +457,8 @@ impl Watcher {
     }
 
     /// Drops what is no longer needed: blocks below the finalized one (or beyond the tracking
-    /// limit), and every finalized game but the newest.
+    /// limit), games beyond the most recent [`MAX_RECENT_GAMES`], and stopped walks that are
+    /// closed.
     fn prune(&mut self) {
         let Some((&top, _)) = self.blocks.last_key_value() else {
             return;
@@ -324,31 +467,59 @@ impl Watcher {
             .finalized
             .unwrap_or(0)
             .max(top.saturating_sub(MAX_TRACKED_BLOCKS));
+        // Games of blocks about to be dropped that are not on the linked chain go with them:
+        // once their blocks are gone, nothing could tell.
+        let unlinked = self.unlinked();
+        let dropped = unlinked.start..unlinked.end.min(floor);
+        self.found.retain(|at, _| !dropped.contains(at));
         self.blocks = self.blocks.split_off(&floor);
-        if let Some(newest_final) = self.newest_finalized().map(|game| game.l1_block.number) {
-            self.found = self.found.split_off(&newest_final);
+        let blocks = &self.blocks;
+        self.resumes
+            .retain(|resume| resume.number >= floor && is_open(blocks, resume));
+        let mut kept = 0_usize;
+        let oldest_kept = self.found.iter().rev().find_map(|(at, games)| {
+            kept = kept.saturating_add(games.len());
+            (kept >= MAX_RECENT_GAMES).then_some(*at)
+        });
+        if let Some(oldest) = oldest_kept {
+            self.found = self.found.split_off(&oldest);
         }
     }
 
-    /// The newest game in a finalized block.
-    fn newest_finalized(&self) -> Option<&VerifiedGame> {
-        let finalized = self.finalized?;
-        self.found
-            .range(..=finalized)
-            .next_back()
-            .map(|(_, game)| game)
-    }
-
-    /// Publishes the games, if they changed.
+    /// Publishes the games on the linked chain, if they changed. Games below every block
+    /// kept count: their blocks were on the linked chain when they were dropped.
     fn publish(&self) {
+        let unlinked = self.unlinked();
+        let mut recent: Vec<VerifiedGame> = self
+            .found
+            .iter()
+            .filter(|(at, _)| !unlinked.contains(at))
+            .flat_map(|(_, games)| games.iter().copied())
+            .collect();
+        let excess = recent.len().saturating_sub(MAX_RECENT_GAMES);
+        recent.drain(..excess);
         let games = L1Games {
-            newest: self.found.last_key_value().map(|(_, game)| *game),
-            finalized: self.newest_finalized().copied(),
+            recent,
+            finalized_l1_block: self.finalized,
         };
         self.games.send_if_modified(|current| {
             let changed = *current != games;
-            *current = games;
+            if changed {
+                *current = games;
+            }
             changed
         });
     }
+}
+
+/// Whether a stopped walk still has something to do: the block it recorded last is still
+/// walked, and the block at `number` is not the one it names as parent (none, or one of
+/// another chain). A reorg or another walk closes it.
+fn is_open(blocks: &BTreeMap<BlockNumber, Walked>, resume: &Resume) -> bool {
+    let child = blocks.get(&resume.number.saturating_add(1));
+    resume.child.is_some()
+        && child.map(|child| child.hash) == resume.child
+        && blocks
+            .get(&resume.number)
+            .is_none_or(|block| block.hash != resume.hash)
 }

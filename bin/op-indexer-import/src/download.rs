@@ -142,7 +142,10 @@ pub(crate) async fn run(
         let (state, plan) = (state.clone(), *plan);
         tokio::task::spawn_blocking(move || {
             plan.chunks()
-                .filter(|chunk| !state.raw_path(*chunk).exists())
+                // A chunk already verified needs no download, even if `raw/` was deleted.
+                .filter(|chunk| {
+                    !state.raw_path(*chunk).exists() && !state.verified_path(*chunk).exists()
+                })
                 .collect::<Vec<_>>()
         })
         .await?

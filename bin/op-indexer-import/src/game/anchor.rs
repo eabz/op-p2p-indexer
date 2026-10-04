@@ -38,17 +38,17 @@ pub(crate) struct AnchorError {
 impl GameAnchor {
     /// Checks that the downloaded block [`Self::l2_block`], given by its hash and three fields
     /// of its header, is the block the game claims. `withdrawals_root` is the header's, which
-    /// from Isthmus on is the storage root of the message passer.
+    /// from Isthmus on (`isthmus_time`) is the storage root of the message passer.
     ///
     /// # Errors
     ///
     /// Returns [`AnchorError`] with the [`ClaimMismatch`]: the game names its block by a time
-    /// the block does not have, the header has no withdrawals root (a block before Isthmus),
-    /// or the output roots differ (both are in the error).
+    /// the block does not have, the block is before Isthmus, or the output roots differ (both
+    /// are in the error).
     pub(crate) fn check(
         &self,
         hash: B256,
-        timestamp: u64,
+        (timestamp, isthmus_time): (u64, u64),
         state_root: B256,
         withdrawals_root: Option<B256>,
     ) -> Result<(), AnchorError> {
@@ -56,7 +56,7 @@ impl GameAnchor {
             self.l2_block,
             (self.output_root, self.timestamp),
             hash,
-            timestamp,
+            (timestamp, isthmus_time),
             (state_root, withdrawals_root),
         )
         .map_err(|mismatch| AnchorError {

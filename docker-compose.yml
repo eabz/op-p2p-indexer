@@ -56,9 +56,10 @@ services:
     ports:
       - "9222:9222/tcp"
       - "9222:9222/udp"
-      # Execution p2p; unused while it is disabled.
+      # The chain's execution p2p; unused unless OP_INDEXER_EL_ENABLED=true.
       - "30303:30303/tcp"
       - "30303:30303/udp"
+      # L1: execution p2p and the beacon light client; unused unless OP_INDEXER_L1_ENABLED=true.
       - "30304:30304/tcp"
       - "30304:30304/udp"
       - "9001:9001/tcp"

@@ -3,8 +3,7 @@
 A Rust indexer for the OP Stack peer-to-peer network. It joins the libp2p gossip network,
 validates and decodes payloads with alloy / op-alloy types, and indexes them. It is a
 **standalone, lightweight binary with no external services**: no L1 or L2 RPC and no embedded
-node. Receipts and logs are planned to come from L2 execution peers, verified against the block
-header (see the roadmap; pending a viability test).
+node. Receipts and logs come from L2 execution peers, verified against the block header.
 
 Scope, decisions and the order of work are in [`docs/roadmap.md`](docs/roadmap.md); each crate's
 spec is linked from there (storage: [`docs/storage.md`](docs/storage.md)). Read the roadmap
@@ -14,13 +13,13 @@ before proposing a design, and record new decisions there.
 
 | Path | Package | Role | Internal deps |
 |---|---|---|---|
-| `bin/op-indexer` | `op-indexer` | Thin binary: config, tracing, wiring, shutdown | chainspec, p2p, el, storage, pipeline, primitives |
+| `bin/op-indexer` | `op-indexer` | Thin binary: config, tracing, wiring, shutdown | chainspec, p2p, el, l1, storage, pipeline, primitives |
 | `bin/op-indexer-import` | `op-indexer-import` | Command-line importer, a separate process: downloads a block range from an external archive (Envio HyperSync), verifies it, loads it into the block archive (and optionally ClickHouse) | chainspec, primitives, storage |
 | `crates/primitives` | `op-indexer-primitives` | Shared domain types (alloy and op-alloy only) | none |
 | `crates/chainspec` | `op-indexer-chainspec` | Static chain parameters (chain id, sequencer signer, bootnodes) | none |
-| `crates/p2p` | `op-indexer-p2p` | discv5 discovery, gossipsub block gossip (scoring, connection limits), unsafe-block validation, fjall node state | primitives, chainspec |
-| `crates/storage` | `op-indexer-storage` | Unsafe store (Redis, fork choice) / committed store (ClickHouse, migrations) / local block archive (fjall), their traits and metrics | primitives |
-| `crates/pipeline` | `op-indexer-pipeline` | Unsafe blocks → unsafe store; promote safe/finalized → committed store and archive; the retry policy | primitives, storage |
+| `crates/p2p` | `op-indexer-p2p` | discv5 discovery, gossipsub block gossip (scoring, connection limits), unsafe-block validation, fjall node state (identity, saved peers and sync progress, for `el` and `l1` too) | primitives, chainspec |
+| `crates/storage` | `op-indexer-storage` | Unsafe store (Redis, fork choice) / committed store (ClickHouse, migrations) / local block archive (fjall), their traits and metrics; the retry policy | primitives |
+| `crates/pipeline` | `op-indexer-pipeline` | Unsafe blocks → unsafe store; promote safe/finalized → committed store and archive | primitives, storage |
 | `crates/el` | `op-indexer-el` | Execution p2p (devp2p): discovery, sessions, receipts of new blocks, serving the archive to peers, range sync | primitives, chainspec |
 | `crates/l1` | `op-indexer-l1` | L1 commitment without an RPC: from L1 block hashes a beacon light client vouches for, finds and verifies the dispute games created for the chain, giving the L2 blocks claimed on L1 | el, chainspec, primitives |
 
@@ -29,7 +28,7 @@ before proposing a design, and record new decisions there.
   `pipeline` and the importer. Nothing about an external API
   (HyperSync or any other) may appear outside `bin/op-indexer-import`. `p2p` depends on `chainspec` (it is chain-specific); the binary parses overrides (e.g.
   bootnodes) at the edge. The binary wires them together with channels.
-- Safe/finalized status will come from an L1 p2p crate, not from reth or an RPC (see `docs/roadmap.md`).
+- Safe/finalized status comes from the `l1` crate (off by default), not from reth or an RPC (see `docs/l1.md`).
 - New crates go in `crates/<name>` as package `op-indexer-<name>`, inherit `[workspace.package]`,
   and set `lints.workspace = true`. All dependency versions live in root `[workspace.dependencies]`.
 

@@ -14,7 +14,6 @@
 //! start. Every read works with a single session.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use alloy_consensus::proofs::calculate_receipt_root;
@@ -25,7 +24,7 @@ use op_indexer_el::{PeerId, Peers, Report, RequestError, SessionHandle};
 use op_indexer_primitives::{rlp_list_items, transactions_root};
 use tokio::task::spawn_blocking;
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Longest wait before the sessions are tried again after none of them gave a usable answer
 /// (or none is open yet). A session opening or ending ends the wait early.
@@ -59,6 +58,9 @@ enum Unusable {
     Wrong,
     /// The answer cannot be decoded: possibly a kind of data this build does not know.
     Undecodable,
+    /// The answer is right, and this node failed with it (data that hashes to a trusted hash
+    /// and does not decode, a task that failed): not the peer's fault.
+    Ours,
     /// The request failed.
     Request(RequestError),
 }
@@ -72,9 +74,11 @@ impl From<RequestError> for Unusable {
 /// Reads from the open L1 sessions.
 #[derive(Debug)]
 pub(crate) struct Fetcher {
+    /// The open sessions. One receiver, whose seen version advances with each wait, so a
+    /// wait for a change ends only at a new one.
     peers: Peers,
     /// What is remembered about peers between requests.
-    notes: Mutex<Notes>,
+    notes: Notes,
 }
 
 #[derive(Debug, Default)]
@@ -89,14 +93,14 @@ impl Fetcher {
     pub(crate) fn new(peers: Peers) -> Self {
         Self {
             peers,
-            notes: Mutex::default(),
+            notes: Notes::default(),
         }
     }
 
     /// Fetches up to `limit` headers going down from the block with hash `start`, inclusive,
     /// each one the parent of the one before it. Never empty.
     pub(crate) async fn headers(
-        &self,
+        &mut self,
         start: B256,
         limit: u64,
         cancel: &CancellationToken,
@@ -110,7 +114,7 @@ impl Fetcher {
     /// Fetches the transactions of `block`, each in the encoding the transactions trie holds,
     /// checked against the header's transactions root.
     pub(crate) async fn transactions(
-        &self,
+        &mut self,
         block: &Sealed<Header>,
         cancel: &CancellationToken,
     ) -> Result<Vec<Bytes>, Stop> {
@@ -121,7 +125,7 @@ impl Fetcher {
             // Hashing a block's transactions is CPU work.
             spawn_blocking(move || transactions(&body, root))
                 .await
-                .unwrap_or(Err(Unusable::Undecodable))
+                .unwrap_or(Err(Unusable::Ours))
         };
         self.ask("body", cancel, request).await
     }
@@ -129,7 +133,7 @@ impl Fetcher {
     /// Fetches the receipts of `block`, which has `count` transactions, checked against the
     /// header's receipts root.
     pub(crate) async fn receipts(
-        &self,
+        &mut self,
         block: &Sealed<Header>,
         count: usize,
         cancel: &CancellationToken,
@@ -141,7 +145,7 @@ impl Fetcher {
             // Counted, decoded and hashed off the runtime.
             spawn_blocking(move || receipts(&item, count, root))
                 .await
-                .unwrap_or(Err(Unusable::Undecodable))
+                .unwrap_or(Err(Unusable::Ours))
         };
         self.ask("receipts", cancel, request).await
     }
@@ -150,7 +154,7 @@ impl Fetcher {
     /// the peers, until one gives a usable answer. A peer at fault is reported. With no usable
     /// answer it waits and tries again, [`MAX_ROUNDS`] times over sessions that were open.
     async fn ask<T, F, Fut>(
-        &self,
+        &mut self,
         what: &'static str,
         cancel: &CancellationToken,
         request: F,
@@ -179,11 +183,11 @@ impl Fetcher {
             if rounds >= MAX_ROUNDS {
                 return Err(Stop::NotHeld);
             }
-            let mut peers = self.peers.clone();
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => return Err(Stop::Cancelled),
-                _ = peers.changed() => {}
+                // A peer set that stopped is shutdown: the retry wait paces the rounds left.
+                true = self.peers.changed() => {}
                 () = tokio::time::sleep(RETRY) => {}
             }
         }
@@ -191,8 +195,8 @@ impl Fetcher {
 
     /// Notes a verified answer from `peer`: its timeouts are forgotten, and it is reported as
     /// worth saving for the next start, once.
-    fn served(&self, peer: PeerId) {
-        let mut notes = self.notes.lock().unwrap_or_else(PoisonError::into_inner);
+    fn served(&mut self, peer: PeerId) {
+        let notes = &mut self.notes;
         notes.timeouts.remove(&peer);
         if notes.served.len() >= MAX_REPORTED_PEERS {
             notes.served.clear();
@@ -203,8 +207,8 @@ impl Fetcher {
     }
 
     /// Notes a request `peer` left unanswered. Returns whether it is now unresponsive.
-    fn timed_out(&self, peer: PeerId) -> bool {
-        let mut notes = self.notes.lock().unwrap_or_else(PoisonError::into_inner);
+    fn timed_out(&mut self, peer: PeerId) -> bool {
+        let notes = &mut self.notes;
         if notes.timeouts.len() >= MAX_REPORTED_PEERS {
             notes.timeouts.clear();
         }
@@ -218,11 +222,15 @@ impl Fetcher {
     }
 
     /// Logs why `session`'s answer was not used and reports the peer if it is at fault.
-    fn note(&self, session: &SessionHandle, what: &'static str, unusable: &Unusable) {
+    fn note(&mut self, session: &SessionHandle, what: &'static str, unusable: &Unusable) {
         let peer = session.peer_id();
         let report = match unusable {
             Unusable::NotHeld => {
                 debug!(%peer, what, "L1 peer does not hold the block");
+                return;
+            }
+            Unusable::Ours => {
+                warn!(%peer, what, "an L1 peer's verified answer could not be used by this node");
                 return;
             }
             Unusable::Wrong | Unusable::Request(RequestError::Excess { .. }) => {
@@ -263,7 +271,7 @@ fn linked_headers(start: B256, items: &[Bytes]) -> Result<Vec<Sealed<Header>>, U
         // It hashes to a trusted hash, so it is a header: one that does not decode is ours
         // to blame, not the peer's.
         let header: Header =
-            alloy_rlp::decode_exact(item).map_err(|_undecodable| Unusable::Undecodable)?;
+            alloy_rlp::decode_exact(item).map_err(|_undecodable| Unusable::Ours)?;
         expected = header.parent_hash;
         headers.push(Sealed::new_unchecked(header, hash));
     }

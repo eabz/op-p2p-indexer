@@ -139,7 +139,7 @@ legacy block), with 105,235,063 and 105,235,064 as controls.
 - Because bodies and receipts are requested by hash and no legacy header was obtained, legacy
   bodies, legacy receipts, transaction types, sender recovery, L1-to-L2 message signatures,
   sizes and bulk rates are **unanswered, not answered negatively**.
-- This matches op-reth's design as the reviewer found it documented: op-reth v2.5.0 removed the
+- This matches op-reth's documented design: op-reth v2.5.0 removed the
   legacy import commands (optimism PR #22942), the recommended setup is
   `init-state --without-ovm`, and pre-Bedrock history is served from a separate l2geth
   instance.
@@ -162,8 +162,8 @@ legacy block), with 105,235,063 and 105,235,064 as controls.
 ## 6. Cost of the wire code
 
 - reth's network crates exist on crates.io only as 0.0.0 placeholders, so they are a git
-  dependency pinned to a release tag. In this workspace that added 66 packages to the lockfile
-  (642 to 708), 12 of them from reth's repository, with no new licence and no advisory.
+  dependency pinned to a release tag. When it was added, that brought 66 packages into the
+  lockfile, 12 of them from reth's repository, with no new licence and no advisory.
 - No usable published alternative was found: `rlpx` and `devp2p` date from 2018, and
   `ethrex-p2p` depends on the rest of its client, RocksDB included.
 - Writing the same parts ourselves would be roughly 2,500 to 3,000 lines of protocol and

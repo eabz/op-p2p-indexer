@@ -3,8 +3,8 @@
 //!
 //! ```text
 //! <state>/verified/<chunk>.blk ─▶ the verified bytes ─▶ FjallArchive::bulk_append (fjall)
-//!            with --clickhouse-url ─▶ typed blocks ─▶ CommittedStore::insert (ClickHouse)
-//!                                 ─▶ <state>/loaded/<chunk>.clickhouse
+//!            with --clickhouse-url ─▶ typed blocks ─▶ ClickHouseStore::bulk_insert (ClickHouse)
+//!                                 ─▶ ClickHouseStore::record_imported (the chunk's range)
 //! ```
 //!
 //! By default nothing but the archive is touched: no database is needed, contacted or
@@ -14,8 +14,11 @@
 //! after the archive's last block, so a stopped run or a new archive directory cannot make it
 //! skip blocks. Before it writes, it checks that the archive starts at the first block of the
 //! range and that its last block is the verified one at that height; an archive of another
-//! range or chain is refused. ClickHouse has no such range to ask, so it keeps one marker per
-//! chunk, written once it holds the chunk; it can be loaded on a later run.
+//! range or chain is refused. ClickHouse records the range of every chunk it holds in its own
+//! table (`imported_ranges`), written once the chunk is in all four tables; `load` reads that
+//! record at start and loads the chunks it lacks. The record lives in the database, so a
+//! dropped, recreated or different database has none and gets every chunk. (Earlier builds
+//! kept marker files in `<state>/loaded/`; they are not read.)
 //!
 //! The archive is written in block order by bulk appends (`FjallArchive::bulk_append`):
 //! chunks are read, decompressed and their blocks prepared (hash checked, values compressed)
@@ -31,10 +34,11 @@
 //! are decoded from those same bytes; nothing is encoded again. Does not download or verify
 //! anything, and trusts a verified chunk's file.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use alloy_primitives::B256;
 use clap::Args;
 use eyre::{WrapErr, ensure, eyre};
 use op_indexer_primitives::{BlockSource, DecodedBlock, EncodedBlock, decode_block};
@@ -50,7 +54,7 @@ use tracing::info;
 use crate::chunk::{self, VerifiedBlock};
 use crate::cli::Secret;
 use crate::progress::{self, Rate};
-use crate::state::{Chunk, Plan, State, write_atomic};
+use crate::state::{Chunk, Plan, State};
 
 /// Fewest and most chunks read, decompressed and prepared at once ahead of the archive's
 /// writer: one per core within these bounds. Preparing (hashing the header, compressing the
@@ -59,7 +63,7 @@ const READ_AHEAD: (usize, usize) = (4, 32);
 /// Bytes of block encodings collected before they are appended to the archive in one bulk
 /// append. Each writes new table and blob files and syncs them, so it must be large; one is
 /// written while the next is prepared, and a prepared one takes about half this in memory.
-const APPEND_BYTES: usize = 1024 * 1024 * 1024;
+const APPEND_BYTES: u64 = 1024 * 1024 * 1024;
 /// Rows (of every table together) per bulk insert into ClickHouse: large enough that the
 /// server writes few, large parts and a round trip is small next to the data, small enough
 /// that a batch takes a few hundred megabytes in memory at most.
@@ -67,9 +71,15 @@ const BULK_ROWS: usize = 500_000;
 /// Batches written at once by default: each waits on the network and the server, not on this
 /// machine, so a few overlap well; a remote service benefits most.
 const DEFAULT_INSERTS: u64 = 4;
-/// How long a store call is retried before `load` gives up. A store that is down for longer
-/// needs an operator; `load` continues where it stopped when it is run again.
-const RETRY_BUDGET: Duration = Duration::from_mins(5);
+/// Most batches written at once. A batch takes about 0.8 GB while it is built and sent
+/// (measured: half a million rows of post-Bedrock blocks), so this keeps the pass near 14 GB
+/// with the chunks being read, well inside a 64 GB machine.
+const MAX_INSERTS: u64 = 16;
+/// How long a store call is retried, from its first failure, before `load` gives up: several
+/// times the longest a single call may take (a bulk insert's five minutes), so a call that
+/// timed out is retried. A store that is down for longer needs an operator; `load` continues
+/// where it stopped when it is run again.
+const RETRY_BUDGET: Duration = Duration::from_mins(30);
 
 /// Settings of `load`. By default it fills the local block archive the node serves from and
 /// needs no database; ClickHouse is loaded only when `--clickhouse-url` is given.
@@ -105,13 +115,13 @@ pub(crate) struct LoadArgs {
     #[arg(long, env = "OP_INDEXER_CLICKHOUSE_PASSWORD", hide_env_values = true)]
     pub(crate) clickhouse_password: Option<Secret>,
     /// ClickHouse inserts in flight at once, each a batch of about half a million rows on its
-    /// own connection. Only used with `--clickhouse-url`. More helps a remote service (4 to 8
-    /// for ClickHouse Cloud); a local server is busy with 2.
+    /// own connection and about 0.8 GB of memory, at most 16. Only used with `--clickhouse-url`.
+    /// More helps a remote service (4 to 8 for ClickHouse Cloud); a local server is busy with 2.
     #[arg(
         long,
         env = "OP_INDEXER_IMPORT_CLICKHOUSE_INSERTS",
         default_value_t = DEFAULT_INSERTS,
-        value_parser = clap::value_parser!(u64).range(1..=64)
+        value_parser = clap::value_parser!(u64).range(1..=MAX_INSERTS)
     )]
     pub(crate) clickhouse_inserts: u64,
 }
@@ -135,13 +145,16 @@ pub(crate) async fn run(
     // Stopped before it began, for example during the step before it in `run`.
     ensure!(!cancel.is_cancelled(), "stopped before `load` began");
     // Only a range `verify` accepted whole (every chunk, every link, the anchor) is loaded.
-    let accepted = state.read_verified()?;
-    ensure!(
-        accepted.is_some_and(|range| range.covers(plan)),
-        "blocks {} to {} are not verified: run `verify`, which must accept the whole range",
-        plan.first,
-        plan.last
-    );
+    let accepted = state
+        .read_verified()?
+        .filter(|range| range.covers(plan))
+        .ok_or_else(|| {
+            eyre!(
+                "blocks {} to {} are not verified: run `verify`, which must accept the whole range",
+                plan.first,
+                plan.last
+            )
+        })?;
     let committed = match &args.clickhouse_url {
         Some(url) => Some(clickhouse(args, url, plan).await?),
         None => None,
@@ -161,6 +174,9 @@ pub(crate) async fn run(
 
     let held_to = archive_tip(&archive, &args.archive_dir, state, plan).await?;
     let stopped_at = fill_archive(&archive, held_to, state, plan, cancel).await?;
+    if stopped_at.is_none() {
+        check_top(&archive, &args.archive_dir, plan, accepted.last_hash).await?;
+    }
     let stopped_at = match (stopped_at, &committed) {
         (None, Some(committed)) => {
             let inserts = usize::try_from(args.clickhouse_inserts).unwrap_or(1);
@@ -232,7 +248,7 @@ async fn fill_archive(
         if let Some(read) = reads.pop_front() {
             pending.extend(read.await.wrap_err("reading a chunk panicked")??);
         }
-        if pending.amount.rlp_bytes < APPEND_BYTES as u64 && !reads.is_empty() {
+        if pending.amount.rlp_bytes < APPEND_BYTES && !reads.is_empty() {
             continue;
         }
         // The previous append must be in before the next is written: each extends the last.
@@ -339,16 +355,16 @@ async fn file_sizes(state: &State, chunks: &[Chunk]) -> eyre::Result<Vec<u64>> {
     .wrap_err("measuring the chunks panicked")?
 }
 
-/// Writes every chunk of the range that has no ClickHouse marker yet, and marks it. Returns
-/// the first block of the earliest chunk not written when `cancel` stopped it, `None` when
-/// ClickHouse holds the whole range.
+/// Writes every chunk of the range the ClickHouse database has no record of, and records it.
+/// Returns the first block of the earliest chunk not written when `cancel` stopped it, `None`
+/// when ClickHouse holds the whole range.
 ///
 /// Chunks are read and turned into rows on blocking threads, joined into batches of about
 /// [`BULK_ROWS`] rows, and written by up to `inserts` batches at once, each in one synchronous
 /// insert per table (`ClickHouseStore::bulk_insert`, child tables before `blocks`). A chunk's
-/// marker is written only once its batch is in every table, so a stop leaves no marker for a
-/// chunk ClickHouse does not fully hold; a chunk written twice is harmless, the tables keep one
-/// row per position. Memory is bounded by the batches in flight and the chunks being read.
+/// range is recorded (`ClickHouseStore::record_imported`) only once its batch is in every
+/// table, so a stop leaves no record for a chunk ClickHouse does not fully hold; a chunk
+/// written twice is harmless, the tables keep one row per position. Memory is bounded by the batches in flight and the chunks being read.
 async fn fill_clickhouse(
     committed: &ClickHouseStore,
     state: &State,
@@ -356,7 +372,10 @@ async fn fill_clickhouse(
     inserts: usize,
     cancel: &CancellationToken,
 ) -> eyre::Result<Option<u64>> {
-    let mut queue = unloaded_chunks(state, plan).await?.into_iter();
+    let Some(queue) = unloaded_chunks(committed, plan, cancel).await? else {
+        return Ok(Some(plan.first));
+    };
+    let mut queue = queue.into_iter();
     let readers = std::thread::available_parallelism().map_or(1, usize::from);
     info!(
         first = plan.first,
@@ -402,9 +421,28 @@ async fn fill_clickhouse(
                 let insert = retry(&cancel, Store::Committed, "ClickHouse insert", || {
                     committed.bulk_insert(&batch.rows)
                 });
+                // The record follows the rows: a chunk is recorded only once every table
+                // holds it.
+                let ranges: Vec<(u64, u64)> = batch
+                    .chunks
+                    .iter()
+                    .map(|chunk| (chunk.from, chunk.to.saturating_sub(1)))
+                    .collect();
+                let insert = async {
+                    let Some(()) = insert.await? else {
+                        return Ok(None);
+                    };
+                    retry(
+                        &cancel,
+                        Store::Committed,
+                        "ClickHouse record_imported",
+                        || committed.record_imported(&ranges),
+                    )
+                    .await
+                };
                 // On a stop, the first block of the batch, whose chunks stay unmarked.
                 let first = batch.chunks.first().map_or(u64::MAX, |chunk| chunk.from);
-                Ok(insert.await?.map(|()| batch).ok_or(first))
+                Ok(Box::pin(insert).await?.map(|()| batch).ok_or(first))
             });
             continue;
         }
@@ -419,10 +457,7 @@ async fn fill_clickhouse(
             }
             Some(written) = writing.join_next() => {
                 match written.wrap_err("an insert panicked")?? {
-                    Ok(written) => {
-                        mark_loaded(state, &written.chunks).await?;
-                        tally.add(&written.rows, writing.len());
-                    }
+                    Ok(written) => tally.add(&written.rows, writing.len()),
                     // Cancelled while retrying: those chunks stay unmarked.
                     Err(first) => abandoned = Some(abandoned.map_or(first, |a| a.min(first))),
                 }
@@ -495,36 +530,29 @@ impl Tally {
     }
 }
 
-/// The chunks of the plan that have no ClickHouse marker, in block order.
-async fn unloaded_chunks(state: &State, plan: &Plan) -> eyre::Result<Vec<Chunk>> {
-    let (state, plan) = (state.clone(), *plan);
-    spawn_blocking(move || -> eyre::Result<Vec<Chunk>> {
-        let mut todo = Vec::new();
-        for chunk in plan.chunks() {
-            if !exists(&state.clickhouse_loaded_path(chunk))? {
-                todo.push(chunk);
-            }
-        }
-        Ok(todo)
-    })
-    .await
-    .wrap_err("listing the chunks panicked")?
-}
-
-/// Writes the markers that ClickHouse holds `chunks`.
-async fn mark_loaded(state: &State, chunks: &[Chunk]) -> eyre::Result<()> {
-    let markers: Vec<PathBuf> = chunks
-        .iter()
-        .map(|chunk| state.clickhouse_loaded_path(*chunk))
-        .collect();
-    spawn_blocking(move || {
-        markers
-            .iter()
-            .try_for_each(|marker| write_atomic(marker, |_file| Ok(())))
-    })
-    .await
-    .wrap_err("writing markers panicked")?
-    .wrap_err("failed to mark a chunk as loaded")
+/// The chunks of the plan the ClickHouse database has no record of, in block order. The
+/// record is in the database itself (`imported_ranges`), so a dropped, recreated or different
+/// database has none and every chunk is loaded again.
+async fn unloaded_chunks(
+    committed: &ClickHouseStore,
+    plan: &Plan,
+    cancel: &CancellationToken,
+) -> eyre::Result<Option<Vec<Chunk>>> {
+    let read = retry(
+        cancel,
+        Store::Committed,
+        "ClickHouse imported_ranges",
+        || committed.imported_ranges(),
+    );
+    let Some(loaded) = read.await? else {
+        return Ok(None);
+    };
+    let loaded: HashSet<(u64, u64)> = loaded.into_iter().collect();
+    Ok(Some(
+        plan.chunks()
+            .filter(|chunk| !loaded.contains(&(chunk.from, chunk.to.saturating_sub(1))))
+            .collect(),
+    ))
 }
 
 /// What the archive pass has done, for its progress lines. The time left is reckoned from
@@ -662,6 +690,36 @@ async fn archive_tip(
     Ok(Some(tip.number))
 }
 
+/// Checks that the archive's block at the top of the range is the one `verify` accepted
+/// (`verified.json`), which binds what was loaded to what was verified.
+async fn check_top(
+    archive: &FjallArchive,
+    directory: &Path,
+    plan: &Plan,
+    accepted: B256,
+) -> eyre::Result<()> {
+    let range = archive.range().await;
+    let tip = range.wrap_err("failed to read the block archive")?;
+    let held = match tip {
+        Some((_, tip)) if tip.number == plan.last => tip.hash == accepted,
+        // The archive reaches past the range: look the accepted block up in it.
+        Some(_) => {
+            let number = archive.number_of(accepted).await;
+            number.wrap_err("failed to read the block archive")? == Some(plan.last)
+        }
+        None => false,
+    };
+    ensure!(
+        held,
+        "the block archive in {} does not hold the block {accepted} that `verify` accepted at \
+         the top of the range ({}): the archive or the verified chunks have changed since \
+         `verify`. Load into an empty directory after running `verify` again",
+        directory.display(),
+        plan.last
+    );
+    Ok(())
+}
+
 /// Connects to ClickHouse at `url` and applies its migrations.
 async fn clickhouse(args: &LoadArgs, url: &str, plan: &Plan) -> eyre::Result<ClickHouseStore> {
     let config = ClickHouseConfig {
@@ -717,11 +775,6 @@ fn decode(block: VerifiedBlock) -> eyre::Result<DecodedBlock> {
         receipts,
         source: BlockSource::Import,
     })
-}
-
-fn exists(path: &Path) -> eyre::Result<bool> {
-    path.try_exists()
-        .wrap_err_with(|| format!("failed to look for {}", path.display()))
 }
 
 /// Runs a call to `store` through storage's retry helper, for at most [`RETRY_BUDGET`].

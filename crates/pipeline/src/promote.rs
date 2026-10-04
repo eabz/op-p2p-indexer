@@ -9,9 +9,11 @@
 //!
 //! `C` is the safe head recorded in the committed store, `S` the new one.
 //!
-//! 1. If `S` is below `C`, or at its height with another hash (an L1 reorg): roll the
-//!    committed store back to `S`, and truncate the archive above it if the archive ends at or
-//!    below `C`.
+//! 1. If `S` is at `C`'s height with another hash, or below `C` with the archive holding
+//!    another block at `S`'s height (an L1 reorg): roll the committed store back to `S`, and
+//!    truncate the archive above it if the archive ends at or below `C`. A block of the
+//!    committed chain below `C`, or one the archive cannot tell about, is nothing to do: a
+//!    rollback deletes committed blocks and is only done on evidence.
 //! 2. Record the heads in the unsafe store.
 //! 3. Read the blocks above `C` up to `S` from the unsafe store.
 //! 4. Insert them into the committed store; append them to the archive if they extend it, and
@@ -175,6 +177,12 @@ where
         finish(self.reconcile_stores(cancel).await)
     }
 
+    /// The heads the committed store recorded, as read by [`Self::reconcile`]: where the heads
+    /// promotion acts on start, which nothing may publish below.
+    pub(crate) const fn committed_heads(&self) -> L1Heads {
+        self.committed
+    }
+
     /// Promotes on every change of the L1 heads until `cancel` fires or the heads' sender is
     /// dropped. A promotion in progress is finished first, except that a store call waiting to
     /// be retried gives up when cancelled; the next start repeats it.
@@ -234,9 +242,21 @@ where
             }
         };
 
-        // Not above `C` and not `C`: the safe head moved back, or changed hash at its height.
-        let reorged = committed_safe.is_some_and(|committed| safe.number <= committed.number);
-        if reorged {
+        // Not above `C` and not `C`. Only a different block at that height is an L1 reorg; a
+        // block of the committed chain below `C` is a head that is behind, and nothing to do.
+        // The commitment task never publishes such a head; this guards the committed store
+        // against any other source of heads.
+        let behind = committed_safe.filter(|committed| safe.number <= committed.number);
+        let reorged = behind.is_some();
+        if let Some(committed) = behind {
+            if !self.replaced(safe, committed, cancel).await? {
+                debug!(
+                    ?safe,
+                    ?committed,
+                    "a safe head behind the committed one; nothing to do"
+                );
+                return Ok(());
+            }
             self.roll_back(safe, cancel).await?;
         }
         self.set_unsafe_heads(heads, cancel).await?;
@@ -254,6 +274,48 @@ where
             safe: heads.safe.or(self.committed.safe),
             finalized: heads.finalized.or(self.committed.finalized),
         }
+    }
+
+    /// Whether `safe`, at or below the committed safe head `committed`, is a block of another
+    /// chain than the committed one: at the committed head's height with another hash, or below it with
+    /// the archive holding another block at that height. When the archive cannot tell (it
+    /// does not reach that height, or there is none), the answer is no: a rollback deletes
+    /// committed blocks, and is only done on evidence.
+    async fn replaced(
+        &self,
+        safe: BlockRef,
+        committed: BlockRef,
+        cancel: &CancellationToken,
+    ) -> Result<bool, Stop> {
+        if safe.number == committed.number {
+            return Ok(safe.hash != committed.hash);
+        }
+        let Some((archive, _)) = &self.archive else {
+            warn!(
+                ?safe,
+                ?committed,
+                "a safe head below the committed one cannot be checked without the archive; not rolling back"
+            );
+            return Ok(false);
+        };
+        let held = call(cancel, Store::Archive, "archive number_of", || {
+            archive.number_of(safe.hash)
+        })
+        .await?;
+        if held == Some(safe.number) {
+            return Ok(false);
+        }
+        let range = call(cancel, Store::Archive, "archive range", || archive.range()).await?;
+        let covers =
+            range.is_some_and(|(first, tip)| (first.number..=tip.number).contains(&safe.number));
+        if !covers {
+            warn!(
+                ?safe,
+                ?committed,
+                "a safe head below the committed one is outside the archive; not rolling back"
+            );
+        }
+        Ok(covers)
     }
 
     /// Step 1: rolls the committed store back to `safe`, and truncates the archive above it if
@@ -296,28 +358,48 @@ where
         Ok(())
     }
 
-    /// Steps 3 and 4: reads the blocks above `committed` up to `safe` and writes them to the
-    /// committed store and the archive. When only the part next to `safe` can be read, that
-    /// part is written and the rest is a hole.
+    /// Steps 3 and 4: reads the blocks above `committed`, or above the archive's last block
+    /// when that is higher and below `safe`, up to `safe` and writes them to the committed
+    /// store and the archive. When only the part next to `safe` can be read, that part is
+    /// written and the rest is a hole.
     async fn commit_range(
         &mut self,
         committed: Option<BlockRef>,
         safe: BlockRef,
         cancel: &CancellationToken,
     ) -> Result<(), Stop> {
-        // Without a committed safe head the committed store begins at `safe`.
-        let floor = committed.map_or_else(|| safe.number.saturating_sub(1), |c| c.number);
+        // The block the range is read above: the archive's last block when it is above the
+        // committed safe head and below `safe`, so the archive is extended from where it ends
+        // and blocks it holds are not read again; else the committed safe head. Without
+        // either the committed store begins at `safe`.
+        let tip = match &self.archive {
+            Some((archive, _)) => {
+                let range = call(cancel, Store::Archive, "archive range", || archive.range());
+                range.await?.map(|(_, tip)| tip)
+            }
+            None => None,
+        };
+        let base = match (committed, tip) {
+            (committed, Some(tip))
+                if tip.number < safe.number
+                    && committed.is_none_or(|committed| tip.number > committed.number) =>
+            {
+                Some(tip)
+            }
+            (committed, _) => committed,
+        };
+        let floor = base.map_or_else(|| safe.number.saturating_sub(1), |base| base.number);
         let RangeRead {
             blocks,
             above: stop_at,
             hole,
         } = self.read_range(floor, safe, cancel).await?;
-        let builds_on_committed = committed
+        let builds_on_base = base
             .zip(blocks.first())
-            .is_none_or(|(committed, first)| first.block.header.parent_hash == committed.hash);
-        let hole = hole.or((!builds_on_committed).then_some(HoleReason::ParentMismatch));
-        match (hole, committed) {
-            (Some(reason), Some(committed)) => report_hole(reason, committed, stop_at, safe),
+            .is_none_or(|(base, first)| first.block.header.parent_hash == base.hash);
+        let hole = hole.or((!builds_on_base).then_some(HoleReason::ParentMismatch));
+        match (hole, base) {
+            (Some(reason), Some(base)) => report_hole(reason, base, stop_at, safe),
             (Some(_), None) => info!(
                 safe = ?safe,
                 "the first safe head is not in the unsafe store; the committed store begins after it"
@@ -515,11 +597,11 @@ where
     }
 }
 
-/// Promote now, backfill later: logs and counts the blocks above `committed` up to
-/// `left_out_to` that are not promoted. With a parent mismatch none are left out, but the
-/// committed block at `committed`'s height is another chain's.
-fn report_hole(reason: HoleReason, committed: BlockRef, left_out_to: BlockNumber, safe: BlockRef) {
-    let missing = left_out_to.saturating_sub(committed.number);
+/// Promote now, backfill later: logs and counts the blocks above `base` (the block the range
+/// was read above) up to `left_out_to` that are not promoted. With a parent mismatch none are
+/// left out, but the block at `base`'s height is another chain's.
+fn report_hole(reason: HoleReason, base: BlockRef, left_out_to: BlockNumber, safe: BlockRef) {
+    let missing = left_out_to.saturating_sub(base.number);
     metrics::promotion_hole(reason, missing);
     let why = match reason {
         HoleReason::MissingAncestor => "a block of the range is not in the unsafe store",
@@ -529,19 +611,20 @@ fn report_hole(reason: HoleReason, committed: BlockRef, left_out_to: BlockNumber
         }
         HoleReason::ParentMismatch => {
             warn!(
-                committed = ?committed,
+                above = ?base,
                 safe = ?safe,
-                "the promoted range does not build on the committed safe head: the committed \
-                 block at that height is another chain's, left for backfill to repair"
+                "the promoted range does not build on the block it was read above (the \
+                 committed safe head, or the archive's last block): that block is another \
+                 chain's, left for backfill to repair"
             );
             return;
         }
     };
     warn!(
-        from = committed.number.saturating_add(1),
+        from = base.number.saturating_add(1),
         to = left_out_to,
         missing,
-        committed = ?committed,
+        above = ?base,
         safe = ?safe,
         why,
         "promotion hole: blocks are left for backfill"

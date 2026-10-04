@@ -35,6 +35,7 @@ use op_indexer_primitives::{BlockRef, ExecutionPeer, ReceiptsRequest, VerifiedRe
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use tracing::{Instrument, info_span};
 
 pub use config::ElConfig;
 pub use discovery::enode_discovery_addr;
@@ -44,7 +45,7 @@ pub use peers::{Peers, Report};
 pub use reth_network_peers::PeerId;
 pub use serve::BlockProvider;
 pub use session::{BlockRange, RequestError, SessionHandle};
-pub use sync::{RangeSync, SyncPlan};
+pub use sync::{RangeSync, RoundEnd, SyncPlan};
 
 use crate::fetch::Fetcher;
 use crate::serve::Server;
@@ -61,6 +62,8 @@ pub struct ExecutionNetwork<P> {
     verified: mpsc::Sender<VerifiedReceipts>,
     /// A range of blocks to fetch from peers; `None` unless one was asked for.
     sync: Option<RangeSync>,
+    /// The network's name, on every line its tasks log.
+    label: &'static str,
 }
 
 impl<P: BlockProvider> ExecutionNetwork<P> {
@@ -91,6 +94,7 @@ impl<P: BlockProvider> ExecutionNetwork<P> {
     ) -> Result<Self, ElError> {
         let (block_server, serving) = serve::new(provider);
         let spec = NetworkSpec::op_stack(config.chain, config.bootnodes.clone());
+        let label = spec.label;
         let peer_config = PeerConfig {
             listen_addr: config.listen_addr,
             advertised_addr: config.advertised_addr,
@@ -106,6 +110,7 @@ impl<P: BlockProvider> ExecutionNetwork<P> {
             requests,
             verified,
             sync: None,
+            label,
         })
     }
 
@@ -132,7 +137,10 @@ impl<P: BlockProvider> ExecutionNetwork<P> {
             requests,
             verified,
             sync,
+            label,
         } = self;
+        // The peer network names itself; these tasks are named here.
+        let span = info_span!("el", network = label);
         // Stopping any part stops the rest.
         let stop = cancel.child_token();
         let mut tasks: JoinSet<Result<(), ElError>> = JoinSet::new();
@@ -142,17 +150,18 @@ impl<P: BlockProvider> ExecutionNetwork<P> {
         }
         {
             let stop = stop.clone();
-            tasks.spawn(async move { block_server.run(stop).await });
+            tasks.spawn(async move { block_server.run(stop).await }.instrument(span.clone()));
         }
         if let Some(sync) = sync {
             let (peers, stop) = (peers.clone(), stop.clone());
             let canyon_time = config.chain.canyon_time;
-            tasks.spawn(async move { sync::run(canyon_time, peers, sync, stop).await });
+            let run = async move { sync::run(canyon_time, peers, sync, stop).await };
+            tasks.spawn(run.instrument(span.clone()));
         }
         let fetcher = Fetcher::new(config.chain, peers, requests, verified);
         {
             let stop = stop.clone();
-            tasks.spawn(async move { fetcher.run(stop).await });
+            tasks.spawn(async move { fetcher.run(stop).await }.instrument(span));
         }
         network::join_all(tasks, &stop).await
     }

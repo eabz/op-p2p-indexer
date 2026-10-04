@@ -188,11 +188,10 @@ impl Update {
                     attested: update.attested_header,
                     aggregate: update.sync_aggregate,
                     signature_slot: update.signature_slot,
-                    finalized: Some((update.finalized_header, update.finality_branch.to_vec())),
-                    next_committee: Some((
-                        update.next_sync_committee,
-                        update.next_sync_committee_branch.to_vec(),
-                    )),
+                    finalized: proven(&update.finality_branch)
+                        .map(|branch| (update.finalized_header, branch)),
+                    next_committee: proven(&update.next_sync_committee_branch)
+                        .map(|branch| (update.next_sync_committee, branch)),
                 }
             }
             Kind::Finality => {
@@ -201,7 +200,8 @@ impl Update {
                     attested: update.attested_header,
                     aggregate: update.sync_aggregate,
                     signature_slot: update.signature_slot,
-                    finalized: Some((update.finalized_header, update.finality_branch.to_vec())),
+                    finalized: proven(&update.finality_branch)
+                        .map(|branch| (update.finalized_header, branch)),
                     next_committee: None,
                 }
             }
@@ -219,11 +219,23 @@ impl Update {
     }
 }
 
+/// A merkle branch, or `None` when it is empty (all zero): the value it would prove is absent
+/// ([`is_sync_committee_update`], [`is_finality_update`]), which is not a fault.
+///
+/// [`is_sync_committee_update`]: https://github.com/ethereum/consensus-specs/blob/master/specs/altair/light-client/sync-protocol.md#is_sync_committee_update
+/// [`is_finality_update`]: https://github.com/ethereum/consensus-specs/blob/master/specs/altair/light-client/sync-protocol.md#is_finality_update
+fn proven(branch: &[B256]) -> Option<Vec<B256>> {
+    branch
+        .iter()
+        .any(|node| !node.is_zero())
+        .then(|| branch.to_vec())
+}
+
 /// Verifies `payloads`, data of one `kind`, against `store`, and returns the store after it
 /// with what it changed. A bootstrap starts a new store from `checkpoint`; every other kind
 /// needs one. Several updates (one per period, oldest first) are applied in turn, each
-/// verified by the committee the one before proved; when one fails, those before it are
-/// kept.
+/// verified by the committee the one before proved; one that brings nothing new is passed
+/// over, and when one fails, those before it are kept.
 ///
 /// # Errors
 ///
@@ -242,16 +254,24 @@ pub(super) fn verify(
     }
     let mut store = store.ok_or(VerifyError::NotBootstrapped)?;
     let mut accepted = Accepted::default();
-    for (applied, ssz) in payloads.iter().enumerate() {
+    let mut applied = false;
+    let mut stale = false;
+    for ssz in payloads {
         match store.apply(spec, &Update::decode(kind, ssz.as_ref())?, now_slot) {
             Ok(step) => {
+                applied = true;
                 accepted.finalized = step.finalized.or(accepted.finalized);
                 accepted.head = step.head.or(accepted.head);
             }
-            Err(err) if applied == 0 => return Err(err),
+            // An update of a period already passed: the next one may still be news.
+            Err(VerifyError::Stale) => stale = true,
+            Err(err) if !applied => return Err(err),
             // The updates before it verified: keep them.
             Err(_) => break,
         }
+    }
+    if !applied && stale {
+        return Err(VerifyError::Stale);
     }
     Ok((store, accepted))
 }
@@ -364,9 +384,20 @@ impl Store {
                 now: now_slot,
             });
         }
-        let learns_committee = update.next_committee.is_some() && self.next.is_none();
-        let moves = attested.slot > self.head_slot
-            || (update.finalized.is_some() && finalized_slot > self.finalized_slot);
+        // The next committee is learned when unknown, and replaced when the update rotates the
+        // committees: its finalized header enters the next period, whose next committee it
+        // carries ([`apply_light_client_update`]). Either way only from an update with
+        // finality, its finalized header in the attested header's period
+        // ([`process_light_client_update`], `update_has_finalized_next_sync_committee`).
+        //
+        // [`apply_light_client_update`]: https://github.com/ethereum/consensus-specs/blob/master/specs/altair/light-client/sync-protocol.md#apply_light_client_update
+        // [`process_light_client_update`]: https://github.com/ethereum/consensus-specs/blob/master/specs/altair/light-client/sync-protocol.md#process_light_client_update
+        let has_finality = update.finalized.is_some();
+        let finalizes = has_finality && finalized_slot > self.finalized_slot;
+        let rotates = finalizes && finalized_slot / SLOTS_PER_PERIOD > self.period();
+        let learns_committee =
+            has_finality && update.next_committee.is_some() && (self.next.is_none() || rotates);
+        let moves = attested.slot > self.head_slot || finalizes;
         if !moves && !learns_committee {
             return Err(VerifyError::Stale);
         }
@@ -421,14 +452,10 @@ impl Store {
         };
 
         let mut accepted = Accepted::default();
-        if let (Some((header, _)), Some(root)) = (&update.finalized, finalized_root)
-            && header.beacon.slot > self.finalized_slot
-        {
+        if finalizes && let (Some((header, _)), Some(root)) = (&update.finalized, finalized_root) {
             // The finalized header enters the next period: its committee, known because it
             // signed this update (signature period ≥ finalized period), becomes the current.
-            if header.beacon.slot / SLOTS_PER_PERIOD > self.period()
-                && let Some(next) = self.next.take()
-            {
+            if rotates && let Some(next) = self.next.take() {
                 self.current = next;
             }
             self.finalized_slot = header.beacon.slot;

@@ -25,12 +25,13 @@ pub(super) struct VerifiedHeader {
 
 /// Fetches one page of headers going down from `start` and returns the checkpoints in it,
 /// highest first: every [`SEGMENT_BLOCKS`]-th block below `start`, and the parent of the
-/// page's last header, where the next page starts. No header below `first` is asked for.
+/// page's last header, where the next page starts. No header below `first` is asked for; when
+/// the page reaches `first`, the parent that block names is returned too.
 pub(super) async fn walk(
     session: &SessionHandle,
     start: BlockRef,
     first: BlockNumber,
-) -> Result<Vec<BlockRef>, Failure> {
+) -> Result<(Vec<BlockRef>, Option<BlockRef>), Failure> {
     let limit = start
         .number
         .saturating_sub(first)
@@ -47,15 +48,17 @@ pub(super) async fn walk(
             hash: header.hash,
         })
         .collect();
-    if let Some(last) = headers.last()
-        && last.header.number > first
-    {
-        checkpoints.push(BlockRef {
-            number: last.header.number.saturating_sub(1),
-            hash: last.header.parent_hash,
-        });
+    let below = headers.last().map(|last| BlockRef {
+        number: last.header.number.saturating_sub(1),
+        hash: last.header.parent_hash,
+    });
+    let reached = headers
+        .last()
+        .is_some_and(|last| last.header.number == first);
+    if !reached && let Some(below) = below {
+        checkpoints.push(below);
     }
-    Ok(checkpoints)
+    Ok((checkpoints, below.filter(|_| reached)))
 }
 
 /// Checks that `raw` are consecutive headers going down from `top`: the first hashes to
