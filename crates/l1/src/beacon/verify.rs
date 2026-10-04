@@ -15,9 +15,13 @@
 //! - **Applying** ([`process_light_client_update`]): the finalized header moves forward only
 //!   when at least two thirds of the committee signed. The head is held to the same
 //!   threshold, which is stricter than the specification's safety threshold (half of the
-//!   recent best participation): a header signed by fewer is not passed on.
-//! - **Rotation**: when the finalized header enters the next period, the next committee
-//!   becomes the current one; it must have been learned from an update before.
+//!   recent best participation): a header signed by fewer is not passed on. Participation
+//!   is counted, and an update that cannot move the store is refused, before the signature
+//!   is checked.
+//! - **Committees**: an update whose attested and finalized headers are in the store's period
+//!   proves the next period's committee; when the finalized header enters that period, it
+//!   becomes the current one. The public keys of a committee are decompressed and checked
+//!   once, when it is learned.
 //!
 //! The generalized indices are Electra's (finalized root 169, current sync committee 86, next
 //! sync committee 87) and Capella's (execution payload 25). Pure: no I/O, no clock. The
@@ -39,7 +43,7 @@ use tree_hash::TreeHash;
 use super::rpc::StatusData;
 use super::spec::{BeaconSpec, SLOTS_PER_EPOCH, SLOTS_PER_PERIOD, hash_pair};
 use super::types::{
-    BeaconBlockHeader, LightClientBootstrap, LightClientFinalityUpdate, LightClientHeader,
+    LightClientBootstrap, LightClientFinalityUpdate, LightClientHeader,
     LightClientOptimisticUpdate, LightClientUpdate, SyncAggregate, SyncCommittee,
 };
 use crate::TrustedL1Block;
@@ -52,10 +56,21 @@ const FINALIZED_ROOT_GINDEX: u64 = 169;
 const CURRENT_SYNC_COMMITTEE_GINDEX: u64 = 86;
 /// Generalized index of the next sync committee in a beacon state (Electra).
 const NEXT_SYNC_COMMITTEE_GINDEX: u64 = 87;
-/// Members of a sync committee.
-const SYNC_COMMITTEE_SIZE: usize = 512;
 /// The signature scheme's domain separation tag for Ethereum's proof-of-possession scheme.
 const BLS_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
+
+/// Which light-client container a piece of data is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Kind {
+    /// `LightClientBootstrap`: starts a store.
+    Bootstrap,
+    /// `LightClientUpdate`: one period's update, with the next sync committee.
+    Update,
+    /// `LightClientFinalityUpdate`.
+    Finality,
+    /// `LightClientOptimisticUpdate`.
+    Optimistic,
+}
 
 /// Why light-client data was refused. Every variant is the sending peer's fault except
 /// those [`VerifyError::is_peer_fault`] names, which an honest peer can cause.
@@ -81,8 +96,12 @@ pub(super) enum VerifyError {
     NotYetValid { signature_slot: u64, now: u64 },
     #[error("the update is signed in period {signature}, the store knows the committee of {store}")]
     UnknownPeriod { signature: u64, store: u64 },
-    #[error("only {0} of 512 sync-committee members signed")]
+    #[error("only {0} of the sync-committee members signed")]
     Participation(usize),
+    #[error("the update brings nothing newer than what the store holds")]
+    Stale,
+    #[error("an update arrived before the bootstrap")]
+    NotBootstrapped,
     #[error("a sync-committee public key or the signature is not a valid curve point")]
     Point,
     #[error("the sync-committee signature does not verify")]
@@ -91,13 +110,37 @@ pub(super) enum VerifyError {
 
 impl VerifyError {
     /// Whether the peer that sent the data misbehaved. It did not if the data is only ahead
-    /// of the committees we know or of our clock, or is an update few members signed: the
-    /// network passes those on, and this client merely holds its heads to a higher bar.
+    /// of the committees we know or of our clock, is an update few members signed, or is
+    /// not news to us: the network passes those on, and this client merely holds its heads
+    /// to a higher bar.
     pub(super) const fn is_peer_fault(&self) -> bool {
         !matches!(
             self,
-            Self::UnknownPeriod { .. } | Self::NotYetValid { .. } | Self::Participation(_)
+            Self::UnknownPeriod { .. }
+                | Self::NotYetValid { .. }
+                | Self::Participation(_)
+                | Self::Stale
+                | Self::NotBootstrapped
         )
+    }
+}
+
+/// A sync committee's public keys, decompressed and checked once.
+#[derive(Debug)]
+struct Committee {
+    keys: Box<[PublicKey]>,
+}
+
+impl Committee {
+    /// Decompresses and checks every key of `committee`.
+    fn new(committee: &SyncCommittee) -> Result<Self, VerifyError> {
+        let keys = committee
+            .pubkeys
+            .iter()
+            .map(|key| PublicKey::key_validate(key.as_slice()))
+            .collect::<Result<Box<[_]>, _>>()
+            .map_err(|_invalid| VerifyError::Point)?;
+        Ok(Self { keys })
     }
 }
 
@@ -113,45 +156,113 @@ pub(super) struct Store {
     /// Root of that header.
     head_root: B256,
     /// The committee of the finalized header's period.
-    current: Arc<SyncCommittee>,
+    current: Arc<Committee>,
     /// The committee of the period after, once an update proved it.
-    next: Option<Arc<SyncCommittee>>,
+    next: Option<Arc<Committee>>,
 }
 
-/// What an accepted update changed, as the execution blocks it vouches for.
+/// What verified data changed, as the execution blocks it vouches for.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct Accepted {
-    /// The execution block of a newer finalized header.
+    /// The execution block of a newer finalized header (for a bootstrap, the checkpoint's).
     pub(super) finalized: Option<TrustedL1Block>,
     /// The execution block of a newer head.
     pub(super) head: Option<TrustedL1Block>,
-    /// Whether the next period's committee was learned.
-    pub(super) next_committee: bool,
-    /// Whether the committees rotated: the finalized header entered a new period.
-    pub(super) rotated: bool,
 }
 
-/// The parts of the three kinds of update that are verified the same way.
-struct Update<'a> {
-    attested: &'a LightClientHeader,
-    aggregate: &'a SyncAggregate,
+/// An update of any of the three kinds, as it is verified.
+struct Update {
+    attested: LightClientHeader,
+    aggregate: SyncAggregate,
     signature_slot: u64,
-    finalized: Option<(&'a LightClientHeader, &'a [B256])>,
-    next_committee: Option<(&'a SyncCommittee, &'a [B256])>,
+    finalized: Option<(LightClientHeader, Vec<B256>)>,
+    next_committee: Option<(SyncCommittee, Vec<B256>)>,
+}
+
+impl Update {
+    fn decode(kind: Kind, ssz: &[u8]) -> Result<Self, VerifyError> {
+        Ok(match kind {
+            Kind::Update => {
+                let update = decode::<LightClientUpdate>(ssz)?;
+                Self {
+                    attested: update.attested_header,
+                    aggregate: update.sync_aggregate,
+                    signature_slot: update.signature_slot,
+                    finalized: Some((update.finalized_header, update.finality_branch.to_vec())),
+                    next_committee: Some((
+                        update.next_sync_committee,
+                        update.next_sync_committee_branch.to_vec(),
+                    )),
+                }
+            }
+            Kind::Finality => {
+                let update = decode::<LightClientFinalityUpdate>(ssz)?;
+                Self {
+                    attested: update.attested_header,
+                    aggregate: update.sync_aggregate,
+                    signature_slot: update.signature_slot,
+                    finalized: Some((update.finalized_header, update.finality_branch.to_vec())),
+                    next_committee: None,
+                }
+            }
+            Kind::Optimistic | Kind::Bootstrap => {
+                let update = decode::<LightClientOptimisticUpdate>(ssz)?;
+                Self {
+                    attested: update.attested_header,
+                    aggregate: update.sync_aggregate,
+                    signature_slot: update.signature_slot,
+                    finalized: None,
+                    next_committee: None,
+                }
+            }
+        })
+    }
+}
+
+/// Verifies `payloads`, data of one `kind`, against `store`, and returns the store after it
+/// with what it changed. A bootstrap starts a new store from `checkpoint`; every other kind
+/// needs one. Several updates (one per period, oldest first) are applied in turn, each
+/// verified by the committee the one before proved; when one fails, those before it are
+/// kept.
+///
+/// # Errors
+///
+/// Returns [`VerifyError`] if the data, or the first of several updates, does not verify.
+pub(super) fn verify(
+    spec: &BeaconSpec,
+    checkpoint: B256,
+    store: Option<Store>,
+    kind: Kind,
+    payloads: &[impl AsRef<[u8]>],
+    now_slot: u64,
+) -> Result<(Store, Accepted), VerifyError> {
+    let first = payloads.first().map(AsRef::as_ref).unwrap_or_default();
+    if kind == Kind::Bootstrap {
+        return Store::bootstrap(spec, checkpoint, first);
+    }
+    let mut store = store.ok_or(VerifyError::NotBootstrapped)?;
+    let mut accepted = Accepted::default();
+    for (applied, ssz) in payloads.iter().enumerate() {
+        match store.apply(spec, &Update::decode(kind, ssz.as_ref())?, now_slot) {
+            Ok(step) => {
+                accepted.finalized = step.finalized.or(accepted.finalized);
+                accepted.head = step.head.or(accepted.head);
+            }
+            Err(err) if applied == 0 => return Err(err),
+            // The updates before it verified: keep them.
+            Err(_) => break,
+        }
+    }
+    Ok((store, accepted))
 }
 
 impl Store {
     /// Starts a store from the SSZ of a bootstrap for `checkpoint`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`VerifyError`] if the bootstrap is not the one of `checkpoint` or its sync
-    /// committee is not proven by its header.
-    pub(super) fn bootstrap(
+    fn bootstrap(
         spec: &BeaconSpec,
         checkpoint: B256,
         ssz: &[u8],
-    ) -> Result<(Self, TrustedL1Block), VerifyError> {
+    ) -> Result<(Self, Accepted), VerifyError> {
         let bootstrap = decode::<LightClientBootstrap>(ssz)?;
         let header = &bootstrap.header;
         let root = header.beacon.tree_hash_root();
@@ -174,15 +285,25 @@ impl Store {
             finalized_root: root,
             head_slot: header.beacon.slot,
             head_root: root,
-            current: Arc::new(bootstrap.current_sync_committee),
+            current: Arc::new(Committee::new(&bootstrap.current_sync_committee)?),
             next: None,
         };
-        Ok((store, trusted(header, true)))
+        let accepted = Accepted {
+            finalized: Some(trusted(header, true)),
+            head: None,
+        };
+        Ok((store, accepted))
     }
 
     /// The sync-committee period of the finalized header: the one whose committee is known.
     pub(super) const fn period(&self) -> u64 {
         self.finalized_slot / SLOTS_PER_PERIOD
+    }
+
+    /// The last period whose committee is known: updates signed after it cannot be verified.
+    pub(super) const fn last_known_period(&self) -> u64 {
+        let next = if self.next.is_some() { 1 } else { 0 };
+        self.period().saturating_add(next)
     }
 
     /// Whether the committee of the period after [`Self::period`] is known.
@@ -201,94 +322,34 @@ impl Store {
         }
     }
 
-    /// Verifies the SSZ of a `LightClientUpdate` and applies it.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`VerifyError`] if the update does not verify; the store is then unchanged.
-    pub(super) fn apply_update(
-        &mut self,
-        spec: &BeaconSpec,
-        ssz: &[u8],
-        now_slot: u64,
-    ) -> Result<Accepted, VerifyError> {
-        let update = decode::<LightClientUpdate>(ssz)?;
-        self.apply(
-            spec,
-            &Update {
-                attested: &update.attested_header,
-                aggregate: &update.sync_aggregate,
-                signature_slot: update.signature_slot,
-                finalized: Some((&update.finalized_header, &update.finality_branch)),
-                next_committee: Some((
-                    &update.next_sync_committee,
-                    &update.next_sync_committee_branch,
-                )),
-            },
-            now_slot,
-        )
+    /// The committee that signs in `period`, if known.
+    fn committee(&self, period: u64) -> Result<&Arc<Committee>, VerifyError> {
+        let store = self.period();
+        let known = if period == store {
+            Some(&self.current)
+        } else if period == store.saturating_add(1) {
+            self.next.as_ref()
+        } else {
+            None
+        };
+        known.ok_or(VerifyError::UnknownPeriod {
+            signature: period,
+            store,
+        })
     }
 
-    /// Verifies the SSZ of a `LightClientFinalityUpdate` and applies it.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`VerifyError`] if the update does not verify; the store is then unchanged.
-    pub(super) fn apply_finality_update(
-        &mut self,
-        spec: &BeaconSpec,
-        ssz: &[u8],
-        now_slot: u64,
-    ) -> Result<Accepted, VerifyError> {
-        let update = decode::<LightClientFinalityUpdate>(ssz)?;
-        self.apply(
-            spec,
-            &Update {
-                attested: &update.attested_header,
-                aggregate: &update.sync_aggregate,
-                signature_slot: update.signature_slot,
-                finalized: Some((&update.finalized_header, &update.finality_branch)),
-                next_committee: None,
-            },
-            now_slot,
-        )
-    }
-
-    /// Verifies the SSZ of a `LightClientOptimisticUpdate` and applies it.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`VerifyError`] if the update does not verify; the store is then unchanged.
-    pub(super) fn apply_optimistic_update(
-        &mut self,
-        spec: &BeaconSpec,
-        ssz: &[u8],
-        now_slot: u64,
-    ) -> Result<Accepted, VerifyError> {
-        let update = decode::<LightClientOptimisticUpdate>(ssz)?;
-        self.apply(
-            spec,
-            &Update {
-                attested: &update.attested_header,
-                aggregate: &update.sync_aggregate,
-                signature_slot: update.signature_slot,
-                finalized: None,
-                next_committee: None,
-            },
-            now_slot,
-        )
-    }
-
-    /// Validates `update` against the store, then moves the store forward by it.
+    /// Validates `update` against the store, then moves the store forward by it. The store
+    /// is unchanged when it fails.
     fn apply(
         &mut self,
         spec: &BeaconSpec,
-        update: &Update<'_>,
+        update: &Update,
         now_slot: u64,
     ) -> Result<Accepted, VerifyError> {
         let attested = &update.attested.beacon;
         let finalized_slot = update
             .finalized
+            .as_ref()
             .map_or(attested.slot, |(header, _)| header.beacon.slot);
         if update.signature_slot <= attested.slot || attested.slot < finalized_slot {
             return Err(VerifyError::SlotOrder {
@@ -303,34 +364,38 @@ impl Store {
                 now: now_slot,
             });
         }
-        // The committee that signs at a slot is the one of that slot's period.
-        let (store_period, signature_period) =
-            (self.period(), update.signature_slot / SLOTS_PER_PERIOD);
-        let committee = if signature_period == store_period {
-            &self.current
-        } else {
-            self.next
-                .as_ref()
-                .filter(|_| signature_period == store_period.saturating_add(1))
-                .ok_or(VerifyError::UnknownPeriod {
-                    signature: signature_period,
-                    store: store_period,
-                })?
-        };
-
-        check_header(spec, update.attested)?;
-        if let Some((header, branch)) = update.finalized {
-            check_header(spec, header)?;
-            let root = header.beacon.tree_hash_root();
-            check_branch(
-                "finalized header",
-                root,
-                branch,
-                FINALIZED_ROOT_GINDEX,
-                attested.state_root,
-            )?;
+        let learns_committee = update.next_committee.is_some() && self.next.is_none();
+        let moves = attested.slot > self.head_slot
+            || (update.finalized.is_some() && finalized_slot > self.finalized_slot);
+        if !moves && !learns_committee {
+            return Err(VerifyError::Stale);
         }
-        if let Some((next, branch)) = update.next_committee {
+        let committee = Arc::clone(self.committee(update.signature_slot / SLOTS_PER_PERIOD)?);
+        // Two thirds of the committee, for the finalized header as the specification has it
+        // and for the head by choice. Counted before any hashing or pairing.
+        let bits = &update.aggregate.sync_committee_bits;
+        let participants = bits.num_set_bits();
+        if participants.saturating_mul(3) < bits.len().saturating_mul(2) {
+            return Err(VerifyError::Participation(participants));
+        }
+
+        check_header(spec, &update.attested)?;
+        let finalized_root = match &update.finalized {
+            Some((header, branch)) => {
+                check_header(spec, header)?;
+                let root = header.beacon.tree_hash_root();
+                check_branch(
+                    "finalized header",
+                    root,
+                    branch,
+                    FINALIZED_ROOT_GINDEX,
+                    attested.state_root,
+                )?;
+                Some(root)
+            }
+            None => None,
+        };
+        if let Some((next, branch)) = &update.next_committee {
             check_branch(
                 "next sync committee",
                 next.tree_hash_root(),
@@ -339,54 +404,49 @@ impl Store {
                 attested.state_root,
             )?;
         }
-        let participants = check_signature(spec, committee, attested, update)?;
-        // Two thirds of the committee, for the finalized header as the specification has it
-        // and for the head by choice.
-        if participants.saturating_mul(3) < SYNC_COMMITTEE_SIZE * 2 {
-            return Err(VerifyError::Participation(participants));
-        }
+        let attested_root = attested.tree_hash_root();
+        check_signature(spec, &committee, update, attested_root)?;
+        // A committee the update proves, decompressed before the store changes, so a bad key
+        // leaves it as it was.
+        let attested_period = attested.slot / SLOTS_PER_PERIOD;
+        let next = match &update.next_committee {
+            Some((next, _))
+                if learns_committee
+                    && attested_period == finalized_slot / SLOTS_PER_PERIOD
+                    && attested_period >= self.period() =>
+            {
+                Some(Committee::new(next)?)
+            }
+            _ => None,
+        };
 
         let mut accepted = Accepted::default();
-        let mut period = store_period;
-        if let Some((header, _)) = update.finalized
+        if let (Some((header, _)), Some(root)) = (&update.finalized, finalized_root)
             && header.beacon.slot > self.finalized_slot
         {
-            let finalized_period = header.beacon.slot / SLOTS_PER_PERIOD;
-            if finalized_period > period {
-                // The finalized header enters the next period: its committee, which must be
-                // known and has signed this update, becomes the current one.
-                let next = self
-                    .next
-                    .take()
-                    .filter(|_| finalized_period == period.saturating_add(1));
-                let Some(next) = next else {
-                    return Err(VerifyError::UnknownPeriod {
-                        signature: finalized_period,
-                        store: period,
-                    });
-                };
+            // The finalized header enters the next period: its committee, known because it
+            // signed this update (signature period ≥ finalized period), becomes the current.
+            if header.beacon.slot / SLOTS_PER_PERIOD > self.period()
+                && let Some(next) = self.next.take()
+            {
                 self.current = next;
-                period = finalized_period;
-                accepted.rotated = true;
             }
             self.finalized_slot = header.beacon.slot;
-            self.finalized_root = header.beacon.tree_hash_root();
+            self.finalized_root = root;
             accepted.finalized = Some(trusted(header, true));
         }
-        // The next committee an update proves is the one after the attested header's period;
-        // it is kept when that is the store's period, after a rotation included, so a run
-        // of updates, one per period, each brings the committee the next one is signed by.
-        if let Some((next, _)) = update.next_committee
-            && self.next.is_none()
-            && attested.slot / SLOTS_PER_PERIOD == period
+        // The next committee an update proves is the one after its attested header's period;
+        // kept when that is the store's period, after a rotation included, so that a run of
+        // updates, one per period, each brings the committee the next one is signed by.
+        if let Some(next) = next
+            && attested_period == self.period()
         {
-            self.next = Some(Arc::new(next.clone()));
-            accepted.next_committee = true;
+            self.next = Some(Arc::new(next));
         }
         if attested.slot > self.head_slot {
             self.head_slot = attested.slot;
-            self.head_root = attested.tree_hash_root();
-            accepted.head = Some(trusted(update.attested, false));
+            self.head_root = attested_root;
+            accepted.head = Some(trusted(&update.attested, false));
         }
         Ok(accepted)
     }
@@ -411,7 +471,7 @@ fn decode<T: Decode>(ssz: &[u8]) -> Result<T, VerifyError> {
 /// [`is_valid_light_client_header`]: https://github.com/ethereum/consensus-specs/blob/master/specs/capella/light-client/sync-protocol.md#modified-is_valid_light_client_header
 fn check_header(spec: &BeaconSpec, header: &LightClientHeader) -> Result<(), VerifyError> {
     let slot = header.beacon.slot;
-    if slot / SLOTS_PER_EPOCH < spec.electra_epoch {
+    if !spec.reads_slot(slot) {
         return Err(VerifyError::BeforeElectra { slot });
     }
     check_branch(
@@ -451,23 +511,22 @@ fn check_branch(
     }
 }
 
-/// Verifies the committee's aggregate signature over the attested header and returns how many
-/// members signed.
+/// Verifies the committee's aggregate signature over the attested header, whose root is
+/// `attested_root`.
 fn check_signature(
     spec: &BeaconSpec,
-    committee: &SyncCommittee,
-    attested: &BeaconBlockHeader,
-    update: &Update<'_>,
-) -> Result<usize, VerifyError> {
+    committee: &Committee,
+    update: &Update,
+    attested_root: B256,
+) -> Result<(), VerifyError> {
     let bits = &update.aggregate.sync_committee_bits;
-    let keys = committee
-        .pubkeys
+    let keys: Vec<&PublicKey> = committee
+        .keys
         .iter()
         .zip(bits.iter())
         .filter(|(_, signed)| *signed)
-        .map(|(key, _)| PublicKey::from_bytes(key.as_slice()))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_invalid| VerifyError::Point)?;
+        .map(|(key, _)| key)
+        .collect();
     if keys.is_empty() {
         // The specification's minimum is one signer: no signer is no signature.
         return Err(VerifyError::Signature);
@@ -476,12 +535,11 @@ fn check_signature(
         .map_err(|_invalid| VerifyError::Point)?;
     // compute_signing_root(header, domain): the root of the pair.
     let domain = spec.sync_committee_domain(update.signature_slot);
-    let signing_root = hash_pair(&attested.tree_hash_root(), &domain);
-    let keys_ref: Vec<&PublicKey> = keys.iter().collect();
-    let verdict =
-        signature.fast_aggregate_verify(true, signing_root.as_slice(), BLS_DST, &keys_ref);
+    let signing_root = hash_pair(&attested_root, &domain);
+    // The keys were checked when the committee was learned; the signature is checked here.
+    let verdict = signature.fast_aggregate_verify(true, signing_root.as_slice(), BLS_DST, &keys);
     if verdict == BLST_ERROR::BLST_SUCCESS {
-        Ok(keys.len())
+        Ok(())
     } else {
         Err(VerifyError::Signature)
     }

@@ -10,28 +10,29 @@
 //! a header or ends at one) and which the next load of the same blocks writes again with the
 //! same values.
 //!
-//! Does not check what a block contains: [`PreparedBlock::new`] checks the header's hash, the
+//! Does not check what a block contains: `PreparedBlock::new` checks the header's hash, the
 //! writer checks the chain.
 
 use std::panic::resume_unwind;
+use std::sync::mpsc;
 use std::thread;
 
-use alloy_primitives::BlockHash;
+use alloy_primitives::{BlockHash, Bytes};
 use fjall::{Keyspace, UserKey, UserValue};
 use op_indexer_primitives::BlockRef;
 
 use super::{Failure, Tables, compress, end_ref, record_usage};
 use crate::{StorageError, Store, metrics};
 
-/// A block ready for [`super::FjallArchive::bulk_append`](crate::archive_store::FjallArchive::bulk_append):
+/// A block ready for [`FjallArchive::bulk_append`](crate::archive_store::FjallArchive::bulk_append):
 /// its header's hash checked, its number and parent read, its values compressed.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(in crate::archive_store) struct Prepared {
     pub(in crate::archive_store) block: BlockRef,
     pub(in crate::archive_store) parent_hash: BlockHash,
-    header: Vec<u8>,
-    body: Vec<u8>,
-    receipts: Option<Vec<u8>>,
+    header: Bytes,
+    body: Bytes,
+    receipts: Option<Bytes>,
 }
 
 impl Prepared {
@@ -47,17 +48,17 @@ impl Prepared {
         Ok(Self {
             block,
             parent_hash,
-            header: compress(header, number)?,
-            body: compress(body, number)?,
+            header: compress(header, number)?.into(),
+            body: compress(body, number)?.into(),
             receipts: receipts
-                .map(|receipts| compress(receipts, number))
+                .map(|receipts| compress(receipts, number).map(Bytes::from))
                 .transpose()?,
         })
     }
 
     /// The bytes this block adds to the archive's keyspaces, before their overhead.
     pub(in crate::archive_store) fn stored_len(&self) -> usize {
-        let receipts = self.receipts.as_ref().map_or(0, Vec::len);
+        let receipts = self.receipts.as_ref().map_or(0, |receipts| receipts.len());
         self.header.len() + self.body.len() + receipts
     }
 }
@@ -100,27 +101,49 @@ pub(in crate::archive_store) fn bulk_append(
     numbers.sort_unstable();
     numbers.dedup_by_key(|(hash, _)| *hash);
 
-    let by_number = |keyspace: &Keyspace, value: fn(&Prepared) -> Option<&[u8]>| {
-        let entries = blocks
+    let by_number = |value: fn(&Prepared) -> Option<&[u8]>| {
+        blocks
             .iter()
-            .filter_map(|block| Some((block.block.number.to_be_bytes(), value(block)?)));
-        ingest(keyspace, entries)
+            .filter_map(move |block| Some((block.block.number.to_be_bytes(), value(block)?)))
     };
+    // `headers` is written alongside the others but registered only once they are: it waits
+    // for word that they all were, and is dropped unregistered otherwise.
+    let (others_done, all_done) = mpsc::sync_channel::<()>(1);
     thread::scope(|scope| {
-        let ingestions = [
-            scope.spawn(|| by_number(&tables.bodies, |block| Some(&block.body))),
-            scope.spawn(|| by_number(&tables.receipts, |block| block.receipts.as_deref())),
+        let headers = scope.spawn(move || {
+            let mut ingestion = tables.headers.start_ingestion()?;
+            for (key, value) in by_number(|block| Some(&block.header)) {
+                ingestion.write(key, value)?;
+            }
+            if all_done.recv().is_ok() {
+                ingestion.finish()?;
+            }
+            Ok::<_, Failure>(())
+        });
+        let others = [
+            scope.spawn(|| ingest(&tables.bodies, by_number(|block| Some(&block.body)))),
+            scope.spawn(|| {
+                let receipts =
+                    by_number(|block| block.receipts.as_ref().map(|receipts| &receipts[..]));
+                ingest(&tables.receipts, receipts)
+            }),
             scope.spawn(|| ingest(&tables.numbers, numbers.iter().copied())),
         ];
-        for ingestion in ingestions {
-            ingestion
+        let mut result = Ok(());
+        for ingestion in others {
+            let joined = ingestion
                 .join()
-                .unwrap_or_else(|panic| resume_unwind(panic))?;
+                .unwrap_or_else(|panic| resume_unwind(panic));
+            result = result.and(joined);
         }
-        Ok::<_, Failure>(())
+        if result.is_ok() {
+            // The headers thread is waiting for it: the send cannot fail.
+            let _sent = others_done.send(());
+        }
+        drop(others_done);
+        let headers = headers.join().unwrap_or_else(|panic| resume_unwind(panic));
+        result.and(headers)
     })?;
-    // Last: once it is registered, the blocks are in the archive.
-    by_number(&tables.headers, |block| Some(&block.header))?;
 
     metrics::blocks_inserted(Store::Archive, blocks.len());
     record_usage(tables);

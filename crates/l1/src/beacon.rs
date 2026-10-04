@@ -134,15 +134,7 @@ impl LightClient {
         });
         let (network, handle, gossip) =
             network::new(config.listen_addr, config.bootnodes, digest, status_rx)?;
-        let client = Client::new(
-            spec,
-            config.checkpoint,
-            digest,
-            handle,
-            gossip,
-            status,
-            trusted,
-        );
+        let client = Client::new(spec, config.checkpoint, handle, gossip, status, trusted);
         // Either part ending stops the other.
         let stop = cancel.child_token();
         let (networking, result) = tokio::join!(

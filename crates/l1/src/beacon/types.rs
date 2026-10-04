@@ -24,7 +24,7 @@ use tree_hash_derive::TreeHash;
 pub(super) type PublicKeyBytes = FixedBytes<48>;
 
 /// A beacon block header.
-#[derive(Debug, Clone, Decode, TreeHash)]
+#[derive(Debug, Decode, TreeHash)]
 pub(super) struct BeaconBlockHeader {
     pub(super) slot: u64,
     pub(super) proposer_index: u64,
@@ -34,7 +34,7 @@ pub(super) struct BeaconBlockHeader {
 }
 
 /// The header of an execution payload (Deneb form): the L1 execution block of a beacon block.
-#[derive(Debug, Clone, Decode, TreeHash)]
+#[derive(Debug, Decode, TreeHash)]
 pub(super) struct ExecutionPayloadHeader {
     pub(super) parent_hash: B256,
     pub(super) fee_recipient: Address,
@@ -56,7 +56,7 @@ pub(super) struct ExecutionPayloadHeader {
 }
 
 /// A beacon header with its execution payload header and the proof that ties the two.
-#[derive(Debug, Clone, Decode)]
+#[derive(Debug, Decode)]
 pub(super) struct LightClientHeader {
     pub(super) beacon: BeaconBlockHeader,
     pub(super) execution: ExecutionPayloadHeader,
@@ -65,14 +65,14 @@ pub(super) struct LightClientHeader {
 }
 
 /// The 512 validators that sign every block header for one period of about 27 hours.
-#[derive(Debug, Clone, Decode, TreeHash)]
+#[derive(Debug, Decode, TreeHash)]
 pub(super) struct SyncCommittee {
     pub(super) pubkeys: FixedVector<PublicKeyBytes, U512>,
     pub(super) aggregate_pubkey: PublicKeyBytes,
 }
 
 /// Which members of the sync committee signed, and their aggregate signature.
-#[derive(Debug, Clone, Decode)]
+#[derive(Debug, Decode)]
 pub(super) struct SyncAggregate {
     pub(super) sync_committee_bits: BitVector<U512>,
     pub(super) sync_committee_signature: FixedBytes<96>,
@@ -80,7 +80,7 @@ pub(super) struct SyncAggregate {
 
 /// What a light client starts from: the header of a trusted block and the sync committee of
 /// its period, proven against the header's state root.
-#[derive(Debug, Clone, Decode)]
+#[derive(Debug, Decode)]
 pub(super) struct LightClientBootstrap {
     pub(super) header: LightClientHeader,
     pub(super) current_sync_committee: SyncCommittee,
@@ -89,7 +89,7 @@ pub(super) struct LightClientBootstrap {
 
 /// One period's update: a signed header, the finalized header it proves, and the next
 /// period's sync committee.
-#[derive(Debug, Clone, Decode)]
+#[derive(Debug, Decode)]
 pub(super) struct LightClientUpdate {
     pub(super) attested_header: LightClientHeader,
     pub(super) next_sync_committee: SyncCommittee,
@@ -101,7 +101,7 @@ pub(super) struct LightClientUpdate {
 }
 
 /// A signed header and the finalized header it proves.
-#[derive(Debug, Clone, Decode)]
+#[derive(Debug, Decode)]
 pub(super) struct LightClientFinalityUpdate {
     pub(super) attested_header: LightClientHeader,
     pub(super) finalized_header: LightClientHeader,
@@ -111,7 +111,7 @@ pub(super) struct LightClientFinalityUpdate {
 }
 
 /// A signed header: the head as the sync committee attested it.
-#[derive(Debug, Clone, Decode)]
+#[derive(Debug, Decode)]
 pub(super) struct LightClientOptimisticUpdate {
     pub(super) attested_header: LightClientHeader,
     pub(super) sync_aggregate: SyncAggregate,

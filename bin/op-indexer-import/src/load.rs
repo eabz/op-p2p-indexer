@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 use clap::Args;
 use eyre::{WrapErr, ensure, eyre};
 use op_indexer_primitives::{BlockSource, DecodedBlock, EncodedBlock, decode_block};
-use op_indexer_storage::archive_store::FjallArchive;
+use op_indexer_storage::archive_store::{FjallArchive, PreparedBlock};
 use op_indexer_storage::committed_store::{BulkRows, ClickHouseStore};
 use op_indexer_storage::{
     ArchiveStore, ClickHouseConfig, RetryError, Severity, StorageError, Store,
@@ -51,12 +51,14 @@ use crate::cli::Secret;
 use crate::progress::{self, Rate};
 use crate::state::{Chunk, Plan, State, write_atomic};
 
-/// Chunks read and decompressed ahead of the archive's writer. A chunk after Bedrock can be
-/// tens of megabytes decompressed, so this is what bounds memory.
-const READ_AHEAD: usize = 4;
-/// Bytes of blocks collected before they are appended to the archive in one call. The archive
-/// commits at most this much at once, so more would not save a synced write.
-const APPEND_BYTES: usize = 16 * 1024 * 1024;
+/// Fewest and most chunks read, decompressed and prepared at once ahead of the archive's
+/// writer: one per core within these bounds. Preparing (hashing the header, compressing the
+/// values) is most of the CPU of a load; a chunk after Bedrock is a few megabytes in memory.
+const READ_AHEAD: (usize, usize) = (4, 32);
+/// Bytes of block encodings collected before they are appended to the archive in one bulk
+/// append. Each writes new table and blob files and syncs them, so it must be large; one is
+/// written while the next is prepared, and a prepared one takes about half this in memory.
+const APPEND_BYTES: usize = 1024 * 1024 * 1024;
 /// Rows (of every table together) per bulk insert into ClickHouse: large enough that the
 /// server writes few, large parts and a round trip is small next to the data, small enough
 /// that a batch takes a few hundred megabytes in memory at most.
@@ -177,6 +179,10 @@ pub(crate) async fn run(
 
 /// Appends the range to the archive from the block after `held_to` on. Returns the first
 /// block not appended if `cancel` stopped it, `None` when the archive holds the whole range.
+///
+/// Chunks are read and prepared for the archive ([`PreparedBlock`]) on blocking threads, one
+/// per core, and collected into bulk appends of about [`APPEND_BYTES`]; one append is written
+/// while the next is collected.
 async fn fill_archive(
     archive: &FjallArchive,
     held_to: Option<u64>,
@@ -186,62 +192,78 @@ async fn fill_archive(
 ) -> eyre::Result<Option<u64>> {
     let next = held_to.map_or(plan.first, |held_to| held_to.saturating_add(1));
     let to_append = plan.last.saturating_add(1).saturating_sub(next);
+    // Chunks that end at or below the archive's last block are held whole. Of one that
+    // straddles it, only the blocks above are taken.
+    let to_load: Vec<Chunk> = plan.chunks().skip_while(|chunk| chunk.to <= next).collect();
+    let file_bytes = files_size(state, &to_load).await?;
     info!(
         archive_holds_to = held_to,
         first = plan.first,
         last = plan.last,
         blocks_to_append = to_append,
+        chunk_bytes = file_bytes,
         "loading the block archive"
     );
-    let mut progress = Progress::new(to_append);
-    // Chunks that end at or below the archive's last block are held whole. Of one that
-    // straddles it, only the blocks above are taken.
-    let mut chunks = plan.chunks().skip_while(|chunk| chunk.to <= next);
-    let mut reads: VecDeque<JoinHandle<eyre::Result<Vec<EncodedBlock>>>> = VecDeque::new();
-    let mut pending: Vec<EncodedBlock> = Vec::new();
-    let (mut pending_bytes, mut appended_to) = (0_usize, next);
+    let mut progress = Progress::new(to_append, file_bytes);
+    let read_ahead = std::thread::available_parallelism()
+        .map_or(READ_AHEAD.0, std::num::NonZero::get)
+        .clamp(READ_AHEAD.0, READ_AHEAD.1);
+    let mut chunks = to_load.into_iter();
+    let mut reads: VecDeque<JoinHandle<eyre::Result<Prepared>>> = VecDeque::new();
+    let mut pending = Prepared::default();
+    // The bulk append being written, with what it holds.
+    let mut writing: Option<(JoinHandle<eyre::Result<Option<()>>>, Written)> = None;
+    let mut appended_to = next;
     let mut stopped = false;
     loop {
-        while reads.len() < READ_AHEAD
+        while reads.len() < read_ahead
             && let Some(chunk) = chunks.next()
         {
             let path = state.verified_path(chunk);
-            reads.push_back(spawn_blocking(move || {
-                let held = usize::try_from(next.saturating_sub(chunk.from))
-                    .wrap_err("a chunk has too many blocks")?;
-                Ok(read(&path, chunk)?
-                    .into_iter()
-                    .skip(held)
-                    .map(|block| block.encoded)
-                    .collect())
-            }));
+            reads.push_back(spawn_blocking(move || prepare(&path, chunk, next)));
         }
-        let read = reads.pop_front();
-        if let Some(read) = read {
-            let blocks = read.await.wrap_err("reading a chunk panicked")??;
-            pending_bytes = pending_bytes.saturating_add(blocks.iter().map(size).sum());
-            pending.extend(blocks);
+        if let Some(read) = reads.pop_front() {
+            pending.extend(read.await.wrap_err("reading a chunk panicked")??);
         }
         // Everything read is appended before stopping, so no read is wasted.
         stopped = stopped || cancel.is_cancelled();
-        if pending_bytes < APPEND_BYTES && !reads.is_empty() && !stopped {
+        if pending.rlp_bytes < APPEND_BYTES && !reads.is_empty() && !stopped {
             continue;
         }
-        if !pending.is_empty() {
-            let (blocks, bytes) = (pending.len(), pending_bytes);
-            // The clone is of reference-counted buffers; the bytes are not copied.
-            let append = retry(cancel, Store::Archive, "archive append_batch", || {
-                archive.append_batch(pending.clone())
-            });
-            if append.await?.is_none() {
+        // The previous append must be in before the next is written: each extends the last.
+        if let Some((write, written)) = writing.take() {
+            if write
+                .await
+                .wrap_err("an archive append panicked")??
+                .is_none()
+            {
                 return Ok(Some(appended_to));
             }
-            appended_to = appended_to.saturating_add(u64::try_from(blocks).unwrap_or(u64::MAX));
-            progress.appended(blocks, bytes, appended_to.saturating_sub(1));
-            pending.clear();
-            pending_bytes = 0;
+            appended_to = progress.appended(&written, appended_to);
         }
-        if stopped || reads.is_empty() {
+        if !pending.blocks.is_empty() {
+            let Prepared {
+                blocks,
+                rlp_bytes,
+                file_bytes,
+            } = std::mem::take(&mut pending);
+            let written = Written {
+                blocks: u64::try_from(blocks.len()).unwrap_or(u64::MAX),
+                rlp_bytes: u64::try_from(rlp_bytes).unwrap_or(u64::MAX),
+                file_bytes,
+            };
+            let (archive, cancel) = (archive.clone(), cancel.clone());
+            let write = tokio::spawn(async move {
+                // The clone is of reference-counted buffers; the bytes are not copied.
+                retry(&cancel, Store::Archive, "archive bulk_append", || {
+                    archive.bulk_append(blocks.clone())
+                })
+                .await
+            });
+            writing = Some((write, written));
+        }
+        // With nothing more to collect, the next turn waits for the last append.
+        if (stopped || reads.is_empty()) && writing.is_none() {
             break;
         }
     }
@@ -251,6 +273,70 @@ async fn fill_archive(
     Ok(stopped
         .then_some(appended_to)
         .filter(|next| *next <= plan.last))
+}
+
+/// Blocks prepared for the archive, with what they amount to.
+#[derive(Default)]
+struct Prepared {
+    blocks: Vec<PreparedBlock>,
+    /// Bytes of their encodings (RLP), as verified.
+    rlp_bytes: usize,
+    /// Bytes of the verified chunk files they were read from.
+    file_bytes: u64,
+}
+
+/// What a bulk append holds, for the progress lines.
+struct Written {
+    blocks: u64,
+    rlp_bytes: u64,
+    file_bytes: u64,
+}
+
+impl Prepared {
+    fn extend(&mut self, other: Self) {
+        self.blocks.extend(other.blocks);
+        self.rlp_bytes = self.rlp_bytes.saturating_add(other.rlp_bytes);
+        self.file_bytes = self.file_bytes.saturating_add(other.file_bytes);
+    }
+}
+
+/// Reads the verified chunk at `path` and prepares its blocks from `next` on for the archive.
+/// Blocking: decompression, a hash and compression per block.
+fn prepare(path: &Path, chunk: Chunk, next: u64) -> eyre::Result<Prepared> {
+    let held =
+        usize::try_from(next.saturating_sub(chunk.from)).wrap_err("a chunk has too many blocks")?;
+    let file_bytes = std::fs::metadata(path)
+        .wrap_err_with(|| format!("failed to read verified chunk {}", path.display()))?
+        .len();
+    let mut prepared = Prepared {
+        file_bytes,
+        ..Prepared::default()
+    };
+    for block in read(path, chunk)?.into_iter().skip(held) {
+        prepared.rlp_bytes = prepared.rlp_bytes.saturating_add(size(&block.encoded));
+        let block = PreparedBlock::new(&block.encoded)
+            .wrap_err_with(|| format!("{} does not hold archivable blocks", path.display()))?;
+        prepared.blocks.push(block);
+    }
+    Ok(prepared)
+}
+
+/// Bytes of the verified files of `chunks`, which progress is measured in.
+async fn files_size(state: &State, chunks: &[Chunk]) -> eyre::Result<u64> {
+    let paths: Vec<PathBuf> = chunks
+        .iter()
+        .map(|chunk| state.verified_path(*chunk))
+        .collect();
+    spawn_blocking(move || {
+        paths.iter().try_fold(0_u64, |total, path| {
+            let len = std::fs::metadata(path)
+                .wrap_err_with(|| format!("failed to read verified chunk {}", path.display()))?
+                .len();
+            Ok(total.saturating_add(len))
+        })
+    })
+    .await
+    .wrap_err("measuring the chunks panicked")?
 }
 
 /// Writes every chunk of the range that has no ClickHouse marker yet, and marks it. Returns
@@ -441,56 +527,64 @@ async fn mark_loaded(state: &State, chunks: &[Chunk]) -> eyre::Result<()> {
     .wrap_err("failed to mark a chunk as loaded")
 }
 
-/// What the archive pass has done, for its progress lines.
+/// What the archive pass has done, for its progress lines. The time left is reckoned from
+/// the verified files' bytes, not from blocks: a block after Bedrock is tens of times larger
+/// than one before.
 struct Progress {
     started: Instant,
     logged: Instant,
     rate: Rate,
     /// Blocks this run has to append.
     total: u64,
+    /// Bytes of the verified files this run reads.
+    total_file_bytes: u64,
     blocks: u64,
-    bytes: u64,
+    rlp_bytes: u64,
+    file_bytes: u64,
 }
 
 impl Progress {
-    fn new(total: u64) -> Self {
+    fn new(total: u64, total_file_bytes: u64) -> Self {
         let now = Instant::now();
         Self {
             started: now,
             logged: now,
             rate: Rate::new(),
             total,
+            total_file_bytes,
             blocks: 0,
-            bytes: 0,
+            rlp_bytes: 0,
+            file_bytes: 0,
         }
     }
 
-    /// Records an append that brought the archive's last block to `tip`, and logs a progress
-    /// line when one is due.
-    fn appended(&mut self, blocks: usize, bytes: usize, tip: u64) {
-        self.blocks = self
-            .blocks
-            .saturating_add(u64::try_from(blocks).unwrap_or(u64::MAX));
-        self.bytes = self
-            .bytes
-            .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+    /// Records an append of `appended`, the blocks from `from` on, logs a progress line when
+    /// one is due, and returns the block after the archive's new last block.
+    fn appended(&mut self, appended: &Written, from: u64) -> u64 {
+        self.blocks = self.blocks.saturating_add(appended.blocks);
+        self.rlp_bytes = self.rlp_bytes.saturating_add(appended.rlp_bytes);
+        self.file_bytes = self.file_bytes.saturating_add(appended.file_bytes);
+        let next = from.saturating_add(appended.blocks);
         if self.logged.elapsed() < progress::INTERVAL {
-            return;
+            return next;
         }
         self.logged = Instant::now();
-        let blocks_per_sec = self.rate.per_sec(self.blocks);
+        let file_bytes_per_sec = self.rate.per_sec(self.file_bytes);
+        let secs = self.started.elapsed().as_secs().max(1);
         info!(
             blocks = self.blocks,
             of = self.total,
-            archive_tip = tip,
-            blocks_per_sec,
+            archive_tip = next.saturating_sub(1),
+            blocks_per_sec = self.blocks / secs,
+            mb_per_sec = self.rlp_bytes / secs / 1_000_000,
             secs_left = self
-                .total
-                .saturating_sub(self.blocks)
-                .checked_div(blocks_per_sec),
-            bytes = self.bytes,
+                .total_file_bytes
+                .saturating_sub(self.file_bytes)
+                .checked_div(file_bytes_per_sec),
+            bytes = self.rlp_bytes,
             "loading"
         );
+        next
     }
 
     fn summary(&self, archive: Option<(u64, u64)>) {
@@ -498,8 +592,9 @@ impl Progress {
         info!(
             blocks = self.blocks,
             of = self.total,
-            bytes = self.bytes,
+            bytes = self.rlp_bytes,
             blocks_per_sec = self.blocks / secs,
+            mb_per_sec = self.rlp_bytes / secs / 1_000_000,
             secs,
             archive_first = archive.map(|(first, _)| first),
             archive_last = archive.map(|(_, last)| last),

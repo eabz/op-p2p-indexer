@@ -9,7 +9,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use alloy_primitives::{B256, FixedBytes, b256};
+use alloy_primitives::{B256, b256};
 use sha2::{Digest, Sha256};
 
 /// Slots in an epoch.
@@ -22,7 +22,7 @@ pub(super) const SLOTS_PER_PERIOD: u64 = SLOTS_PER_EPOCH * EPOCHS_PER_SYNC_COMMI
 const DOMAIN_SYNC_COMMITTEE: [u8; 4] = [7, 0, 0, 0];
 
 /// A fork version.
-pub(super) type Version = [u8; 4];
+type Version = [u8; 4];
 /// A fork digest: what names a network and fork on the wire.
 pub(super) type ForkDigest = [u8; 4];
 
@@ -30,22 +30,22 @@ pub(super) type ForkDigest = [u8; 4];
 #[derive(Debug)]
 pub(super) struct BeaconSpec {
     /// Time of slot 0, in seconds since the Unix epoch.
-    pub(super) genesis_time_secs: u64,
+    genesis_time_secs: u64,
     /// Seconds in a slot.
-    pub(super) seconds_per_slot: u64,
+    seconds_per_slot: u64,
     /// Root of the validator set at genesis: part of every signing domain and fork digest.
-    pub(super) genesis_validators_root: B256,
+    genesis_validators_root: B256,
     /// Root of the genesis block, which a node that has synced nothing reports as its head.
     pub(super) genesis_block_root: B256,
-    /// Every fork's activation epoch and version, ascending.
-    pub(super) forks: &'static [(u64, Version)],
+    /// The activation epoch and version of every fork whose light-client containers have
+    /// the shapes of `types` (Electra and later), ascending. Older forks are never met: a
+    /// light client starts from a recent checkpoint.
+    forks: &'static [(u64, Version)],
     /// From Fulu on, the epochs at which the blob limit changed and the limit from then on,
     /// ascending: the fork digest depends on the entry in force ([EIP-7892]).
     ///
     /// [EIP-7892]: https://eips.ethereum.org/EIPS/eip-7892
-    pub(super) blob_schedule: &'static [(u64, u64)],
-    /// Epoch from which the light-client containers have the shapes of `types`.
-    pub(super) electra_epoch: u64,
+    blob_schedule: &'static [(u64, u64)],
 }
 
 /// Ethereum mainnet. Fork epochs and versions are those of the consensus-specs mainnet
@@ -58,35 +58,40 @@ pub(super) const MAINNET: BeaconSpec = BeaconSpec {
         "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"
     ),
     genesis_block_root: b256!("0x4d611d5b93fdab69013a7f0a2f961caca0c853f87cfe9595fe50038163079360"),
-    forks: &[
-        (0, [0, 0, 0, 0]),
-        (74_240, [1, 0, 0, 0]),
-        (144_896, [2, 0, 0, 0]),
-        (194_048, [3, 0, 0, 0]),
-        (269_568, [4, 0, 0, 0]),
-        (364_032, [5, 0, 0, 0]),
-        (411_392, [6, 0, 0, 0]),
-    ],
+    forks: &[(364_032, [5, 0, 0, 0]), (411_392, [6, 0, 0, 0])],
     blob_schedule: &[(412_672, 15), (419_072, 21)],
-    electra_epoch: 364_032,
 };
 
 impl BeaconSpec {
-    /// The slot at `now_secs` (seconds since the Unix epoch); 0 before genesis.
-    pub(super) const fn slot_at(&self, now_secs: u64) -> u64 {
-        now_secs.saturating_sub(self.genesis_time_secs) / self.seconds_per_slot
-    }
-
-    /// The slot the wall clock is in.
+    /// The slot the wall clock is in; 0 before genesis.
     pub(super) fn now_slot(&self) -> u64 {
         let now = SystemTime::now().duration_since(UNIX_EPOCH);
-        self.slot_at(now.map_or(0, |since| since.as_secs()))
+        let secs = now.map_or(0, |since| since.as_secs());
+        secs.saturating_sub(self.genesis_time_secs) / self.seconds_per_slot
     }
 
-    /// The version of the fork in force at `epoch`.
-    pub(super) fn fork_version(&self, epoch: u64) -> Version {
+    /// Whether a header at `slot` is of a fork whose containers `types` reads.
+    pub(super) fn reads_slot(&self, slot: u64) -> bool {
+        let first = self.forks.first().map_or(u64::MAX, |(epoch, _)| *epoch);
+        slot / SLOTS_PER_EPOCH >= first
+    }
+
+    /// Whether `digest` names a fork whose containers `types` reads: data under it can be
+    /// decoded and verified, whichever of those forks is current.
+    pub(super) fn knows_digest(&self, digest: ForkDigest) -> bool {
+        let forks = self.forks.iter().map(|(epoch, _)| *epoch);
+        let blobs = self.blob_schedule.iter().map(|(epoch, _)| *epoch);
+        forks
+            .chain(blobs)
+            .any(|epoch| self.fork_digest(epoch) == digest)
+    }
+
+    /// The version of the fork in force at `epoch`; the oldest known before it.
+    fn fork_version(&self, epoch: u64) -> Version {
         let active = self.forks.iter().rev().find(|(at, _)| *at <= epoch);
-        active.map_or([0; 4], |(_, version)| *version)
+        active
+            .or_else(|| self.forks.first())
+            .map_or([0; 4], |(_, version)| *version)
     }
 
     /// The fork digest at `epoch`: the first four bytes of the fork data root, and from Fulu
@@ -97,8 +102,7 @@ impl BeaconSpec {
     /// [EIP-7892]: https://eips.ethereum.org/EIPS/eip-7892
     pub(super) fn fork_digest(&self, epoch: u64) -> ForkDigest {
         let root = self.fork_data_root(self.fork_version(epoch));
-        let mut digest = [0; 4];
-        digest.copy_from_slice(root.get(..4).unwrap_or_default());
+        let mut digest = root.0.first_chunk::<4>().copied().unwrap_or_default();
         let blobs = self.blob_schedule.iter().rev().find(|(at, _)| *at <= epoch);
         if let Some((at, max_blobs)) = blobs {
             let mask = Sha256::new()
@@ -119,20 +123,19 @@ impl BeaconSpec {
     pub(super) fn sync_committee_domain(&self, signature_slot: u64) -> B256 {
         let epoch = signature_slot.saturating_sub(1) / SLOTS_PER_EPOCH;
         let root = self.fork_data_root(self.fork_version(epoch));
-        let mut domain = B256::ZERO;
+        let mut domain = [0; 32];
         let (kind, rest) = domain.split_at_mut(4);
         kind.copy_from_slice(&DOMAIN_SYNC_COMMITTEE);
-        rest.copy_from_slice(root.get(..28).unwrap_or_default());
-        domain
+        rest.copy_from_slice(root.0.first_chunk::<28>().unwrap_or(&[0; 28]));
+        B256::from(domain)
     }
 
     /// `hash_tree_root(ForkData(version, genesis_validators_root))`.
     fn fork_data_root(&self, version: Version) -> B256 {
-        let mut leaf = FixedBytes::<32>::ZERO;
-        leaf.get_mut(..4)
-            .unwrap_or_default()
-            .copy_from_slice(&version);
-        hash_pair(&leaf, &self.genesis_validators_root)
+        hash_pair(
+            &B256::right_padding_from(&version),
+            &self.genesis_validators_root,
+        )
     }
 }
 

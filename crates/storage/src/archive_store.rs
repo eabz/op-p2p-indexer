@@ -136,8 +136,9 @@ impl FjallArchive {
 }
 
 /// A block checked and compressed for [`FjallArchive::bulk_append`], off the writer: its
-/// header hashes to its hash, and its number and parent are read from it.
-#[derive(Debug)]
+/// header hashes to its hash, and its number and parent are read from it. Cheap to clone: the
+/// compressed values are shared.
+#[derive(Debug, Clone)]
 pub struct PreparedBlock(Prepared);
 
 impl PreparedBlock {

@@ -8,12 +8,13 @@
 //!    the store: ask for `LightClientUpdatesByRange` from the store's period (one update per
 //!    period, each proving the committee that signs the next);
 //! 3. a finality or optimistic update arrived over gossip: take it;
-//! 4. when no update verified for a while: ask for the optimistic update every slot, and
-//!    once an epoch for the finality update.
+//! 4. when gossip has brought nothing new for a while: ask for the optimistic update every
+//!    slot, and once an epoch for the finality update.
 //!
 //! Each answer and gossip message is verified off the runtime (`verify`) against a copy of
 //! the store, which replaces the store when it verifies. A peer whose data fails
-//! verification is reported to the network, which drops it.
+//! verification is reported to the network, which drops it. Data is accepted under any fork
+//! digest whose containers this build reads.
 //!
 //! Does not touch the swarm, pick peers or frame messages: see `network`.
 
@@ -32,17 +33,17 @@ use tracing::{debug, info};
 use super::BeaconError;
 use super::network::{Gossip, NetworkHandle, Request, RequestError, Response, Topic, Verdict};
 use super::rpc::StatusData;
-use super::spec::{BeaconSpec, ForkDigest, SLOTS_PER_EPOCH, SLOTS_PER_PERIOD};
-use super::verify::{Accepted, Store, VerifyError};
+use super::spec::{BeaconSpec, SLOTS_PER_EPOCH, SLOTS_PER_PERIOD};
+use super::verify::{Accepted, Kind, Store, VerifyError, verify};
 use crate::TrustedL1Block;
 
 /// How often the loop looks for something to ask.
 const TICK: Duration = Duration::from_secs(1);
 /// Time between two polls for the newest update: a slot.
 const POLL_INTERVAL: Duration = Duration::from_secs(12);
-/// How long polling stays quiet after an update that verified: gossip delivers one every
+/// How long polling stays quiet after gossip brought news: gossip delivers an update every
 /// slot, and polling only fills in when it stops.
-const QUIET_AFTER_UPDATE: Duration = Duration::from_secs(30);
+const QUIET_AFTER_GOSSIP: Duration = Duration::from_secs(30);
 /// Time between two attempts to learn the next sync committee, which peers can only prove
 /// once a block of the period is finalized.
 const COMMITTEE_RETRY: Duration = Duration::from_secs(600);
@@ -52,15 +53,6 @@ const CATCH_UP_RETRY: Duration = Duration::from_secs(20);
 /// Peers that must say they do not hold the checkpoint's bootstrap before the checkpoint is
 /// given up as too old.
 const BOOTSTRAP_REFUSALS: usize = 12;
-
-/// What a piece of light-client data is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
-    Bootstrap,
-    Updates,
-    Finality,
-    Optimistic,
-}
 
 /// The answer to the request in flight, once it comes.
 type Answer = Pin<Box<dyn Future<Output = Result<Response, RequestError>> + Send>>;
@@ -75,21 +67,11 @@ async fn answered(
     }
 }
 
-/// A verified answer: the store after it, and what it changed.
-#[derive(Debug)]
-struct Verified {
-    store: Store,
-    accepted: Accepted,
-    /// The checkpoint's own execution block, when the answer was the bootstrap.
-    bootstrapped: Option<TrustedL1Block>,
-}
-
 /// The light client's state machine.
 #[derive(Debug)]
 pub(super) struct Client {
     spec: &'static BeaconSpec,
     checkpoint: B256,
-    digest: ForkDigest,
     network: NetworkHandle,
     gossip: mpsc::Receiver<Gossip>,
     /// What the network reports about this node in `Status`: follows the store.
@@ -108,7 +90,6 @@ impl Client {
     pub(super) fn new(
         spec: &'static BeaconSpec,
         checkpoint: B256,
-        digest: ForkDigest,
         network: NetworkHandle,
         gossip: mpsc::Receiver<Gossip>,
         status: watch::Sender<StatusData>,
@@ -118,7 +99,6 @@ impl Client {
         Self {
             spec,
             checkpoint,
-            digest,
             network,
             gossip,
             status,
@@ -175,13 +155,6 @@ impl Client {
                     continue;
                 }
             };
-            if self.store.is_none() && kind != Kind::Bootstrap {
-                // Gossip before the bootstrap: nothing to verify it with.
-                if let Some(id) = gossip {
-                    self.network.report_gossip(id, peer, Verdict::Ignore);
-                }
-                continue;
-            }
             let (spec, checkpoint, store) = (self.spec, self.checkpoint, self.store.clone());
             let now_slot = self.spec.now_slot();
             let verifying = tokio::task::spawn_blocking(move || {
@@ -190,15 +163,20 @@ impl Client {
             // Not cancelled: BLS over one update takes milliseconds.
             let result = verifying.await.map_err(BeaconError::Verification)?;
             if let Some(id) = gossip {
-                // Forwarded to the mesh only if it verified and is news.
-                // News on the finality topic is a newer finalized block; on the optimistic
-                // topic, a newer head.
-                let news = |accepted: &Accepted| match kind {
-                    Kind::Finality => accepted.finalized.is_some(),
-                    Kind::Optimistic | Kind::Bootstrap | Kind::Updates => accepted.head.is_some(),
+                // Forwarded to the mesh only if it verified and is news: on the finality
+                // topic a newer finalized block, on the optimistic topic a newer head.
+                let news = |accepted: &Accepted| {
+                    if kind == Kind::Finality {
+                        accepted.finalized.is_some()
+                    } else {
+                        accepted.head.is_some()
+                    }
                 };
                 let verdict = match &result {
-                    Ok(verified) if news(&verified.accepted) => Verdict::Accept,
+                    Ok((_, accepted)) if news(accepted) => {
+                        self.next_poll = Instant::now() + QUIET_AFTER_GOSSIP;
+                        Verdict::Accept
+                    }
                     Err(err) if err.is_peer_fault() => Verdict::Reject,
                     Ok(_) | Err(_) => Verdict::Ignore,
                 };
@@ -226,8 +204,7 @@ impl Client {
         let (period, clock_period) = (store.period(), now_slot / SLOTS_PER_PERIOD);
         // With the next committee known, updates signed in the next period verify and the
         // store rotates by itself when one of them finalizes a block there.
-        let last_known = period.saturating_add(u64::from(store.knows_next_committee()));
-        let stuck = clock_period > last_known;
+        let stuck = clock_period > store.last_known_period();
         if (stuck || !store.knows_next_committee()) && now >= self.next_committee_attempt {
             let retry = if stuck {
                 CATCH_UP_RETRY
@@ -240,7 +217,7 @@ impl Client {
                 start_period: period,
                 count: clock_period.saturating_sub(period).saturating_add(1),
             };
-            return Ok(Some((Kind::Updates, request)));
+            return Ok(Some((Kind::Update, request)));
         }
         if now < self.next_poll {
             return Ok(None);
@@ -254,8 +231,8 @@ impl Client {
         Ok(Some((Kind::Finality, Request::FinalityUpdate)))
     }
 
-    /// The data of an answer that is of our fork digest, with who sent it; `None` if there
-    /// is none. A peer that answered a bootstrap request without data is counted.
+    /// The data of an answer under a fork digest this build reads, with who sent it; `None`
+    /// if there is none. A peer that answered a bootstrap request without data is counted.
     fn payloads(
         &mut self,
         kind: Kind,
@@ -269,7 +246,7 @@ impl Client {
                 {
                     self.refused.insert(peer);
                 }
-                if kind == Kind::Updates {
+                if kind == Kind::Update {
                     // Nobody was asked, or nobody answered: ask again soon, not after the
                     // long wait that follows an answer.
                     self.next_committee_attempt = Instant::now() + CATCH_UP_RETRY;
@@ -285,7 +262,7 @@ impl Client {
         let payloads: Vec<Bytes> = response
             .chunks
             .into_iter()
-            .filter(|(digest, _)| *digest == self.digest)
+            .filter(|(digest, _)| self.spec.knows_digest(*digest))
             .map(|(_, ssz)| ssz)
             .collect();
         (!payloads.is_empty()).then_some((peer, payloads))
@@ -297,10 +274,10 @@ impl Client {
         &mut self,
         peer: PeerId,
         kind: Kind,
-        result: Result<Verified, VerifyError>,
+        result: Result<(Store, Accepted), VerifyError>,
         cancel: &CancellationToken,
     ) -> bool {
-        let verified = match result {
+        let (store, accepted) = match result {
             Ok(verified) => verified,
             Err(err) if err.is_peer_fault() => {
                 debug!(%peer, ?kind, %err, "light-client data does not verify");
@@ -312,30 +289,28 @@ impl Client {
                 return true;
             }
         };
-        let accepted = verified.accepted;
-        if let Some(block) = verified.bootstrapped {
+        let before = self
+            .store
+            .as_ref()
+            .map(|old| (old.period(), old.knows_next_committee()));
+        let after = (store.period(), store.knows_next_committee());
+        if kind == Kind::Bootstrap {
             info!(
                 checkpoint = %self.checkpoint,
-                l1_block = block.number,
-                period = verified.store.period(),
+                l1_block = accepted.finalized.map(|block| block.number),
+                period = after.0,
                 "light client bootstrapped from the checkpoint"
             );
-        }
-        if accepted.rotated || accepted.next_committee {
+        } else if before != Some(after) {
             info!(
-                period = verified.store.period(),
-                rotated = accepted.rotated,
-                knows_next = verified.store.knows_next_committee(),
+                period = after.0,
+                knows_next = after.1,
                 "sync committees updated"
             );
         }
-        if accepted.finalized.is_some() || accepted.head.is_some() {
-            self.next_poll = Instant::now() + QUIET_AFTER_UPDATE;
-        }
-        self.status.send_replace(verified.store.status());
-        self.store = Some(verified.store);
-        let blocks = [verified.bootstrapped, accepted.finalized, accepted.head];
-        for block in blocks.into_iter().flatten() {
+        self.status.send_replace(store.status());
+        self.store = Some(store);
+        for block in [accepted.finalized, accepted.head].into_iter().flatten() {
             debug!(number = block.number, hash = %block.hash, finalized = block.finalized, "trusted L1 block");
             tokio::select! {
                 biased;
@@ -349,47 +324,4 @@ impl Client {
         }
         true
     }
-}
-
-/// Verifies an answer against a copy of the store. Blocking: BLS and hashing.
-fn verify(
-    spec: &BeaconSpec,
-    checkpoint: B256,
-    store: Option<Store>,
-    kind: Kind,
-    payloads: &[Bytes],
-    now_slot: u64,
-) -> Result<Verified, VerifyError> {
-    let first = payloads.first().map(|ssz| &ssz[..]).unwrap_or_default();
-    let Some(mut store) = store else {
-        let (store, block) = Store::bootstrap(spec, checkpoint, first)?;
-        return Ok(Verified {
-            store,
-            accepted: Accepted::default(),
-            bootstrapped: Some(block),
-        });
-    };
-    let mut accepted = Accepted::default();
-    match kind {
-        Kind::Updates => {
-            // One update per period, oldest first: each is verified by the committee the one
-            // before it proved.
-            for ssz in payloads {
-                let step = store.apply_update(spec, ssz, now_slot)?;
-                accepted.finalized = step.finalized.or(accepted.finalized);
-                accepted.head = step.head.or(accepted.head);
-                accepted.next_committee |= step.next_committee;
-                accepted.rotated |= step.rotated;
-            }
-        }
-        Kind::Finality => accepted = store.apply_finality_update(spec, first, now_slot)?,
-        Kind::Optimistic | Kind::Bootstrap => {
-            accepted = store.apply_optimistic_update(spec, first, now_slot)?;
-        }
-    }
-    Ok(Verified {
-        store,
-        accepted,
-        bootstrapped: None,
-    })
 }
