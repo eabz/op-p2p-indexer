@@ -45,7 +45,7 @@ main() (
                 printf '%s\n' '--set SECTION.KEY=TOML_VALUE (prefer private config files for secrets)'
                 printf '%s\n' '--register writes systemd units; --enable and --start are explicit opt-ins.'
                 printf '%s\n' '--restart restarts selected services after update. Remove keeps config/data.'
-                printf '%s\n' 'Linux x86_64, glibc >=2.35. Setup needs Python3 with tomllib or python3-tomli.'
+                printf '%s\n' 'Linux x86_64, glibc >=2.35. Missing Ubuntu prerequisites are installed automatically when run as root.'
                 exit 0 ;;
             *) die "unknown option: $1 (see --help)" ;;
         esac
@@ -53,16 +53,45 @@ main() (
     [[ -z "$version" || "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die 'version must be vX.Y.Z'
     [[ "$prefix" == /* ]] || die 'prefix must be an absolute path'
     while [[ "$prefix" != / && "$prefix" == */ ]]; do prefix="${prefix%/}"; done
-    local tool
-    for tool in uname getconf curl tar sha256sum mktemp install mv rm mkdir grep; do
-        command -v "$tool" >/dev/null 2>&1 || die "missing $tool; install curl, ca-certificates, tar and coreutils"
-    done
     [[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]] || die 'only Linux x86_64 is supported'
     local libc major minor
     libc=$(getconf GNU_LIBC_VERSION 2>/dev/null) || die 'glibc is required (musl is not supported)'
     [[ "$libc" =~ ^glibc\ ([0-9]+)\.([0-9]+)$ ]] || die "cannot determine glibc version: $libc"
     major="${BASH_REMATCH[1]}"; minor="${BASH_REMATCH[2]}"
     (( 10#$major > 2 || (10#$major == 2 && 10#$minor >= 35) )) || die 'glibc >= 2.35 is required (Ubuntu 22.04 or newer)'
+
+
+    # The installer itself is the bootstrap: fresh Ubuntu needs no Python/pip preparation.
+    # Only known distro packages are installed, and only when a required tool is missing.
+    local tool package
+    local packages=()
+    for tool in curl tar sha256sum mktemp install mv rm mkdir chmod grep; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            case "$tool" in curl|tar|grep) package="$tool" ;; *) package=coreutils ;; esac
+            packages+=("$package")
+        fi
+    done
+    [[ -s /etc/ssl/certs/ca-certificates.crt ]] || packages+=(ca-certificates)
+    if (( ! binaries_only )); then
+        if ! command -v python3 >/dev/null 2>&1; then
+            packages+=(python3 python3-tomli)
+        elif ! python3 -c 'try:
+ import tomllib
+except ImportError:
+ import tomli' 2>/dev/null; then
+            packages+=(python3-tomli)
+        fi
+    fi
+    if (( ${#packages[@]} )); then
+        command -v apt-get >/dev/null 2>&1 || die "missing prerequisites: ${packages[*]}; install them with your package manager"
+        (( EUID == 0 )) || die "missing prerequisites: ${packages[*]}; rerun with sudo or install them first"
+        printf 'Installing required Ubuntu packages: %s\n' "${packages[*]}"
+        apt-get update || die 'cannot refresh Ubuntu package metadata'
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages[@]}" || die 'cannot install prerequisites'
+    fi
+    for tool in uname getconf curl tar sha256sum mktemp install mv rm mkdir chmod grep; do
+        command -v "$tool" >/dev/null 2>&1 || die "missing required tool: $tool"
+    done
 
     if (( ! binaries_only )); then
         command -v python3 >/dev/null || die 'setup requires python3'
@@ -132,7 +161,7 @@ except ImportError:
         grep -Fxq "$name/$binary" "$download_dir/members" || die "archive missing $binary"
         members+=("$name/$binary")
     done
-    for item in .env.example config.toml.example setup.py install.sh bench.py README.md LICENSE; do
+    for item in config.toml.example setup.py install.sh bench.py README.md LICENSE; do
         if grep -Fxq "$name/$item" "$download_dir/members"; then
             companions+=("$item")
             members+=("$name/$item")

@@ -8,8 +8,8 @@ use eyre::WrapErr;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::time::ChronoUtc;
 
+mod args;
 pub mod config;
-pub mod env_file;
 pub mod machine;
 pub mod service;
 
@@ -19,8 +19,8 @@ pub mod service;
 pub enum Startup {
     /// Run in the foreground, with the configuration file loaded from here, if one was.
     Run {
-        /// Where the TOML or legacy environment file was.
-        env_file: Option<PathBuf>,
+        /// Where the TOML file was.
+        config_file: Option<PathBuf>,
     },
     /// The command line asked for something done already (`--version`, a service command):
     /// exit.
@@ -28,7 +28,7 @@ pub enum Startup {
 }
 
 /// The start of `indexer`, `server` and `balancer`, before any thread or runtime: answers
-/// `--version` before loading configuration, then resolves TOML or legacy environment
+/// `--version` before loading configuration, then resolves TOML
 /// settings ([`config::initialize`]) and runs a service command if the command line names one
 /// ([`service`]).
 ///
@@ -42,18 +42,18 @@ pub fn startup(binary: &str, version: &str) -> eyre::Result<Startup> {
     if config::command(binary)? {
         return Ok(Startup::Exit);
     }
-    let env_file = config::initialize(binary)?;
-    if !config::check_requested() && service::command(binary, env_file.as_deref())? {
+    let config_file = config::initialize(binary)?;
+    if !config::check_requested() && service::command(binary, config_file.as_deref())? {
         return Ok(Startup::Exit);
     }
-    Ok(Startup::Run { env_file })
+    Ok(Startup::Run { config_file })
 }
 
 /// Prints `<binary> <version>` and returns `true` if the command line asks for the version
-/// (`--version` or `-V`, among [`env_file::other_args`]): the binary then exits at once, before
-/// it loads the `.env` file or starts anything.
+/// (`--version` or `-V`, among [`config::other_args`]): the binary then exits at once, before
+/// it loads the TOML file or starts anything.
 pub fn version_requested(binary: &str, version: &str) -> bool {
-    let asked = env_file::other_args(std::env::args_os().skip(1))
+    let asked = config::other_args(std::env::args_os().skip(1))
         .iter()
         .any(|arg| arg == "--version" || arg == "-V");
     if asked {
@@ -69,17 +69,17 @@ pub(crate) fn say(line: fmt::Arguments<'_>) {
 }
 
 /// Initializes logging and reports the configuration file without its contents.
-pub fn init_tracing(env_file: Option<&Path>) {
+pub fn init_tracing(config_file: Option<&Path>) {
     tracing_subscriber::fmt()
         .with_timer(ChronoUtc::new("%H:%M:%S%.3f".to_owned()))
         // Colours for a terminal only: a log file (`start`, systemd) gets plain text.
         .with_ansi(io::stdout().is_terminal())
         .with_env_filter(
-            EnvFilter::try_new(env_var("RUST_LOG").unwrap_or_else(|| "info".to_owned()))
+            EnvFilter::try_new(setting("RUST_LOG").unwrap_or_else(|| "info".to_owned()))
                 .unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
-    if let Some(path) = env_file {
+    if let Some(path) = config_file {
         tracing::info!(path = %path.display(), "loaded configuration");
     }
 }
@@ -94,21 +94,10 @@ pub enum SignalPolicy {
     CtrlCFallback,
 }
 
-/// Reads the effective value: CLI chain override, nonempty Unicode process environment,
-/// then the selected TOML role. Empty process variables do not hide TOML values.
-pub fn env_var(name: &str) -> Option<String> {
+/// Reads the selected role's TOML setting by its internal lookup key. CLI chain selection
+/// takes precedence. Process environment variables are never consulted.
+pub fn setting(name: &str) -> Option<String> {
     config::value(name)
-}
-
-/// Reads `name`, which is read for this release only, warning if the environment sets it:
-/// `instead` says what replaces it (another variable, a flag, or nothing because it is now
-/// automatic). Call it once at startup, after [`init_tracing`]. Never logs the value.
-pub fn deprecated(name: &str, instead: impl fmt::Display) -> Option<String> {
-    let value = env_var(name);
-    if std::env::var_os(name).is_some() {
-        tracing::warn!("{name} is deprecated and read for this release only: {instead}");
-    }
-    value
 }
 
 /// Resolves with the signal's name on Ctrl-C (SIGINT) or, on Unix, SIGTERM.

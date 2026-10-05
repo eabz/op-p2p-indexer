@@ -6,7 +6,7 @@ use std::sync::Arc;
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::{FlightDescriptor, Ticket};
 use op_indexer_api::ticket::Query;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 use tonic::transport::{Channel, Endpoint};
 
 use crate::{Auth, BenchError, Config};
@@ -17,8 +17,26 @@ const MAX_JOBS: usize = 100_000;
 #[derive(Debug)]
 pub(crate) struct Server {
     pub(crate) url: String,
-    pub(crate) client: FlightServiceClient<Channel>,
+    endpoint: Endpoint,
+    max_message_bytes: usize,
+    idle: Mutex<Vec<FlightServiceClient<Channel>>>,
     pub(crate) permits: Arc<Semaphore>,
+}
+
+impl Server {
+    /// Called only under a server permit: one exclusive reusable connection per active
+    /// read, allocated lazily so a large cap/plan does not eagerly allocate a large pool.
+    pub(crate) async fn checkout(&self) -> FlightServiceClient<Channel> {
+        self.idle.lock().await.pop().unwrap_or_else(|| {
+            FlightServiceClient::new(self.endpoint.connect_lazy())
+                .max_decoding_message_size(self.max_message_bytes)
+        })
+    }
+
+    /// The reader has been dropped before this connection is made available again.
+    pub(crate) async fn checkin(&self, client: FlightServiceClient<Channel>) {
+        self.idle.lock().await.push(client);
+    }
 }
 
 #[derive(Debug)]
@@ -50,17 +68,17 @@ pub(crate) fn url(value: &str) -> Result<String, BenchError> {
     Ok(normalized)
 }
 
-fn client(url: String, config: &Config) -> Result<FlightServiceClient<Channel>, BenchError> {
-    let endpoint = Endpoint::from_shared(url)
+fn endpoint(url: String, config: &Config) -> Result<Endpoint, BenchError> {
+    Ok(Endpoint::from_shared(url)
         .map_err(|_invalid| BenchError::Config("invalid Flight endpoint"))?
         .connect_timeout(config.plan_timeout.min(config.rpc_timeout))
-        .http2_adaptive_window(true);
-    Ok(FlightServiceClient::new(endpoint.connect_lazy())
-        .max_decoding_message_size(config.max_message_bytes))
+        .http2_adaptive_window(true))
 }
 
 pub(crate) async fn plan(config: &Config, auth: &Auth) -> Result<Vec<Job>, BenchError> {
-    let mut client = client(url(&config.balancer)?, config)?;
+    let mut client =
+        FlightServiceClient::new(endpoint(url(&config.balancer)?, config)?.connect_lazy())
+            .max_decoding_message_size(config.max_message_bytes);
     let descriptor = FlightDescriptor::new_cmd(config.query.ticket().ticket);
     let mut request = tonic::Request::new(descriptor);
     request
@@ -95,7 +113,9 @@ pub(crate) async fn plan(config: &Config, auth: &Auth) -> Result<Vec<Job>, Bench
             let address = url(&location.uri)?;
             if !servers.contains_key(&address) {
                 let server = Server {
-                    client: self::client(address.clone(), config)?,
+                    endpoint: self::endpoint(address.clone(), config)?,
+                    max_message_bytes: config.max_message_bytes,
+                    idle: Mutex::new(Vec::new()),
                     url: address.clone(),
                     permits: Arc::new(Semaphore::new(config.per_server)),
                 };

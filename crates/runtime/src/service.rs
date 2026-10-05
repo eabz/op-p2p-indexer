@@ -7,8 +7,8 @@
 //! file, and writes its pid next to it. Everything else reads that pid file. Signals, process
 //! details and the log's tail go through `kill`, `ps` and `tail`, as on any Unix: no unsafe code.
 //!
-//! Where: the directory of the `.env` file loaded, else the working directory. The log is
-//! `<binary>.log` there, or the path in `--log-file` / `OP_INDEXER_LOG_FILE` (relative to that
+//! Where: the directory of the TOML file loaded, else the working directory. The log is
+//! `<binary>.log` there, or the path in `--log-file` / the role's `log_file` setting (relative to that
 //! directory); the pid file is always `<binary>.pid` there. The log is never rotated by the
 //! binary: logrotate with `copytruncate` does it (README, "Running in the background").
 
@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use eyre::{WrapErr, bail, eyre};
 
-use crate::{env_file, env_var, say};
+use crate::{args, config, say, setting};
 
 /// The flag naming the log file.
 const LOG_FLAG: &str = "--log-file";
@@ -53,7 +53,7 @@ const LOGS_LINES: &str = "100";
 
 /// Runs the service command the command line names (`start`, `stop [--force]`,
 /// `restart [--force]`, `status`, `logs [-f]`, `install-service`), if any, for `binary`;
-/// `false` if it names none. Called once the `.env` file is loaded (`env_file` is where it
+/// `false` if it names none. Called once the TOML file is loaded (`config_file` is where it
 /// was) and before anything starts.
 ///
 /// # Errors
@@ -61,9 +61,9 @@ const LOGS_LINES: &str = "100";
 /// Returns an error if the command cannot do what it was asked: the node is already running
 /// (`start`), it exited at once, it did not stop in time without `--force`, a file cannot be
 /// read or written, or `kill`/`ps`/`tail` cannot be run.
-pub(crate) fn command(binary: &str, env_file: Option<&Path>) -> eyre::Result<bool> {
+pub(crate) fn command(binary: &str, config_file: Option<&Path>) -> eyre::Result<bool> {
     let all: Vec<OsString> = std::env::args_os().skip(1).collect();
-    let others = env_file::other_args(all.iter().cloned());
+    let others = config::other_args(all.iter().cloned());
     let Some(name) = others
         .first()
         .and_then(|arg| arg.to_str())
@@ -73,15 +73,15 @@ pub(crate) fn command(binary: &str, env_file: Option<&Path>) -> eyre::Result<boo
     };
     let has = |flag: &str| others.iter().any(|arg| arg == flag);
     let force = has(FORCE_FLAG);
-    let node = Node::new(binary, env_file, &others)?;
+    let node = Node::new(binary, config_file, &others)?;
     // What the node itself runs with: everything but the command and the service flags.
-    let mut child = env_file::without_flag(LOG_FLAG, all.iter().cloned());
+    let mut child = args::without_flag(LOG_FLAG, all.iter().cloned());
     if let Some(at) = child.iter().position(|arg| arg == name) {
         child.remove(at);
     }
     child.retain(|arg| arg != FORCE_FLAG);
-    if let Some(path) = crate::config::path() {
-        child = env_file::without_flag("--config", child);
+    if let Some(path) = config::path() {
+        child = args::without_flag("--config", child);
         child.push("--config".into());
         child.push(path.as_os_str().to_owned());
     }
@@ -109,14 +109,14 @@ struct Node<'a> {
 }
 
 impl<'a> Node<'a> {
-    fn new(binary: &'a str, env_file: Option<&Path>, args: &[OsString]) -> eyre::Result<Self> {
+    fn new(binary: &'a str, config_file: Option<&Path>, args: &[OsString]) -> eyre::Result<Self> {
         let cwd = std::env::current_dir().wrap_err("failed to read the working directory")?;
-        let dir = env_file
+        let dir = config_file
             .and_then(|file| std::path::absolute(file).ok())
             .and_then(|file| file.parent().map(Path::to_path_buf))
             .unwrap_or(cwd);
-        let log = env_file::flag_value(LOG_FLAG, args.iter().cloned())
-            .or_else(|| env_var(LOG_VAR).map(OsString::from))
+        let log = args::flag_value(LOG_FLAG, args.iter().cloned())
+            .or_else(|| setting(LOG_VAR).map(OsString::from))
             .map_or_else(|| dir.join(format!("{binary}.log")), |log| dir.join(log));
         let pid = dir.join(format!("{binary}.pid"));
         Ok(Self {

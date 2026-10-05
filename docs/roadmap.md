@@ -20,9 +20,12 @@ What runs today is in [architecture.md](architecture.md), and how it got here is
   [import §3.1](import.md#31-download)).
 - **Exporter**: running on the Unichain fleet; not yet seen sealing a chunk.
 
-## Installation work on the current branch
+## Installation and TOML-only configuration (release pending)
 
-- Implemented: shared TOML configuration, environment migration, per-chain and per-role
+- Breaking change: runtime environment overrides and dotenv loading are removed; operational
+  CLI flags override TOML, then defaults. `--env-file` is rejected. Explicit
+  `--migrate-env INPUT --config OUTPUT` converts old files without loading them at runtime.
+- Implemented: shared TOML configuration, legacy-file conversion, per-chain and per-role
   state paths, interactive and unattended setup, collision-aware port assignment, and named
   systemd services with chain start/stop targets.
 - Implemented: checksum-verified installation and atomic binary replacement from published

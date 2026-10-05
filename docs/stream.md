@@ -27,7 +27,7 @@ generated code trips, and only those.
 
 | RPC | What |
 |---|---|
-| `Subscribe(SubscribeRequest) returns (stream Event)` | From a block number, or from the head; the payload, `DECODED` or `RAW`, chosen per subscription. A number the stores do not hold and never will is refused with `OUT_OF_RANGE`: below the archive's first block (the archive keeps all it has), or, with range sync off, between the archive's tip and the unsafe store's lowest block (the unsafe store drops heights more than 24 h older than its newest block, `RETENTION_SECS`, and its lowest heights past `OP_INDEXER_UNSAFE_MAX_BYTES`). A subscription whose next height becomes such ends with `OUT_OF_RANGE` too. With range sync on (`OP_INDEXER_EL_SYNC`) that gap is being filled: a subscription in it waits. |
+| `Subscribe(SubscribeRequest) returns (stream Event)` | From a block number, or from the head; the payload, `DECODED` or `RAW`, chosen per subscription. A number the stores do not hold and never will is refused with `OUT_OF_RANGE`: below the archive's first block (the archive keeps all it has), or, with range sync off, between the archive's tip and the unsafe store's lowest block (the unsafe store drops heights more than 24 h older than its newest block, `RETENTION_SECS`, and its lowest heights past `<role>.unsafe_max_bytes`). A subscription whose next height becomes such ends with `OUT_OF_RANGE` too. With range sync on (`<role>.el.sync`) that gap is being filled: a subscription in it waits. |
 | `GetHeads(GetHeadsRequest) returns (Heads)` | Unsafe, safe and finalized heads, and whether receipts are fetched. |
 | `GetBlock(GetBlockRequest) returns (Block)` | One canonical block, by number or hash, in either payload. `NOT_FOUND` if not held, or a side block. |
 
@@ -134,7 +134,7 @@ execution network disabled no receipts come, and `Heads.receipts` says so.
   consumer reads slowly. A subscription whose queue stays full for 30 s is ended with
   `RESOURCE_EXHAUSTED`, never buffered without bound: one slot of the queue is held back for
   that status, so a full queue still tells the consumer why it ends.
-- At most `OP_INDEXER_STREAM_MAX_SUBSCRIPTIONS` subscriptions (default 64); one more is refused
+- At most `<role>.stream.max_subscriptions` subscriptions (default 64); one more is refused
   with `RESOURCE_EXHAUSTED`.
 - History is read in batches of at most 64 blocks or 16 MiB, each sent before the next is read.
 - At most 16 `GetHeads` and `GetBlock` calls are served at once; one more is refused with
@@ -150,7 +150,7 @@ execution network disabled no receipts come, and `Heads.receipts` says so.
 
 ## 5. Configuration
 
-The stream's variables (`OP_INDEXER_STREAM_*`: the listen address, local by default; the
+The `<role>.stream` TOML settings ( the listen address, local by default; the
 subscriptions, Flight streams and Flight builds at once; the Flight queue; the API keys) and
 their defaults, some sized from the machine, are in [configuration.md](configuration.md). What
 each limit does is in sections 4 and 6. Use API keys or a suitable proxy when exposing the
@@ -204,7 +204,7 @@ rebuilding their blooms; `transactions`, `receipts` and `logs` decode each block
 blocking thread, which converts it to one record batch and encodes it as Flight messages:
 arrow-flight's encoder, which cuts it into pieces of about 2 MiB for gRPC. Up to
 `PARALLEL_BUILDS` (2) reads of one stream are built at once, so one stream uses that many
-cores, and at most `OP_INDEXER_STREAM_MAX_BUILDS` across all streams (two per core by default,
+cores, and at most `<role>.stream.max_builds` across all streams (two per core by default,
 within memory; [configuration.md](configuration.md)): a stream that finds none free sends what
 it has built first, then waits, so streams never wait on each other's places. Messages are
 sent in order, `MESSAGES_AHEAD` (4) of them queued ahead of the consumer
@@ -233,9 +233,9 @@ A range ends early with an error in two cases:
 - `ABORTED`: a block does not build on the one before it (a reorg during the read; only with
   `any`).
 
-At most `OP_INDEXER_STREAM_MAX_FLIGHTS` `DoGet`s run at once (default sized from the
+At most `<role>.stream.max_flights` `DoGet`s run at once (default sized from the
 machine, at least 8). One more waits for
-a place up to `OP_INDEXER_STREAM_FLIGHT_QUEUE_MS` (default 2000; 0 refuses at once), among at
+a place up to `<role>.stream.flight_queue_ms` (default 2000; 0 refuses at once), among at
 most as many waiters as there are places, before it reads anything; past that, or with the
 waiters full, it is refused with `RESOURCE_EXHAUSTED`, and a client backs off and asks again
 (or asks the next location). A `DoGet` waiting counts as a stream in use in the load a `server`

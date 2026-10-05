@@ -3,13 +3,18 @@
 `bench` ships with the other Linux binaries. Build locally with `cargo build --release -p bench`.
 It requires no Python or PyArrow. The `bin/bench` CLI uses `crates/bench`, a standalone Flight
 consumer with no storage, node or ingestion dependency. `scripts/bench.py` remains available
-for cross-client comparisons.
+for cross-client comparisons. It also reads `[bench].api_key` and `[bench].balancer_url`
+from `--config PATH` (default `config.toml`), and requires PyArrow plus Python 3.11 or
+`tomli` on older Python.
 
-Set `KEY` in the environment (or `.env` / `--env-file`) to a key accepted by the balancer and
-servers. The key is not a command-line argument and is excluded from reports and debug output.
+Set `[bench].api_key` in the private TOML configuration to a key accepted by the balancer
+and servers, and `[bench].balancer_url` to the endpoint. Select the file with `--config PATH`
+or `--chain unichain`. Runtime environment settings and `--env-file` are no longer supported.
+The key is excluded from reports and debug output. CLI workload flags override TOML defaults.
+This configuration change is pending release; published older binaries may use the old format.
 
 ```bash
-./target/release/bench \
+./target/release/bench --config "$HOME/indexer/unichain/config.toml" \
   --balancer grpc://146.190.220.254:50060 \
   --table blocks --from 40000000 --to 45000000 \
   --concurrency 24 --per-server 8 --compression zstd \
@@ -17,7 +22,9 @@ servers. The key is not a command-line argument and is excluded from reports and
 ```
 
 `--concurrency` replaces Python's processes × threads. Native tasks share one per-server
-admission pool across the run and reuse each server's HTTP/2 connection. Arrow decoding runs
+admission pool across the run and reuse a bounded pool of HTTP/2 connections per server,
+one connection per active read. Connections are created only as needed under the server's
+permits, then reused once a stream ends. Arrow decoding runs
 on blocking workers; network runtime threads stay available. Only one batch per stream is
 consumed at a time, without collecting the requested range in memory. Whole suites run
 sequentially, so concurrency limits also bound the heavy workload.
@@ -33,7 +40,7 @@ the complete four-table workload, with a new plan for every table and repetition
 Start with a representative range containing large transactions and logs:
 
 ```bash
-./target/release/bench \
+./target/release/bench --config "$HOME/indexer/unichain/config.toml" \
   --balancer grpc://146.190.220.254:50060 \
   --heavy --from 48000000 --to 48100000 \
   --concurrency 24 --per-server 8 --compression zstd \
@@ -43,7 +50,7 @@ Start with a representative range containing large transactions and logs:
 Then widen the range to increase total work without raising server admission:
 
 ```bash
-./target/release/bench \
+./target/release/bench --config "$HOME/indexer/unichain/config.toml" \
   --balancer grpc://146.190.220.254:50060 \
   --heavy --from 40000000 --to 45000000 \
   --concurrency 24 --per-server 8 --compression zstd \

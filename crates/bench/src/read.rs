@@ -1,6 +1,8 @@
 //! Runs bounded jobs with fallback locations and finite retries. Blocking workers decode and
 //! validate one batch at a time; dropping a failed stream cancels its RPC before releasing a slot.
 
+use std::error::Error;
+use std::io;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -8,13 +10,15 @@ use std::time::Duration;
 use arrow_array::{Array as _, RecordBatch, UInt64Array};
 use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::error::FlightError;
+use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_schema::DataType;
 use futures_util::{StreamExt as _, TryStreamExt as _};
 use op_indexer_api::ticket::{Query, Table};
 use tokio::time::{Instant, sleep};
 use tokio_util::sync::CancellationToken;
+use tonic::transport::Channel;
 
-use crate::plan::{Job, Server};
+use crate::plan::Job;
 use crate::{Auth, BenchError, Config, JobReport, Progress};
 
 /// Polling free fallback slots is local, and never sends an RPC without a permit.
@@ -48,7 +52,14 @@ enum ReadError {
 impl ReadError {
     fn code(&self) -> tonic::Code {
         match self {
-            Self::Flight(FlightError::Tonic(status)) => status.code(),
+            Self::Flight(FlightError::Tonic(status)) => {
+                let code = status.code();
+                if matches!(code, tonic::Code::Unknown | tonic::Code::Internal) {
+                    transport_code(status.as_ref()).unwrap_or(code)
+                } else {
+                    code
+                }
+            }
             Self::Timeout => tonic::Code::DeadlineExceeded,
             Self::Cancelled => tonic::Code::Cancelled,
             Self::Flight(_) | Self::Arrow(_) | Self::Invalid(_) => tonic::Code::DataLoss,
@@ -93,14 +104,15 @@ pub(crate) async fn job(job: Job, context: Context) -> Result<JobReport, BenchEr
             let attempt_deadline = deadline.min(Instant::now() + context.config.rpc_timeout);
             let worker_context = context.clone();
             let worker_job = Arc::clone(&job);
-            let worker_server = Arc::clone(server);
+            let client = server.checkout().await;
+            let worker_client = client.clone();
             let runtime = tokio::runtime::Handle::current();
             // Await even on cancellation: the decoder observes cancellation/deadlines, and
             // its RPC must be gone before this permit is released or this job is drained.
             let worker = tokio::task::spawn_blocking(move || {
                 runtime.block_on(attempt(
                     &worker_job,
-                    &worker_server,
+                    worker_client,
                     &worker_context,
                     result,
                     attempt_deadline,
@@ -108,6 +120,11 @@ pub(crate) async fn job(job: Job, context: Context) -> Result<JobReport, BenchEr
             });
             let (updated, outcome) = worker.await.map_err(BenchError::Worker)?;
             result = updated;
+            // A failed transport may still be reconnecting internally. Replace that channel
+            // rather than putting it back in the idle pool; protocol errors retain their code.
+            if !matches!(&outcome, Err(error) if error.code() == tonic::Code::Unavailable) {
+                server.checkin(client).await;
+            }
             drop(permit);
             match outcome {
                 Ok(()) => break 'retry,
@@ -142,6 +159,41 @@ pub(crate) async fn job(job: Job, context: Context) -> Result<JobReport, BenchEr
     Ok(result)
 }
 
+/// Tonic can retain hyper/h2 as a typed source while assigning UNKNOWN to a broken body.
+/// h2's Error does not expose its I/O error through `source`, so inspect `get_io` explicitly.
+fn transport_code(error: &(dyn Error + 'static)) -> Option<tonic::Code> {
+    let mut source = Some(error);
+    while let Some(error) = source {
+        let h2 = error.downcast_ref::<h2::Error>();
+        let io = error
+            .downcast_ref::<io::Error>()
+            .or_else(|| h2.and_then(h2::Error::get_io));
+        if let Some(io) = io {
+            if io.kind() == io::ErrorKind::TimedOut {
+                return Some(tonic::Code::DeadlineExceeded);
+            }
+            if matches!(
+                io.kind(),
+                io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::NotConnected
+                    | io::ErrorKind::UnexpectedEof
+            ) {
+                return Some(tonic::Code::Unavailable);
+            }
+        }
+        if h2.is_some_and(|error| {
+            error.reason() == Some(h2::Reason::REFUSED_STREAM)
+                || (error.is_go_away() && error.reason() == Some(h2::Reason::NO_ERROR))
+        }) {
+            return Some(tonic::Code::Unavailable);
+        }
+        source = error.source();
+    }
+    None
+}
+
 fn record_failure(code: tonic::Code, result: &mut JobReport, cancelled: bool) -> bool {
     match code {
         tonic::Code::ResourceExhausted => result.failures.exhausted += 1,
@@ -172,7 +224,7 @@ fn record_failure(code: tonic::Code, result: &mut JobReport, cancelled: bool) ->
 
 async fn attempt(
     job: &Job,
-    server: &Server,
+    mut client: FlightServiceClient<Channel>,
     context: &Context,
     mut result: JobReport,
     deadline: Instant,
@@ -180,7 +232,7 @@ async fn attempt(
     let started = Instant::now();
     let before = result.received;
     let outcome = {
-        let read = read(job, server, context, &mut result, deadline);
+        let read = read(job, &mut client, context, &mut result, deadline);
         tokio::select! {
             biased;
             () = context.cancel.cancelled() => Err(ReadError::Cancelled),
@@ -205,7 +257,7 @@ async fn attempt(
 
 async fn read(
     job: &Job,
-    server: &Server,
+    client: &mut FlightServiceClient<Channel>,
     context: &Context,
     result: &mut JobReport,
     deadline: Instant,
@@ -219,9 +271,7 @@ async fn read(
         tonic::metadata::MetadataValue::from_static(context.config.compression.name()),
     );
     request.set_timeout(deadline.saturating_duration_since(Instant::now()));
-    let stream = server
-        .client
-        .clone()
+    let stream = client
         .do_get(request)
         .await
         .map_err(FlightError::from)?

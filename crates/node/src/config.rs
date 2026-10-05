@@ -10,8 +10,8 @@ use op_indexer_chainspec::{ChainSpec, OP_MAINNET};
 use op_indexer_el::{ElConfig, PeerConfig};
 use op_indexer_p2p::{Bootnode, NetworkConfig};
 use op_indexer_primitives::{ChainIdentity, ExecutionPeer};
-use op_indexer_runtime::env_var as var;
 use op_indexer_runtime::machine::Machine;
+use op_indexer_runtime::setting as var;
 use op_indexer_storage::{ArchiveConfig, StorageConfig, UnsafeConfig};
 use op_indexer_stream::StreamConfig;
 
@@ -76,7 +76,7 @@ impl ElSettings {
 /// What a binary changes of the configuration's defaults.
 #[derive(Debug, Clone, Copy)]
 pub struct Defaults {
-    /// `OP_INDEXER_EL_MAX_SESSIONS` when unset (the server's is
+    /// `indexer.el.max_sessions` when unset (the server's is
     /// [`sizing::server_el_sessions`]).
     pub el_max_sessions: usize,
 }
@@ -115,14 +115,14 @@ pub enum Profile {
 }
 
 impl Profile {
-    fn from_env() -> eyre::Result<Option<Self>> {
+    fn from_config() -> eyre::Result<Option<Self>> {
         match var("OP_INDEXER_PROFILE").as_deref() {
             None => Ok(None),
             Some("live") => Ok(Some(Self::Live)),
             Some("archive") => Ok(Some(Self::Archive)),
             Some("fleet") => Ok(Some(Self::Fleet)),
             Some(value) => Err(eyre!(
-                "invalid OP_INDEXER_PROFILE: {value}; expected live, archive or fleet"
+                "invalid indexer.profile: {value}; expected live, archive or fleet"
             )),
         }
     }
@@ -167,48 +167,48 @@ pub struct Config {
 impl Config {
     /// Reads the configuration:
     ///
-    /// - `OP_INDEXER_PROFILE`: optional `live` (execution receipts), `archive` (receipts,
+    /// - `indexer.profile`: optional `live` (execution receipts), `archive` (receipts,
     ///   range sync and L1 tracking), or `fleet` (archive defaults, requires the server binary
-    ///   and its object storage). Archive and fleet need `OP_INDEXER_L1_CHECKPOINT` while L1
+    ///   and its object storage). Archive and fleet need `indexer.l1.checkpoint` while L1
     ///   is enabled. Explicit capability variables override profile defaults; dependency
     ///   validation still applies. Unset preserves the legacy defaults (all three off).
-    /// - `OP_INDEXER_CHAIN_ID`: L2 chain id, one of [`ChainSpec::ALL`] (default 10, OP
+    /// - `chain`: L2 chain id, one of [`ChainSpec::ALL`] (default 10, OP
     ///   Mainnet).
-    /// - `OP_INDEXER_P2P_LISTEN_ADDR`: p2p listen socket, TCP and UDP (default `0.0.0.0:9222`).
-    /// - `OP_INDEXER_P2P_BOOTNODES`: comma-separated `enr:` records or `enode://` URLs (default: the
+    /// - `indexer.p2p.listen_addr`: p2p listen socket, TCP and UDP (default `0.0.0.0:9222`).
+    /// - `indexer.p2p.bootnodes`: comma-separated `enr:` records or `enode://` URLs (default: the
     ///   chain's bootnodes).
-    /// - `OP_INDEXER_P2P_ADVERTISED_ADDR`: public socket (IP and port, the same for TCP and UDP)
+    /// - `indexer.p2p.advertised_addr`: public socket (IP and port, the same for TCP and UDP)
     ///   the consensus-layer node record advertises (default: unset, the address
     ///   peers observe). Set it behind NAT or in a container, with the port forwarded.
-    /// - `OP_INDEXER_P2P_MAX_PEERS`: maximum connections, inbound and outbound (default 30).
-    /// - `OP_INDEXER_DATA_DIR`: node state directory (default `data-<chain>`: `data-op` or
+    /// - `indexer.p2p.max_peers`: maximum connections, inbound and outbound (default 30).
+    /// - `indexer.data_dir`: node state directory (default `data-<chain>`: `data-op` or
     ///   `data-unichain`, so two chains on one host never share one by default). Without it,
     ///   the node refuses to start while `data`, an earlier build's default, holds an archive
     ///   or a node store and `data-<chain>` does not exist.
-    /// - `OP_INDEXER_UNSAFE_MAX_BYTES`: memory the unsafe chain's blocks may take, in bytes
+    /// - `indexer.unsafe_max_bytes`: memory the unsafe chain's blocks may take, in bytes
     ///   (default sized from the machine: an eighth of its memory, 256 MiB to 2 GiB, see
     ///   [`sizing`]); past it the lowest heights leave. Its journal is `unsafe/` in the data
     ///   directory, replayed on start.
-    /// - `OP_INDEXER_EL_ENABLED`: `true` to join the execution p2p network (devp2p) and fetch
+    /// - `indexer.el.enabled`: `true` to join the execution p2p network (devp2p) and fetch
     ///   the receipts gossip does not carry (default `false`: blocks stay without receipts;
     ///   `true` with a profile or the range sync, which needs it).
     ///   The variables below only apply when it is enabled.
-    /// - `OP_INDEXER_EL_LISTEN_ADDR`: execution p2p listen socket, TCP and UDP (default
+    /// - `indexer.el.listen_addr`: execution p2p listen socket, TCP and UDP (default
     ///   `0.0.0.0:30303`).
-    /// - `OP_INDEXER_EL_BOOTNODES`: comma-separated `enr:` records or `enode://` URLs
+    /// - `indexer.el.bootnodes`: comma-separated `enr:` records or `enode://` URLs
     ///   (default: the chain's execution bootnodes).
-    /// - `OP_INDEXER_EL_ADVERTISED_ADDR`: public socket (IP and port, the same for TCP and
+    /// - `indexer.el.advertised_addr`: public socket (IP and port, the same for TCP and
     ///   UDP) announced in the execution node record, for a node behind NAT or in a container
     ///   (default: unset, the address other peers observe).
-    /// - `OP_INDEXER_EL_MAX_SESSIONS`: execution sessions kept in each direction, dialed and
+    /// - `indexer.el.max_sessions`: execution sessions kept in each direction, dialed and
     ///   accepted (default 4; the server's is sized from its cores, see [`Defaults`]). Four more are
     ///   accepted for peers that want history (op-p2p-indexers, nodes syncing far behind), and
     ///   one more dialed for an op-p2p-indexer. Full nodes ration their slots: an `indexer`
     ///   keeps it low; a `server` exists to serve and keeps many.
-    /// - `OP_INDEXER_EL_TRUSTED_PEERS`: comma-separated `enode://<id>@<ip>:<port>` of the peers of
+    /// - `indexer.el.trusted_peers`: comma-separated `enode://<id>@<ip>:<port>` of the peers of
     ///   our own deployment (the other servers): dialed first, always accepted, never released,
     ///   and counted against no limit (default: none).
-    /// - `OP_INDEXER_EL_SYNC`: `true` to fetch from execution peers the blocks between the
+    /// - `indexer.el.sync`: `true` to fetch from execution peers the blocks between the
     ///   archive's last block and the chain that gossip cannot fill, into the archive
     ///   (default `false`; `true` with the archive or fleet profile or the L1 side, which needs
     ///   it), in rounds from the block after the archive's last
@@ -220,61 +220,61 @@ impl Config {
     ///   blocks L1 has not committed (the stream marks them unsafe), and an unsafe reorg deeper
     ///   than 64 blocks leaves it on a dead branch, which only rebuilding the archive repairs.
     ///   Promotion extends the archive otherwise. A restart continues after the archive's last
-    ///   block. Needs the execution network, which it turns on (`OP_INDEXER_EL_ENABLED=false`
+    ///   block. Needs the execution network, which it turns on (`indexer.el.enabled=false`
     ///   with it is refused). Required with the L1 side.
-    /// - `OP_INDEXER_L1_ENABLED`: `true` to follow Ethereum L1 for what it commits to
+    /// - `indexer.l1.enabled`: `true` to follow Ethereum L1 for what it commits to
     ///   (default `false`: no safe or finalized head, nothing is promoted). The node then
     ///   runs a beacon light client, which follows Ethereum's finality from the checkpoint,
     ///   and joins L1's execution p2p network to read the dispute games of the chain from
     ///   the L1 blocks the light client vouches for; it checks each claim against its own
-    ///   block and promotes on a match. Needs `OP_INDEXER_L1_CHECKPOINT`, and the range sync
-    ///   (and so the execution network), which it turns on (`OP_INDEXER_EL_SYNC=false` with
+    ///   block and promotes on a match. Needs `indexer.l1.checkpoint`, and the range sync
+    ///   (and so the execution network), which it turns on (`indexer.el.sync=false` with
     ///   it is refused): promotion records only
     ///   what the archive holds, and range sync fills the gaps gossip leaves. If no peer serves
     ///   the checkpoint (nor the saved one) any more the node stops and asks for a newer one.
-    /// - `OP_INDEXER_L1_CHECKPOINT`: root of a recent finalized beacon block, from a source
+    /// - `indexer.l1.checkpoint`: root of a recent finalized beacon block, from a source
     ///   you trust: the one value the L1 side takes on trust, everything after it is
     ///   verified. Used on the first start, or when it is newer than the saved one: the node
     ///   saves the newest finalized block the light client verified from it, and later starts
     ///   bootstrap from that (it adds no trust), so the configured root may grow old.
-    /// - `OP_INDEXER_L1_LISTEN_ADDR`: L1 execution p2p listen socket, TCP and UDP (default
-    ///   `0.0.0.0:30304`; it must differ from `OP_INDEXER_EL_LISTEN_ADDR`).
-    /// - `OP_INDEXER_L1_BEACON_LISTEN_ADDR`: listen socket of the beacon light client, TCP
+    /// - `indexer.l1.listen_addr`: L1 execution p2p listen socket, TCP and UDP (default
+    ///   `0.0.0.0:30304`; it must differ from `indexer.el.listen_addr`).
+    /// - `indexer.l1.beacon_listen_addr`: listen socket of the beacon light client, TCP
     ///   and UDP (default `0.0.0.0:9001`; it must differ from the other listen addresses).
-    /// - `OP_INDEXER_L1_ADVERTISED_ADDR`: public socket (IP and port, the same for TCP and
-    ///   UDP) announced in the L1 node record, as `OP_INDEXER_EL_ADVERTISED_ADDR` is for the
+    /// - `indexer.l1.advertised_addr`: public socket (IP and port, the same for TCP and
+    ///   UDP) announced in the L1 node record, as `indexer.el.advertised_addr` is for the
     ///   execution network (default: unset, the address other peers observe). Worth setting
     ///   on a server with a public address: L1 peers have few free slots, and a node they
     ///   can dial gets sessions it would not get by dialing.
-    /// - `OP_INDEXER_STREAM_LISTEN_ADDR`: gRPC listen socket of the stream (default
+    /// - `indexer.stream.listen_addr`: gRPC listen socket of the stream (default
     ///   `127.0.0.1:50051`, local only; API keys are configured separately).
-    /// - `OP_INDEXER_STREAM_MAX_SUBSCRIPTIONS`: stream subscriptions at once (default 64).
-    /// - `OP_INDEXER_STREAM_MAX_FLIGHTS`: Arrow Flight `DoGet` streams at once, on the same
+    /// - `indexer.stream.max_subscriptions`: stream subscriptions at once (default 64).
+    /// - `indexer.stream.max_flights`: Arrow Flight `DoGet` streams at once, on the same
     ///   listener (default sized from the machine: as many as the Flight builds it runs at
     ///   once, at least 8, see [`sizing`]).
-    /// - `OP_INDEXER_STREAM_MAX_BUILDS`: reads of Flight streams built at once, server-wide,
+    /// - `indexer.stream.max_builds`: reads of Flight streams built at once, server-wide,
     ///   each on a blocking thread holding about 100 MiB (default sized from the machine: two
     ///   per core, within an eighth of its memory, see [`sizing`]).
-    /// - `OP_INDEXER_STREAM_FLIGHT_QUEUE_MS`: how long one more `DoGet` waits for a free
+    /// - `indexer.stream.flight_queue_ms`: how long one more `DoGet` waits for a free
     ///   stream before `RESOURCE_EXHAUSTED`, in ms (default 2000; 0 refuses at once).
-    /// - `OP_INDEXER_STREAM_API_KEYS`: comma-separated API keys; with any set, a gRPC or Flight
+    /// - `indexer.stream.api_keys`: comma-separated API keys; with any set, a gRPC or Flight
     ///   request is served only with one of them as `authorization: Bearer <key>` (default:
     ///   none, no check). Never logged.
     ///
     /// # Errors
     ///
     /// Returns an error if a variable is invalid or the settings contradict each other.
-    pub fn from_env() -> eyre::Result<Self> {
-        Self::from_env_with(Defaults::default())
+    pub fn from_config() -> eyre::Result<Self> {
+        Self::from_config_with(Defaults::default())
     }
 
-    /// Reads the configuration as [`Self::from_env`] does, with a binary's own `defaults`.
+    /// Reads the configuration as [`Self::from_config`] does, with a binary's own `defaults`.
     ///
     /// # Errors
     ///
-    /// As [`Self::from_env`].
-    pub fn from_env_with(defaults: Defaults) -> eyre::Result<Self> {
-        let profile = Profile::from_env()?;
+    /// As [`Self::from_config`].
+    pub fn from_config_with(defaults: Defaults) -> eyre::Result<Self> {
+        let profile = Profile::from_config()?;
         let history = profile.is_some_and(Profile::history);
         let chain_id = parse_var("OP_INDEXER_CHAIN_ID")?.unwrap_or(DEFAULT_CHAIN_ID);
         let chain = ChainSpec::by_chain_id(chain_id)
@@ -301,7 +301,7 @@ impl Config {
         let el = el_settings(chain, profile.is_some() || sync, defaults.el_max_sessions)?;
         ensure!(
             !sync || el.is_some(),
-            "{SYNC_VAR} needs the execution network, but OP_INDEXER_EL_ENABLED is false"
+            "{SYNC_VAR} needs the execution network, but indexer.el.enabled is false"
         );
         // Promotion records only what the archive holds; with the L1 side, range sync is what
         // fills a gap gossip left, so without it the committed chain would stop at the first.
@@ -317,7 +317,7 @@ impl Config {
             .unwrap_or_else(|| sizing::max_builds(machine));
         ensure!(
             max_builds > 0,
-            "OP_INDEXER_STREAM_MAX_BUILDS must be at least 1"
+            "indexer.stream.max_builds must be at least 1"
         );
         let stream = StreamConfig {
             listen_addr: parse_var("OP_INDEXER_STREAM_LISTEN_ADDR")?
@@ -486,7 +486,7 @@ fn el_settings(
 
 /// An `enode://<id>@<ip>:<port>` URL (a `?discport=` is ignored) as a peer to dial.
 fn parse_enode(url: &str) -> eyre::Result<ExecutionPeer> {
-    let invalid = || eyre!("OP_INDEXER_EL_TRUSTED_PEERS has an invalid enode URL: {url}");
+    let invalid = || eyre!("indexer.el.trusted_peers has an invalid enode URL: {url}");
     let rest = url.strip_prefix("enode://").ok_or_else(invalid)?;
     let (id, addr) = rest.split_once('@').ok_or_else(invalid)?;
     let addr = addr.split('?').next().unwrap_or(addr);
@@ -497,14 +497,11 @@ fn parse_enode(url: &str) -> eyre::Result<ExecutionPeer> {
     })
 }
 
-/// `OP_INDEXER_EL_MAX_SESSIONS`, `default` when unset; at least 1.
+/// `indexer.el.max_sessions`, `default` when unset; at least 1.
 fn max_sessions(default: usize) -> eyre::Result<usize> {
     let sessions = parse_var("OP_INDEXER_EL_MAX_SESSIONS")?;
     let sessions = sessions.unwrap_or(default);
-    eyre::ensure!(
-        sessions > 0,
-        "OP_INDEXER_EL_MAX_SESSIONS must be at least 1"
-    );
+    eyre::ensure!(sessions > 0, "indexer.el.max_sessions must be at least 1");
     Ok(sessions)
 }
 
@@ -538,9 +535,12 @@ where
 {
     var(name)
         .map(|value| {
-            value
-                .parse()
-                .wrap_err_with(|| format!("{name} is invalid: {value}"))
+            value.parse().map_err(|_err| {
+                eyre!(
+                    "{} is invalid",
+                    op_indexer_runtime::config::setting_name(name)
+                )
+            })
         })
         .transpose()
 }

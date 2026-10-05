@@ -4,7 +4,7 @@
 /graphify-out
 .DS_Store
 
-# Env files hold keys; `.env.example` is tracked.
+# Legacy env files may still contain credentials.
 .env
 *.env
 

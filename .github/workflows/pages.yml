@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'website/**'
+      - 'scripts/install.sh'
       - '.github/workflows/pages.yml'
   workflow_dispatch:
 
@@ -28,6 +29,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Check website JavaScript
         run: node --check website/dist/app.js
+      - name: Stage the canonical installer
+        run: |
+          bash -n scripts/install.sh
+          cp scripts/install.sh website/dist/install.sh
+          cmp scripts/install.sh website/dist/install.sh
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:

@@ -28,14 +28,6 @@ impl R2Config {
             .with_secret_access_key(&self.secret_access_key)
     }
 
-    /// Reads the shared `OP_INDEXER_R2_*` settings from the process environment.
-    ///
-    /// # Errors
-    /// Returns an error naming a missing account id, access key id or secret key.
-    pub fn from_env(chain: &ChainSpec) -> Result<Self, R2ConfigError> {
-        Self::from_lookup(chain, |name| std::env::var(name).ok())
-    }
-
     /// Reads R2 settings through a lookup, allowing command-line overrides at the binary edge.
     /// Empty values are treated as absent; the bucket defaults to `<chain>-snapshot` and
     /// the prefix to `archive`.
@@ -49,16 +41,16 @@ impl R2Config {
         let mut lookup = |name| lookup(name).filter(|value| !value.is_empty());
         Ok(Self {
             account_id: lookup("OP_INDEXER_R2_ACCOUNT_ID").ok_or(R2ConfigError {
-                name: "OP_INDEXER_R2_ACCOUNT_ID",
+                name: "r2.account_id",
             })?,
             bucket: lookup("OP_INDEXER_R2_BUCKET")
                 .unwrap_or_else(|| format!("{}-snapshot", chain.name)),
             prefix: lookup("OP_INDEXER_R2_PREFIX").unwrap_or_else(|| "archive".to_owned()),
             access_key_id: lookup("OP_INDEXER_R2_ACCESS_KEY_ID").ok_or(R2ConfigError {
-                name: "OP_INDEXER_R2_ACCESS_KEY_ID",
+                name: "r2.access_key_id",
             })?,
             secret_access_key: lookup("OP_INDEXER_R2_SECRET_ACCESS_KEY").ok_or(R2ConfigError {
-                name: "OP_INDEXER_R2_SECRET_ACCESS_KEY",
+                name: "r2.secret_access_key",
             })?,
             endpoint: lookup("OP_INDEXER_R2_ENDPOINT"),
             public_url: lookup("OP_INDEXER_R2_PUBLIC_URL"),

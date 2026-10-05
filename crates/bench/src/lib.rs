@@ -231,7 +231,8 @@ impl Benchmark {
                     }
                 }
                 _ = interval.tick() => {
-                    info!(done = results.len(), planned, seconds = began.elapsed().as_secs_f64(),
+                    info!(finished = results.len(), failed = results.iter().filter(|job| job.error.is_some()).count(),
+                        planned, seconds = began.elapsed().as_secs_f64(),
                         received_decoded_bytes = progress.received.load(Ordering::Relaxed),
                         failed_attempt_bytes = progress.failed_bytes.load(Ordering::Relaxed), "progress");
                 }

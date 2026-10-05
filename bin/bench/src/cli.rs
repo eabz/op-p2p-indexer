@@ -4,14 +4,15 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use clap::Parser;
+use clap::{CommandFactory as _, FromArgMatches as _, Parser};
 use op_indexer_api::ticket::{Cap, Query, Table};
 use op_indexer_bench::{Compression, Config};
 
 #[derive(Debug, Parser)]
 #[command(
     version,
-    about = "Bounded Arrow Flight benchmark (set KEY in the environment)"
+    about = "Bounded Arrow Flight benchmark (credentials from [bench] in TOML)",
+    after_help = "Shared options: --config PATH, --chain op|unichain|base, --check-config."
 )]
 pub(crate) struct Cli {
     /// Balancer grpc://host:port.
@@ -62,12 +63,35 @@ pub(crate) struct Cli {
     /// Save cumulative results after each run (no API key); existing files are replaced.
     #[arg(long)]
     pub(crate) json: Option<PathBuf>,
-    /// Environment file, loaded before the runtime starts.
-    #[arg(long)]
-    env_file: Option<PathBuf>,
 }
 
 impl Cli {
+    /// Parses operational flags over TOML defaults, hiding configured values from help.
+    pub(crate) fn configured() -> Self {
+        let command = Self::command().mut_args(|arg| {
+            let key = arg.get_long().map(|flag| {
+                if flag == "balancer" {
+                    "BENCH_BALANCER_URL".to_owned()
+                } else {
+                    format!("BENCH_{}", flag.replace('-', "_").to_ascii_uppercase())
+                }
+            });
+            match key.as_deref().and_then(op_indexer_runtime::setting) {
+                Some(value) => {
+                    let takes_values = arg.get_action().takes_values();
+                    arg.required(false)
+                        .default_value(value)
+                        .hide_default_value(takes_values)
+                }
+                None => arg,
+            }
+        });
+        let args = std::iter::once(std::ffi::OsString::from("bench")).chain(
+            op_indexer_runtime::config::other_args(std::env::args_os().skip(1)),
+        );
+        Self::from_arg_matches(&command.get_matches_from(args)).unwrap_or_else(|error| error.exit())
+    }
+
     pub(crate) fn validate(&self) -> eyre::Result<()> {
         eyre::ensure!(self.from <= self.to, "--to is below --from");
         Ok(())

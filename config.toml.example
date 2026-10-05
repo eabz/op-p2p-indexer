@@ -1,8 +1,26 @@
 # Copy to ~/indexer/unichain/config.toml and keep private (chmod 600).
 # One file serves all roles for one chain. Values are examples, not production credentials.
-# Paths are relative to this file. CLI overrides process environment, then TOML, then defaults.
+# Paths are relative to their source file. CLI overrides child, then parent, then defaults.
+# Environment settings are not read. Keep reusable [node]/[r2] settings in ../config.toml:
+# extends = "../config.toml"
 chain = "unichain" # op, unichain, base
 log_filter = "info"
+
+# Shared node capabilities apply only to configured indexer/server roles.
+# Role settings below override these. Keep paths and network bindings in each role.
+[node]
+profile = "live"
+
+[node.stream]
+# api_keys = ["replace-me"]
+max_subscriptions = 64
+
+[node.el]
+enabled = true
+
+[node.l1]
+enabled = false
+# checkpoint = "0x..." # Required when enabled: a trusted recent finalized beacon root.
 
 [server]
 data_dir = "data/server"
@@ -20,13 +38,10 @@ listen_addr = "127.0.0.1:50051"
 listen_addr = "0.0.0.0:9222"
 
 [server.el]
-enabled = true
 sync = true
 listen_addr = "0.0.0.0:30303"
 
 [server.l1]
-enabled = false
-# checkpoint = "0x..." # Required when enabled: a trusted recent finalized beacon root.
 listen_addr = "0.0.0.0:30304"
 beacon_listen_addr = "0.0.0.0:9001"
 
@@ -40,7 +55,6 @@ listen_addr = "0.0.0.0:9322"
 enabled = false
 listen_addr = "0.0.0.0:30403"
 [indexer.l1]
-enabled = false
 listen_addr = "0.0.0.0:30404"
 beacon_listen_addr = "0.0.0.0:9101"
 
@@ -65,3 +79,12 @@ prefix = "archive"
 # public_url = "https://archive.example"
 # presign_access_key_id = "replace-me"
 # presign_secret_access_key = "replace-me"
+
+[bench]
+# balancer_url = "grpc://balancer.example:50060"
+# api_key = "replace-me"
+# from = 40000000
+# to = 45000000
+concurrency = 24
+per_server = 8
+compression = "zstd"

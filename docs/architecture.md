@@ -65,8 +65,8 @@ flowchart LR
 | `bench` | Native Flight consumer: validates plans and streamed block ranges, measures throughput and retries, repeats single-table or heavy four-table workloads ([usage](bench.md)) | Optional JSON reports; decoded batches are discarded |
 
 `indexer`, `server` and `balancer` also take `start`, `stop`, `restart`, `status`, `logs` and
-`install-service`, to run in the background; settings are environment variables, read from
-`.env` ([configuration.md](configuration.md)). All fleet servers read the same sealed history;
+`install-service`, to run in the background; settings come from the chain
+`config.toml` ([configuration.md](configuration.md)). All fleet servers read the same sealed history;
 exactly one exports, with a write key, and the rest read only.
 
 ## Crates
@@ -80,16 +80,15 @@ exactly one exports, with a write key, and the rest read only.
 - `server`: the archive over sealed chunks plus the local tail, and the exporter.
 - `stream`: gRPC and Flight, history then live.
 - `node`: wiring, machine sizing, sync coordination, staged shutdown.
-- `balancer`, `api`, `runtime`: fleet directory; shared keys, tickets and schemas; environment,
+- `balancer`, `api`, `runtime`: fleet directory; shared keys, tickets and schemas; TOML configuration,
   tracing, signals and service commands.
 
 The dependency rules between them are in the repository's `CLAUDE.md`.
 
 ## Operating modes
 
-With no profile, the settings in `.env` decide what runs. The `live`, `archive` and `fleet`
-profiles (`OP_INDEXER_PROFILE`) group the usual combinations and are checked at startup. The
+With no profile, the settings in TOML decide what runs. The `live`, `archive` and `fleet`
+profiles (`<role>.profile`) group the usual combinations and are checked at startup. The
 tuning limits are sized from the machine's cores and memory and logged at startup. See the
-README and `.env.example` for commands and profile requirements, and
-[configuration.md](configuration.md) for every setting: the minimal `.env` per binary, the
-advanced settings sized from the machine or derived, and the deprecated names.
+README and `config.toml.example` for commands and profile requirements, and
+[configuration.md](configuration.md) for the schema, machine-sized defaults and explicit legacy migration.

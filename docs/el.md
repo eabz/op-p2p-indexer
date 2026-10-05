@@ -130,9 +130,9 @@ network it joins (the OP Stack chain's and, with the L1 side, Ethereum's):
 
 | | Policy | Where |
 |---|---|---|
-| Sessions | 4 dialed and 4 accepted by an `indexer`, two per core (8 to 64) by a `server`, which exists to serve (`OP_INDEXER_EL_MAX_SESSIONS`; the L1 side uses 4); on the OP Stack network one more dialed, not counted against these, for an op-p2p-indexer with blocks before Bedrock (section 13) | `PeerConfig::max_sessions`, `sizing::server_el_sessions` (`crates/node`) |
+| Sessions | 4 dialed and 4 accepted by an `indexer`, two per core (8 to 64) by a `server`, which exists to serve (`<role>.el.max_sessions`; the L1 side uses 4); on the OP Stack network one more dialed, not counted against these, for an op-p2p-indexer with blocks before Bedrock (section 13) | `PeerConfig::max_sessions`, `sizing::server_el_sessions` (`crates/node`) |
 | Peers that want history | up to 4 more accepted for a peer that wants history most peers prune: an op-p2p-indexer (by its node record, or its `op-indexer/` client name) or a node whose head is over 10,000 blocks behind ours (syncing). When those are full too, the inbound peer that has asked us for nothing the longest (2 minutes at least, and not one that wants history) is disconnected ("too many peers") to make room, so a full node's slots cannot lock them out | `peers.rs` `HISTORY_SLOTS`, `SYNCING_BEHIND`, `UNASKED_EVICTION` |
-| Our own deployment | peers listed in `OP_INDEXER_EL_TRUSTED_PEERS` (the other servers): dialed first, always accepted, never released for being unused, and counted against no limit, so they neither take the slots kept for others nor are refused | `PeerConfig::trusted_peers` |
+| Our own deployment | peers listed in `<role>.el.trusted_peers` (the other servers): dialed first, always accepted, never released for being unused, and counted against no limit, so they neither take the slots kept for others nor are refused | `PeerConfig::trusted_peers` |
 | Inbound connections | at most 8 handshakes at once, 2 from one host (an IPv4 address or an IPv6 /64), with 5 s each for the encrypted handshake, the hello and the status; further connections are closed and warned about once a minute, with a count; one established inbound session per host | `session/listener.rs`, `peers.rs` |
 | Unused sessions | an outbound session we have not sent a request on for 10 minutes is closed ("disconnect requested"), keeping the 2 used most recently (the receipts of new blocks) and the session in the indexer slot; the outbound target then drops to 2, so no other peer is dialed in their place, and goes back up only after every kept session has been busy (used within a minute) for 5 minutes in a row; a released peer is not dialed again for 30 minutes; sessions peers opened are theirs and stay | `peers.rs` `IDLE_RELEASE`, `KEEP_IDLE`, `BUSY`, `BUSY_TICKS`, `RELEASED_REDIAL` |
 | Dials | at most 8 at once, 30 a minute, no peer more often than once a minute | `peers.rs`, `peers/schedule.rs` |
@@ -191,7 +191,7 @@ planner and the wiring; a `server`'s provider reads sealed history from R2 (`cra
 
 ## 10. Configuration and identity
 
-- The variables (`OP_INDEXER_EL_*`: enabled, listen address, bootnodes, sessions, advertised
+- The `<role>.el` TOML settings ( enabled, listen address, bootnodes, sessions, advertised
   address, trusted peers, range sync) and their defaults are in
   [configuration.md](configuration.md). Behaviour: with an advertised address set, the node
   record carries it for TCP and UDP (a server or a forwarded port). Unset, discovery fills in
@@ -341,7 +341,7 @@ history can get it from one that has it.
 - An empty receipts list for a block with transactions is "not held" (a node that pruned its
   receipts answers so), never bad data: until 2026-10-05 it was hashed and failed the
   receipts root, and banned honest reth peers (seen on Unichain at block 385). While a
-  round runs the peer set dials for twice `OP_INDEXER_EL_MAX_SESSIONS` outbound sessions and
+  round runs the peer set dials for twice `<role>.el.max_sessions` outbound sessions and
   releases none for being unused.
 - Items in an answer are matched by what verifies: leading items that belong to their blocks
   are kept and the rest asked for again; an item of a later block means "not held from here";
@@ -359,7 +359,7 @@ history can get it from one that has it.
   the other.
 - It needs an archive that keeps every block and whose range the sync continues; otherwise
   the binary refuses to start it. A store that refuses a batch stops the process.
-- On with `OP_INDEXER_EL_SYNC`, a profile that turns it on, or the L1 side
+- On with `<role>.el.sync`, a profile that turns it on, or the L1 side
   ([configuration.md](configuration.md)); it then runs in rounds, for as long as the node runs.
   It only closes the gaps gossip cannot; otherwise promotion extends the archive from the
   unsafe store, and no block is fetched twice. Each round goes from the block after the
@@ -426,7 +426,7 @@ find each other without a protocol of their own.
   waits for one; other peers are not asked for them. On a chain without a legacy chain
   (Unichain) the Bedrock block is 0 and none of this changes anything.
 - **Finding each other.** Indexers are few: one outbound slot beyond
-  `OP_INDEXER_EL_MAX_SESSIONS` is kept for an indexer that says it holds blocks before
+  `<role>.el.max_sessions` is kept for an indexer that says it holds blocks before
   Bedrock (its advertised `earliest` is below Bedrock), and its session is not counted
   against the ordinary slots; inbound, indexers share the four history slots (section 6). Only an indexer discovery saw in this run is dialed for it.
   The session in the outbound slot is exempt from the release of unused sessions, and is

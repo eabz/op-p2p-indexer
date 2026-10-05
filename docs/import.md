@@ -191,7 +191,7 @@ Each missing field follows from what the download and L1 have:
 **Fetched from the RPC**: what L1 cannot give (lists, holes, the fields above that cannot be
 rebuilt, blocks that do not hash), or everything with `--fill-from rpc`.
 
-- **Endpoint**: `--rpc-endpoint` (`OP_INDEXER_IMPORT_RPC_ENDPOINT`). With `--fill-from l1`
+- **Endpoint**: `--rpc-endpoint` (or `importer.rpc_endpoint` in TOML). With `--fill-from l1`
   none is used unless given; then something that needs one stops the run with a message to
   give one. With `--fill-from rpc` the default is the chain's public endpoint
   (`https://mainnet.unichain.org`, `https://mainnet.base.org`; none for OP Mainnet). Only its
@@ -322,8 +322,8 @@ In order:
   manifest records the chain (id and genesis hash), and a run of another chain refuses it. Its
   exporter id is `import`.
 - **Target**: R2, from the account id, the two keys and optionally the bucket, the prefix and
-  `--r2-endpoint` (another S3-compatible store); the keys are flags with an environment
-  fallback (prefer the environment: a flag shows in `ps`), and their values are never shown or
+  `--r2-endpoint` (another S3-compatible store); store credentials in the private `[r2]` TOML section
+  (a command-line secret would show in `ps`), and their values are never shown or
   logged. Or `--to-dir <dir>`: a local directory with the same layout, for a check or the
   bench without credentials.
 - **Uploads**: one PUT per chunk (about 20 to 40 MB), create-only as a guard; an object above
@@ -349,7 +349,7 @@ In order:
 straight from R2, through presigned URLs a balancer hands out (`raw` plans), checks every
 block (chunk root, segments, header hashes and links, transactions and receipts roots) and
 writes them as RLP files. It needs no state directory and no R2 key; the balancer's URL and
-an API key fall back to `OP_INDEXER_BALANCER_URL` and `OP_INDEXER_API_KEY`. See
+an API key fall back to `importer.balancer_url` and `importer.api_key` in TOML. See
 [serving §6.8](serving.md#68-raw-chunk-download-2026-10-05).
 
 ## 4. Running it
@@ -358,30 +358,18 @@ The importer is a self-contained command-line tool, meant to be built here and r
 machine: `cargo build --release -p op-indexer-import` produces one file to copy.
 
 - Subcommands: `download`, `verify`, `run` (both in order) and `fetch`.
-- `--api-token <TOKEN>` carries the HyperSync token; `OP_INDEXER_IMPORT_API_TOKEN` in the
-  environment is the fallback (`ENVIO_API_TOKEN`, its former name, still works, with a
-  warning). A flag is visible in the process list and the shell history, the variable is
-  not. The token is never logged and never written to the state directory.
-- Settings that are secret or name a place are flags with an environment fallback: the state
-  directory (`OP_INDEXER_IMPORT_STATE_DIR`), the chain (`OP_INDEXER_CHAIN_ID`), the
-  endpoints (`OP_INDEXER_IMPORT_ENDPOINT`, `OP_INDEXER_IMPORT_L1_ENDPOINT`,
-  `OP_INDEXER_IMPORT_RPC_ENDPOINT`, whose URL often holds a key), and for `verify` the bucket
-  and its keys (`OP_INDEXER_R2_ACCOUNT_ID`, `OP_INDEXER_R2_BUCKET`, `OP_INDEXER_R2_PREFIX`,
-  `OP_INDEXER_R2_ACCESS_KEY_ID`, `OP_INDEXER_R2_SECRET_ACCESS_KEY`, `OP_INDEXER_R2_ENDPOINT`;
-  section 3.2).
-- Every other setting is a flag only, with a default: the range (`--first-block`,
-  `--last-block`, `--anchor-hash`, `--legacy-only`), the chunk size (`--chunk-blocks`),
-  requests in flight (`--requests`), the RPC's batch size and requests in flight
-  (`--rpc-batch`, `--rpc-requests`; section 3.1a), where missing header fields come from
-  (`--fill-from`, `l1` or `rpc`), the refetch (`--refetch-incomplete`, `--refetch-requests`,
-  `--rescan`, `--scan`), and for `verify`: `--to-dir`, its threads (`--threads`, one per CPU)
-  and its uploads (`--uploads`, 4, from 1 to 64). Their former variables
-  (`OP_INDEXER_IMPORT_FIRST_BLOCK` and the like) are still read for this release, with a
-  warning naming the flag ([configuration.md](configuration.md), "Deprecated variables").
-- `--state-dir` and `--env-file` (`OP_INDEXER_ENV_FILE`; `.env` if it exists) are shared by
-  every step: the range is decided by the first `download` and read from `plan.json`
-  afterwards. `import --help` and `<command> --help` list every flag, its environment
-  variable and its default.
+- Use `--config PATH` or `--chain unichain` to select the shared private TOML file. Put
+  source credentials and endpoints in `[importer]`, and destination credentials in `[r2]`.
+  `importer.api_token` holds the HyperSync token; secret values are not logged or written to
+  import state. Avoid putting credentials in flags because process listings expose them.
+- Operational CLI flags override TOML, then defaults apply. Ranges (`--first-block`,
+  `--last-block`, `--anchor-hash`, `--legacy-only`), chunk sizes, concurrency, refetch and
+  verification options remain available; `import --help` and each subcommand's `--help`
+  describe them. `--state-dir` selects the import state; the first download writes its range
+  to `plan.json`, which subsequent steps read.
+- Runtime environment configuration and `.env` loading are removed; `--env-file` is rejected.
+  Use explicit [migration](configuration.md#migrate-an-existing-deployment) to convert an old
+  deployment. This is a breaking change pending release.
 - What the bucket holds is asked of the bucket: `verify` continues after the manifest's last
   chunk and the records in `sealed/`, and refuses a manifest of another chain.
 - `verify` exits with an error if it stops before the end of the range, and says what to run.
@@ -403,7 +391,7 @@ import download --api-token <TOKEN> --requests 64
 ```
 
 ```bash
-OP_INDEXER_R2_ACCOUNT_ID=<account id> OP_INDEXER_R2_ACCESS_KEY_ID=<key id> OP_INDEXER_R2_SECRET_ACCESS_KEY=<secret> import verify
+import --config /path/to/config.toml verify
 ```
 
 - **The range**: with no range flags, block 0 to the L2 block of the newest dispute game of
@@ -504,13 +492,13 @@ the hash of an empty requests list, which has no column in HyperSync).
 
 ## 9. Any chain
 
-The chain is chosen with `--chain <id>` on the first `download` and recorded in `plan.json`;
+The chain is selected from TOML or overridden with `--chain <id>` on the first `download`
+and recorded in `plan.json`;
 a later run with another `--chain` is refused, and one without it continues the recorded
 chain. Its parameters (fork times, the Bedrock block and its time, the hash of the last
 legacy block if it has a legacy chain, the block time, the dispute-game factory) come from
 `op-indexer-chainspec`, which knows OP Mainnet (10), Unichain (130) and Base (8453). The
-chain is also `OP_INDEXER_CHAIN_ID`, the variable the node reads, so one `.env` sets it for
-both. The HyperSync endpoint is the importer's concern, not the chain specification's: a table
+top-level `chain` in the shared TOML configuration selects it for both. The HyperSync endpoint is the importer's concern, not the chain specification's: a table
 in the importer gives `https://optimism.hypersync.xyz` for 10, `https://unichain.hypersync.xyz`
 for 130 and `https://base.hypersync.xyz` for 8453, `--endpoint` overrides it, and a chain
 without an entry needs `--endpoint`. The L1 endpoint (`--l1-endpoint`, default Ethereum's) is
@@ -529,7 +517,7 @@ import --state-dir unichain-state download --chain 130 --api-token <TOKEN> --rpc
 ```
 
 ```bash
-OP_INDEXER_R2_ACCOUNT_ID=<account id> OP_INDEXER_R2_ACCESS_KEY_ID=<key id> OP_INDEXER_R2_SECRET_ACCESS_KEY=<secret> import --state-dir unichain-state verify
+import --config /path/to/config.toml --state-dir unichain-state verify
 ```
 
 - **No legacy chain.** Unichain began with Bedrock at its genesis (block 0, time
@@ -552,7 +540,7 @@ import --state-dir base-state download --chain 8453 --api-token <TOKEN> --rpc-en
 ```
 
 ```bash
-OP_INDEXER_R2_ACCOUNT_ID=<account id> OP_INDEXER_R2_ACCESS_KEY_ID=<key id> OP_INDEXER_R2_SECRET_ACCESS_KEY=<secret> import --state-dir base-state verify
+import --config /path/to/config.toml --state-dir base-state verify
 ```
 
 - **No legacy chain**, as Unichain: about 52 million blocks (2 s blocks), 521,890 downloaded

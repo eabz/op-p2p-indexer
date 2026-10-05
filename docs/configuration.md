@@ -1,32 +1,110 @@
 # Configuration
 
-## TOML configuration and chain layout
+Each chain uses one private `config.toml`, shared by its roles. The installer writes
+`~/indexer/<chain>/config.toml`, where the chain is `op`, `unichain` or `base`.
+Use `--chain unichain` to select that file or `--config PATH` to select another.
+A normal run requires a configuration file; `--help` and `--version` do not.
+Without explicit selection, discovery checks `./config.toml`, then the chain home file.
+Relative paths resolve beside the file that defines them. Role state defaults to separate
+`data/indexer`, `data/server` and `data/importer` directories.
 
-Use [`config.toml.example`](../config.toml.example) as the schema guide. The installer writes
-`~/indexer/<chain>/config.toml` (`op`, `unichain`, or `base`), with separate role state below
-`data/indexer`, `data/server`, and `data/importer`. Relative paths resolve beside the config,
-not against the shell's working directory. Shared R2 credentials live in `[r2]`; role settings
-live in `[indexer]`, `[server]`, `[balancer]` and `[importer]`. Node roles have nested `[stream]`,
-`[p2p]`, `[el]` and `[l1]` tables as shown in the example.
+**Breaking change, pending release:** runtime configuration comes from TOML only.
+Operational CLI flags override child-file settings, then inherited settings, then built-in defaults. Process environment
+settings and automatic `.env` loading no longer configure the programs. `--env-file` is
+rejected. The legacy format is accepted only by the explicit migration command below.
+
+```toml
+chain = "unichain"
+log_filter = "info"
+
+[indexer]
+profile = "live"
+
+[indexer.stream]
+listen_addr = "127.0.0.1:50051"
+api_keys = ["replace-with-client-key"]
+
+[bench]
+balancer_url = "http://balancer.internal:50060"
+api_key = "replace-with-client-key"
+```
+
+Keep credentials in a mode `0600` file. Unknown keys and incorrect types fail validation;
+errors do not echo secret values. Each binary uses its own role section and shared `[r2]`
+settings. Generated services contain the configuration path rather than credentials.
 
 ```bash
-indexer --chain unichain
 server --config "$HOME/indexer/unichain/config.toml" --check-config
 import --config "$HOME/indexer/unichain/config.toml" run --help
 ```
 
-Command-line flags override process environment, which overrides TOML, which overrides
-machine defaults. TOML is read without copying credentials into the process environment.
-Unknown keys and incorrectly typed values fail startup. `--check-config` validates without
-opening a database or contacting peers/R2; importer operation-specific requirements are
-also checked when its subcommand runs. Configuration files containing credentials should
-be mode `0600`; generated service files contain paths, not credentials.
+`--check-config` validates without opening a database or contacting peers or R2. Import
+subcommands also check their operation-specific requirements when invoked.
 
-### Migrate an existing deployment
+## Reuse settings across roles and chains
 
-Keep the old instance stopped while changing service registration. Convert its environment
-file with the binary that owns its state, from its original working directory, using an
-explicit output path:
+A chain file can inherit a shared file with `extends = "../config.toml"`. This produces a
+simple layout: `~/indexer/config.toml` holds reusable credentials and tuning, while
+`~/indexer/unichain/config.toml`, `~/indexer/op/config.toml` and `~/indexer/base/config.toml`
+hold each chain's identity, configured roles, paths and ports. The shared file may omit
+`chain`; the final merged chain configuration must supply it.
+
+Shared file, `~/indexer/config.toml`:
+
+```toml
+log_filter = "info"
+
+[node]
+profile = "live"
+
+[node.stream]
+api_keys = ["replace-with-client-key"]
+max_subscriptions = 64
+
+[r2]
+account_id = "replace-me"
+access_key_id = "replace-me"
+secret_access_key = "replace-me"
+```
+
+Chain file, `~/indexer/unichain/config.toml`:
+
+```toml
+extends = "../config.toml"
+chain = "unichain"
+
+[r2]
+bucket = "unichain-snapshot"
+
+[indexer]
+data_dir = "data/indexer"
+
+[indexer.stream]
+listen_addr = "127.0.0.1:50151"
+
+[server]
+data_dir = "data/server"
+
+[server.stream]
+listen_addr = "127.0.0.1:50051"
+```
+
+Tables merge recursively; a child's scalar or array replaces the parent's whole value.
+The `extends` path is relative to the referring file. Every path setting remains relative
+to its own source file, even after inheritance. Cycles and chains exceeding eight files
+are rejected. Keep every file containing credentials private (`0600`).
+
+`[node]` supplies common capabilities and limits to explicitly configured `[indexer]` and
+`[server]` roles. Their own values override `[node]`, including inherited role values.
+Use `[node.stream]`, `[node.p2p]`, `[node.el]` and `[node.l1]` for shared nested settings.
+State paths, log paths, listen addresses and advertised addresses are not allowed in
+`[node]`: keep these per-instance values in each role to avoid shared databases and port
+collisions. Adding `[node]` alone does not register another role.
+
+## Migrate an existing deployment
+
+Stop the old instance before changing its service registration. From its original working
+directory, convert its environment file using the binary that owns the state:
 
 ```bash
 mkdir -p "$HOME/indexer/unichain"
@@ -34,220 +112,209 @@ server --migrate-env /path/to/old/.env --config "$HOME/indexer/unichain/config.t
 server --config "$HOME/indexer/unichain/config.toml" --check-config
 ```
 
-Migration refuses to overwrite an existing config or discard unknown/other-role settings.
-Split a legacy file shared by several roles into role-specific inputs first. Review the generated settings before
-starting; legacy data paths must continue to identify the original state. Add another role
-through the installer so it gets separate paths and ports. Do not run two processes against
-the same database. Environment-file loading remains a deprecated transition path when no
-TOML configuration is selected; explicit `--config` and `--env-file` cannot be combined.
+Conversion preserves the source, writes a new mode `0600` file and refuses to overwrite an
+existing config. Legacy relative paths become absolute so they still identify the same
+state. Duplicate assignments retain the first value, matching the old loader. Unknown or
+other-role settings are refused rather than silently dropped; split a shared legacy input
+by role before migration. Review the output before restarting. Migration does not move data,
+and two processes must never open the same database.
 
-### Several chains on one host
+## Role setup and defaults
 
-The installer checks saved configurations and occupied TCP/UDP sockets before assigning
-ports. It preserves existing assignments and allows manual choices. Server and indexer
-instances of the same chain also get distinct ports and state. The public advertised Flight
-address must use the selected API port. Service names are `server-unichain.service`,
-`indexer-base.service`, and `balancer-unichain.service`; a chain target groups them for start
-and stop. See the [installer commands](../README.md#install-on-a-server).
+- `indexer`: no credentials required for gossip. `profile = "live"` adds execution receipts.
+- `server`: shared R2 credentials (or `chunks_dir`), a balancer URL and registration key.
+  Set `export = true` on only one server per deployment to seal finalized chunks.
+- `balancer`: accepted server registration keys, client API keys and shared R2 settings.
+- `importer`: source token and destination R2 credentials; operational range and concurrency
+  flags are described by `import run --help`.
+- `bench`: a balancer URL and client API key; workload flags are described by `bench --help`.
 
-## Legacy environment reference
+The `archive` and `fleet` profiles enable L1 tracking and range sync; L1 requires a trusted
+checkpoint. L1 implies range sync, and range sync implies execution networking. Explicit
+contradictory switches fail startup. With no profile, these optional capabilities are off.
 
-The following examples document the retained environment overrides and transition format.
-New deployments should use TOML and the installer.
+Default stream binding is `127.0.0.1:50051`; balancer binding is `0.0.0.0:50060`.
+The installer chooses distinct ports for every saved role and chain, including stopped
+instances, and checks occupied TCP/UDP sockets. A server's advertised address must use its
+selected stream port. Without an explicit address, a concrete listen IP is used; wildcard
+binding requires discovery of a public IP through execution networking.
 
-Every binary (`indexer`, `server`, `balancer`, `import`) reads `OP_INDEXER_*` environment
-variables, from the process environment or from `.env` in the current directory (`--env-file
-<path>`, or `OP_INDEXER_ENV_FILE`, for another file). The process environment wins over the file.
+Unsafe memory, Flight build/stream limits and server read budgets are sized from available
+cores and memory. The node logs the chosen limits. Their formulas live in
+`crates/node/src/sizing.rs`; tune them only after measuring the limiting resource.
 
-Only what differs between machines goes in `.env`:
+## Accepted TOML fields
 
-- what to run: the chain, the data directory, and the role switches;
-- secrets: the R2 keys, API keys, server keys and the HyperSync token;
-- where things are: the balancer, the server's public address, the R2 account and bucket, and
-  the L1 checkpoint.
+The tables below follow `crates/runtime/src/config/schema.rs`. `chain` is a top-level chain
+name or quoted ID. `extends` is an optional parent-file path. `[node]` accepts the shared
+subset of indexer/server fields described above. Strings are quoted, booleans are `true`/`false`, integers are nonnegative, and
+lists are arrays of strings. Path strings resolve beside the configuration file.
+See [`config.toml.example`](../config.toml.example) for an editable example.
 
-[`.env.example`](../.env.example) lists exactly those, with a short required block per binary
-at the top. The rest has defaults that fit. The tuning knobs are sized from the machine's
-cores and memory, and the node logs what they chose at startup. The importer's options are
-flags. Every other variable is still read: see [Advanced settings](#advanced-settings).
+### bench
 
-## Minimal `.env` per binary
-
-`indexer`: nothing is required, and an empty `.env` runs OP Mainnet with gossip only. A full
-node that follows L1 needs:
-
-```sh
-OP_INDEXER_L1_ENABLED=true
-OP_INDEXER_L1_CHECKPOINT=0x...
-```
-
-L1 turns on the range sync, which turns on the execution network.
-
-`server` (one per machine; one of them exports):
-
-```sh
-OP_INDEXER_DATA_DIR=data-op-server
-OP_INDEXER_L1_ENABLED=true
-OP_INDEXER_L1_CHECKPOINT=0x...
-OP_INDEXER_STREAM_LISTEN_ADDR=0.0.0.0:50051
-OP_INDEXER_STREAM_API_KEYS=...
-OP_INDEXER_R2_ACCOUNT_ID=...
-OP_INDEXER_R2_ACCESS_KEY_ID=...
-OP_INDEXER_R2_SECRET_ACCESS_KEY=...
-OP_INDEXER_BALANCER_URL=http://balancer.internal:50060
-OP_INDEXER_BALANCER_SERVER_KEY=...
-# On the exporter only, with the write key:
-# OP_INDEXER_EXPORT=true
-```
-
-The server's name is its host name. Its address is the public IP the execution network learns,
-with the stream's port (see `OP_INDEXER_SERVER_ADDRESS` below).
-
-`balancer`:
-
-```sh
-OP_INDEXER_BALANCER_SERVER_KEYS=...
-OP_INDEXER_STREAM_API_KEYS=...
-OP_INDEXER_R2_ACCOUNT_ID=...
-OP_INDEXER_R2_ACCESS_KEY_ID=...
-OP_INDEXER_R2_SECRET_ACCESS_KEY=...
-```
-
-`import` (`run`: download, then verify and upload):
-
-```sh
-OP_INDEXER_IMPORT_API_TOKEN=...
-OP_INDEXER_R2_ACCOUNT_ID=...
-OP_INDEXER_R2_ACCESS_KEY_ID=...
-OP_INDEXER_R2_SECRET_ACCESS_KEY=...
-```
-
-The range and the rest are flags: `import run --help`.
-
-## Advanced settings
-
-These are out of `.env.example` because their defaults fit almost every deployment. Set one in
-`.env` or the environment to override it.
-
-### Sized from the machine
-
-Each default is computed at startup from the cores the process may use
-(`available_parallelism`, a container's CPU quota included) and its memory. On Linux the memory
-is `MemTotal`, lowered to a cgroup's limit; on macOS it is `hw.memsize`. The node logs the
-inputs and the results on one line ("settings sized from the machine"), and the server logs
-its read budget. Memory is shared out in eighths, so the three memory-sized settings together
-take at most three eighths of it, and the rest is left to the page cache and fjall. The formulas
-are in `crates/node/src/sizing.rs`.
-
-| Variable | Default | Unknown memory |
-|---|---|---|
-| `OP_INDEXER_UNSAFE_MAX_BYTES` | memory / 8, from 256 MiB to 2 GiB (about a day of a busy chain's blocks; more is never read) | 2 GiB |
-| `OP_INDEXER_STREAM_MAX_BUILDS` | Flight builds at once, server-wide: 2 × cores, but no more than (memory / 8) / 100 MiB (each build holds about 100 MiB until sent), and at least 2 | 2 × cores |
-| `OP_INDEXER_STREAM_MAX_FLIGHTS` | Flight `DoGet` streams at once: the build cap, at least 8. A stream runs up to two builds at once, so half of them keep every build busy; the others wait their turn while their consumers read | — |
-| `OP_INDEXER_EL_MAX_SESSIONS` | `indexer`: 4, whatever the machine (full nodes ration their slots); `server`: 2 × cores, from 8 to 64 | — |
-| `OP_INDEXER_SERVER_READ_BUDGET_MB` | server only: memory / 8, from 256 MiB to 16 GiB: decoded blocks read ahead and chunk streams open, for every reader together | 1 GiB |
-
-Some limits are deliberately not sized from the machine. They bound network and R2 use, not
-memory, so they are constants:
-
-- the server's peer reads: 16 at once, matching the execution network's serving limit;
-- the bytes served per peer: 4 GiB a minute.
-
-### Derived
-
-| Variable | Default |
+| Field | Type |
 |---|---|
-| `OP_INDEXER_SERVER_ID` | The host name (`uname`). It is the server's name at the balancer and, on the exporter, in the manifest. |
-| `OP_INDEXER_SERVER_ADDRESS` | Where the balancer sends clients. If `OP_INDEXER_STREAM_LISTEN_ADDR` names an IP (`127.0.0.1:50051`, `10.0.0.5:50051`), that address as it is. If it listens on every interface (`0.0.0.0:50051`), the public IP the execution network's discovery learns, with the stream's port. The server waits for that IP before it registers: tens of seconds after start. It warns after a minute and keeps waiting. Without the execution network the variable is required. |
-| `OP_INDEXER_EL_ENABLED` | `true` with a profile, or with the range sync (which needs it); otherwise `false`. |
-| `OP_INDEXER_EL_SYNC` | `true` with the `archive` or `fleet` profile, or with L1 (which needs it); otherwise `false`. |
+| `bench.api_key` | string |
+| `bench.balancer_url` | string |
+| `bench.table` | string |
+| `bench.heavy` | boolean |
+| `bench.from` | integer |
+| `bench.to` | integer |
+| `bench.cap` | string |
+| `bench.concurrency` | integer |
+| `bench.per_server` | integer |
+| `bench.compression` | string |
+| `bench.plan_timeout` | integer |
+| `bench.rpc_timeout` | integer |
+| `bench.retry_for` | integer |
+| `bench.progress` | integer |
+| `bench.repeat` | integer |
+| `bench.max_message_bytes` | integer |
+| `bench.json` | path |
 
-An explicit `false` where a switch above needs `true` stops startup with an error naming the
-variable.
+### bench
 
-### Everything else
-
-Node (`indexer`, `server`; documented on `Config::from_env` in `crates/node/src/config.rs`):
-
-| Variable | Default |
+| Field | Type |
 |---|---|
-| `OP_INDEXER_PROFILE` | unset. `live`, `archive` or `fleet` pick the role switches' defaults in one line. |
-| `OP_INDEXER_P2P_LISTEN_ADDR` | `0.0.0.0:9222` |
-| `OP_INDEXER_P2P_ADVERTISED_ADDR` | unset: the address peers observe; set it behind NAT |
-| `OP_INDEXER_P2P_BOOTNODES` | the chain's bootnodes |
-| `OP_INDEXER_P2P_MAX_PEERS` | 30 |
-| `OP_INDEXER_EL_LISTEN_ADDR` | `0.0.0.0:30303` |
-| `OP_INDEXER_EL_ADVERTISED_ADDR` | unset: learned by discovery |
-| `OP_INDEXER_EL_BOOTNODES` | the chain's execution bootnodes |
-| `OP_INDEXER_EL_TRUSTED_PEERS` | none: `enode://` URLs of the deployment's other servers |
-| `OP_INDEXER_L1_LISTEN_ADDR` | `0.0.0.0:30304` |
-| `OP_INDEXER_L1_BEACON_LISTEN_ADDR` | `0.0.0.0:9001` |
-| `OP_INDEXER_L1_ADVERTISED_ADDR` | unset |
-| `OP_INDEXER_STREAM_MAX_SUBSCRIPTIONS` | 64 |
-| `OP_INDEXER_STREAM_FLIGHT_QUEUE_MS` | 2000: how long a `DoGet` waits for a free stream before `RESOURCE_EXHAUSTED` |
+| `bench.api_key` | string |
+| `bench.balancer_url` | string |
+| `bench.table` | string |
+| `bench.heavy` | boolean |
+| `bench.from` | integer |
+| `bench.to` | integer |
+| `bench.cap` | string |
+| `bench.concurrency` | integer |
+| `bench.per_server` | integer |
+| `bench.compression` | string |
+| `bench.plan_timeout` | integer |
+| `bench.rpc_timeout` | integer |
+| `bench.retry_for` | integer |
+| `bench.progress` | integer |
+| `bench.repeat` | integer |
+| `bench.max_message_bytes` | integer |
+| `bench.json` | path |
 
-Server (documented on `ServerConfig::from_env_and_args` in `bin/server/src/config.rs`):
+### r2
 
-| Variable | Default |
+| Field | Type |
 |---|---|
-| `OP_INDEXER_R2_PREFIX` | `archive` |
-| `OP_INDEXER_R2_ENDPOINT` | `https://<account id>.r2.cloudflarestorage.com` |
-| `OP_INDEXER_R2_PUBLIC_URL` | unset: every read through the S3 API ([serving.md](serving.md) 6.9) |
-| `OP_INDEXER_CHUNKS_DIR` | unset: reads the chunks from a local directory instead of R2 (local runs, the bench) |
+| `r2.public_url` | string |
+| `r2.account_id` | string |
+| `r2.access_key_id` | string |
+| `r2.secret_access_key` | string |
+| `r2.bucket` | string |
+| `r2.prefix` | string |
+| `r2.endpoint` | string |
+| `r2.presign_access_key_id` | string |
+| `r2.presign_secret_access_key` | string |
 
-Balancer: `OP_INDEXER_BALANCER_LISTEN_ADDR` (`0.0.0.0:50060`).
+### General
 
-Importer (environment fallbacks of its flags, kept for endpoints, whose URLs can hold a key):
-
-| Variable | Default |
+| Field | Type |
 |---|---|
-| `OP_INDEXER_IMPORT_ENDPOINT` | the chain's HyperSync endpoint |
-| `OP_INDEXER_IMPORT_L1_ENDPOINT` | `https://eth.hypersync.xyz` |
+| `log_filter` | string |
 
-Every binary:
+### indexer
 
-| Variable | Default |
+| Field | Type |
 |---|---|
-| `RUST_LOG` | `info` |
-| `OP_INDEXER_LOG_FILE` | `<binary>.log` next to the `.env` file, for `start`, `status` and `logs` |
-| `OP_INDEXER_ENV_FILE` | `.env` |
+| `indexer.data_dir` | path |
+| `indexer.profile` | string |
+| `indexer.unsafe_max_bytes` | integer |
+| `indexer.log_file` | path |
+| `indexer.stream.listen_addr` | string |
+| `indexer.stream.api_keys` | string array |
+| `indexer.stream.max_subscriptions` | integer |
+| `indexer.stream.max_flights` | integer |
+| `indexer.stream.max_builds` | integer |
+| `indexer.stream.flight_queue_ms` | integer |
+| `indexer.p2p.listen_addr` | string |
+| `indexer.p2p.advertised_addr` | string |
+| `indexer.p2p.bootnodes` | string array |
+| `indexer.p2p.max_peers` | integer |
+| `indexer.el.enabled` | boolean |
+| `indexer.el.sync` | boolean |
+| `indexer.el.listen_addr` | string |
+| `indexer.el.advertised_addr` | string |
+| `indexer.el.bootnodes` | string array |
+| `indexer.el.trusted_peers` | string array |
+| `indexer.el.max_sessions` | integer |
+| `indexer.l1.enabled` | boolean |
+| `indexer.l1.checkpoint` | string |
+| `indexer.l1.listen_addr` | string |
+| `indexer.l1.advertised_addr` | string |
+| `indexer.l1.beacon_listen_addr` | string |
 
-### A second instance on the same host
+### server
 
-Each instance needs its own data directory, its own ports and its own `.env`. For example,
-Unichain next to an OP Mainnet node, with every port shifted by 100:
-
-```sh
-OP_INDEXER_CHAIN_ID=130
-OP_INDEXER_P2P_LISTEN_ADDR=0.0.0.0:9322
-OP_INDEXER_EL_LISTEN_ADDR=0.0.0.0:30403
-OP_INDEXER_L1_LISTEN_ADDR=0.0.0.0:30404
-OP_INDEXER_L1_BEACON_LISTEN_ADDR=0.0.0.0:9101
-OP_INDEXER_STREAM_LISTEN_ADDR=127.0.0.1:50151
-```
-
-The data directory follows the chain (`data-unichain`). A second instance of the same chain also
-sets `OP_INDEXER_DATA_DIR`. Give the importer one state directory per chain.
-
-## Deprecated variables
-
-Each of these is still read for this release, with one warning at startup that names its
-replacement. None of them is logged with its value.
-
-| Variable | Instead |
+| Field | Type |
 |---|---|
-| `OP_INDEXER_EXPORT_ID` | Automatic: the exporter is named after the server (`OP_INDEXER_SERVER_ID`, default the host name). |
-| `OP_INDEXER_IMPORT_FIRST_BLOCK` | `--first-block` |
-| `OP_INDEXER_IMPORT_LAST_BLOCK` | `--last-block` |
-| `OP_INDEXER_IMPORT_ANCHOR_HASH` | `--anchor-hash` |
-| `OP_INDEXER_IMPORT_LEGACY_ONLY` | `--legacy-only` |
-| `OP_INDEXER_IMPORT_CHUNK_BLOCKS` | `--chunk-blocks` |
-| `OP_INDEXER_IMPORT_FILL_FROM` | `--fill-from` |
-| `OP_INDEXER_IMPORT_RPC_BATCH` | `--rpc-batch` |
-| `OP_INDEXER_IMPORT_RPC_REQUESTS` | `--rpc-requests` |
-| `OP_INDEXER_IMPORT_REQUESTS` | `--requests` |
-| `OP_INDEXER_IMPORT_REFETCH_INCOMPLETE` | `--refetch-incomplete` |
-| `OP_INDEXER_IMPORT_REFETCH_REQUESTS` | `--refetch-requests` |
-| `OP_INDEXER_IMPORT_VERIFY_THREADS` | `--threads` |
-| `OP_INDEXER_IMPORT_VERIFY_UPLOADS` | `--uploads` |
-| `ENVIO_API_TOKEN` | `OP_INDEXER_IMPORT_API_TOKEN` |
+| `server.data_dir` | path |
+| `server.profile` | string |
+| `server.unsafe_max_bytes` | integer |
+| `server.log_file` | path |
+| `server.stream.listen_addr` | string |
+| `server.stream.api_keys` | string array |
+| `server.stream.max_subscriptions` | integer |
+| `server.stream.max_flights` | integer |
+| `server.stream.max_builds` | integer |
+| `server.stream.flight_queue_ms` | integer |
+| `server.p2p.listen_addr` | string |
+| `server.p2p.advertised_addr` | string |
+| `server.p2p.bootnodes` | string array |
+| `server.p2p.max_peers` | integer |
+| `server.el.enabled` | boolean |
+| `server.el.sync` | boolean |
+| `server.el.listen_addr` | string |
+| `server.el.advertised_addr` | string |
+| `server.el.bootnodes` | string array |
+| `server.el.trusted_peers` | string array |
+| `server.el.max_sessions` | integer |
+| `server.l1.enabled` | boolean |
+| `server.l1.checkpoint` | string |
+| `server.l1.listen_addr` | string |
+| `server.l1.advertised_addr` | string |
+| `server.l1.beacon_listen_addr` | string |
+| `server.export` | boolean |
+| `server.chunks_dir` | path |
+| `server.id` | string |
+| `server.address` | string |
+| `server.balancer_url` | string |
+| `server.balancer_server_key` | string |
+| `server.read_budget_mb` | integer |
+| `server.export_id` | string |
+
+### balancer
+
+| Field | Type |
+|---|---|
+| `balancer.listen_addr` | string |
+| `balancer.server_keys` | string array |
+| `balancer.api_keys` | string array |
+| `balancer.log_file` | path |
+
+### importer
+
+| Field | Type |
+|---|---|
+| `importer.state_dir` | path |
+| `importer.api_token` | string |
+| `importer.rpc_endpoint` | string |
+| `importer.endpoint` | string |
+| `importer.l1_endpoint` | string |
+| `importer.verify_threads` | integer |
+| `importer.verify_uploads` | integer |
+| `importer.first_block` | integer |
+| `importer.last_block` | integer |
+| `importer.anchor_hash` | string |
+| `importer.legacy_only` | boolean |
+| `importer.chunk_blocks` | integer |
+| `importer.fill_from` | string |
+| `importer.rpc_batch` | integer |
+| `importer.rpc_requests` | integer |
+| `importer.requests` | integer |
+| `importer.refetch_incomplete` | boolean |
+| `importer.refetch_requests` | integer |
+| `importer.balancer_url` | string |
+| `importer.api_key` | string |

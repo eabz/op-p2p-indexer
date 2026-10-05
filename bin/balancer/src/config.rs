@@ -8,7 +8,7 @@ use op_indexer_balancer::BalancerConfig;
 use op_indexer_chainspec::{ChainSpec, OP_MAINNET};
 use op_indexer_chunks::{R2Config, ReadOptions};
 use op_indexer_runtime::config;
-use op_indexer_runtime::env_var as var;
+use op_indexer_runtime::setting as var;
 
 /// Clear of the stream's default port (50051).
 const DEFAULT_LISTEN_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 50060);
@@ -30,20 +30,20 @@ impl BalancerSettings {
     ///
     /// - `--env-file <path>` (command line): read by the env-file loader before this; no other
     ///   argument is taken.
-    /// - `OP_INDEXER_CHAIN_ID`: L2 chain id, one of [`ChainSpec::ALL`] (default 10, OP
+    /// - `chain`: L2 chain id, one of [`ChainSpec::ALL`] (default 10, OP
     ///   Mainnet). One balancer per chain.
-    /// - `OP_INDEXER_BALANCER_LISTEN_ADDR`: gRPC listen socket of the balancer service and
+    /// - `balancer.listen_addr`: gRPC listen socket of the balancer service and
     ///   Flight (default `0.0.0.0:50060`).
-    /// - `OP_INDEXER_BALANCER_SERVER_KEYS` (required): comma-separated keys servers register
+    /// - `balancer.server_keys` (required): comma-separated keys servers register
     ///   with. Never logged.
-    /// - `OP_INDEXER_STREAM_API_KEYS`: comma-separated user keys, the servers' own: a client
+    /// - `balancer.api_keys`: comma-separated user keys, the servers' own: a client
     ///   reads from the servers with the key it asked the balancer with (default: none, no
     ///   check). Never logged.
-    /// - `OP_INDEXER_R2_ACCOUNT_ID`, `OP_INDEXER_R2_ACCESS_KEY_ID`,
-    ///   `OP_INDEXER_R2_SECRET_ACCESS_KEY` (required), `OP_INDEXER_R2_BUCKET`,
-    ///   `OP_INDEXER_R2_PREFIX`, `OP_INDEXER_R2_ENDPOINT`: the chain's bucket, as for `server`;
+    /// - `r2.account_id`, `r2.access_key_id`,
+    ///   `r2.secret_access_key` (required), `r2.bucket`,
+    ///   `r2.prefix`, `r2.endpoint`: the chain's bucket, as for `server`;
     ///   a read-only key is enough.
-    /// - `OP_INDEXER_R2_PRESIGN_ACCESS_KEY_ID`, `OP_INDEXER_R2_PRESIGN_SECRET_ACCESS_KEY`: a
+    /// - `r2.presign_access_key_id`, `r2.presign_secret_access_key`: a
     ///   read-only R2 key the balancer signs raw chunk URLs with (`docs/serving.md`, raw chunk
     ///   download). Both or neither; without them raw plans are refused. Never logged; a URL
     ///   carries the key's id, never its secret.
@@ -52,7 +52,7 @@ impl BalancerSettings {
     ///
     /// Returns an error if a required variable is missing or one is invalid, or an argument
     /// is unknown.
-    pub(crate) fn from_env_and_args() -> eyre::Result<Self> {
+    pub(crate) fn from_config_and_args() -> eyre::Result<Self> {
         eyre::ensure!(
             config::other_args(env::args_os().skip(1)).is_empty(),
             "unknown balancer argument; use --config, --chain or --check-config"
@@ -60,7 +60,7 @@ impl BalancerSettings {
         let chain_id = var("OP_INDEXER_CHAIN_ID")
             .map(|id| {
                 id.parse::<u64>()
-                    .wrap_err_with(|| format!("OP_INDEXER_CHAIN_ID is invalid: {id}"))
+                    .wrap_err_with(|| format!("chain is invalid: {id}"))
             })
             .transpose()?
             .unwrap_or(OP_MAINNET.chain_id);
@@ -69,13 +69,13 @@ impl BalancerSettings {
         let listen_addr = var("OP_INDEXER_BALANCER_LISTEN_ADDR")
             .map(|addr| {
                 addr.parse()
-                    .wrap_err_with(|| format!("OP_INDEXER_BALANCER_LISTEN_ADDR is invalid: {addr}"))
+                    .wrap_err_with(|| format!("balancer.listen_addr is invalid: {addr}"))
             })
             .transpose()?
             .unwrap_or(DEFAULT_LISTEN_ADDR);
         let server_keys = list("OP_INDEXER_BALANCER_SERVER_KEYS");
         if server_keys.is_empty() {
-            return Err(eyre!("OP_INDEXER_BALANCER_SERVER_KEYS is required"));
+            return Err(eyre!("balancer.server_keys is required"));
         }
         let r2 = R2Config::from_lookup(chain, var)?;
         let presign = match (
@@ -90,8 +90,8 @@ impl BalancerSettings {
             (None, None) => None,
             _ => {
                 return Err(eyre!(
-                    "set both OP_INDEXER_R2_PRESIGN_ACCESS_KEY_ID and \
-                     OP_INDEXER_R2_PRESIGN_SECRET_ACCESS_KEY, or neither"
+                    "set both r2.presign_access_key_id and \
+                     r2.presign_secret_access_key, or neither"
                 ));
             }
         };

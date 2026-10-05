@@ -15,10 +15,10 @@ TTFB and job latency include queueing and retries; planning is reported separate
 the end-to-end rate. Latency is observed in the parent and includes IPC delivery. Empty
 streams have no first-batch sample.
 
-    KEY=<api key> scripts/bench.py --balancer grpc://balancer:50060 \
+    scripts/bench.py --config config.toml --balancer grpc://balancer:50060 \
         --table logs --from 120000000 --to 120100000 --processes 4 --threads 8 --per-server 8
 
-Needs pyarrow. Use matching ranges and report cold/warm runs separately.
+Needs pyarrow and Python 3.11+ (or tomli on older Python). Reads credentials from [bench]. Use matching ranges and report cold/warm runs separately.
 """
 
 import argparse
@@ -268,7 +268,8 @@ def totals(results):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--balancer", required=True, help="grpc://host:port of the balancer")
+    parser.add_argument("--config", default="config.toml", help="TOML file containing [bench] credentials")
+    parser.add_argument("--balancer", help="grpc://host:port of the balancer")
     parser.add_argument("--table", required=True, choices=["blocks", "transactions", "receipts", "logs"])
     parser.add_argument("--from", dest="start", type=int, required=True, help="first block")
     parser.add_argument("--to", dest="end", type=int, required=True, help="last block")
@@ -293,9 +294,23 @@ def main():
             parser.error("--{} must be positive and finite".format(name.replace("_", "-")))
     if not 0 <= args.start <= args.end <= 2**64 - 1:
         parser.error("require 0 <= --from <= --to <= 2^64-1")
-    args.key = os.environ.get("KEY")
-    if not args.key:
-        sys.exit("set KEY to an API key the servers accept")
+    try:
+        try:
+            import tomllib
+        except ImportError:
+            import tomli as tomllib
+        with open(args.config, "rb") as source:
+            settings = tomllib.load(source).get("bench", {})
+        args.key = settings.get("api_key")
+        args.balancer = args.balancer or settings.get("balancer_url")
+    except ImportError:
+        parser.error("TOML support needs Python 3.11+ or the tomli package")
+    except (OSError, ValueError, AttributeError):
+        parser.error("cannot read TOML benchmark configuration (contents withheld)")
+    if not isinstance(args.key, str) or not args.key:
+        parser.error("set bench.api_key in the TOML file")
+    if not isinstance(args.balancer, str) or not args.balancer:
+        parser.error("set bench.balancer_url or give --balancer")
 
     overall_started = time.monotonic()
     try:

@@ -5267,6 +5267,7 @@ dependencies = [
  "arrow-schema",
  "fastrand",
  "futures-util",
+ "h2",
  "op-indexer-api",
  "serde",
  "thiserror 2.0.21",

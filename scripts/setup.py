@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Configure chain roles and explicit systemd lifecycle operations."""
 import argparse
+import copy
 import errno
 import getpass
 import hashlib
@@ -49,13 +50,67 @@ def yes(prompt):
     return ask(prompt + " (y/N)").lower() in ("y", "yes")
 
 
-def read_config(path):
+def read_local(path):
     if path.is_symlink():
         fail("refusing symlink config " + str(path))
     if not path.exists():
         return {}
     with path.open("rb") as source:
         return tomllib.load(source)
+
+
+def merge(base, overrides):
+    result = copy.deepcopy(base)
+    for key, value in overrides.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = merge(result[key], value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
+
+
+def read_config(path, local=None):
+    """Resolve inheritance for checks without copying shared secrets into child files."""
+    path_fields = {"indexer": ("data_dir", "log_file"),
+                   "server": ("data_dir", "log_file", "chunks_dir"),
+                   "balancer": ("log_file",), "importer": ("state_dir",), "bench": ("json",)}
+    def load(current, supplied, seen):
+        canonical = current.resolve()
+        if canonical in seen:
+            fail("configuration inheritance cycle")
+        if len(seen) >= 8:
+            fail("configuration inheritance exceeds eight files")
+        values = copy.deepcopy(read_local(current) if supplied is None else supplied)
+        parent = values.pop("extends", None)
+        base = {}
+        if parent is not None:
+            if not isinstance(parent, str) or not parent:
+                fail("extends must name a configuration file")
+            inherited = current.parent / parent
+            if not inherited.is_file():
+                fail("inherited configuration file is missing")
+            base = load(inherited, None, seen + [canonical])
+        for role, fields in path_fields.items():
+            for field in fields:
+                value = values.get(role, {}).get(field)
+                if isinstance(value, str) and value and not Path(value).is_absolute():
+                    values[role][field] = str(current.parent / value)
+        return merge(base, values)
+    effective = load(path, local, [])
+    common = effective.pop("node", {})
+    if not isinstance(common, dict):
+        fail("node must be a configuration table")
+    def shared(node):
+        for key, value in node.items():
+            if key in ("data_dir", "log_file", "listen_addr", "beacon_listen_addr", "advertised_addr"):
+                fail("node defaults cannot share state paths or listener/advertised addresses")
+            if isinstance(value, dict):
+                shared(value)
+    shared(common)
+    for role in ("server", "indexer"):
+        if role in effective:
+            effective[role] = merge(common, effective[role])
+    return effective
 
 
 def toml(data):
@@ -241,8 +296,20 @@ def main():
     config = directory / "config.toml"
     if root.is_symlink() or directory.is_symlink():
         fail("root and chain directories must not be symlinks")
-    data = read_config(config)
-    if data.get("chain", chain) != chain:
+    data = read_local(config)
+    if not config.exists() and (root / "config.toml").is_file():
+        data["extends"] = "../config.toml"
+    # Resolve extends before prompts/allocation; other overrides are applied after defaults.
+    for item in a.set:
+        key, separator, value = item.partition("=")
+        if separator and (key == "extends" or key.startswith("node.") or key.startswith("r2.")):
+            target = data
+            pieces = key.split(".")
+            for piece in pieces[:-1]:
+                target = target.setdefault(piece, {})
+            target[pieces[-1]] = tomllib.loads("value = " + value)["value"]
+    effective = read_config(config, data)
+    if effective.get("chain", chain) != chain:
         fail("config belongs to another chain")
     units = [unit_name(role, chain) for role in roles if role != "importer"]
     # A concrete role/chain unit is unique on this host. Never take another installation over.
@@ -299,7 +366,8 @@ def main():
         reserved.update(saved_ports)
         if saved != config:
             other.update(saved_ports)
-    original_ports = set(ports(data))
+    reserved.update(ports(effective))
+    original_ports = set(ports(read_config(config)))
     overrides = {}
     for item in a.port_base:
         role, equal, number = item.partition("=")
@@ -308,11 +376,13 @@ def main():
         overrides[role] = int(number)
     data["chain"] = chain
     for role in roles:
-        if role in data:
+        effective = read_config(config, data)
+        if role in effective:
             if role in overrides:
                 fail("existing role ports preserved; edit config explicitly to relocate")
             continue
         section = data.setdefault(role, {})
+        inherited = read_config(config, data).get(role, {})
         if role == "importer":
             section["state_dir"] = "data/importer"
             continue
@@ -333,13 +403,20 @@ def main():
                 section["data_dir"] = ask(role + " data directory (existing path retains identity/history)", section["data_dir"])
             section["stream"] = {"listen_addr": "127.0.0.1:" + str(base)}
             section["p2p"] = {"listen_addr": "0.0.0.0:" + str(block[1])}
-            section["el"] = {"enabled": True, "listen_addr": "0.0.0.0:" + str(block[2])}
-            section["l1"] = {"enabled": False, "listen_addr": "0.0.0.0:" + str(block[3]), "beacon_listen_addr": "0.0.0.0:" + str(block[4])}
+            section["el"] = {"listen_addr": "0.0.0.0:" + str(block[2])}
+            if "enabled" not in inherited.get("el", {}) and "profile" not in inherited:
+                section["el"]["enabled"] = True
+            section["l1"] = {"listen_addr": "0.0.0.0:" + str(block[3]), "beacon_listen_addr": "0.0.0.0:" + str(block[4])}
+            if "enabled" not in inherited.get("l1", {}) and "profile" not in inherited:
+                section["l1"]["enabled"] = False
+            if inherited.get("stream", {}).get("api_keys"):
+                section["stream"]["listen_addr"] = "0.0.0.0:" + str(base)
             if interactive:
-                key = ask(role + " API key (blank keeps localhost API)", secret=True)
-                if key:
-                    section["stream"].update(listen_addr="0.0.0.0:" + str(base), api_keys=[key])
-                checkpoint = ask("L1 checkpoint (blank disables L1)")
+                if not inherited.get("stream", {}).get("api_keys"):
+                    key = ask(role + " API key (blank keeps localhost API)", secret=True)
+                    if key:
+                        section["stream"].update(listen_addr="0.0.0.0:" + str(base), api_keys=[key])
+                checkpoint = "" if inherited.get("l1", {}).get("checkpoint") else ask("L1 checkpoint (blank keeps configured L1 setting)")
                 if checkpoint:
                     section["l1"].update(enabled=True, checkpoint=checkpoint)
                     section["el"]["sync"] = True
@@ -349,11 +426,12 @@ def main():
                         section.update(address=address, balancer_url=ask("Balancer URL"), balancer_server_key=ask("Registration key", secret=True))
                     section["export"] = yes("Make this server the single exporter for this chain?")
     if interactive and any(role in ("server", "balancer") for role in roles):
-        r2 = data.setdefault("r2", {})
+        inherited_r2 = read_config(config, data).get("r2", {})
         for key in ("account_id", "bucket", "access_key_id", "secret_access_key"):
-            if not r2.get(key):
-                r2[key] = ask("R2 " + key, secret="key" in key)
-        r2.setdefault("prefix", "archive")
+            if not inherited_r2.get(key):
+                data.setdefault("r2", {})[key] = ask("R2 " + key, secret="key" in key)
+        if "prefix" not in inherited_r2:
+            data.setdefault("r2", {})["prefix"] = "archive"
     for item in a.set:
         key, equal, value = item.partition("=")
         if not equal:
@@ -365,12 +443,18 @@ def main():
         target[parts[-1]] = tomllib.loads("value = " + value)["value"]
     if data["chain"] != chain:
         fail("--set cannot change chain")
-    final_ports = ports(data)
+    for role in ROLES:
+        key = "state_dir" if role == "importer" else "data_dir"
+        local_state = data.get(role, {}).get(key)
+        if isinstance(local_state, str) and local_state.startswith("~/"):
+            data[role][key] = str(Path(account.pw_dir) / local_state[2:])
+    effective = read_config(config, data)
+    final_ports = ports(effective)
     if len(final_ports) != len(set(final_ports)) or other.intersection(final_ports):
         fail("listen ports collide with this or another saved chain")
     if any(not free(port) for port in set(final_ports) - original_ports):
         fail("new listen port is occupied")
-    server = data.get("server", {})
+    server = effective.get("server", {})
     if server.get("address"):
         address = server["address"]
         parsed = urlsplit("//" + address)
@@ -380,13 +464,10 @@ def main():
         print("Server registration address: " + address + "; listener: " + listener)
     state_paths = []
     for role in ROLES:
-        if role not in data or role == "balancer":
+        if role not in effective or role == "balancer":
             continue
         key = "state_dir" if role == "importer" else "data_dir"
-        state = Path(data[role].get(key, "data/" + role))
-        if str(state).startswith("~/"):
-            state = Path(account.pw_dir) / str(state)[2:]
-            data[role][key] = str(state)
+        state = Path(effective[role].get(key, "data/" + role))
         state_paths.append((directory / state).resolve())
     if len(state_paths) != len(set(state_paths)):
         fail("each node/importer role needs a distinct state directory")
@@ -399,13 +480,12 @@ def main():
     try:
         with os.fdopen(fd, "w") as out:
             out.write(content)
-        check_env = {key: value for key, value in os.environ.items() if not key.startswith("OP_INDEXER_")}
         for role in ROLES:
-            if role not in data:
+            if role not in effective:
                 continue
             check_capability(prefix, role)
             binary = prefix / "bin" / ("import" if role == "importer" else role)
-            result = subprocess.run([str(binary), "--config", candidate, "--check-config"], env=check_env, capture_output=True, text=True)
+            result = subprocess.run([str(binary), "--config", candidate, "--check-config"], capture_output=True, text=True)
             if result.returncode:
                 fail(role + " config validation failed; check required settings (values withheld)")
         atomic(config, content, 0o600, account)

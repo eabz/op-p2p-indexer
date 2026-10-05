@@ -1,7 +1,7 @@
 //! The indexer: the full node for a single user, every service in one process, its history in
 //! a local fjall archive.
 //!
-//! Loads the `.env` file ([`op_indexer_runtime::env_file`]), sets up tracing, reads the
+//! Loads the TOML file ([`op_indexer_runtime::config`]), sets up tracing, reads the
 //! configuration, opens the archive and runs the node ([`op_indexer_node::run`]).
 
 use std::path::PathBuf;
@@ -12,7 +12,7 @@ use op_indexer_runtime::Startup;
 use op_indexer_storage::archive_store::FjallArchive;
 
 fn main() -> eyre::Result<()> {
-    let Startup::Run { env_file } =
+    let Startup::Run { config_file } =
         op_indexer_runtime::startup(env!("CARGO_BIN_NAME"), env!("CARGO_PKG_VERSION"))?
     else {
         return Ok(());
@@ -21,17 +21,17 @@ fn main() -> eyre::Result<()> {
         .enable_all()
         .build()
         .wrap_err("failed to start the tokio runtime")?
-        .block_on(run(env_file))
+        .block_on(run(config_file))
 }
 
-async fn run(env_file: Option<PathBuf>) -> eyre::Result<()> {
-    op_indexer_runtime::init_tracing(env_file.as_deref());
+async fn run(config_file: Option<PathBuf>) -> eyre::Result<()> {
+    op_indexer_runtime::init_tracing(config_file.as_deref());
 
     eyre::ensure!(
         op_indexer_runtime::config::other_args(std::env::args_os().skip(1)).is_empty(),
         "unknown indexer argument; use --config, --chain or --check-config"
     );
-    let config = Config::from_env()?;
+    let config = Config::from_config()?;
     eyre::ensure!(
         config.profile() != Some(op_indexer_node::Profile::Fleet),
         "the fleet profile requires the server binary"

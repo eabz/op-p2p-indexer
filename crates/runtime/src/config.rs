@@ -1,5 +1,4 @@
-//! Immutable TOML settings shared by the binaries, with legacy environment compatibility.
-//! Process variables override the selected role's settings; CLI chain selection wins over both.
+//! Immutable TOML settings shared by the binaries. CLI chain selection overrides the file.
 
 mod migration;
 mod schema;
@@ -11,12 +10,13 @@ use std::sync::OnceLock;
 
 use eyre::{WrapErr, bail, ensure, eyre};
 
-use crate::env_file;
+use crate::args;
 use schema::FIELDS;
 
 static SETTINGS: OnceLock<Settings> = OnceLock::new();
 
 struct Settings {
+    role: String,
     values: BTreeMap<String, String>,
     chain_override: Option<String>,
     path: Option<PathBuf>,
@@ -24,7 +24,7 @@ struct Settings {
 
 /// Loads configuration before startup, installing an immutable role-specific overlay.
 /// Explicit `--config` wins over discovery (`./config.toml`, then `~/indexer/<chain>/config.toml`).
-/// Without TOML, the legacy `.env` loader remains available for one release.
+/// Normal runs require a TOML file; help and version commands do not.
 ///
 /// # Errors
 /// Returns an error for missing explicit files, invalid TOML, unsupported chains, conflicting
@@ -33,14 +33,15 @@ pub fn initialize(binary: &str) -> eyre::Result<Option<PathBuf>> {
     let role = role(binary)?;
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let explicit = argument("--config", &args)?.map(PathBuf::from);
-    let legacy = argument("--env-file", &args)?.is_some()
-        || std::env::var_os("OP_INDEXER_ENV_FILE").is_some();
     ensure!(
-        !(explicit.is_some() && legacy),
-        "--config and legacy env-file selection cannot be combined"
+        !args.iter().any(|arg| arg == "--env-file"
+            || arg
+                .to_str()
+                .is_some_and(|arg| arg.starts_with("--env-file="))),
+        "--env-file is no longer supported; convert with --migrate-env INPUT --config OUTPUT"
     );
     let chain_argument = argument("--chain", &args)?;
-    // Numeric importer chain flags predate TOML and must keep working without a file.
+    // Numeric importer chain flags select the chain without changing file discovery.
     let selects_home = chain_argument
         .as_deref()
         .is_some_and(|chain| !matches!(chain.to_str(), Some("10" | "130" | "8453")));
@@ -52,17 +53,31 @@ pub fn initialize(binary: &str) -> eyre::Result<Option<PathBuf>> {
                 .and_then(chain_id)
         })
         .transpose()?;
-    let discovery_chain = chain_override
-        .clone()
-        .or_else(|| process_var("OP_INDEXER_CHAIN_ID"))
-        .unwrap_or_else(|| "10".to_owned());
-    let path = if legacy {
-        None
-    } else {
-        discover(explicit, &discovery_chain, selects_home)?
-    };
+    let discovery_chain = chain_override.clone().unwrap_or_else(|| "10".to_owned());
+    let path = discover(explicit, &discovery_chain, selects_home)?;
+    ensure!(
+        path.is_some() || args.iter().any(|arg| arg == "--help" || arg == "-h"),
+        "no TOML configuration found; use --config PATH or --chain NAME"
+    );
     let (values, loaded) = if let Some(path) = &path {
-        let table = read(path)?;
+        let mut table = read(path, &mut Vec::new())?;
+        if matches!(role, "indexer" | "server") {
+            table
+                .entry(role.to_owned())
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        }
+        if let Some(common) = table
+            .remove("node")
+            .and_then(|value| value.as_table().cloned())
+        {
+            for name in ["indexer", "server"] {
+                if let Some(settings) = table.get_mut(name).and_then(toml::Value::as_table_mut) {
+                    let mut combined = common.clone();
+                    merge(&mut combined, std::mem::take(settings));
+                    *settings = combined;
+                }
+            }
+        }
         let base = path
             .parent()
             .ok_or_else(|| eyre!("configuration has no parent directory"))?;
@@ -96,16 +111,11 @@ pub fn initialize(binary: &str) -> eyre::Result<Option<PathBuf>> {
             .or_insert_with(|| base.join("data").join(role).to_string_lossy().into_owned());
         (values, Some(path.clone()))
     } else {
-        let loaded = env_file::load(args)?;
-        if loaded.is_some() {
-            crate::say(format_args!(
-                "legacy .env configuration is deprecated; use --migrate-env to create TOML"
-            ));
-        }
-        (BTreeMap::new(), loaded)
+        (BTreeMap::new(), None)
     };
     SETTINGS
         .set(Settings {
+            role: role.to_owned(),
             values,
             chain_override,
             path,
@@ -150,9 +160,8 @@ pub fn command(binary: &str) -> eyre::Result<bool> {
 
 /// Arguments for the binary's parser, excluding shared configuration and chain-selection flags.
 pub fn other_args(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
-    let args = env_file::without_flag(env_file::FLAG, args);
-    let args = env_file::without_flag("--config", args);
-    env_file::without_flag("--chain", args)
+    let args = args::without_flag("--config", args);
+    args::without_flag("--chain", args)
         .into_iter()
         .filter(|arg| arg != "--check-config")
         .collect()
@@ -170,16 +179,29 @@ pub(crate) fn value(name: &str) -> Option<String> {
     {
         return Some(chain.clone());
     }
-    process_var(name).or_else(|| settings.and_then(|s| s.values.get(name)).cloned())
+    settings.and_then(|s| s.values.get(name)).cloned()
 }
 
-fn process_var(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|value| !value.is_empty())
+/// Returns the public TOML field name for an internal setting key, without any value.
+pub fn setting_name(key: &str) -> &str {
+    if key == "OP_INDEXER_CHAIN_ID" {
+        return "chain";
+    }
+    let role = SETTINGS.get().map(|settings| settings.role.as_str());
+    FIELDS
+        .iter()
+        .find(|field| {
+            field.env == key
+                && (role.is_some_and(|role| field.path.starts_with(&format!("{role}.")))
+                    || field.path.starts_with("r2.")
+                    || field.path == "log_filter")
+        })
+        .map_or(key, |field| field.path)
 }
 
 fn role(binary: &str) -> eyre::Result<&str> {
     match binary {
-        "indexer" | "server" | "balancer" => Ok(binary),
+        "indexer" | "server" | "balancer" | "bench" => Ok(binary),
         "import" | "importer" => Ok("importer"),
         _ => bail!("unknown binary role"),
     }
@@ -232,10 +254,111 @@ fn discover(
     Ok(None)
 }
 
-fn read(path: &Path) -> eyre::Result<toml::Table> {
-    let text = std::fs::read_to_string(path).wrap_err("cannot read TOML configuration")?;
-    text.parse::<toml::Table>()
-        .map_err(|_err| eyre!("invalid TOML configuration (contents redacted)"))
+/// Loads a bounded inheritance chain. Each file's paths are resolved before merging so an
+/// inherited relative path keeps its original meaning. Child values replace parent values;
+/// tables merge recursively and arrays replace as a whole.
+fn read(path: &Path, stack: &mut Vec<PathBuf>) -> eyre::Result<toml::Table> {
+    let path = path
+        .canonicalize()
+        .wrap_err("cannot open TOML configuration")?;
+    ensure!(
+        stack.len() < 8 && !stack.contains(&path),
+        "configuration inheritance cycle or depth exceeds eight files"
+    );
+    stack.push(path.clone());
+    let text = std::fs::read_to_string(&path).wrap_err("cannot read TOML configuration")?;
+    let mut table = text
+        .parse::<toml::Table>()
+        .map_err(|_err| eyre!("invalid TOML configuration (contents redacted)"))?;
+    let base = path
+        .parent()
+        .ok_or_else(|| eyre!("configuration has no parent"))?;
+    let parent = table
+        .remove("extends")
+        .map(|value| {
+            let value = value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| eyre!("extends must be a nonempty file path"))?;
+            Ok::<_, eyre::Report>(base.join(value))
+        })
+        .transpose()?;
+    let common = table.remove("node");
+    if let Some(common) = &common {
+        let common = common
+            .as_table()
+            .ok_or_else(|| eyre!("node must be a table"))?;
+        validate_common(common)?;
+        schema::flatten(common, "indexer", base, &mut BTreeMap::new())?;
+    }
+    // Validate each layer, so a child cannot hide a misspelled field in a parent.
+    let mut fields = BTreeMap::new();
+    schema::flatten(&table, "", base, &mut fields)?;
+    if let Some(chain) = table.get("chain") {
+        chain_id(
+            chain
+                .as_str()
+                .ok_or_else(|| eyre!("chain must be a string"))?,
+        )?;
+    }
+    for field in FIELDS
+        .iter()
+        .filter(|field| matches!(field.kind, schema::Kind::Path))
+    {
+        if let Some(value) = fields.get(field.path) {
+            set_path(&mut table, field.path, value);
+        }
+    }
+    if let Some(common) = common {
+        table.insert("node".to_owned(), common);
+    }
+    let result = if let Some(parent) = parent {
+        let mut inherited = read(&parent, stack)?;
+        merge(&mut inherited, table);
+        inherited
+    } else {
+        table
+    };
+    stack.pop();
+    Ok(result)
+}
+
+fn validate_common(table: &toml::Table) -> eyre::Result<()> {
+    for (key, value) in table {
+        ensure!(
+            !matches!(
+                key.as_str(),
+                "data_dir" | "log_file" | "listen_addr" | "beacon_listen_addr" | "advertised_addr"
+            ),
+            "node defaults cannot share state paths or network bindings; put them in each role"
+        );
+        if let Some(child) = value.as_table() {
+            validate_common(child)?;
+        }
+    }
+    Ok(())
+}
+
+fn merge(parent: &mut toml::Table, child: toml::Table) {
+    for (key, value) in child {
+        if let Some(existing) = parent.get_mut(&key).and_then(toml::Value::as_table_mut)
+            && let Some(table) = value.as_table()
+        {
+            merge(existing, table.clone());
+        } else {
+            parent.insert(key, value);
+        }
+    }
+}
+
+fn set_path(table: &mut toml::Table, path: &str, value: &str) {
+    if let Some((first, rest)) = path.split_once('.') {
+        if let Some(child) = table.get_mut(first).and_then(toml::Value::as_table_mut) {
+            set_path(child, rest, value);
+        }
+    } else {
+        table.insert(path.to_owned(), toml::Value::String(value.to_owned()));
+    }
 }
 
 fn argument(flag: &str, args: &[OsString]) -> eyre::Result<Option<OsString>> {

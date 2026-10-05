@@ -17,7 +17,7 @@ mod config;
 mod persistence;
 mod supervision;
 mod sync;
-pub use op_indexer_runtime::{env_file, shutdown_signal};
+pub use op_indexer_runtime::shutdown_signal;
 mod peers;
 mod provider;
 pub mod sizing;

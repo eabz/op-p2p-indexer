@@ -4,7 +4,6 @@
 mod cli;
 mod output;
 
-use clap::Parser;
 use eyre::WrapErr as _;
 use op_indexer_bench::Benchmark;
 use tokio_util::sync::CancellationToken;
@@ -14,11 +13,16 @@ fn main() -> eyre::Result<()> {
     if op_indexer_runtime::version_requested(env!("CARGO_BIN_NAME"), env!("CARGO_PKG_VERSION")) {
         return Ok(());
     }
-    let env_file = op_indexer_runtime::env_file::load(std::env::args_os().skip(1))?;
-    let args = cli::Cli::parse();
+    let config_file = op_indexer_runtime::config::initialize("bench")?;
+    if op_indexer_runtime::config::check_requested() {
+        op_indexer_runtime::init_tracing(config_file.as_deref());
+        info!("configuration valid; workload requirements are checked when the benchmark runs");
+        return Ok(());
+    }
+    let args = cli::Cli::configured();
     args.validate()?;
-    let key = op_indexer_runtime::env_var("KEY")
-        .ok_or_else(|| eyre::eyre!("set KEY to an API key the servers accept"))?;
+    let key = op_indexer_runtime::setting("BENCH_API_KEY")
+        .ok_or_else(|| eyre::eyre!("set bench.api_key in TOML to an API key the servers accept"))?;
     // Validate every configuration before starting the suite.
     let clients = args
         .tables()
@@ -26,7 +30,7 @@ fn main() -> eyre::Result<()> {
         .map(|table| Benchmark::new(args.config(table), &key))
         .collect::<Result<Vec<_>, _>>()?;
     drop(key);
-    op_indexer_runtime::init_tracing(env_file.as_deref());
+    op_indexer_runtime::init_tracing(config_file.as_deref());
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

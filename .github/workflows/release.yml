@@ -63,7 +63,7 @@ jobs:
           for bin in $BINARIES; do
             cp "target/release/$bin" "dist/$name/"
           done
-          cp .env.example config.toml.example README.md LICENSE "dist/$name/"
+          cp config.toml.example README.md LICENSE "dist/$name/"
           cp scripts/bench.py scripts/install.sh scripts/setup.py "dist/$name/"
           cd dist
           tar -czf "$name.tar.gz" "$name"

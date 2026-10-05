@@ -22,6 +22,91 @@ pub(super) struct Field {
 
 pub(super) const FIELDS: &[Field] = &[
     Field {
+        path: "bench.api_key",
+        env: "BENCH_API_KEY",
+        kind: Kind::Text,
+    },
+    Field {
+        path: "bench.balancer_url",
+        env: "BENCH_BALANCER_URL",
+        kind: Kind::Text,
+    },
+    Field {
+        path: "bench.table",
+        env: "BENCH_TABLE",
+        kind: Kind::Text,
+    },
+    Field {
+        path: "bench.heavy",
+        env: "BENCH_HEAVY",
+        kind: Kind::Bool,
+    },
+    Field {
+        path: "bench.from",
+        env: "BENCH_FROM",
+        kind: Kind::Number,
+    },
+    Field {
+        path: "bench.to",
+        env: "BENCH_TO",
+        kind: Kind::Number,
+    },
+    Field {
+        path: "bench.cap",
+        env: "BENCH_CAP",
+        kind: Kind::Text,
+    },
+    Field {
+        path: "bench.concurrency",
+        env: "BENCH_CONCURRENCY",
+        kind: Kind::Number,
+    },
+    Field {
+        path: "bench.per_server",
+        env: "BENCH_PER_SERVER",
+        kind: Kind::Number,
+    },
+    Field {
+        path: "bench.compression",
+        env: "BENCH_COMPRESSION",
+        kind: Kind::Text,
+    },
+    Field {
+        path: "bench.plan_timeout",
+        env: "BENCH_PLAN_TIMEOUT",
+        kind: Kind::Number,
+    },
+    Field {
+        path: "bench.rpc_timeout",
+        env: "BENCH_RPC_TIMEOUT",
+        kind: Kind::Number,
+    },
+    Field {
+        path: "bench.retry_for",
+        env: "BENCH_RETRY_FOR",
+        kind: Kind::Number,
+    },
+    Field {
+        path: "bench.progress",
+        env: "BENCH_PROGRESS",
+        kind: Kind::Number,
+    },
+    Field {
+        path: "bench.repeat",
+        env: "BENCH_REPEAT",
+        kind: Kind::Number,
+    },
+    Field {
+        path: "bench.max_message_bytes",
+        env: "BENCH_MAX_MESSAGE_BYTES",
+        kind: Kind::Number,
+    },
+    Field {
+        path: "bench.json",
+        env: "BENCH_JSON",
+        kind: Kind::Path,
+    },
+    Field {
         path: "r2.public_url",
         env: "OP_INDEXER_R2_PUBLIC_URL",
         kind: Kind::Text,

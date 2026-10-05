@@ -1,5 +1,5 @@
 //! Where clients reach this server, as it registers with the balancer:
-//! `OP_INDEXER_SERVER_ADDRESS`, else derived from the stream's listen address.
+//! `server.address`, else derived from the stream's listen address.
 //!
 //! - A listen address that names an IP (`127.0.0.1:50051` for a local deployment,
 //!   `10.0.0.5:50051` for one interface) is the address, as it is.
@@ -20,7 +20,7 @@ use tracing::{info, warn};
 /// within half a minute.
 const PATIENCE: Duration = Duration::from_secs(60);
 
-/// The `host:port` to register: `given` (`OP_INDEXER_SERVER_ADDRESS`), else derived from
+/// The `host:port` to register: `given` (`server.address`), else derived from
 /// `listen`, the stream's listen address. `None` if `cancel` fires first, or the execution
 /// network stops (the node is stopping).
 ///
@@ -43,7 +43,7 @@ pub(crate) async fn resolve(
     }
     let mut public_ip = view.public_ip().ok_or_else(|| {
         eyre::eyre!(
-            "OP_INDEXER_SERVER_ADDRESS is required: the stream listens on every interface \
+            "server.address is required: the stream listens on every interface \
              ({listen}) and the execution network, which learns the public IP, is disabled"
         )
     })?;
@@ -52,7 +52,7 @@ pub(crate) async fn resolve(
         warn!(
             waited = ?PATIENCE,
             "the public IP is not known yet; registration with the balancer waits for it \
-             (set OP_INDEXER_SERVER_ADDRESS to skip the wait)"
+             (set server.address to skip the wait)"
         );
         future::pending::<()>().await;
     };

@@ -122,7 +122,7 @@ header over exactly those bytes; a mismatch is `InvalidBlock` (`TransactionsRoot
 **Bounds.** Blocks leave when the caller prunes; when their height's blocks are more than a
 day (`RETENTION_SECS`) older than the newest block, a few lowest heights per insert, the
 backstop for when nothing prunes (no L1); and when the blocks take more than
-`UnsafeConfig::max_bytes` (`OP_INDEXER_UNSAFE_MAX_BYTES`, default an eighth of the memory, 256 MiB to 2 GiB, or 2 GiB when the memory is unknown), lowest heights first,
+`UnsafeConfig::max_bytes` (`<role>.unsafe_max_bytes`, default an eighth of the memory, 256 MiB to 2 GiB, or 2 GiB when the memory is unknown), lowest heights first,
 never the head's. Evictions are logged. Readers must not expect blocks older than that.
 
 **Measured** (2026-10-04, synthetic, release build, Apple M-series): 3,600 linked blocks of 20
@@ -326,21 +326,21 @@ Neither needs a service. `storage::config` defines `StorageConfig { unsafe_chain
 UnsafeConfig, archive: ArchiveConfig, chain: ChainIdentity }` as plain data, with
 `UnsafeConfig { path, canyon_time, max_bytes }` (the journal's directory, the chain's Canyon
 time for receipts roots, the memory cap) and `ArchiveConfig { path }`. The archive cannot be
-disabled and keeps every block (section 9.3). The binary fills it from the environment:
+disabled and keeps every block (section 9.3). The binary fills it from TOML and machine-sized defaults:
 
-| Variable | Default | Meaning |
+| TOML field | Default | Meaning |
 |---|---|---|
-| `OP_INDEXER_UNSAFE_MAX_BYTES` | memory / 8, 256 MiB to 2 GiB | Memory the unsafe chain's blocks may take (section 3.1). |
+| `<role>.unsafe_max_bytes` | memory / 8, 256 MiB to 2 GiB | Memory the unsafe chain's blocks may take (section 3.1). |
 
 The binary opens the archive, then opens the unsafe chain and replays its journal, and fails
 fast if either is another chain's. The pipeline then writes the blocks.
 
 ### Several instances on one host
 
-Each instance needs its own data directory (`OP_INDEXER_DATA_DIR`, by default named after the
-chain: `data-op`, `data-unichain`, `data-base`), its own ports and its own `.env`. The archive,
+Each instance needs its own data directory (`<role>.data_dir`, by default
+`data/<role>` beside the configuration), its own ports and its chain configuration. The archive,
 the unsafe chain's journal and the node store all live in the data directory, record their
-chain and refuse another's. See [configuration.md](configuration.md#a-second-instance-on-the-same-host).
+chain and refuse another's. See [configuration.md](configuration.md#role-setup-and-defaults).
 
 Storage has no metrics: retries, reorgs, evictions and failed operations are logged.
 
@@ -363,7 +363,7 @@ Storage has no metrics: retries, reorgs, evictions and failed operations are log
 | `MAX_REORG_DEPTH` | 256 | jump and fill walks |
 | `MAX_ANCESTRY_BLOCKS` | 1024 | one `ancestry` call |
 | `EVENTS_KEPT` | 10000 | events kept for readers |
-| `OP_INDEXER_UNSAFE_MAX_BYTES` | memory / 8, 256 MiB to 2 GiB | the unsafe chain's memory cap |
+| `<role>.unsafe_max_bytes` | memory / 8, 256 MiB to 2 GiB | the unsafe chain's memory cap |
 | Journal cache / journal cap / memtable | 8 MiB / 64 MiB / 8 MiB | the unsafe chain's journal |
 | Archive cache / journal cap / memtable | 64 MiB / 128 MiB / 16 MiB per keyspace | fjall archive |
 | Archive background threads | 2 | fjall archive |
@@ -526,12 +526,12 @@ The indexer's archive keeps every block: it is the history the node serves and s
 is no window and no setting; the archive cannot be disabled. A server's archive is a tail
 (`tail/` in its data directory) that drops blocks once sealed chunks in R2 cover them.
 
-With the range sync on (`OP_INDEXER_EL_SYNC`) and no L1 side, the sync anchors on a block 64
+With the range sync on (`<role>.el.sync`) and no L1 side, the sync anchors on a block 64
 below the gossiped head, so the archive holds blocks L1 has not committed (the stream marks
 them unsafe), and an unsafe reorg deeper than 64 blocks leaves it on a dead branch, which only
 rebuilding the archive repairs. With the L1 side every archived block is committed.
 
-The archive lives at `{OP_INDEXER_DATA_DIR}/archive/`. The binary opens it at startup;
+The archive lives at `{<role>.data_dir}/archive/`. The binary opens it at startup;
 promotion and range sync write to it.
 
 **Sizing.** The full OP Mainnet archive (blocks 0 to 157,745,023, with senders) measured about

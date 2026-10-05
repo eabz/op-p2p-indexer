@@ -3,10 +3,10 @@
 //! [`R2Archive`]: sealed chunks read from R2 on demand, and a small local tail of committed
 //! blocks not sealed yet (`docs/serving.md` section 5).
 //!
-//! With `--export` (or `OP_INDEXER_EXPORT=true`) it is also the deployment's exporter, which seals full chunks from its tail
+//! With `--export` (or `server.export=true`) it is also the deployment's exporter, which seals full chunks from its tail
 //! into R2 (section 4). Exactly one server per deployment runs it, with the only R2 write key.
 //!
-//! Loads the `.env` file ([`op_indexer_runtime::env_file`]), sets up tracing, reads the
+//! Loads the TOML file ([`op_indexer_runtime::config`]), sets up tracing, reads the
 //! configuration (the node's, then the server's own), opens the
 //! tail and the chunk store, and runs the node ([`op_indexer_node::run`]) with the manifest
 //! follower and, when exporting, the exporter next to it.
@@ -39,7 +39,7 @@ const INDEX_DIR: &str = "index-build";
 const TAIL_DIR: &str = "tail";
 
 fn main() -> eyre::Result<()> {
-    let Startup::Run { env_file } =
+    let Startup::Run { config_file } =
         op_indexer_runtime::startup(env!("CARGO_BIN_NAME"), env!("CARGO_PKG_VERSION"))?
     else {
         return Ok(());
@@ -48,19 +48,19 @@ fn main() -> eyre::Result<()> {
         .enable_all()
         .build()
         .wrap_err("failed to start the tokio runtime")?
-        .block_on(run(env_file))
+        .block_on(run(config_file))
 }
 
-async fn run(env_file: Option<PathBuf>) -> eyre::Result<()> {
-    op_indexer_runtime::init_tracing(env_file.as_deref());
+async fn run(config_file: Option<PathBuf>) -> eyre::Result<()> {
+    op_indexer_runtime::init_tracing(config_file.as_deref());
 
     // A server exists to serve: it holds every sealed block and serves peers that sync from
     // it, so it keeps many execution sessions, where an indexer keeps few.
-    let config = Config::from_env_with(Defaults {
+    let config = Config::from_config_with(Defaults {
         el_max_sessions: sizing::server_el_sessions(Machine::get()),
     })?;
     let chain = config.chain();
-    let server = ServerConfig::from_env_and_args(chain)?;
+    let server = ServerConfig::from_config_and_args(chain)?;
     if op_indexer_runtime::config::check_requested() {
         tracing::info!("configuration valid");
         return Ok(());
@@ -81,7 +81,7 @@ async fn run(env_file: Option<PathBuf>) -> eyre::Result<()> {
             .try_exists()
             .wrap_err("failed to look for an indexer's archive")?,
         "{} holds an indexer's block archive: give the server a data directory of its own \
-         (OP_INDEXER_DATA_DIR)",
+         (server.data_dir)",
         config.data_dir().display()
     );
     let tail = FjallArchive::open(&config.data_dir().join(TAIL_DIR), storage.chain)

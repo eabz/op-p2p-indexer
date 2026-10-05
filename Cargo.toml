@@ -136,6 +136,8 @@ governor = { version = "0.10", default-features = false, features = ["std"] }
 arrow-flight = { version = "60", default-features = false }
 arrow-array = { version = "60", default-features = false }
 arrow-schema = { version = "60", default-features = false }
+# Inspect typed HTTP/2 I/O causes when tonic wraps a connection reset as UNKNOWN.
+h2 = { version = "0.4", default-features = false }
 # `IpcWriteOptions` for the schemas and record batches Flight sends; `lz4` and `zstd` for the
 # IPC buffer compression a client may ask for per `DoGet` (LZ4 frame, ZSTD), which readers such
 # as pyarrow undo transparently.
@@ -143,7 +145,7 @@ arrow-ipc = { version = "60", default-features = false, features = ["lz4", "zstd
 
 # Importer (`bin/op-indexer-import`) only. Command line: flags with environment fallbacks and
 # generated help.
-clap = { version = "4", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context", "string"] }
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "string"] }
 # HTTPS client for the archive service. No decompression features: answers are stored as they
 # travel. No HTTP/2: every request gets its own connection.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
@@ -170,7 +172,7 @@ object_store = { version = "0.14", default-features = false, features = ["aws", 
 mimalloc = { version = "0.1", default-features = false }
 # Typed configuration parsing and migration output; values remain outside process env.
 toml = { version = "1.1", default-features = false, features = ["std", "serde", "parse", "display"] }
-# Legacy NAME=value configuration, retained for one migration release.
+# Explicit legacy-to-TOML conversion only; never used to load runtime settings.
 dotenvy = { version = "0.15", default-features = false }
 
 [workspace.lints.rust]

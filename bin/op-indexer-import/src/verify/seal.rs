@@ -39,7 +39,7 @@ pub(super) const CHUNKS_PER_SEGMENT: usize = 16;
 /// Chunk indexes read at once when a resumed run rebuilds the hash index's input.
 const INDEX_READS: usize = 32;
 
-/// The store `args` name: a local directory, or R2 from the environment's credentials, in the
+/// The store `args` name: a local directory, or R2 from the configured credentials, in the
 /// chain's bucket (`<chain>-snapshot` unless given) under the prefix.
 pub(super) fn open_store(args: &VerifyArgs, plan: &Plan) -> eyre::Result<ChunkStore> {
     if let Some(dir) = &args.to_dir {

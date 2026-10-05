@@ -148,7 +148,7 @@ again.
 ```
 
 The bucket defaults to `<chain>-snapshot` (`op-snapshot`, `unichain-snapshot`,
-`base-snapshot`) and the prefix to `archive` (`OP_INDEXER_R2_BUCKET`, `OP_INDEXER_R2_PREFIX`).
+`base-snapshot`) and the prefix to `archive` (`r2.bucket`, `r2.prefix`).
 
 **D6.**
 - Every manifest segment records the chain id and genesis hash, and a reader of another chain
@@ -332,7 +332,7 @@ Unchanged code over `R2Archive`:
   - Read-ahead (5.2): each consumer owns a range stream that reads chunk after chunk ahead
     of it, at most 16 MiB per reader; dropping the reader cancels its producer. No shared
     next-block lookup, idle expiry, disk writes or chunk cache.
-    The read budget (`OP_INDEXER_SERVER_READ_BUDGET_MB`, default an eighth of the memory,
+    The read budget (`server.read_budget_mb`, default an eighth of the memory,
     256 MiB to 16 GiB, [configuration.md](configuration.md)) bounds them all,
     whatever the number of readers: half for decoded blocks read ahead, half for the chunk
     streams open at once (26 MiB each, with the server's reads of about a segment, two
@@ -352,10 +352,11 @@ Unchanged code over `R2Archive`:
       eth/69 anyway); eth/68 receipts whole. Measured on a local chunk: 256 headers 5 ms,
       256 bodies 2 ms, eth/69 receipts 7 ms, a skeleton page 3 ms of server time.
   - `Exporter` (section 4).
-- `bin/server`: `OP_INDEXER_CHUNKS_DIR` reads the chunks from a local directory instead of R2 (local runs, the bench); `--export` or `OP_INDEXER_EXPORT=true`; `OP_INDEXER_R2_ACCOUNT_ID`, `_BUCKET`, `_ACCESS_KEY_ID`,
-  `_SECRET_ACCESS_KEY`, `_ENDPOINT`; `OP_INDEXER_SERVER_ID` (default the host name), the
-  exporter's name too; the node's variables otherwise ([configuration.md](configuration.md)).
-- API keys (D18): `OP_INDEXER_STREAM_API_KEYS` on `indexer` and `server` alike, an interceptor on
+- `bin/server`: `server.chunks_dir` selects local chunks instead of R2; `--export` or
+  `server.export = true` enables export. Shared `[r2]` settings hold object-store credentials.
+  `server.id` defaults to the host name and also names the exporter. See
+  [configuration.md](configuration.md) for the remaining TOML settings.
+- API keys (D18): `<role>.stream.api_keys` on `indexer` and `server` alike, an interceptor on
   the gRPC and Flight services (`crates/api/src/auth.rs`); empty means no check.
 
 ### 5.6 The indexer's history from chunks (design, not built)
@@ -386,11 +387,11 @@ counted exactly.
 
 | Part | Bound | Set by |
 |---|---|---|
-| Unsafe chain | its blocks' encoded bytes, an eighth of the memory by default (256 MiB to 2 GiB) | `OP_INDEXER_UNSAFE_MAX_BYTES` |
-| Reads of sealed history (feeds) | half the budget for decoded blocks read ahead, half for open chunk streams (their GETs and decoded ranges); an eighth of the memory by default (256 MiB to 16 GiB) | `OP_INDEXER_SERVER_READ_BUDGET_MB` |
-| Flight builds (converting and encoding reads to Arrow) | two per core server-wide, within an eighth of the memory, each up to about 100 MiB until its messages are sent: 800 MiB on 4 cores, whatever the number of `DoGet`s | `OP_INDEXER_STREAM_MAX_BUILDS` (`crates/node/src/sizing.rs`) |
-| Flight messages queued per `DoGet` | 4 × about 2 MiB, × the `DoGet`s at once (as many as the builds by default, at least 8; 16: 128 MiB) | `OP_INDEXER_STREAM_MAX_FLIGHTS` |
-| Subscriptions catching up | one history batch each (64 blocks or 16 MiB) and their messages, × the subscriptions | `OP_INDEXER_STREAM_MAX_SUBSCRIPTIONS` |
+| Unsafe chain | its blocks' encoded bytes, an eighth of the memory by default (256 MiB to 2 GiB) | `<role>.unsafe_max_bytes` |
+| Reads of sealed history (feeds) | half the budget for decoded blocks read ahead, half for open chunk streams (their GETs and decoded ranges); an eighth of the memory by default (256 MiB to 16 GiB) | `server.read_budget_mb` |
+| Flight builds (converting and encoding reads to Arrow) | two per core server-wide, within an eighth of the memory, each up to about 100 MiB until its messages are sent: 800 MiB on 4 cores, whatever the number of `DoGet`s | `<role>.stream.max_builds` (`crates/node/src/sizing.rs`) |
+| Flight messages queued per `DoGet` | 4 × about 2 MiB, × the `DoGet`s at once (as many as the builds by default, at least 8; 16: 128 MiB) | `<role>.stream.max_flights` |
+| Subscriptions catching up | one history batch each (64 blocks or 16 MiB) and their messages, × the subscriptions | `<role>.stream.max_subscriptions` |
 | Exporter (one server per deployment) | the chunk being sealed (256 MiB of records, about 40 MB compressed) and one read of 64 MiB | `crates/chunks` (`CHUNK_BYTES`), `crates/server/src/export.rs` |
 | fjall tail and the unsafe chain's journal | caches of 64 and 8 MiB, memtables of at most 7 × 16 and 8 MiB | `crates/storage` |
 | Peer reads from R2 | `MAX_PEER_READS` reads in flight, each one answer | `crates/server/src/budget.rs` |
@@ -424,7 +425,7 @@ heartbeat:
 - heads: unsafe, safe, finalized, and the last sealed block it has read from the manifest;
 - contiguity (`contiguous_through`): the highest block N such that it holds every block from
   the chain's first through N, each with its receipts. A server holds the sealed chunks (R2),
-  its own tail (committed blocks above them; filled by range sync, `OP_INDEXER_EL_SYNC=true`)
+  its own tail (committed blocks above them; filled by range sync, `sync = true` in the role's `[el]` table)
   and its own unsafe chain (gossip since it started). Without range sync there is a gap
   between the last sealed block and the first block it gossiped: its head is above the gap
   but it cannot serve it. The server computes it at each heartbeat, cheaply, as the range
@@ -439,7 +440,7 @@ heartbeat:
   rate over each heartbeat interval);
 - stream limits: Flight `DoGet` streams and subscriptions at once (`max_flights`,
   `max_subscriptions`) and how many of each are taken now. A server with none free makes a
-  `DoGet` wait up to `OP_INDEXER_STREAM_FLIGHT_QUEUE_MS` (2 s) for a place, then refuses
+  `DoGet` wait up to `<role>.stream.flight_queue_ms` (2 s) for a place, then refuses
   with `RESOURCE_EXHAUSTED` ("too many Flight streams at once", "too many subscriptions"), so
   the picker counts them (6.4, 6.5). Unset from an older server, which is then taken to have
   room;
@@ -550,8 +551,7 @@ A ranged GET is a GET; the page does not say otherwise.
 **D18. API keys.** The balancer and the servers accept a request only with a key from their
 configured list, sent as gRPC metadata (`authorization: Bearer <key>`). That covers gRPC,
 Flight `GetFlightInfo` and Flight `DoGet`, which go straight to a server with the same key.
-Servers register with the balancer using a server key of their own. Keys come from the
-environment and are never logged. TLS is not part of this design.
+Servers register with the balancer using a server key of their own. Keys come from private TOML settings and are never logged. TLS is not part of this design.
 
 ### 6.7 As built
 
@@ -562,10 +562,10 @@ environment and are never logged. TLS is not part of this design.
   heartbeat with `Registered`. A 15 s gap between heartbeats, a heartbeat of another chain or
   id, or a newer registration of the same id ends the call, and the server's entry with it.
   The client (`register::Registration::run`, wired into `server` by
-  `OP_INDEXER_BALANCER_URL`) heartbeats every 5 s from a `watch` of the server's `Report`,
+  `server.balancer_url`) heartbeats every 5 s from a `watch` of the server's `Report`,
   and registers again after a backoff of 1 s doubling to 30 s with jitter. Only a bad
   configuration stops the server at startup (an invalid balancer URL or key, an invalid
-  `OP_INDEXER_SERVER_ADDRESS`, or none when the execution network is off). A server's address must be exactly `host:port` (`register::is_valid_address`).
+  `server.address`, or none when the execution network is off). A server's address must be exactly `host:port` (`register::is_valid_address`).
 - **Picking** (6.4, 6.5): servers with a free place of the kind the request takes (Flight or
   subscription; the jobs given out for the same request count against it) first, then by
   requests in flight plus those jobs, then bytes per second, ties round-robin
@@ -577,8 +577,8 @@ environment and are never logged. TLS is not part of this design.
   in each `FlightInfo`). A range is clipped by the best reach among the servers (the head of
   its cap, but no further than the server's `contiguous_through`), and may not start below the
   first sealed chunk (`OUT_OF_RANGE`). `ordered` is set.
-- **Keys** (D18): `Locate` and Flight take a user key from `OP_INDEXER_STREAM_API_KEYS`, the
-  servers' own list; `Register` takes a server key from `OP_INDEXER_BALANCER_SERVER_KEYS`,
+- **Keys** (D18): `Locate` and Flight take a user key from `<role>.stream.api_keys`, the
+  servers' own list; `Register` takes a server key from `balancer.server_keys`,
   which is required. Checked per call (`op_indexer_api::ApiKeys`: an interceptor on Flight,
 `verify` in `Register` and `Locate`), never logged.
 - **Load reporting**: servers report measured `bytes_per_second` from the change in encoded
@@ -599,7 +599,7 @@ sealed chunks straight from R2: no server CPU or egress, and R2 egress is free.
   Flight call. The part above the last sealed chunk is not in a raw plan: read it from a server.
 - **Signing.** `ChunkSigner` (`crates/chunks/src/raw.rs`) signs with object_store's S3 signer,
   locally, no request made. The URL carries the key's id, never its secret. The key is the
-  balancer's `OP_INDEXER_R2_PRESIGN_ACCESS_KEY_ID` / `OP_INDEXER_R2_PRESIGN_SECRET_ACCESS_KEY`:
+  balancer's `r2.presign_access_key_id` / `r2.presign_secret_access_key`:
   give it a **read-only** R2 token (a URL is good for whoever holds it until it expires).
   Without them the balancer refuses raw plans (`FAILED_PRECONDITION`).
 - **Client.** `import fetch --balancer <url> --from <n> --to <n> [--out fetched]
@@ -621,7 +621,7 @@ sealed chunks straight from R2: no server CPU or egress, and R2 egress is free.
 ### 6.9 Optional Cloudflare cache in front of R2 (2026-10-05)
 
 R2 GETs cost $0.36 per million and every server read goes to R2. With
-`OP_INDEXER_R2_PUBLIC_URL` set (a custom domain on the bucket, behind Cloudflare's cache, e.g.
+`r2.public_url` set (a custom domain on the bucket, behind Cloudflare's cache, e.g.
 `https://chunks.example.com`), the servers read **sealed chunk** ranges from it over plain
 HTTPS (`https://<domain>/<prefix>/chunks/…`, ranged GETs; Cloudflare serves ranges from the
 cached object), and a cache hit costs no R2 operation. On any error (after one quick retry)
@@ -641,7 +641,7 @@ Setup, in the Cloudflare dashboard:
    for cache, edge TTL a long fixed time (e.g. a month; chunks never change), browser TTL
    respected or short. Objects above the plan's cacheable size limit (512 MB on Free/Pro) are
    not cached; a chunk is about 40 MB.
-4. Set `OP_INDEXER_R2_PUBLIC_URL=https://chunks.example.com` on the servers, the exporter
+4. Set `public_url = "https://chunks.example.com"` in `[r2]` on the servers, the exporter
    included (it reads chunk indexes through it too). The importer and the balancer ignore it.
 
 The public domain makes the chunks world-readable. They are the chain's public history, and
@@ -680,15 +680,17 @@ seconds) bounds planning. A worker process crash aborts the run, since its share
 cannot safely be recovered. The client checks that plan tickets cover exactly the requested
 range with no gaps or overlaps; a head-clipped plan fails before any reads start.
 
-It needs pyarrow and an API key in `KEY`. Release archives also include the script as
+This comparison client needs PyArrow and Python 3.11 or newer (or `tomli` on older Python).
+It reads `bench.api_key` and `bench.balancer_url` from `--config PATH`, defaulting to
+`config.toml`. Native benchmark usage is in [bench.md](bench.md). Release archives include the script as
 `bench.py`:
 
 ```bash
-python3 scripts/bench.py --balancer grpc://balancer.example:50060 --table blocks --from 40000000 --to 45000000 --processes 4 --threads 6 --per-server 8
+python3 scripts/bench.py --config /path/to/config.toml --balancer grpc://balancer.example:50060 --table blocks --from 40000000 --to 45000000 --processes 4 --threads 6 --per-server 8
 ```
 
-Replace `balancer.example` with the deployment's balancer and set `KEY` in the environment
-first.
+Replace `balancer.example` with the deployment's balancer and put its client key in the
+private TOML configuration.
 
 **What the numbers mean.** Progress counts decoded Arrow bytes as batches arrive, including
 bytes from attempts that subsequently fail. Final useful MB/s and rows/s count only

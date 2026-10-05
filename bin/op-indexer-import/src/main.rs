@@ -59,16 +59,16 @@ const DEFAULT_CHUNK_BLOCKS: u64 = 1000;
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> eyre::Result<()> {
-    // Before the `.env` file, which may not load: clap's `--version` answers only after it.
+    // Answer version requests before loading configuration.
     if op_indexer_runtime::version_requested(env!("CARGO_BIN_NAME"), env!("CARGO_PKG_VERSION")) {
         return Ok(());
     }
     if config::command(env!("CARGO_BIN_NAME"))? {
         return Ok(());
     }
-    let env_file = config::initialize(env!("CARGO_BIN_NAME"))?;
+    let config_file = config::initialize(env!("CARGO_BIN_NAME"))?;
     if config::check_requested() {
-        op_indexer_runtime::init_tracing(env_file.as_deref());
+        op_indexer_runtime::init_tracing(config_file.as_deref());
         tracing::info!(
             "configuration valid; operation-specific requirements are checked by each import command"
         );
@@ -79,12 +79,11 @@ fn main() -> eyre::Result<()> {
         .enable_all()
         .build()
         .wrap_err("failed to start the tokio runtime")?
-        .block_on(run(cli, env_file))
+        .block_on(run(cli, config_file))
 }
 
-async fn run(cli: Cli, env_file: Option<PathBuf>) -> eyre::Result<()> {
-    op_indexer_runtime::init_tracing(env_file.as_deref());
-    cli::warn_deprecated();
+async fn run(cli: Cli, config_file: Option<PathBuf>) -> eyre::Result<()> {
+    op_indexer_runtime::init_tracing(config_file.as_deref());
     // Startup-only blocking I/O, before any task runs; `fetch` needs no state directory.
     let open = || State::open(&cli.state_dir).wrap_err("failed to open the state directory");
 
