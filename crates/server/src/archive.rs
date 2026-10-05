@@ -48,8 +48,13 @@ const MANIFEST_REFRESH: Duration = Duration::from_secs(30);
 /// and asks again from its end.
 const MAX_SPACED_HEADERS: usize = 64;
 const SPACED_READS: usize = 16;
-/// How a spaced header is read: its own segment and nothing more.
-const ONE_SEGMENT: StreamReads = StreamReads::fixed(1, 1);
+/// How a spaced header is read: its own segment and nothing more, without its receipts.
+const ONE_SEGMENT: StreamReads = StreamReads {
+    range_bytes: 1,
+    in_flight: 1,
+    lend: None,
+    parts: ReadParts::WithoutReceipts,
+};
 
 /// One item, of any size.
 const ONE: ReadLimits = ReadLimits {
@@ -296,7 +301,15 @@ impl<S: ChunkSource> R2Archive<S> {
             limits,
             convert,
         };
-        let mut cursor = Cursor::new(self, sealed);
+        // What of each block the answer needs: rebuilding receipts' blooms is most of what
+        // reading a sealed block costs. Headers and bodies need no receipts; receipts sent the
+        // eth/69 way (converted, which drops the bloom) need no blooms.
+        let parts = match read {
+            BlockRead::Headers { .. } | BlockRead::Bodies(_) => ReadParts::WithoutReceipts,
+            BlockRead::Receipts(_) if convert.is_some() => ReadParts::WithoutBlooms,
+            BlockRead::Receipts(_) => ReadParts::Whole,
+        };
+        let mut cursor = Cursor::new(self, sealed, parts);
         match read {
             BlockRead::Headers {
                 start,
@@ -585,16 +598,19 @@ struct Cursor<'a, S> {
     archive: &'a R2Archive<S>,
     sealed: Sealed,
     open: Option<(BlockNumber, BoxStream<'static, io::Result<ArchivedBlock>>)>,
+    /// What of each block is read.
+    parts: ReadParts,
     /// Bytes read from R2 so far.
     bytes: u64,
 }
 
 impl<'a, S: ChunkSource> Cursor<'a, S> {
-    const fn new(archive: &'a R2Archive<S>, sealed: Sealed) -> Self {
+    const fn new(archive: &'a R2Archive<S>, sealed: Sealed, parts: ReadParts) -> Self {
         Self {
             archive,
             sealed,
             open: None,
+            parts,
             bytes: 0,
         }
     }
@@ -619,10 +635,14 @@ impl<'a, S: ChunkSource> Cursor<'a, S> {
             let Some(chunk) = self.sealed.find(number) else {
                 return Ok(None);
             };
-            let mut stream = self
-                .archive
-                .source
-                .stream(chunk, number, crate::feed::PEER_READS);
+            let mut stream = self.archive.source.stream(
+                chunk,
+                number,
+                StreamReads {
+                    parts: self.parts,
+                    ..crate::feed::PEER_READS
+                },
+            );
             let Some(block) = stream.next().await else {
                 return Ok(None);
             };

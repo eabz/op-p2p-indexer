@@ -445,6 +445,11 @@ Unchanged code over `R2Archive`:
       run of hashes costs one index lookup; a stream continues into the next chunk; a
       spaced header request (a skeleton) answers at most 64 headers, read 16 at once, one
       segment each.
+    - Each reads only what its answer needs (`ReadParts`): headers and bodies without the
+      receipts, eth/69 receipts without rebuilding their blooms (the bloom is dropped for
+      eth/69 anyway); eth/68 receipts whole. Measured on the local chunk without added
+      latency (2026-10-05): 256 headers 43 → 5 ms, 256 bodies 23 → 2 ms, eth/69 receipts
+      21 → 7 ms, a skeleton page 28 → 3 ms of server time.
   - `Exporter` (section 4): adds a block to the chunk being written once it is finalized and
     has its receipts, and publishes the chunk when the writer ends it.
 - `bin/server`: `OP_INDEXER_CHUNKS_DIR` reads the chunks from a local directory instead of R2 (local runs, the bench); `--export` or `OP_INDEXER_EXPORT=true`; `OP_INDEXER_R2_ACCOUNT_ID`, `_BUCKET`, `_ACCESS_KEY_ID`,
