@@ -45,7 +45,6 @@ use op_alloy_consensus::{
 };
 use op_indexer_chainspec::{ChainSpec, Hardfork};
 
-use crate::rows::BlockRow;
 use crate::rpc::RpcHeader;
 use crate::source::{HyperSync, L1Header, SourceError};
 
@@ -174,18 +173,6 @@ impl Parent {
             extra_data: header.extra_data.clone()?,
         })
     }
-
-    /// The parent a downloaded row gives (with its fill), if it has its base fee.
-    pub(super) fn of_row(block: &BlockRow) -> Option<Self> {
-        Some(Self {
-            number: block.number,
-            timestamp: block.timestamp.to(),
-            gas_limit: block.gas_limit.to(),
-            gas_used: block.gas_used.to(),
-            base_fee: block.base_fee_per_gas?.to(),
-            extra_data: block.extra_data.clone(),
-        })
-    }
 }
 
 /// The base fee of the block after `parent`, at `timestamp`, by EIP-1559 as the OP Stack runs
@@ -221,20 +208,30 @@ fn base_fee(chain: &ChainSpec, parent: &Parent, timestamp: u64) -> Option<u64> {
     ))
 }
 
-/// The source hashes of a block's deposits, in their order, from its L1-attributes deposit,
-/// the portal's logs in its L1 origin (`logs`, if the epoch starts here) and the fork it is
-/// the first block of; `None` if the deposits are not those.
-fn sources(chain: &ChainSpec, row: &HeaderRow, l1: &L1Data) -> Option<Vec<B256>> {
+/// The source hashes of a block's deposits, in their order, with what each is from: its
+/// L1-attributes deposit, the portal's logs in its L1 origin (if the epoch starts here) and
+/// the fork it is the first block of; `None` if the deposits are not those.
+fn sources(chain: &ChainSpec, row: &HeaderRow, l1: &L1Data) -> Option<Vec<(B256, Derivation)>> {
     let info = row.l1_info?;
     let deposits = usize::try_from(row.deposits).ok()?;
     let mut hashes = Vec::with_capacity(deposits);
-    hashes.push(L1InfoDepositSource::new(info.hash, info.sequence).source_hash());
+    hashes.push((
+        L1InfoDepositSource::new(info.hash, info.sequence).source_hash(),
+        Derivation::L1Info {
+            origin: info.number,
+            sequence: info.sequence,
+        },
+    ));
     if info.sequence == 0 && deposits > 1 {
-        hashes.extend(
-            l1.logs(info)?
-                .iter()
-                .map(|&index| UserDepositSource::new(info.hash, index).source_hash()),
-        );
+        hashes.extend(l1.logs(info)?.iter().map(|&log_index| {
+            (
+                UserDepositSource::new(info.hash, log_index).source_hash(),
+                Derivation::User {
+                    origin: info.number,
+                    log_index,
+                },
+            )
+        }));
     }
     let upgrades = deposits.checked_sub(hashes.len())?;
     if upgrades > 0 {
@@ -248,11 +245,12 @@ fn sources(chain: &ChainSpec, row: &HeaderRow, l1: &L1Data) -> Option<Vec<B256>>
         if intents.len() != upgrades {
             return None;
         }
-        hashes.extend(
-            intents
-                .iter()
-                .map(|intent| UpgradeDepositSource::new((*intent).to_owned()).source_hash()),
-        );
+        hashes.extend(intents.iter().map(|&intent| {
+            (
+                UpgradeDepositSource::new(intent.to_owned()).source_hash(),
+                Derivation::Upgrade(intent),
+            )
+        }));
     }
     Some(hashes)
 }
@@ -322,6 +320,31 @@ pub(super) struct Source {
     pub(super) number: u64,
     pub(super) index: u64,
     pub(super) hash: B256,
+    from: Derivation,
+}
+
+/// What a rebuilt source hash is derived from, by the deposit's kind.
+#[derive(Debug, Clone, Copy)]
+enum Derivation {
+    L1Info { origin: u64, sequence: u64 },
+    User { origin: u64, log_index: u64 },
+    Upgrade(&'static str),
+}
+
+impl fmt::Display for Derivation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::L1Info { origin, sequence } => write!(
+                f,
+                "L1-attributes deposit of L1 origin {origin}, sequence number {sequence}"
+            ),
+            Self::User { origin, log_index } => write!(
+                f,
+                "user deposit of the portal log at index {log_index} of L1 block {origin}"
+            ),
+            Self::Upgrade(intent) => write!(f, "upgrade deposit \"{intent}\""),
+        }
+    }
 }
 
 /// The rebuild of one chunk's missing fields.
@@ -334,27 +357,53 @@ pub(super) struct Rebuilt {
     pub(super) sources: Vec<Source>,
     /// The blocks with a field that cannot be rebuilt, and that field (the first).
     pub(super) left: Vec<(BlockNumHash, &'static str)>,
-    /// The blocks whose user deposits' source hashes were rebuilt, with the L1 log indexes
-    /// they were rebuilt from: what to look at when such a block does not hash.
-    pub(super) from_logs: Vec<FromLogs>,
 }
 
-/// The portal logs a block's user deposits' source hashes were rebuilt from.
-#[derive(Debug)]
-pub(super) struct FromLogs {
-    block: u64,
-    origin: u64,
-    log_indexes: Vec<u64>,
-}
-
-impl fmt::Display for FromLogs {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "block {} from the logs of L1 block {} at indexes {:?}",
-            self.block, self.origin, self.log_indexes
-        )
+/// Every field rebuilt for block `number` among `headers` and `sources`, with its value and,
+/// for a source hash, what it is from: the header hash covers them all at once, and the rows
+/// carry no transaction hashes or roots to tell them apart.
+pub(super) fn describe(number: u64, headers: &[RpcHeader], sources: &[Source]) -> String {
+    let mut fields = Vec::new();
+    if let Some(header) = headers
+        .iter()
+        .find(|header| header.number.to::<u64>() == number)
+    {
+        let hashes = [
+            ("mix_hash", header.mix_hash),
+            ("parent_beacon_block_root", header.parent_beacon_block_root),
+            ("withdrawals_root", header.withdrawals_root),
+        ];
+        let numbers = [
+            ("base_fee_per_gas", header.base_fee_per_gas),
+            ("blob_gas_used", header.blob_gas_used),
+            ("excess_blob_gas", header.excess_blob_gas),
+        ];
+        fields.extend(
+            hashes
+                .iter()
+                .filter_map(|(field, value)| Some(format!("{field} {}", (*value)?))),
+        );
+        fields.extend(
+            numbers
+                .iter()
+                .filter_map(|(field, value)| Some(format!("{field} {}", (*value)?))),
+        );
     }
+    fields.extend(
+        sources
+            .iter()
+            .filter(|source| source.number == number)
+            .map(|source| {
+                format!(
+                    "transaction {}'s source_hash {} ({})",
+                    source.index, source.hash, source.from
+                )
+            }),
+    );
+    if fields.is_empty() {
+        return format!("nothing was rebuilt for block {number}");
+    }
+    format!("rebuilt for block {number}: {}", fields.join(", "))
 }
 
 /// Rebuilds the fields `rows` (one chunk's, in block order) lack, from `l1` and from `parent`,
@@ -411,25 +460,14 @@ pub(super) fn rebuild(
         }
         let mut sources = Vec::new();
         if !row.lacking_sources.is_empty() {
-            if let Some(info) = row.l1_info
-                && info.sequence == 0
-                && row.deposits > 1
-                && let Some(log_indexes) = l1.logs(info)
-                && !log_indexes.is_empty()
-            {
-                rebuilt.from_logs.push(FromLogs {
-                    block: row.number,
-                    origin: info.number,
-                    log_indexes: log_indexes.to_vec(),
-                });
-            }
             match self::sources(chain, row, l1) {
                 Some(hashes) => sources.extend(row.lacking_sources.iter().filter_map(|&index| {
-                    let hash = *hashes.get(usize::try_from(index).ok()?)?;
+                    let (hash, from) = *hashes.get(usize::try_from(index).ok()?)?;
                     Some(Source {
                         number: row.number,
                         index,
                         hash,
+                        from,
                     })
                 })),
                 None => {

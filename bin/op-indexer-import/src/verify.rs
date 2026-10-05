@@ -175,18 +175,22 @@ impl Stats {
 }
 
 /// Rebuilds the downloaded chunk at `raw` with its fill at `fill` and then `overlay` as
-/// `verify` does, and says why it does not rebuild to its hashes, if it does not: `fill`'s
-/// check of the header fields it rebuilt, before it writes them. Blocking, CPU-bound.
+/// `verify` does, and says why it does not rebuild to its hashes, if it does not, with the
+/// block that does not, if one: `fill`'s check of the fields it rebuilt, before it writes them.
+/// Blocking, CPU-bound.
 pub(crate) fn rebuild_error(
     forks: &Forks,
     chunk: Chunk,
     raw: &std::path::Path,
     fill: &std::path::Path,
     overlay: crate::fill::Fill,
-) -> Option<String> {
-    block::verify_chunk(forks, chunk, raw, fill, Some(overlay))
-        .err()
-        .map(|err| err.to_string())
+) -> Option<(Option<u64>, String)> {
+    let err = block::verify_chunk(forks, chunk, raw, fill, Some(overlay)).err()?;
+    let block = match &err {
+        ChunkError::Block { number, .. } => Some(*number),
+        ChunkError::Fill(_) | ChunkError::Rows { .. } => None,
+    };
+    Some((block, err.to_string()))
 }
 
 /// Verifies, seals and uploads the blocks of `plan` the store does not list yet, then, once
