@@ -18,6 +18,7 @@
 use std::path::Path;
 
 use alloy_consensus::{EMPTY_OMMER_ROOT_HASH, Header};
+use alloy_eips::eip1559::INITIAL_BASE_FEE;
 use alloy_eips::eip7685::EMPTY_REQUESTS_HASH;
 use alloy_primitives::{B256, Bloom, keccak256};
 use op_indexer_primitives::{
@@ -126,9 +127,17 @@ fn verify_block(
         None if row.number <= forks.bedrock_block => (B256::ZERO, true),
         None => return Err(Check::MissingMixHash),
     };
+    // The Bedrock block is the chain's first London block, whose base fee is EIP-1559's
+    // initial one; the header hash proves the guess. Any later block's base fee is required.
+    let (base_fee, rebuilt_fee) = match row.base_fee_per_gas {
+        Some(fee) => (Some(fee.to()), false),
+        None if row.number == forks.bedrock_block => (Some(INITIAL_BASE_FEE), true),
+        None => (None, false),
+    };
     stats.rebuilt_header_fields = stats
         .rebuilt_header_fields
-        .saturating_add(u64::from(rebuilt));
+        .saturating_add(u64::from(rebuilt))
+        .saturating_add(u64::from(rebuilt_fee));
     let mut encodings = Vec::with_capacity(transactions.len());
     let mut senders = Vec::with_capacity(transactions.len());
     let mut receipts = Vec::with_capacity(transactions.len());
@@ -168,7 +177,7 @@ fn verify_block(
         transactions_root,
         receipts_root,
         logs_bloom,
-        mix_hash,
+        (mix_hash, base_fee),
     );
     let computed = keccak256(&header);
     if computed != row.hash {
@@ -191,15 +200,15 @@ fn verify_block(
 }
 
 /// Encodes the header of `row` with the roots and the bloom computed from the block's
-/// transactions, receipts and logs, and `mix_hash` (the row's, or zero for a legacy row
-/// without it).
+/// transactions, receipts and logs, and `mix_hash` and the base fee (the row's, or rebuilt
+/// where the row lacks them, see [`verify_block`]).
 fn encode_header(
     forks: &Forks,
     row: &BlockRow,
     transactions_root: B256,
     receipts_root: B256,
     logs_bloom: Bloom,
-    mix_hash: B256,
+    (mix_hash, base_fee_per_gas): (B256, Option<u64>),
 ) -> Vec<u8> {
     let timestamp: u64 = row.timestamp.to();
     alloy_rlp::encode(Header {
@@ -218,7 +227,7 @@ fn encode_header(
         extra_data: row.extra_data.clone(),
         mix_hash,
         nonce: row.nonce,
-        base_fee_per_gas: row.base_fee_per_gas.map(|fee| fee.to()),
+        base_fee_per_gas,
         withdrawals_root: row.withdrawals_root,
         blob_gas_used: row.blob_gas_used.map(|gas| gas.to()),
         excess_blob_gas: row.excess_blob_gas.map(|gas| gas.to()),

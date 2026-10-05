@@ -62,17 +62,16 @@ pub(crate) fn missing(forks: &Forks, rows: &Rows, mut found: impl FnMut(Missing,
 /// Calls `found` with each header field of `block`'s forks that its row lacks.
 fn header(forks: &Forks, block: &BlockRow, mut found: impl FnMut(&'static str)) {
     let timestamp: u64 = block.timestamp.to();
-    let bedrock = block.number >= forks.bedrock_block;
+    // The Bedrock block's own `mix_hash` and base fee are rebuilt by `verify` (zero, and
+    // EIP-1559's initial base fee); every later block needs them.
+    let after_bedrock = block.number > forks.bedrock_block;
     let canyon = timestamp >= forks.canyon;
     let ecotone = timestamp >= forks.ecotone;
     let fields = [
-        (
-            "mix_hash",
-            block.number > forks.bedrock_block && block.mix_hash.is_none(),
-        ),
+        ("mix_hash", after_bedrock && block.mix_hash.is_none()),
         (
             "base_fee_per_gas",
-            bedrock && block.base_fee_per_gas.is_none(),
+            after_bedrock && block.base_fee_per_gas.is_none(),
         ),
         (
             "withdrawals_root",
