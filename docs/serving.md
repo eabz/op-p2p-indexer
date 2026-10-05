@@ -1,12 +1,13 @@
 # Serving at scale: chunks, `server` and `balancer`
 
-Status: **built, except the balancer.** The storage core (`crates/chunks`, sections 1, 2 and
-2.4) and the converter (`import export`, section 3) are built and checked end to end against a
-local directory. The stateless `server` (`crates/server`, `bin/server`: history from R2 with no
-cache, section 5; the exporter, `server --export`, section 4) is built and not yet run against
-R2 (5.5). The `balancer` is in progress; the bench comes next. Decision: [roadmap.md](roadmap.md),
-2026-10-04, "Four binaries". Decisions are marked **D**; the user's answers of 2026-10-04 settled
-the open questions (they are recorded in the decisions). Measurements are from 2026-10-04.
+Status: **built.** The storage core (`crates/chunks`, sections 1, 2 and 2.4) and the converter
+(`import verify`, section 3, which replaced `import export`) are built and checked end to end
+against a local directory. The stateless `server` (`crates/server`, `bin/server`: history from
+R2 with no cache, section 5; the exporter, `server --export`, section 4) is built and not yet
+run against R2 (5.5). The `balancer` (section 6) is built and checked locally (6.7); the bench
+comes next. Decision: [roadmap.md](roadmap.md), 2026-10-04, "Four binaries". Decisions are
+marked **D**; the user's answers of 2026-10-04 settled the open questions (they are recorded in
+the decisions). Measurements are from 2026-10-04.
 
 Four binaries (`op-indexer` is renamed `indexer`; the importer keeps its `import` command):
 
@@ -14,7 +15,7 @@ Four binaries (`op-indexer` is renamed `indexer`; the importer keeps its `import
 |---|---|---|
 | `indexer` | Today's node: one user, every service in one process | fjall archive, unsafe chain in memory + fjall journal |
 | `server` | A full node (p2p layers, its own unsafe chain, serving peers, gRPC and Flight) that holds no history: it reads sealed chunks from R2 on demand and streams them; one server per deployment also exports (section 4) | a small fjall tail of unsealed committed blocks, unsafe chain in memory + fjall journal; no chunk cache |
-| `importer` (`import`) | Today's importer, plus the one-time converter of `verified/` to chunks (section 3) | state directory, R2 (write, during the conversion) |
+| `importer` (`import`) | Downloads a chain from an external archive; `verify` checks every block and uploads it as sealed chunks (section 3) | state directory, R2 (write) |
 | `balancer` | The single entry point: keeps the servers' health and load, splits each request into per-chunk jobs and spreads them over the servers; no block data passes through it | an in-memory table |
 
 R2 holds only sealed, immutable history. Live and recent data never go through R2: every
@@ -254,6 +255,14 @@ moving part and it is not needed while by-hash reads of old blocks stay rare: et
 number, except for the block a range sync starts from.
 
 ## 3. The converter: `verified/` to chunks (one-time)
+
+**Superseded (2026-10-05, the user's decision).** `import export` and the verified copy are
+gone: `import verify` checks each downloaded chunk, seals the blocks into the same D4 chunks
+and uploads them, deleting the downloaded chunks as it goes, and lists them in the manifest
+only once the last block matches the anchor. Base's 2.57 TB of downloaded chunks did not fit
+twice on its disk. See `docs/import.md`, section 3.2. The rest of this section is the design
+as it was built for `export`; its chunk format, cuts, upload and index are what `verify` does
+now.
 
 **D10.** An `import` subcommand, `import export --state-dir <dir>`, not a separate tool, which
 replaces `import load` (removed, 2026-10-04). It runs once per existing `verified/` folder (OP Mainnet's and Unichain's on the user's
@@ -574,11 +583,11 @@ environment and are never logged. TLS is not part of this design.
 Setup:
 - 2 or 3 `server`s (no cache), one of them with `--export`;
 - one `balancer`;
-- a bucket filled by `import export` from OP Mainnet's `verified/`.
+- a bucket filled by `import verify` from OP Mainnet's downloaded chunks.
 
 Measure:
-- **Converter**: blocks/s and MB/s from `verified/` to R2; total time and objects; R2 Class A
-  operations.
+- **Converter** (`import verify`): blocks/s and MB/s from the downloaded chunks to R2; total
+  time and objects; R2 Class A operations.
 - **R2 from a droplet**:
   - time to first byte, and its spread;
   - streaming throughput per server, with 1, 4 and 16 GETs in flight;
@@ -617,7 +626,8 @@ Measure:
   - the chunk index and footer, `R2Archive` with its streaming read-ahead, and the hash index
     shards (D9);
   - the R2 client (an S3-compatible crate, chosen when built) and the manifest;
-  - `import export` (the converter) and `server --export` (the exporter);
+  - `import verify` (checks and uploads; it replaced `import export`) and `server --export`
+    (the exporter);
   - the `server` and `balancer` binaries, the registration protocol and the API keys.
 - **Settled by the bench, not decided here**: the chunk size target (D4), whether R2 honours
   conditional PUT (D8), level 1 against level 3 on real servers (D3).

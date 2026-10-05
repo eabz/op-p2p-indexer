@@ -2,11 +2,13 @@
 
 Status: **built; the whole OP Mainnet chain (blocks 0 to 157,745,023) has been downloaded
 and verified on the real service, and Unichain's verified on the user's server; Base (8453) is
-supported and has not run yet (section 10). Three steps: `download` (with the fill from the
-chain's RPC of what the service leaves out, section 3.1a), `verify`, and `export` of the
-verified history to object storage as sealed chunks (section 3.3), which servers read from
-(`docs/serving.md`). `load` (into the node's fjall archive) was removed on 2026-10-04 (section
-4). ClickHouse is no longer part of the project.**
+supported, its download is on the user's server (2.57 TB of downloaded chunks, 2026-10-05) and
+it has not been verified yet (section 10). Two steps: `download` (with the fill from the
+chain's RPC of what the service leaves out, section 3.1a), and `verify`, which checks every
+block, seals the range into chunks and uploads them to object storage (section 3.2), which
+servers read from (`docs/serving.md`). The former `export` step and the verified copy it read
+were folded into `verify` on 2026-10-05. `load` (into the node's fjall archive) was removed on
+2026-10-04 (section 4). ClickHouse is no longer part of the project.**
 
 **Goal (user, 2026-10-04): sync the whole chain from HyperSync as a separate process, usable
 for any chain, into the store that servers serve history from (R2 chunks since the "Four
@@ -15,8 +17,9 @@ binaries" decision); then test a normal p2p sync against those servers.**
 OP Mainnet's blocks before the Bedrock upgrade (0 to 105,235,062) cannot be re-executed by a
 modern EVM, and no execution peer we reached serves them (`docs/el-viability.md`). This binary
 downloads a chain's blocks from Envio HyperSync, verifies every block against a trusted anchor,
-and exports the verified bytes as sealed chunks to Cloudflare R2. It keeps what it downloaded,
-so `verify` and `export` can be repeated without HyperSync.
+and seals the verified bytes into chunks that it uploads to Cloudflare R2. It keeps each
+downloaded chunk until the sealed chunks covering it are uploaded, so a stopped `verify`
+continues without HyperSync.
 
 It is a separate binary: the indexer never links it and never talks to an external service.
 The HTTP client and the compression crates belong to this package only.
@@ -59,6 +62,9 @@ again; a completed chunk is never redone.
   HTTP/1.1 connection.
 - A response may cover less than the range asked for; the chunk is complete only when every
   block of it has arrived.
+- **Done chunks.** A chunk is done when its file is in `raw/`, or when the records of sealed
+  chunks (`sealed/`, section 3.2) cover it whole: `verify` deleted its file once it was sealed
+  and uploaded. Only the other chunks are fetched.
 - **Stored as it travels.** The response body is written to the chunk's file exactly as
   received, in the content encoding the service chose (zstd is asked for first, then gzip),
   after one byte naming that encoding. Nothing is decompressed to be compressed again. The
@@ -104,18 +110,20 @@ Two gaps are known, both on Unichain; OP Mainnet's whole chain verified without 
   transaction rows is a hole: the whole block is fetched.
 
 - **Checked after every download.** Once the chunks are on disk, `download` reads every chunk
-  not verified yet (one per core at a time, within `verify`'s 256 MiB of downloaded bytes in
-  flight) and lists every field its rows lack that the
+  not sealed yet (one per core at a time, within 256 MiB of downloaded bytes in flight, the
+  bound `verify` uses too) and
+  lists every field its rows lack that the
   rebuild needs, or fills with a default the header hash must then prove: header fields of
   the block's forks (`mix_hash` and `base_fee_per_gas` from Bedrock, `withdrawals_root` from
   Canyon, the blob gas fields and the parent beacon block root from Ecotone), the fields of
   each transaction type, a receipt's status, and a deposit receipt's nonce and version from
   Canyon. Each is logged once, at warn, with its count and its first block: one pass shows
   them all, where `verify` would stop at the first. Progress is logged every 10 seconds
-  (chunks per second, time left). The pass costs about what reading the rows costs `verify`
-  (decompress and parse, no hashing, nothing written): by section 6's measurements about a
-  third of a `verify` pass over the same chunks. It runs again on every `download` over the
-  chunks still not verified, and skips the verified ones.
+  (chunks per second, time left). The pass costs what reading the rows costs `verify`
+  (decompress and parse; no hashing, no signature, nothing written): by section 6's
+  measurements about 20 ms of processor time per 1,000 legacy blocks, of `verify`'s 0.17 s.
+  It runs again on every `download` over the chunks not sealed yet, and skips those the
+  sealed records cover (their files are gone).
 - **Left out** means: a type-4 row with no `authorization_list`, no bytes, or a list of zero
   entries (the service writes an empty list as a count of zero, as it does `access_list`), and
   no fill. The scan and `verify` use the same rule (`TransactionRow::lacks_authorization_list`).
@@ -133,15 +141,15 @@ Two gaps are known, both on Unichain; OP Mainnet's whole chain verified without 
 - **Kept apart.** What is fetched goes to the chunk's fill, `raw/<from>-<to>.fill.json`,
   written atomically and durably, in the RPC's JSON form (a list per transaction; a hole's
   transactions and receipts with their logs); the downloaded chunk stays as received. A
-  chunk downloaded again loses its old fill first. `verify` stays offline: it puts the fill
+  chunk downloaded again loses its old fill first. `verify` reads no RPC: it puts the fill
   into the rows before rebuilding, a list into its transaction, a hole's transactions and
   logs as rows like the service's (the receipt's fields with the transaction's, the access
   list in the service's layout). A type-4 row with no list, or a block after Bedrock with no
   transactions, and no fill, fails `verify` with a message to run `download`, not the generic
-  hash mismatch.
+  hash mismatch. A fill is deleted with its downloaded chunk once that chunk is sealed.
 - **Trust unchanged.** What is filled goes into the rebuilt block; the transactions and
   receipts roots, so the header hash, prove it. A hole's senders are the endpoint's `from`,
-  which `export` recovers from the signatures and checks like every other. A wrong fill fails `verify` like a wrong row (checked: one
+  which `verify` recovers from the signatures and checks like every other. A wrong fill fails `verify` like a wrong row (checked: one
   changed signature byte gives a header hash mismatch).
 - **Endpoint**: `--rpc-endpoint` (`OP_INDEXER_IMPORT_RPC_ENDPOINT`), by default
   `https://mainnet.unichain.org` for Unichain and none for OP Mainnet, whose rows need none so
@@ -165,24 +173,45 @@ receipts in one batch (8 transactions, 6 logs) and `verify` rebuilt the header t
 0x8f43…ca26. Block 16,068,511 as a hole (its type-4 transaction, with its authorization list
 and access list, coming from the endpoint) verified too. The receipt-by-receipt fallback has
 not run: Unichain's endpoint has `eth_getBlockReceipts`. Not checked against HyperSync's own
-Unichain answers.
+Unichain answers. (These checks ran with the build of the time, whose `verify` wrote a
+verified copy instead of sealing.)
 
-### 3.2 `verify`
+### 3.2 `verify`: check, seal and upload
 
-Offline; reads the downloaded chunks only, several at once (`--verify-threads`, default one
-per core).
+`verify` is the one step that checks the downloaded blocks and puts them in object storage.
+It reads the downloaded chunks only (never HyperSync or the chain's RPC) and writes sealed
+chunks, their manifest and the global hash index, in the layout `docs/serving.md` describes
+(sections 1 to 3), to Cloudflare R2 or a local directory, so a `server` can read the history
+from there. It is the importer's only path to object storage, through `crates/chunks`. It
+replaced the pair `verify` (which wrote a verified copy of every chunk to `<state>/verified/`)
+and `export` (which sealed and uploaded that copy) on 2026-10-05 (user decision): Base is 2.57
+TB of downloaded chunks on a disk with 0.99 TB free, and the copy would not have fit.
 
-For every block it rebuilds the transactions and the receipts from the downloaded rows,
-computes the transactions root over the transaction encodings and the receipts root over the
-receipts, rebuilds the header with those roots and the bloom of the logs, and requires the
-header to hash to the block's hash and to name the previous block as its parent. Once every
-chunk is verified, the chunks are linked to each other and the last block is checked against
-the anchor (section 11). The bytes that passed are written as verified chunks.
+In order:
+
+1. **Check**, on every core (`--threads`, default one per CPU). For every block of a downloaded
+   chunk it rebuilds the transactions and the receipts from the downloaded rows (with the
+   chunk's fill, section 3.1a), computes the transactions root over the transaction encodings
+   and the receipts root over the receipts, rebuilds the header with those roots and the bloom
+   of the logs, and requires the header to hash to the block's hash and to name the previous
+   block as its parent. Then it checks every sender (below).
+2. **Seal**, in block order: a `ChunkWriter` (`crates/chunks`) turns the checked blocks into the
+   chunks of `docs/serving.md` section 1. A chunk ends at 256 MiB uncompressed, at 100,000
+   blocks, before the Bedrock block, or at the range's last block. The cuts depend on the
+   blocks only, so the same range always gives the same chunks, those `export` produced.
+3. **Upload**: each chunk goes to R2 (or `--to-dir`), `--uploads` at once (default 4).
+4. **Record**: once a chunk's upload succeeds, its manifest entry is written to
+   `<state>/sealed/<first>-<last>.json`, in block order, and the downloaded chunks the records
+   now cover whole are deleted, with their fills.
+5. **At the end**: the last block is checked against the anchor (section 11). Only then are
+   the chunks listed in the manifest (segments of 16 chunks) and a new generation of the hash
+   index written.
 
 - **What is proven** for every block: its header hashes to its block hash and links to its
   parent up to the anchor; its transactions root is the root over the stored transaction
-  encodings; its receipts root is the root over the stored receipts. That is what a peer
-  checks when the bytes are served to it.
+  encodings; its receipts root is the root over the stored receipts; the sender of every
+  signed transaction is the one recovered from its signature, and a deposit's is its `from`.
+  The first three are what a peer checks when the bytes are served to it.
 - **Header fields `verify` rebuilds.** The transactions root, the receipts root and the logs
   bloom are never downloaded: `verify` computes them from the transactions, receipts and logs,
   and the header hash proves them (they are not compared with anything the service says).
@@ -192,113 +221,112 @@ the anchor (section 11). The bytes that passed are written as verified chunks.
   header hash decides: a wrong guess is refused, never accepted. The blocks rebuilt this way
   are logged per chunk and counted in the summary (`rebuilt_header_fields`). From Bedrock on
   a row without `mix_hash` is refused ("the header lacks `mix_hash`").
-- **Senders are proven by `export`, not by `verify`.** `verify` checks no signature: the sender
-  it records in each verified chunk is the `from` HyperSync reports. `export` then proves it
-  before anything is sealed (user decision, 2026-10-04): for every signed transaction it
-  recovers the sender from the signature and compares; for a deposit it compares with the
-  `from` in the deposit's encoding, which the transactions root and so the block hash cover.
-  A mismatch stops `export` before that block, naming the block, the transaction's index and
-  both addresses. So every sender in the chunks is proven (recovered, or hashed for
-  deposits) except one kind: a legacy transaction signed with all zeros (an L1-to-L2 message
-  of OP Mainnet's client before Bedrock) has no signer, keeps the recorded zero address, and
-  is counted, by `verify` and again at the end of `export` (`zero_signature_transactions`).
-  The recovery runs on libsecp256k1 (alloy's `secp256k1` backend), which does it in about a
-  fifth of the time of k256.
-- **The accepted range.** Only when every chunk is verified, every link holds and the anchor
-  matches does `verify` write `verified.json` (range, anchor, hash of the last block, time).
-  Every run of `verify` removes it first. `export` refuses to run without a record that matches
-  the plan, so nothing `verify` did not accept as a whole is ever exported.
-- A chunk that fails stops the phase with the block number, the check and the file; delete
-  the file and run `download` again. With the roots not downloaded, a wrong transaction,
-  receipt or log shows as the header hash not matching, for its block.
-- Memory: the chunks verified at once are limited to 256 MiB of downloaded bytes (one chunk is
-  always allowed); a chunk takes about twenty times its downloaded size while it is verified.
-- Progress every 10 seconds (chunks, blocks, transactions, their speed over the last minute,
-  busy threads, bytes written, free disk space, and the time left, estimated from the
-  downloaded bytes still to verify over those verified per second), a line at start saying
-  how many chunks are already verified, how many are not downloaded, the downloaded bytes to
-  read and the free space, and lines during the linking pass.
-- Disk: a verified chunk is about as large as its downloaded one. `verify` refuses to start
-  if free space is under half of the downloaded bytes it has to verify, warns under 64 GiB
-  free and stops cleanly under 16 GiB.
-- `--from-block N` verifies only the chunks from that block on and neither links nor accepts
-  the range: a quick check of one part of the chain (for example the first blocks after
-  Bedrock) without waiting for everything before it. The chunks it verifies are kept;
-  `verify` without the flag must still run before `export`. `run` does not take it.
-
-### 3.3 `export`: the verified range to object storage
-
-`import export` converts the range `verify` accepted into sealed chunks, their manifest and the
-global hash index, in the layout `docs/serving.md` describes (sections 1 to 3), and uploads
-them to Cloudflare R2. It runs once per chain, so a `server` can read the history from R2. It
-is the importer's only path to object storage, through `crates/chunks`.
-
-- **Needs** the whole range accepted (`verified.json`). It checks every sender before a block is
-  sealed (section 3.2): the verified chunks record the service's senders. Sender recovery is
-  about 32 µs per transaction on one core (libsecp256k1), so a whole chain is about 13
-  CPU-hours, spread over every core.
+- **Senders.** The sender recorded with each transaction is the `from` HyperSync reports;
+  `verify` proves it before the block is sealed (user decision, 2026-10-04, then in
+  `export`): for every signed transaction it recovers the sender from the signature and
+  compares; for a deposit it compares with the `from` in the deposit's encoding, which the
+  transactions root and so the block hash cover. A mismatch stops `verify` before that block
+  is sealed, naming the block, the transaction's index and both addresses. So every sender
+  in the chunks is proven (recovered, or hashed for deposits) except one kind: a legacy
+  transaction signed with all zeros (an L1-to-L2 message of OP Mainnet's client before
+  Bedrock) has no signer, keeps the reported zero address, and is counted
+  (`zero_signature_transactions`). The recovery runs on libsecp256k1 (alloy's `secp256k1`
+  backend), which does it in about a fifth of the time of k256: about 32 µs per transaction on
+  one core, so a whole chain is about 13 CPU-hours, spread over every core.
+- **Links, then the anchor.** The links are checked as the chunks are sealed: inside a chunk
+  by the writer, between chunks by each chunk's first parent against the last hash before it,
+  and the first chunk against the manifest's last chunk when the range continues one the
+  manifest lists (for example a catch-up of a chain whose earlier range is in the bucket). A
+  broken link stops the run at once, naming the block. The anchor is checked once the whole
+  range is sealed: a hash is compared with the last chunk's last hash; a dispute game's claim
+  needs the last block's header, which is read back from the store (one GET of the chunk's
+  index, one of the block's segment). Only when it matches are the chunks listed. If it does
+  not, nothing is listed: the chunks uploaded stay in the bucket, unlisted and
+  content-addressed, and nobody reads them.
+- **A downloaded chunk that fails a check** is kept, nothing from its first failing block on
+  is sealed, and the run stops with the block number, the check and the file. If the data is
+  wrong, delete the file (and its fill, if there is one) and run `download` again; a row left
+  without a field says to run `download`, which fills it (section 3.1a). With the roots not
+  downloaded, a wrong transaction, receipt or log shows as the header hash not matching, for
+  its block. A chunk not downloaded at all stops `verify` before anything is read, naming its
+  blocks and its file.
+- **Resumable.** A restart continues after the last record in `sealed/` with a fresh
+  `ChunkWriter`, which cuts the same chunks an unbroken run would. The records are checked
+  first: they must follow each other and the manifest's last chunk without a gap or a broken
+  link. One listing of the bucket at the start finds the chunks it already holds (a run
+  stopped between upload and record, or an earlier run), and those are not uploaded again:
+  their names carry their root, and a PUT is create-only anyway. Downloaded chunks a record
+  covers but a stopped run did not delete are deleted at the start. When the manifest already
+  lists the whole range and the hash index covers it, `verify` says so and exits. Ctrl-C lets
+  the uploads in flight finish and records them; nothing is listed until a run reaches the end.
+- **The hash index.** Every block's hash and number go to the index's input as the blocks are
+  sealed; a resumed run first reads them back from the chunks the manifest lists and the
+  records name (one GET of each chunk's index, 32 at once). At the end the index is written
+  as a new generation of the manifest, covering every listed block.
 - **Layout**: one bucket per chain, `<chain>-snapshot` (`op-snapshot`, `unichain-snapshot`,
   `base-snapshot`), and the folder `archive/` in it: `archive/chunks/…`,
-  `archive/manifest/…`, `archive/index/…`. Both can be changed (`OP_INDEXER_R2_BUCKET`,
-  `OP_INDEXER_R2_PREFIX`). The manifest records the chain (id and genesis hash), and a run
-  of another chain refuses it.
-- **Target**: R2, from `OP_INDEXER_R2_ACCOUNT_ID`, `OP_INDEXER_R2_ACCESS_KEY_ID`,
-  `OP_INDEXER_R2_SECRET_ACCESS_KEY` and optionally `OP_INDEXER_R2_BUCKET`,
-  `OP_INDEXER_R2_PREFIX` and `OP_INDEXER_R2_ENDPOINT`. The keys are read from the environment, hidden from `--help`, and
-  never logged. Or `--to-dir <dir>`: a local directory with the same layout, for a check or the
-  bench without credentials.
-- **Resumable**: the manifest says where it stopped. A second run continues after the last
-  listed chunk, or ends at once when everything, the index included, is there. One listing of
-  the bucket at the start finds chunks uploaded but not yet listed (a run stopped between the
-  two), and those are not uploaded again: their names carry their root. Ctrl-C lets the uploads
-  in flight finish and lists them.
+  `archive/manifest/…`, `archive/index/…`. Both can be changed (`--r2-bucket`,
+  `OP_INDEXER_R2_BUCKET`; `--r2-prefix`, `OP_INDEXER_R2_PREFIX`). The manifest records the
+  chain (id and genesis hash), and a run of another chain refuses it. The manifest's exporter
+  id is `import` (it was `import-export`); nothing reads it but people.
+- **Target**: R2, from `OP_INDEXER_R2_ACCOUNT_ID` (`--r2-account-id`),
+  `OP_INDEXER_R2_ACCESS_KEY_ID` and `OP_INDEXER_R2_SECRET_ACCESS_KEY`, and optionally the bucket,
+  the prefix and `OP_INDEXER_R2_ENDPOINT` (`--r2-endpoint`, another S3-compatible store). The
+  keys are read from the environment, hidden from `--help`, and never logged. Or
+  `--to-dir <dir>`: a local directory with the same layout, for a check or the bench without
+  credentials.
 - **Uploads**: one PUT per chunk (about 20 to 40 MB), create-only as a guard; an object above
   64 MiB goes up in parts. No HEAD is sent. Failed requests (timeouts, connection errors, 5xx)
   are retried with exponential backoff, from 200 ms to 30 s, up to 10 times or 3 minutes.
-- **Progress** every 10 s, as in `download` and `verify`: blocks done of the range, chunks
-  (and those skipped as already uploaded), blocks/s, MB/s read and uploaded (speeds over the
-  last minute), uploads in flight, senders recovered, and the time left from the verified bytes
-  still to read. A start line gives the range, the verified bytes and the chunks already in
-  the bucket; an end line gives the totals.
-- **Settings**: `--threads` (verified chunks prepared at once, one per CPU) and `--uploads`
-  (chunks uploaded at once, 4).
-- **Disk**: chunks are uploaded from memory. The hash index's input spills under
-  `<state>/export-index/` (about 2.5 GB for OP Mainnet) and is removed at the end.
-- **Measured** on the 20 sample chunks (2,000 post-Isthmus blocks, `--to-dir`, 10 cores):
-  sealing at about 5,400 blocks/s (400 MB/s of records, senders recovered), one 20.5 MB chunk,
-  and the index's 4,096 shards in 1.6 s. Read back byte for byte equal (`docs/serving.md`
-  section 3).
+- **Progress** every 10 seconds: blocks done of the range, transactions, chunks sealed (and
+  those skipped as already uploaded), blocks per second, MB/s of downloaded chunks read and
+  MB/s uploaded (speeds over the last minute), uploads in flight, and the time left from the
+  downloaded bytes still to read. A start line gives the range, the chunks sealed before and
+  the free space, then one the chunks to read, their bytes and the chunks the bucket already
+  holds; an end line gives the totals (blocks, transactions, `senders_recovered`,
+  `zero_signature_transactions`, `rebuilt_header_fields`, `rpc_filled_transactions`, chunks,
+  skipped, bytes uploaded).
+- **Memory**: up to `--threads` downloaded chunks are checked at once, within 256 MiB of
+  downloaded bytes in flight (one chunk is always allowed); a chunk takes about twenty times
+  its downloaded size while it is checked, so that is roughly 5 GB at most. The chunk being
+  sealed (up to 256 MiB uncompressed) and the chunks uploading are held in memory too.
+- **Disk**: no copy of the range is written. Besides the downloaded chunks still to seal, the
+  only extra disk is the hash index's input, `<state>/index-build/`: 16 bytes per block (about
+  2.5 GB for OP Mainnet), emptied at the start of each run and removed once the index is
+  written. The downloaded chunks shrink as the run goes. `verify` refuses to start with less
+  than 16 GiB free. An old `<state>/verified/` directory is not read and can be deleted.
 
 ## 4. The local history store (removed)
 
 `load` appended the verified blocks to the node's fjall archive through a bulk path
 (`FjallArchive::bulk_append`); both were removed on 2026-10-04, when the history moved to R2
-chunks (`export`, section 3.3; `docs/serving.md`). Its measurements are in section 6.
+chunks (`verify`, section 3.2; `docs/serving.md`). Its measurements are in section 6.
 
 ## 5. Running it
 
 The importer is a self-contained command-line tool, meant to be built here and run on another
 machine: `cargo build --release -p op-indexer-import` produces one file to copy.
 
-- Subcommands: `download`, `verify`, `export`, and `run` for all three in order.
+- Subcommands: `download`, `verify`, and `run` for both in order.
 - `--api-token <TOKEN>` carries the HyperSync token; `OP_INDEXER_IMPORT_API_TOKEN` in the
   environment is the fallback (`ENVIO_API_TOKEN`, its former name, still works, with a
   warning). A flag is visible in the process list and the shell history, the variable is
   not. The token is never logged and never written to the state directory.
 - Every other setting is a flag with an environment fallback and a default: the state
   directory (`OP_INDEXER_IMPORT_STATE_DIR`), the chain (`OP_INDEXER_CHAIN_ID`), the
-  endpoints (`OP_INDEXER_IMPORT_ENDPOINT`, `OP_INDEXER_IMPORT_L1_ENDPOINT`), the range
-  (`OP_INDEXER_IMPORT_FIRST_BLOCK`, `_LAST_BLOCK`, `_ANCHOR_HASH`, `_LEGACY_ONLY`), the chunk
-  size (`OP_INDEXER_IMPORT_CHUNK_BLOCKS`), requests in flight (`OP_INDEXER_IMPORT_REQUESTS`),
-  `verify`'s threads and start (`OP_INDEXER_IMPORT_VERIFY_THREADS`,
-  `OP_INDEXER_IMPORT_VERIFY_FROM_BLOCK`), and for `export` the bucket and its keys
-  (`OP_INDEXER_R2_*`, section 3.3) and its threads and uploads
-  (`OP_INDEXER_IMPORT_EXPORT_THREADS`, `OP_INDEXER_IMPORT_EXPORT_UPLOADS`).
+  endpoints (`OP_INDEXER_IMPORT_ENDPOINT`, `OP_INDEXER_IMPORT_L1_ENDPOINT`,
+  `OP_INDEXER_IMPORT_RPC_ENDPOINT`), the range (`OP_INDEXER_IMPORT_FIRST_BLOCK`,
+  `_LAST_BLOCK`, `_ANCHOR_HASH`, `_LEGACY_ONLY`), the chunk size
+  (`OP_INDEXER_IMPORT_CHUNK_BLOCKS`), requests in flight (`OP_INDEXER_IMPORT_REQUESTS`), and
+  for `verify`: `--to-dir`, the bucket and its keys (`OP_INDEXER_R2_ACCOUNT_ID`,
+  `OP_INDEXER_R2_BUCKET`, `OP_INDEXER_R2_PREFIX`, `OP_INDEXER_R2_ACCESS_KEY_ID`,
+  `OP_INDEXER_R2_SECRET_ACCESS_KEY`, `OP_INDEXER_R2_ENDPOINT`; section 3.2), its threads
+  (`--threads`, `OP_INDEXER_IMPORT_VERIFY_THREADS`, one per CPU) and its uploads (`--uploads`,
+  `OP_INDEXER_IMPORT_VERIFY_UPLOADS`, 4, from 1 to 64).
 - **The importer fills the bucket servers read history from, and needs no database.**
-- `export` needs the range accepted by `verify` (`verified.json`) and refuses anything else.
-  What the bucket holds is asked of the bucket: `export` continues after the manifest's last
-  chunk, and refuses a manifest of another chain.
-- `export` exits with an error if it stops before the end of the range, and says what to run.
+- What the bucket holds is asked of the bucket: `verify` continues after the manifest's last
+  chunk and the records in `sealed/`, and refuses a manifest of another chain.
+- `verify` exits with an error if it stops before the end of the range, and says what to run.
 
 ### How to run it
 
@@ -316,11 +344,7 @@ import download --api-token <TOKEN> --requests 64
 ```
 
 ```bash
-import verify
-```
-
-```bash
-OP_INDEXER_R2_ACCOUNT_ID=<account id> OP_INDEXER_R2_ACCESS_KEY_ID=<key id> OP_INDEXER_R2_SECRET_ACCESS_KEY=<secret> import export
+OP_INDEXER_R2_ACCOUNT_ID=<account id> OP_INDEXER_R2_ACCESS_KEY_ID=<key id> OP_INDEXER_R2_SECRET_ACCESS_KEY=<secret> import verify
 ```
 
 `import --help` and `<command> --help` list every flag, its environment variable
@@ -335,23 +359,15 @@ and its default. Only `--state-dir` is shared by the steps: the range is decided
   range, or to extend to a newer game, use an empty state directory.
 - **State directory**: section 7.
 - **Stopping and restarting**: Ctrl-C or SIGTERM stops a step within a fraction of a second
-  and exits with status 1 and a summary; `run` does not start the next step. Run the same
-  command again: it continues with exactly the chunks that are missing. A killed process
-  (SIGKILL, power loss) is as safe: a chunk file is written under a `.tmp` name, synced and
-  renamed, so a file with a final name is always complete, and leftover `.tmp` files are
-  removed at the next start. A rename lost to a power loss only loses that chunk, which the
-  next run does again; `verified/` is synced once before `verified.json` is written, and the
-  JSON files' directory after each of them.
-- **A damaged verified chunk is not a verified one.** A file copied or downloaded short
-  (seen on a server filled from a snapshot: three files under the 64-byte header) would
-  otherwise block linking and be skipped by `download`. One check decides for both: a
-  verified file counts only if it starts with the two hashes and then a zstd frame's magic
-  number (68 bytes read). `verify` removes a file that fails it, with a warning per file and a
-  `damaged_removed` count in its start line, and verifies the chunk again from `raw/`. If
-  `raw/` no longer has it, it counts as not downloaded, and `download` fetches just those
-  chunks. Damage past the first bytes shows when a chunk is read in full (linking a game
-  anchor, or `export`): every such error names the file and says what is wrong and what to
-  run.
+  (`verify` first finishes and records the uploads in flight) and exits with status 1 and a
+  summary; `run` does not start the next step. Run the same command again: it continues with
+  exactly the chunks that are missing. A killed process (SIGKILL, power loss) is as safe: a
+  file is written under a `.tmp` name, synced and renamed, so a file with a final name is
+  always complete, and leftover `.tmp` files are removed at the next start. A rename lost to a
+  power loss only loses that file: a downloaded chunk is fetched again; a lost record means its
+  chunk is sealed again from the downloaded chunks, which are deleted only after the record is
+  durable, and not uploaded again, being in the bucket. The directory of the JSON files (plan,
+  fills, records) is synced after each is written.
 - **One process per state directory**: the directory is locked while a process runs; a second
   one exits with "another `import` process is using this state directory". The lock
   is released by the system when the process ends, however it ends.
@@ -359,61 +375,87 @@ and its default. Only `--state-dir` is shared by the steps: the range is decided
   chunks are missing. Reset the window and run the same command again: only missing chunks are
   fetched. Ctrl-C stops any step cleanly; run it again to continue.
 - **A chunk that fails `verify`**: the error names the block, the check and the file. Delete
-  that file from `raw/` and run `download` again.
+  that file from `raw/` (and its fill) and run `download` again.
 - **Disk**: a downloaded legacy chunk is 0.7 to 1.0 KB per block (zstd or gzip, as the
-  service sends it) and a verified one about 0.5 KB per block: roughly 75 to 105 GB and 52 GB
-  for the legacy range if the sample of section 6 is typical. The whole OP Mainnet chain was
-  589 GB downloaded (section 6). `raw/` can be deleted once `verify` has accepted the range:
-  `download` counts a chunk with a verified file as done, so a later `download` or `run` on
-  the same state directory does not fetch it again.
+  service sends it): roughly 75 to 105 GB for the legacy range if the sample of section 6 is
+  typical. The whole OP Mainnet chain was 589 GB downloaded (section 6). `verify` writes no
+  copy: it deletes each downloaded chunk as soon as the sealed chunks covering it are uploaded
+  and recorded, so the downloaded bytes shrink as it goes, and `download` counts a chunk the
+  records cover as done, so a later `download` or `run` on the same state directory does not
+  fetch it again.
 
 ## 6. Measured
 
-Offline, on 1,000 saved blocks (50,000,000 to 50,000,999, one transaction each), Apple M-series:
+Offline, on 1,000 saved blocks (50,000,000 to 50,000,999, one transaction each), Apple M-series,
+with an earlier build, whose `verify` wrote a verified copy:
 
 - Size: 4.7 MB of JSON with the fields requested; 0.75 MB as zstd, 1.0 MB as gzip.
-- `verify`, one thread: 0.17 s of processor time per 1,000 blocks with sender recovery, about
-  0.06 s without (what `verify` does now): reading and decoding 6 to 8 ms, parsing 10 to
-  13 ms, receipts and their blooms 8 ms, the two tries 9 ms, header, body and receipts
-  encoding 5 ms, transactions 1 ms, writing the verified chunk with its sync 17 to 22 ms (on
-  macOS; a sync is cheaper on Linux).
-- Projection, not a measurement: 105 million legacy blocks at 0.06 s per 1,000 are about 105
-  core-minutes, 13 minutes on 8 cores if the disk keeps up.
+- `verify`, one thread: 0.17 s of processor time per 1,000 blocks with sender recovery (what
+  `verify` does now, before sealing), about 0.06 s without: reading and decoding 6 to 8 ms,
+  parsing 10 to 13 ms, receipts and their blooms 8 ms, the two tries 9 ms, header, body and
+  receipts encoding 5 ms, transactions 1 ms, writing the verified chunk with its sync 17 to
+  22 ms (on macOS; a sync is cheaper on Linux; no longer done).
+- Projection, not a measurement: 105 million legacy blocks at 0.17 s per 1,000 are about 300
+  core-minutes, under 40 minutes on 8 cores if the disk keeps up, sealing not counted.
 
 On the real service:
 
 - 2026-10-03, 8 cores, 1 Gbit, an earlier build: the legacy range downloaded at about
   185,000 blocks per second with 64 requests in flight.
 - The whole chain, a 32-core server: `download` of blocks 0 to 157,745,023 (157,745,024
-  blocks, 589 GB) in about 25 minutes at 300 to 380 MB/s; `verify` accepted the whole chain
-  (630,336 chunks, linking 58 s), its top block matching the claim of the newest dispute game
-  (a type 9 super game); the bulk load into the fjall archive (since removed, section 4) ran
-  at 190,000 to 235,000 blocks/s, 580 to 665 MB/s of RLP, on a volume `dd` measured at
-  325 MB/s of sequential writes.
+  blocks, 589 GB) in about 25 minutes at 300 to 380 MB/s; `verify` of the build of the time
+  (verified copy, no sender recovery) accepted the whole chain (630,336 chunks, linking 58 s),
+  its top block matching the claim of the newest dispute game (a type 9 super game); the bulk
+  load into the fjall archive (since removed, section 4) ran at 190,000 to 235,000 blocks/s,
+  580 to 665 MB/s of RLP, on a volume `dd` measured at 325 MB/s of sequential writes.
+
+The sealing, on the local sample of 20 downloaded chunks (OP Mainnet blocks 140,000,063 to
+140,002,062, 2,000 post-Isthmus blocks, 26.8 MB downloaded, a hash anchor), `--to-dir`:
+
+- With the `export` step (since folded into `verify`), 10 cores: sealing at about 5,400
+  blocks/s (400 MB/s of records, senders recovered), one 20.5 MB chunk, and the index's 4,096
+  shards in 1.6 s. Read back byte for byte equal (`docs/serving.md` section 3).
+- 2026-10-05, `verify` (check, seal and upload in one step), release build: 2,000 blocks and
+  50,368 transactions verified, 48,357 senders recovered, sealed into one chunk of 20.5 MB in
+  0.64 s; the hash index in 1.7 s; 3.0 s wall time in all; peak RSS 680 MB; all 20 downloaded
+  chunks deleted. The chunk object is byte-identical to the one `export` produced
+  (`000140000063-000140002062-5ccbb6a645147824.opxc`), and the manifest segment identical but
+  for its timestamp and exporter id.
+- 2026-10-05, the same sample with a wrong anchor: the chunk was uploaded, the downloaded
+  chunks deleted, and the run stopped with nothing listed. Run again with the right anchor, it
+  continued from the record (nothing sealed again), listed the chunk and wrote a byte-identical
+  index.
+- 2026-10-05, the same sample with one downloaded chunk damaged: the run stopped naming its
+  blocks and its file, with all 20 downloaded chunks kept and nothing uploaded.
 
 ## 7. The state directory
 
 ```text
-<state>/plan.json                 the chain, the range, its anchor and the chunk size
-<state>/verified.json             the range `verify` accepted; `export` requires it
-<state>/raw/<from>-<to>.raw       downloaded chunk: the service's answers as they travelled
-<state>/raw/<from>-<to>.fill.json fields the service left out, from the chain's RPC (3.1a)
-<state>/verified/<from>-<to>.blk  verified chunk: the consensus encodings that passed
-<state>/export-index/             `export`'s hash index input while it runs (removed at the end)
-<state>/lock                      held by the one process working on the directory
+<state>/plan.json                   the chain, the range, its anchor and the chunk size
+<state>/raw/<from>-<to>.raw         downloaded chunk: the service's answers as they travelled
+<state>/raw/<from>-<to>.fill.json   fields the service left out, from the chain's RPC (3.1a)
+<state>/sealed/<first>-<last>.json  a sealed chunk `verify` uploaded: its manifest entry
+<state>/index-build/                `verify`'s hash index input while it runs (removed at the end)
+<state>/lock                        held by the one process working on the directory
 ```
 
 - `plan.json` is written by the first `download` and never changed: chain id, first and last
   block, the anchor (a trusted hash, or the dispute game found on L1) and the chunk size. Every
-  later run of any step reads it; `verify` and `export` take no range flags. Files already
-  written were cut by it, which is why it cannot change.
+  later run of any step reads it; `verify` takes no range flags. Files already written were cut
+  by it, which is why it cannot change.
+- A downloaded chunk and its fill are deleted once the records in `sealed/` cover it whole;
+  `download` and its fill pass treat such a chunk as done.
 - A directory written by a build with another layout is refused: it either has chunks and no
-  `plan.json`, or a `plan.json` with another version. Delete it and download again.
+  `plan.json`, or a `plan.json` with another version. Delete it and download again. The
+  layout version did not change when `verify` and `export` were merged: a state directory of
+  the earlier build (Base's) keeps working, and its `verified/` and `verified.json` are not
+  read and can be deleted.
 - A file exists only when it is complete: it is written under a `.tmp` name, synced and
   renamed; leftover `.tmp` files are removed at the next start.
-  How the three short files on the new server came about is not known: this code syncs the
-  data before the rename, so a crash cannot leave a short file under the final name; the copy
-  of the snapshot is the likelier cause.
+  Three short verified files (under their 64-byte header) were seen with an earlier build, on
+  a server filled from a snapshot. How they came about is not known: this code syncs the data
+  before the rename, so a crash cannot leave a short file under the final name; the copy of
+  the snapshot is the likelier cause.
 
 ## 8. Not built
 
@@ -465,11 +507,7 @@ import --state-dir unichain-state download --chain 130 --api-token <TOKEN>
 ```
 
 ```bash
-import --state-dir unichain-state verify
-```
-
-```bash
-OP_INDEXER_R2_ACCOUNT_ID=<account id> OP_INDEXER_R2_ACCESS_KEY_ID=<key id> OP_INDEXER_R2_SECRET_ACCESS_KEY=<secret> import --state-dir unichain-state export
+OP_INDEXER_R2_ACCOUNT_ID=<account id> OP_INDEXER_R2_ACCESS_KEY_ID=<key id> OP_INDEXER_R2_SECRET_ACCESS_KEY=<secret> import --state-dir unichain-state verify
 ```
 
 What differs from OP Mainnet:
@@ -479,11 +517,11 @@ What differs from OP Mainnet:
   by default), and `--legacy-only` is refused. Block 0's parent hash is zero and its header
   already has the fields of every fork through Granite, which are all active at genesis; the
   transaction and receipt rules are chosen by each block's timestamp as for OP Mainnet.
-- **One-second blocks**, so about 60 million blocks today and about 600,000 chunks at the
-  default size, about as many as OP Mainnet's: the linking pass, `verified.json` and memory
-  are sized by chunk, not by block, and stay as they are. Unichain blocks are small, so
-  `--chunk-blocks 10000` (1,000 blocks per chunk) means fewer requests and files; it is
-  recorded in the plan and cannot change later.
+- **One-second blocks**, so about 60 million blocks today and about 600,000 downloaded chunks
+  at the default size, about as many as OP Mainnet's. The sealed chunks are cut by size and
+  block count, not by downloaded chunk, so there are far fewer of them. Unichain blocks are
+  small, so `--chunk-blocks 10000` (1,000 blocks per chunk) means fewer requests and files; it
+  is recorded in the plan and cannot change later.
 - **The endpoint** is `https://unichain.hypersync.xyz`, the host the service's naming gives.
   It has not been reached from here; if it is wrong, give the right one with `--endpoint`.
 - **EIP-7702 authorization lists** are missing from HyperSync's rows; `download` fetches them
@@ -493,11 +531,18 @@ What differs from OP Mainnet:
   (`0x2F12d621a16e2d3285929C9996f478508951dFe4` on Ethereum): super games (type 9), whose
   claim is read for chain 130, with the timestamp turned into a block at one block a second
   from genesis.
+- **A later range**, from where the bucket's manifest ends to a newer game, goes in an empty
+  state directory with `--first-block` set to the block after the manifest's last; `verify`
+  checks that its first block names the manifest's last hash as its parent before anything is
+  listed.
 
 **Run so far** (by the user, reported 2026-10-04): a download of 604,009 chunks, and a
 `verify` that stopped at block 16,068,511 on the missing authorization list (section 3.1a).
-Since then the range was verified on the user's server (reported by the user, 2026-10-04);
-`export` has not run on Unichain yet.
+Since then the range was verified on the user's server (reported by the user, 2026-10-04), by
+the build that wrote a verified copy, and exported to `unichain-snapshot` by that build's
+`export` (1,693 chunks, blocks 0 to 60,400,897). On 2026-10-05 a catch-up import of blocks
+60,400,898 to 60,422,316 (anchored on a dispute game, no field missing) was appended as one
+more chunk, its first block linked to the manifest's last.
 
 ### Base (chain 8453)
 
@@ -506,26 +551,27 @@ import --state-dir base-state download --chain 8453 --api-token <TOKEN> --rpc-en
 ```
 
 ```bash
-import --state-dir base-state verify
-```
-
-```bash
-OP_INDEXER_R2_ACCOUNT_ID=<account id> OP_INDEXER_R2_ACCESS_KEY_ID=<key id> OP_INDEXER_R2_SECRET_ACCESS_KEY=<secret> import --state-dir base-state export
+OP_INDEXER_R2_ACCOUNT_ID=<account id> OP_INDEXER_R2_ACCESS_KEY_ID=<key id> OP_INDEXER_R2_SECRET_ACCESS_KEY=<secret> import --state-dir base-state verify
 ```
 
 What differs (`docs/base.md`):
 
 - **No legacy chain**, as Unichain: Bedrock at block 0, every chunk 100 blocks by default.
-  About 52 million blocks (2 s blocks), so about 520,000 chunks: fewer than OP Mainnet's
-  630,336, which `verify`'s linking pass and `verified.json` already handle.
-- **The endpoint** is `https://base.hypersync.xyz` (the service's list of networks); not yet
-  reached from here.
+  About 52 million blocks (2 s blocks), so about 520,000 downloaded chunks: fewer than OP
+  Mainnet's 630,336.
+- **The endpoint** is `https://base.hypersync.xyz` (the service's list of networks). The
+  user's download of blocks 0 to 52,166,660 completed on it on 2026-10-05 (521,890 chunks,
+  2.57 TB).
+- **Authorization lists are in HyperSync's Base rows**, unlike Unichain's: two type-4
+  transactions (block 49,194,764 index 82, block 49,194,364 index 73) carry the one entry the
+  public RPC shows (checked 2026-10-05). A spot check, not the whole range: `verify` is what
+  proves every block.
 - **Base's own forks** (Azul, Beryl, Cobalt) change nothing the import rebuilds: the header,
   the transaction types (0, 1, 2, 4, 0x7E) and the receipts are OP's. `verify` takes its fork
   times (Regolith, Canyon, Ecotone, Isthmus) from the chain's fork list. Checked on
   2026-10-04: blocks 1,000,000, 13,000,000, 46,700,000 (Azul), 47,900,000 (Beryl) and
   52,100,000 (Cobalt) rebuilt to their hashes, from Base's public endpoints in the rows'
-  form (as holes, section 3.1a). Not checked against HyperSync's own Base answers.
+  form (as holes, section 3.1a).
 - **The top anchor** is the newest game of Base's factory
   (`0x43edB88C4B80fDD2AdFF2412A7BebF9dF42cB40e` on Ethereum): `AggregateVerifier` games (type
   621), created with `createWithInitData`, whose extra data starts with the L2 block number and
@@ -538,14 +584,15 @@ What differs (`docs/base.md`):
   own Base answers. Two public ones work: `https://mainnet.base.org` (Base's own; it has no `eth_getBlockReceipts`, so a hole's
   receipts are read one by one, and it limits the rate with an error in the answer, which is
   waited out like HTTP 429) and `https://base.drpc.org` (has it).
-- **Size.** The archive is estimated at 2 to 3.5 TB (`docs/base.md` section 6). Scaled from
-  OP Mainnet's 589 GB downloaded for a 914 GB archive, the download is about 1.3 to 2.3 TB, and
-  the verified chunks about as much again: up to three copies at once is 5 to 9 TB. `download`
-  stops at 16 GiB free and `verify` refuses to start without half the downloaded bytes free.
-  `export` writes nothing large locally (chunks go up from memory; its index input is a few
-  GB). Once `verify` has accepted the range, `raw/` (with its fills) is not needed by `export`
-  and can be deleted, or kept on another disk, to make room. Chunks are about ten times larger
-  per block than OP Mainnet's, so `verify` runs fewer at once (its 256 MiB in-flight bound).
+- **Size.** The archive was estimated at 2 to 3.5 TB (`docs/base.md` section 6). The download
+  on the user's server is 2.57 TB of downloaded chunks, on a disk with 0.99 TB free (reported
+  2026-10-05). It fits: `verify` writes no copy, and deletes each downloaded chunk once the
+  sealed chunks covering it are uploaded, so the 2.57 TB shrinks as it goes. The extra disk is
+  the hash index's input, 16 bytes per block (under 1 GB for 52 million blocks), and `verify`
+  refuses to start with less than 16 GiB free. The state directory written by the earlier
+  build keeps working (section 7). Downloaded chunks are about ten times larger per block than
+  OP Mainnet's, so `download`'s scan of missing fields runs fewer at once (its 256 MiB
+  in-flight bound), and so does `verify` (the same bound).
 
 ## 11. Where the import stops, and the top anchor
 
@@ -556,7 +603,7 @@ trusted hash at its top (section 3.2); a range that reaches the present needs on
 - **End of a range that reaches the present:** the L2 block of the newest dispute game the
   chain's `DisputeGameFactory` created on L1 (the factory's `DisputeGameCreated` logs of the
   last day, every game type; the claim is read from the calldata of the `create` call). The
-  game is recorded with the plan in the state directory, so `verify` stays offline
+  game is recorded with the plan in the state directory, so `verify` needs no L1 lookup
   and a resumed download keeps the same end. The lookup uses the service's L1 endpoint, so it
   counts against the token's window like any download.
 - **The kind of game is chosen by its type**, from the chain's table in
@@ -570,11 +617,12 @@ trusted hash at its top (section 3.2); a range that reaches the present needs on
   (found from the Bedrock block, its time and the block time in the chain specification), and
   `verify` also requires the block to have that timestamp. A newest game of a type that is
   not in the table is refused by name, with the types the factory created.
-- **The check is mandatory.** `verify` computes the output root of that block from its
-  downloaded header, `keccak256(bytes32(0) ‖ state root ‖ withdrawals root ‖ block hash)`, and
-  requires it to equal the game's root claim. A mismatch fails `verify` with both values, and
-  nothing is loaded. The block's hash is then the top anchor, in addition to the link to the
-  block below the range.
+- **The check is mandatory.** Once the range is sealed, `verify` reads the last block's header
+  back from the store, computes its output root,
+  `keccak256(bytes32(0) ‖ state root ‖ withdrawals root ‖ block hash)`, and requires it to
+  equal the game's root claim. A mismatch fails `verify` with both values, and nothing is
+  listed in the manifest. The block's hash is then the top anchor, in addition to the link to
+  the block below the range.
 - **What it proves:** the whole range is the chain a game on L1 claims; the proposer proposes
   blocks that are already safe, so the range is committed to L1. The import ends up to about
   an hour behind the safe head (OP Mainnet creates a game about hourly).
