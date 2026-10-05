@@ -8,7 +8,7 @@ verifies into the safe and finalized heads. Store calls go through storage's ret
 (`op_indexer_storage::retry`), without a time limit.
 
 It does not depend on `p2p`: the binary hands it a channel. It is generic over the two store
-traits, so it does not know about Redis or fjall.
+traits, so it does not know how either store keeps its blocks.
 
 ## 1. Inputs and outputs
 
@@ -229,7 +229,7 @@ gives to the execution network as the newest block the node knows.
 ## 5. Startup
 
 1. Read `C` from the archive. If there is none, start both tasks.
-2. Write the heads to the unsafe store (Redis may have been wiped by a layout change), prune it
+2. Write the heads to the unsafe store (its journal may have been emptied by a layout change), prune it
    up to `C` (the last run may have stopped between the marker and the prune), and publish
    `C`'s number to `p2p`.
 3. Start both tasks.
@@ -280,8 +280,9 @@ ingest lag (now minus block timestamp), channel depth.
 
 ## 9. What has been verified
 
-- **Ingest**: live, on mainnet gossip. Blocks, transactions and senders appear in Redis; reorg
-  and fill events show in the log and the event stream.
+- **Ingest**: live, on mainnet gossip, with the Redis store this replaced (D0): blocks,
+  transactions and senders were stored; reorg and fill events showed in the log and the event
+  stream. Not yet run on the in-memory unsafe chain.
 - **Promotion**: with a throwaway driver outside the repo that feeds safe heads trailing the
   unsafe head, including a step back (L1 reorg), a missing block, and a kill between each pair
   of steps. Not run on heads from the L1 side.

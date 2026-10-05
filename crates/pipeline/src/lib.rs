@@ -19,7 +19,7 @@
 //!   made the call.
 //! - [`metrics`] names and records what the tasks do.
 //!
-//! Generic over the two store traits, so it does not know about Redis or fjall,
+//! Generic over the two store traits, so it does not know how either store keeps its blocks,
 //! and it talks to the networks through channels, so it depends on neither. It does not fetch
 //! or verify receipts, it asks for them and stores the answers; it does not fetch missing
 //! blocks. The design is in `docs/pipeline.md`.

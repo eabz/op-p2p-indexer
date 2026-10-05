@@ -1,6 +1,8 @@
 # Serving at scale: chunks, `server` and `balancer`
 
-Status: **design, nothing built.** Decision: [roadmap.md](roadmap.md), 2026-10-04, "Four
+Status: **design; the storage core (`crates/chunks`, sections 1, 2 and 2.4) and the converter
+(`import export`, section 3) are built and checked end to end against a local directory (not
+against R2: no credentials here); the server side is built, not run (5.5).** Decision: [roadmap.md](roadmap.md), 2026-10-04, "Four
 binaries". To be built after Base. Decisions are marked **D**; the user's answers of
 2026-10-04 settled the open questions (they are recorded in the decisions). Measurements are
 from 2026-10-04.
@@ -26,8 +28,8 @@ to fill.
 in memory in the node process, `indexer` and `server` alike, and every change to it is
 journaled to a local fjall keyspace, so a restart replays it without the network. Nothing
 needs a separate service: no Redis in the binaries, in docker compose or in the docs. (This
-replaces the Redis unsafe store of today's `storage` crate; `docs/storage.md` and the compose
-file still describe Redis and change with it.)
+replaced the Redis unsafe store of the `storage` crate: `MemoryStore`, `docs/storage.md`
+section 3.)
 
 ## 1. The chunk
 
@@ -57,25 +59,32 @@ transactions per block). The compressed saving was not measured.
 
 ### 1.2 Layout and compression
 
+Built (`crates/chunks/src/format.rs`):
+
 ```text
-chunk  = magic "OPXC" | version u16 | chain id u64 | first number u64 | last number u64
-       | first parent hash (32) | last hash (32)
-       | segment* | index | footer
-segment = one zstd frame (with its checksum) of up to 1 MiB of block records
-record  = the verified chunk's block record (hash, senders, header, body, receipts)
-index   = zstd frame: per segment (offset, length, first number);
-          per block (hash, segment, offset in segment), sorted by hash in a second table
-footer  = index offset u64 | index length u64 | sha256 of everything before the footer (32)
-          | magic "OPXC"
+chunk    = segment* | index | footer
+segment  = one zstd frame (level 1, with its checksum) of up to ~1 MiB of block records
+record   = hash (32) | sender count u32 | senders (20 each) | header length u32 | header RLP
+         | body length u32 | body RLP | receipts length u32 | receipts RLP without blooms
+index    = zstd frame: version u16 | chain id u64 | first u64 | last u64 | first parent (32)
+         | last hash (32) | level i32 | segment count u32
+         | per segment: offset u64, length u32, first block u64, blocks u32, sha256 (32)
+         | per block, in block order: hash (32)
+footer   = index offset u64 | index length u32 | magic "OPXC"
+root     = sha256 of the index frame: the manifest records it, the object's name carries it
 ```
 
 Integers are little-endian. **D2.**
 - **Segmented zstd frames.** One block is read by decompressing one ~1 MiB segment, not the
-  chunk. A ranged GET of one segment works on R2.
-- **A per-chunk index for by-hash lookups**, in the chunk itself: no global index object to keep
-  up to date (section 2.4).
-- **The footer at the end**, so one ranged GET of the last bytes (`Range: bytes=-N`) gives the
-  index without downloading the chunk.
+  chunk. A ranged GET of one segment, or of a run of them, works on R2.
+- **A per-chunk index** with every block's hash, in the chunk itself: by-hash lookups within
+  a chunk, and the input of the global index (section 2.4).
+- **Index and footer at the end**: the manifest records where the index starts
+  (`footer_offset`), so one ranged GET gives the index without downloading the chunk.
+- **A two-level root**: the manifest holds the sha256 of the index, and the index holds each
+  segment's sha256. Any ranged read is checked before it is decompressed, for a whole chunk or
+  one segment alike. There is no hash over the whole object, which a single-segment read could
+  not check.
 
 Compression on that sample, 146.9 MB of records (blooms still in), zstd 1.5.7's in-memory
 benchmark (`zstd -b`), one thread, Apple M-series:
@@ -147,8 +156,10 @@ Base: about 2 to 3.5 TB of archive (`docs/base.md` section 6), so roughly a TB o
 
 **D5.** Three checks, no root recomputation (CPU is the dearer resource). A chunk that fails
 any of them is discarded and refetched once, then reported:
-1. **the object's sha256** equals the manifest's (and the footer's): transport or storage
-   damage;
+1. **the chunk's root**: the index frame hashes to the manifest's sha256, and every segment
+   read hashes to the index's sha256 for it before it is decompressed (and zstd's frame
+   checksum holds): transport or storage damage, or tampering, before a byte is used. Built:
+   one flipped byte fails "a segment does not hash to the index's sha256";
 2. **the manifest chain**: the segments' hash chain, the chunk's first parent hash and last
    hash equal to the manifest's, and its first parent equal to the previous chunk's last hash.
    The chain of chunks ends at a block the server verified itself (its own committed head,
@@ -168,9 +179,12 @@ again.
 
 ```text
 <bucket>/<chain id>-<genesis hash, 8 hex>/
-    chunks/<first:012>-<last:012>-<sha256, 16 hex>.opxc     immutable
+    chunks/<first:012>-<last:012>-<root, 16 hex>.opxc       immutable
     manifest/<sequence:010>.json                            immutable, append-only
+    index/<generation:06>/<shard:03x>.idx                   immutable (section 2.4)
 ```
+
+As built: OP Mainnet's prefix is `10-7ca38a19`.
 
 **D6.**
 - The prefix carries the genesis hash, so a bucket can never mix two chains with the same id.
@@ -214,22 +228,22 @@ hash → number index the servers read from R2.
 
 **D9.** Hash-prefix shards, immutable, in generations:
 - **Shards**: 4,096 files per generation, split by the hash's first 12 bits. Each holds its
-  entries sorted by hash: the next 8 bytes of the hash and the block number (u64), 16 bytes an
-  entry. A 256-entry fan-out table on the next 8 bits (1 KB) heads each shard.
+  entries sorted: hash bytes 2 to 10 and the block number (u64), 16 bytes an entry. A fan-out
+  table heads each shard: 257 u32s, where each value of the hash's byte 2 starts, then the
+  count (1 KB). Built: `crates/chunks/src/hash_index.rs`.
 - **Sized for OP Mainnet**: 157.7 M blocks give about 38,500 entries per shard. That is 616 KB a
   shard and 2.5 GB a generation, about 150 entries (2.4 KB) per fan-out bucket. An 8-byte
   remainder after a 12-bit prefix leaves a false match below one in 10^9 over the whole chain;
   a match is confirmed by the block's own hash anyway.
-- **Lookup**: two ranged GETs, the shard's fan-out table and then its bucket (about 3 KB), then
-  the block's own segment. Shard sizes are in the generation's manifest entry, so no HEAD is
-  needed.
+- **Lookup**: two ranged GETs, the shard's fan-out table at offset 0 (fixed size, so no HEAD)
+  and then its bucket (about 3 KB), then the block's own segment.
 - **Generations**: shards are never modified.
   - The exporter writes a new full generation every 50,000 blocks (`server --export`), and
     the converter writes the first. Names carry the generation number:
     `index/<gen>/<prefix:03x>.idx`.
   - A rewrite is 2.5 GB and 4,096 PUTs, about $0.02.
   - Between generations the hashes of the chunks sealed since the last generation are in those
-    chunks' footers (section 1.2). That is at most about 14 chunks at OP Mainnet's rate, read
+    chunks' indexes (section 1.2). That is at most about 14 chunks at OP Mainnet's rate, read
     with one ranged GET each, newest first, only when the generation's shard misses.
 - **Recent blocks** (the unsealed tail and the unsafe chain) are found locally, as today.
 
@@ -240,25 +254,56 @@ number, except for the block a range sync starts from.
 
 ## 3. The converter: `verified/` to chunks (one-time)
 
-**D10.** An `import` subcommand, `import export --state-dir <dir> --bucket ...`, not a separate
-tool. It runs once per existing `verified/` folder (OP Mainnet's and Unichain's on the user's
+**D10.** An `import` subcommand, `import export --state-dir <dir>`, not a separate tool, which
+replaces `import load` (removed, 2026-10-04). It runs once per existing `verified/` folder (OP Mainnet's and Unichain's on the user's
 server). It needs exactly what `importer` already has:
 - the state directory and its accepted range (`verified.json`, so only what `verify` accepted
   is exported);
 - the verified chunk reader (`chunk.rs`);
-- the sender proof `load` does (recover and compare; senders in `verified/` are the service's
-  until then);
+- the sender proof `load` did, now `export`'s (recover and compare; senders in `verified/` are
+  the service's until then);
 - progress and stop handling.
 
-It reads the verified 100-block chunks in order, proves the senders as `load` does, re-cuts
-the records into D4 chunks (dropping the blooms), writes them at level 1 with their index,
-uploads them and appends
-a manifest segment every N chunks. It is resumable: on start it reads the manifest and
-continues after its last chunk. Uploads run several at once with backoff, bounded by bytes in
-flight.
+Built (`bin/op-indexer-import/src/export.rs`; `docs/import.md` section 3.3):
+- **Flow**: the verified 100-block chunks are read, their senders proven (`docs/import.md` 3.2)
+  and their records prepared, several chunks at once (`--threads`, one per CPU). The records
+  are cut into D4 chunks in order (blooms dropped, each receipt's bloom first checked against
+  its logs) and sealed at level 1 with their index.
+- **Upload and listing**: up to `--uploads` chunks (4) are uploaded at once. A manifest
+  segment is appended every 16 chunks, after their objects are stored.
+- **Index**: once the range is done, the hash index's first generation is written from every
+  exported block and recorded in a manifest segment of its own.
+- **The last chunk** ends at the range's last block, wherever D4 would have cut it: boundaries
+  are deterministic from the manifest's tip. The exporter continues after it.
+- **Resumable**: on start it reads the manifest and continues after its last chunk,
+  rebuilding the index input from the exported chunks' indexes. A chunk uploaded but not yet
+  listed is sealed again, to the same name and bytes. A run with nothing left to do ends at
+  once.
+- **Targets**: R2, with credentials from the environment (`OP_INDEXER_R2_ACCOUNT_ID`,
+  `_BUCKET`, `_ACCESS_KEY_ID`, `_SECRET_ACCESS_KEY`, optional `_ENDPOINT`), never logged. Or
+  `--to-dir`, a local directory with the same layout (`object_store`'s local backend).
+- **Disk**: a chunk lives in memory until it is uploaded. The index input spills by shard
+  under `<state>/export-index/` (about 2.5 GB for OP Mainnet) and is removed at the end.
 
-For the converter's own disk it writes each chunk to a temporary file, uploads it, and
-deletes it; nothing else is kept.
+**Measured** (2026-10-04, Apple M-series, 10 cores, release build, `--to-dir` on the internal
+SSD): the 20 sample chunks (2,000 post-Isthmus OP Mainnet blocks, 50,368 transactions, 147 MB
+of records):
+- sealing took 0.37 s, about 5,400 blocks/s or 400 MB/s of records, with 48,357 senders
+  recovered; this is CPU-bound and runs in parallel;
+- the result is one chunk of 20.5 MB (7.2×);
+- the index generation took 1.6 s, its 4,096 shard files mostly system time on the local
+  disk; on R2 it is 4,096 PUTs.
+
+Reading it back through `ChunkStore` (scratch program, local backend):
+- the stream returned all 2,000 blocks byte for byte equal to the verified chunks, receipts
+  with rebuilt blooms included, in 231 ms (8,600 blocks/s, 635 MB/s of records);
+- a stream started mid-chunk begins at its block;
+- an index read, three single blocks and four hash lookups (one a miss) took 13 ms;
+- one flipped byte was refused.
+
+Extrapolated to OP Mainnet's 157.7 M blocks, at the measured sealing rate of post-Bedrock
+blocks, the whole conversion is bound by sender recovery (about 13 CPU-hours)
+and by the upload. Not measured whole.
 
 ## 4. Sealing new chunks: the exporter
 
@@ -341,6 +386,52 @@ Unchanged code over `R2Archive`:
 - **Flight `DoGet`** streams a ticket's range from R2. A ticket the balancer clipped to one
   chunk (section 6.4) is one GET.
 
+### 5.5 As built (2026-10-04, not run)
+
+- `crates/node` (`op-indexer-node`) holds the node's wiring, generic over the committed
+  store: `indexer` runs it on its fjall archive, `server` on an `R2Archive`. A binary adds
+  tasks of its own (`op_indexer_node::Task`).
+- `crates/server` (`op-indexer-server`):
+  - `ChunkSource`: what the server needs of the sealed chunks (listing, refresh, a chunk's
+    blocks from a number, hash lookup, publish). `R2Chunks` implements it over the chunk
+    store and holds the manifest; publishing rolls the hash-index generation every 50,000
+    blocks.
+  - `R2Archive<S: ChunkSource>`: the routing of 5.1, the tail pruned with
+    `FjallArchive::prune_below` as the manifest grows (read every 30 s), and an empty tail
+    accepting only the block after the last sealed one.
+  - Read-ahead (5.2): a consumer's `blocks` calls are served by a feed that streams chunk after
+    chunk ahead of it, at most 64 MiB per reader and 512 MiB in all, dropped after a minute
+    unread; no disk, no cache.
+  - Peers (5.3): a read that needs R2 takes one of 4 places and counts against 512 MiB a
+    minute; without one the peer gets the empty answer.
+  - `Exporter` (section 4): adds a block to the chunk being written once it is finalized and
+    has its receipts, and publishes the chunk when the writer ends it.
+- `bin/server`: `--export`; `OP_INDEXER_R2_ACCOUNT_ID`, `_BUCKET`, `_ACCESS_KEY_ID`,
+  `_SECRET_ACCESS_KEY`, `_ENDPOINT`, `OP_INDEXER_EXPORTER_ID`; the node's variables otherwise.
+- API keys (D18): `OP_INDEXER_API_KEYS` on `indexer` and `server` alike, an interceptor on
+  the gRPC and Flight services (`crates/stream/src/auth.rs`); empty means no check.
+- Not built: retry-once-then-`UNAVAILABLE` on a failed chunk read (5.2) is left to the
+  caller's own retry; the hash lookup is the chunk store's (no index cache on the server side).
+
+### 5.6 The indexer's history from chunks (design, not built)
+
+Without `import load`, a single-user `indexer` gets its history from the same chunks (or from
+peers, by range sync, as today). Design:
+- **Where**: a task the `indexer` binary adds through `op_indexer_node::Task`, so `crates/node`
+  stays free of R2; it reads through `ChunkSource`, which moves to `crates/chunks` with the
+  reader so the indexer does not depend on `crates/server`. Enabled by the R2 variables of
+  `server` with a read-only key.
+- **Trust**: the archive's first block is one the node verified itself (gossip and range sync,
+  anchored on L1). The backfill fills `[0, first − 1]` and is accepted only if the chunks
+  link (D5) down from a chunk whose last hash is the first block's parent hash; chunks are
+  checked as they stream, nothing is stored before its chunk is.
+- **Writes**: below the archive's first block, newest chunk first, so every stored block
+  hangs off one already verified. That needs a `FjallArchive` prepend (the bulk path writing
+  below the first block, durable per chunk, resumable from the archive's first block); today
+  the archive only grows upwards.
+- **Gap**: blocks between the last sealed chunk and the archive's first come from range sync,
+  as they do now.
+
 ## 6. The balancer
 
 ### 6.1 Table
@@ -395,10 +486,12 @@ R2 Standard, from Cloudflare's pricing page (read 2026-10-04):
 
 A ranged GET is a GET; the page does not say otherwise.
 
-- **Streaming**: one GET per chunk. At about 39 MB a chunk, 1 TB served (compressed bytes read
-  from R2) is about 26,000 GETs, about **$0.01 per TB**. Reading by segment instead (about
-  150 KB compressed each) would be about 6.7 million GETs, $2.40 per TB, so streams read whole
-  chunks or large ranges of segments, never one segment at a time.
+- **Streaming**: as built, a stream reads runs of segments of 8 MiB per GET
+  (`ReadOptions::range_bytes`), four at once, for read-ahead and parallel transfer. So 1 TB
+  served (compressed bytes read from R2) is about 125,000 GETs, about **$0.05 per TB**. Whole
+  39 MB chunks per GET would be about 26,000 GETs, $0.01 per TB. Reading one segment (about
+  150 KB compressed) per GET would be about 6.7 million GETs, $2.40 per TB, so streams never do
+  that.
 - **Random single blocks**: two GETs each (footer, segment), $0.72 per million blocks; by hash,
   two or three more.
 - **Storage**: OP Mainnet's ~500 GB of chunks plus a 2.5 GB index generation is about

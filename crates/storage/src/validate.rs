@@ -1,16 +1,12 @@
-//! The checks a decoded block must pass before the unsafe store takes it: what its Lua
-//! scripts and its JSON layout can hold. Holds only what does not depend on the store's
-//! state; checks against stored data (the parent's number, the stored number of a block) stay
-//! with the store. The archive takes blocks in their consensus encoding and checks those
-//! itself.
+//! The checks a decoded block must pass before the unsafe store takes it: what its layout can
+//! hold. Holds only what does not depend on the store's state; checks against stored data
+//! (the parent's number, the stored number of a block) and the roots stay with the store. The
+//! archive takes blocks in their consensus encoding and checks those itself.
 
 use op_alloy_consensus::OpTxEnvelope;
 use op_indexer_primitives::DecodedBlock;
 
 use crate::{InvalidBlockReason, StorageError};
-
-/// Highest block number the unsafe store's scripts hold exactly: Lua numbers are doubles.
-const MAX_BLOCK_NUMBER: u64 = 1 << 53;
 
 /// Checks that `block` fits the unsafe store.
 ///
@@ -34,9 +30,6 @@ pub(crate) fn validate_block(block: &DecodedBlock) -> Result<(), StorageError> {
             number,
             tx_type: u8::from(unsupported.tx_type()),
         });
-    }
-    if number > MAX_BLOCK_NUMBER {
-        return Err(invalid(InvalidBlockReason::NumberRange));
     }
     if block.senders.len() != transactions.len() {
         return Err(invalid(InvalidBlockReason::SenderCount));

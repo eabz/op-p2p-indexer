@@ -3,7 +3,8 @@
 A self-hosted source of OP Stack chain data. It syncs blocks, transactions, receipts and logs from
 the chains' own peer-to-peer networks, verifies everything against the block hashes the sequencer
 signs and L1 commits to, keeps the history in a local archive, and streams it to consumers over
-gRPC and Apache Arrow Flight. It calls no RPC and needs no database besides Redis.
+gRPC and Apache Arrow Flight. It calls no RPC and needs no other service: no database, no RPC
+endpoint.
 
 It also tries to leave the networks it reads from better off: it serves the blocks it holds to
 other nodes, follows each network's peer rules, and shares pre-Bedrock history with other
@@ -18,7 +19,7 @@ many users means running several servers behind one balancer.
 
 | Binary | Role | Storage | Status |
 |---|---|---|---|
-| **`indexer`** | The full node for a single user: every service in one process. Takes part in the p2p networks, follows L1, keeps history and serves it over gRPC and Arrow Flight | Its own local block archive (fjall) | built (today `op-indexer`) |
+| **`indexer`** | The full node for a single user: every service in one process. Takes part in the p2p networks, follows L1, keeps history and serves it over gRPC and Arrow Flight | Its own local block archive (fjall) | built |
 | **`server`** | A full node for serving at scale: the same p2p participation and live data, but its history is a local cache of immutable block chunks mapped to Cloudflare R2, filled from R2 only when a chunk is missing | Chunk cache backed by R2 | planned |
 | **`importer`** | Fills history once from an external archive, verifying every block, and produces the chunks the archive and R2 are built from | Its state directory | built (`import`) |
 | **`balancer`** | The single entry point for users: keeps the table of which chunk ranges each server holds and points every request at the right server. No data passes through it | The chunk table | planned |
@@ -33,23 +34,23 @@ sealed only once all their blocks are finalized on L1, so they never change.
 | Consensus p2p (`crates/p2p`) | Joins the OP Stack gossip network, validates sequencer-signed blocks, serves `payload_by_number` to older op-nodes |
 | Execution p2p (`crates/el`) | Joins the execution network (devp2p, eth/68 and eth/69): fetches each block's receipts and verifies them against the header, serves headers, bodies and receipts, and syncs missing ranges |
 | L1 (`crates/l1`, optional) | A beacon light client plus L1 execution peers: finds the chain's dispute games on Ethereum and marks blocks safe and finalized |
-| Storage (`crates/storage`) | Redis for the unsafe tip, a fjall block archive for committed history |
+| Storage (`crates/storage`) | The unsafe tip in memory with a local journal, a fjall block archive for committed history |
 | Stream (`crates/stream`) | gRPC subscriptions (history, then the live chain, with reorgs) and Arrow Flight tables (`blocks`, `transactions`, `receipts`, `logs`) |
 
 ## Quick start
 
-Requirements: a recent stable Rust, Docker (for Redis), and for a public node open ports 9222
-(gossip) and 30303 (execution p2p), TCP and UDP.
+Requirements: a recent stable Rust, and for a public node open ports 9222 (gossip) and 30303
+(execution p2p), TCP and UDP.
 
 ```bash
-docker compose up -d redis
 cargo build --release
-OP_INDEXER_EL_ENABLED=true ./target/release/op-indexer
+OP_INDEXER_EL_ENABLED=true ./target/release/indexer
 ```
 
 The node keeps its state in `data-op/` (`data-unichain/`, `data-base/` for the others): its identity, known
-peers and the block archive. Every setting is an `OP_INDEXER_*` environment variable, all of them
-documented on `Config::from_env` in [`bin/op-indexer/src/config.rs`](bin/op-indexer/src/config.rs).
+peers, the block archive and the unsafe chain's journal. Every setting is an `OP_INDEXER_*`
+environment variable, all of them documented on `Config::from_env` in
+[`crates/node/src/config.rs`](crates/node/src/config.rs).
 Some useful ones:
 
 | Variable | Default | |
@@ -61,7 +62,7 @@ Some useful ones:
 | `OP_INDEXER_STREAM_LISTEN_ADDR` | `127.0.0.1:50051` | The stream has no authentication: keep it local or behind a proxy |
 | `OP_INDEXER_ADVERTISED_ADDR`, `OP_INDEXER_EL_ADVERTISED_ADDR` | unset | Your public `ip:port`, when behind NAT |
 
-With Docker, `docker compose up -d` runs Redis and the node; `unichain.env.example` shows a second
+With Docker, `docker compose up -d` runs the node; `unichain.env.example` shows a second
 instance for Unichain next to the first. See [storage.md](docs/storage.md), "Several instances on
 one host".
 

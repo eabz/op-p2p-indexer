@@ -1,0 +1,21 @@
+[package]
+name = "server"
+description = "Binary: a full node that keeps no history, reading sealed chunks from R2; optionally the exporter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+op-indexer-chainspec.workspace = true
+op-indexer-chunks.workspace = true
+op-indexer-node.workspace = true
+op-indexer-server.workspace = true
+op-indexer-storage.workspace = true
+
+eyre.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

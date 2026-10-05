@@ -20,9 +20,6 @@
 //! there), read after every batch of events; a change is published as `Heads`. Then the
 //! published blocks still without receipts are looked up once more: the pipeline attaches
 //! late receipts to archived blocks, which has no event.
-//!
-//! A stream that went back (Redis restarted or lost it) is a reset: its last event is older
-//! than the position, and the follower reads the state again.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -257,7 +254,7 @@ impl<U: UnsafeStore, A: ArchiveStore> Follower<U, A> {
             let (unsafe_head, heads) = self.source.heads().await?;
             let tracked = state.without_receipts.clone();
             // A head at or below the last block published, and not it: the store went back
-            // (a reorg to a shorter chain, or Redis lost its state) under the published tail.
+            // (a reorg to a shorter chain) under the published tail.
             let went_back = match (state.chain.back(), unsafe_head) {
                 (Some(last), Some(head)) => last.number >= head.number && *last != head,
                 (Some(_), None) => true,
@@ -286,12 +283,6 @@ impl<U: UnsafeStore, A: ArchiveStore> Follower<U, A> {
             .await?;
         if batch.missed {
             warn!("the stream's follower fell behind the unsafe store's events; reading state");
-            return Ok(None);
-        }
-        // An empty wait may be a stream that went back: reading after a position it no longer
-        // reaches would wait forever.
-        if batch.events.is_empty() && self.last_event_id().await? < after {
-            warn!("the unsafe store's event stream was reset; the follower reads the state");
             return Ok(None);
         }
         let mut position = after;

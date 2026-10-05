@@ -1,0 +1,26 @@
+[package]
+name = "op-indexer-server"
+description = "The server's committed store: sealed history read from R2, a local tail, and the exporter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+op-indexer-chainspec.workspace = true
+op-indexer-chunks.workspace = true
+op-indexer-primitives.workspace = true
+op-indexer-storage.workspace = true
+
+alloy-consensus.workspace = true
+alloy-primitives.workspace = true
+alloy-rlp.workspace = true
+op-alloy-consensus.workspace = true
+futures-util.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+tokio-util.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

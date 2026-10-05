@@ -11,15 +11,19 @@ use op_indexer_chainspec::{ChainSpec, OP_MAINNET};
 use op_indexer_el::{ElConfig, PeerConfig};
 use op_indexer_p2p::{Bootnode, NetworkConfig};
 use op_indexer_primitives::{ChainIdentity, ExecutionPeer};
-use op_indexer_storage::{ArchiveConfig, RedisConfig, StorageConfig};
+use op_indexer_storage::{ArchiveConfig, StorageConfig, UnsafeConfig};
 use op_indexer_stream::StreamConfig;
 
 const DEFAULT_CHAIN_ID: u64 = OP_MAINNET.chain_id;
 const DEFAULT_LISTEN_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9222);
 const DEFAULT_MAX_PEERS: u32 = 30;
-const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:6379";
+/// The memory the unsafe chain's blocks may take: about a day of a busy chain's blocks
+/// (measured in docs/storage.md section 3).
+const DEFAULT_UNSAFE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// Directory of the local block archive, inside the data directory.
 const ARCHIVE_DIR: &str = "archive";
+/// The unsafe chain's journal, inside the data directory.
+const UNSAFE_DIR: &str = "unsafe";
 /// Directory of the node store (identity and known peers), inside the data directory.
 pub(crate) const NODE_DIR: &str = "node";
 /// The data directory's default before it was named after the chain.
@@ -34,7 +38,7 @@ const DEFAULT_L1_BEACON_LISTEN_ADDR: SocketAddr =
 const DEFAULT_L1_LISTEN_ADDR: SocketAddr =
     SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 30304);
 /// Local only: the stream has no authentication. Clear of the p2p (9222), execution (30303),
-/// L1 (30304, 9001) and Redis (6379) ports.
+/// and L1 (30304, 9001) ports.
 const DEFAULT_STREAM_LISTEN_ADDR: SocketAddr =
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50051);
 const DEFAULT_STREAM_MAX_SUBSCRIPTIONS: usize = 64;
@@ -80,7 +84,7 @@ pub(crate) struct L1Settings {
 
 /// Process configuration.
 #[derive(Debug)]
-pub(crate) struct Config {
+pub struct Config {
     pub(crate) network: NetworkConfig,
     /// The execution network, which fetches receipts; `None` when it is disabled.
     pub(crate) el: Option<ElSettings>,
@@ -89,12 +93,14 @@ pub(crate) struct Config {
     pub(crate) sync: bool,
     /// The L1 side, which learns what L1 commits to; `None` when it is disabled.
     pub(crate) l1: Option<L1Settings>,
-    /// Unsafe store (Redis) and the block archive (fjall), the committed store.
+    /// The unsafe chain (in memory, journaled to fjall) and the block archive (fjall), the
+    /// committed store.
     pub(crate) storage: StorageConfig,
-    /// Directory for local state: the node store (`node/`) and the block archive (`archive/`).
+    /// Directory for local state: the node store (`node/`), the block archive (`archive/`) and
+    /// the unsafe chain's journal (`unsafe/`).
     pub(crate) data_dir: PathBuf,
     /// The gRPC stream of the chain to consumers.
-    pub(crate) stream: StreamConfig,
+    pub stream: StreamConfig,
 }
 
 impl Config {
@@ -113,7 +119,9 @@ impl Config {
     ///   `data-unichain`, so two chains on one host never share one by default). Without it,
     ///   the node refuses to start while `data`, an earlier build's default, holds an archive
     ///   or a node store and `data-<chain>` does not exist.
-    /// - `OP_INDEXER_REDIS_URL`: unsafe store (default `redis://127.0.0.1:6379`).
+    /// - `OP_INDEXER_UNSAFE_MAX_BYTES`: memory the unsafe chain's blocks may take, in bytes
+    ///   (default 2 GiB); past it the lowest heights leave. Its journal is `unsafe/` in the data
+    ///   directory, replayed on start.
     /// - `OP_INDEXER_EL_ENABLED`: `true` to join the execution p2p network (devp2p) and fetch
     ///   the receipts gossip does not carry (default `false`: blocks stay without receipts).
     ///   The variables below only apply when it is enabled.
@@ -165,7 +173,14 @@ impl Config {
     /// - `OP_INDEXER_STREAM_MAX_SUBSCRIPTIONS`: stream subscriptions at once (default 64).
     /// - `OP_INDEXER_STREAM_MAX_FLIGHTS`: Arrow Flight `DoGet` streams at once, on the same
     ///   listener (default 8).
-    pub(crate) fn from_env() -> eyre::Result<Self> {
+    /// - `OP_INDEXER_API_KEYS`: comma-separated API keys; with any set, a gRPC or Flight
+    ///   request is served only with one of them as `authorization: Bearer <key>` (default:
+    ///   none, no check). Never logged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a variable is invalid or the settings contradict each other.
+    pub fn from_env() -> eyre::Result<Self> {
         let chain_id = parse_var("OP_INDEXER_CHAIN_ID")?.unwrap_or(DEFAULT_CHAIN_ID);
         let chain = ChainSpec::by_chain_id(chain_id)
             .ok_or_else(|| eyre!("unsupported chain id {chain_id}"))?;
@@ -210,6 +225,9 @@ impl Config {
             block_time: Duration::from_secs(chain.block_time_secs),
             receipts: el.is_some(),
             sync,
+            api_keys: var("OP_INDEXER_API_KEYS")
+                .map(|keys| keys.split(',').map(|key| key.trim().to_owned()).collect())
+                .unwrap_or_default(),
         };
         Ok(Self {
             l1,
@@ -224,9 +242,11 @@ impl Config {
                 max_peers: parse_var("OP_INDEXER_MAX_PEERS")?.unwrap_or(DEFAULT_MAX_PEERS),
             },
             storage: StorageConfig {
-                redis: RedisConfig {
-                    url: var_or("OP_INDEXER_REDIS_URL", DEFAULT_REDIS_URL),
+                unsafe_chain: UnsafeConfig {
+                    path: data_dir.join(UNSAFE_DIR),
                     canyon_time: chain.canyon_time(),
+                    max_bytes: parse_var("OP_INDEXER_UNSAFE_MAX_BYTES")?
+                        .unwrap_or(DEFAULT_UNSAFE_MAX_BYTES),
                 },
                 archive,
                 chain: ChainIdentity {
@@ -236,6 +256,26 @@ impl Config {
             },
             data_dir,
         })
+    }
+}
+
+impl Config {
+    /// The chain the node runs.
+    #[must_use]
+    pub const fn chain(&self) -> &'static ChainSpec {
+        self.network.chain
+    }
+
+    /// The stores' configuration: the committed archive's path and the chain it holds.
+    #[must_use]
+    pub const fn storage(&self) -> &StorageConfig {
+        &self.storage
+    }
+
+    /// The directory of the node's local state.
+    #[must_use]
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
     }
 }
 
@@ -321,10 +361,6 @@ fn l1_settings() -> eyre::Result<Option<L1Settings>> {
 
 fn var(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.is_empty())
-}
-
-fn var_or(name: &str, default: &str) -> String {
-    var(name).unwrap_or_else(|| default.to_owned())
 }
 
 fn parse_bootnode(bootnode: &str) -> eyre::Result<Bootnode> {

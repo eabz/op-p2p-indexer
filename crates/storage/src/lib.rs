@@ -1,13 +1,14 @@
 //! Block storage: an unsafe store for live blocks, and the archive of blocks committed to L1.
 //!
 //! ```text
-//! DecodedBlock ─▶ UnsafeStore (Redis: unsafe blocks, fork choice, events for readers)
+//! DecodedBlock ─▶ UnsafeStore (in memory, journaled to fjall: unsafe blocks, fork choice,
+//!                 events for readers)
 //! ArchivedBlock ─▶ ArchiveStore (fjall: the committed store, a contiguous range of committed
 //!                  blocks as RLP with their senders, and the committed L1 heads)
 //! ```
 //!
 //! - [`UnsafeStore`] and [`ArchiveStore`] are the contracts; [`unsafe_store`] and
-//!   [`archive_store`] hold the Redis and fjall implementations.
+//!   [`archive_store`] hold the in-memory and fjall implementations.
 //! - [`StorageConfig`] is plain data filled by the binary; [`StorageError`] classifies failures
 //!   by [`Severity`]: transient, expected or fatal.
 //! - [`metrics`] names and records every metric of the two stores.
@@ -26,7 +27,6 @@ pub mod unsafe_store;
 mod validate;
 
 use std::fmt;
-use std::str::FromStr;
 use std::time::Duration;
 
 use alloy_primitives::{BlockHash, BlockNumber, Bytes};
@@ -36,7 +36,7 @@ use op_indexer_primitives::{
     ReadLimits, UnsafeEvent,
 };
 
-pub use config::{ArchiveConfig, RedisConfig, StorageConfig};
+pub use config::{ArchiveConfig, StorageConfig, UnsafeConfig};
 pub use error::{InvalidBlockReason, ParseError, Severity, StorageError};
 pub use retry::{RetryError, retry};
 
@@ -44,19 +44,22 @@ pub use retry::{RetryError, retry};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Store {
-    /// The unsafe store (Redis).
+    /// The unsafe store (in memory).
     Unsafe,
     /// The local block archive (fjall), the committed store.
     Archive,
+    /// The remote archive of sealed chunks (R2), read by a server.
+    R2,
 }
 
 impl Store {
-    /// The store's backend: `redis` or `fjall`.
+    /// The store's name: `unsafe`, `archive` or `r2`.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Unsafe => "redis",
-            Self::Archive => "fjall",
+            Self::Unsafe => "unsafe",
+            Self::Archive => "archive",
+            Self::R2 => "r2",
         }
     }
 }
@@ -67,37 +70,29 @@ impl fmt::Display for Store {
     }
 }
 
-/// A position in the unsafe store's event stream: a Redis stream id, `millis-seq`. Ordered as
-/// the events are; [`EventId::START`] is before every event.
+/// A position in the unsafe store's events: a sequence number, ordered as the events are;
+/// [`EventId::START`] is before every event. It restarts with the process.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct EventId {
-    /// Milliseconds part.
-    pub millis: u64,
-    /// Sequence within the millisecond.
-    pub seq: u64,
-}
+pub struct EventId(u64);
 
 impl EventId {
-    /// Before every event: `0-0`.
-    pub const START: Self = Self { millis: 0, seq: 0 };
+    /// Before every event.
+    pub const START: Self = Self(0);
+
+    pub(crate) const fn new(sequence: u64) -> Self {
+        Self(sequence)
+    }
+
+    /// The sequence number.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
 }
 
 impl fmt::Display for EventId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}-{}", self.millis, self.seq)
-    }
-}
-
-impl FromStr for EventId {
-    type Err = std::num::ParseIntError;
-
-    /// Parses `millis-seq`; `millis` alone means sequence 0, as Redis reads it.
-    fn from_str(id: &str) -> Result<Self, Self::Err> {
-        let (millis, seq) = id.split_once('-').unwrap_or((id, "0"));
-        Ok(Self {
-            millis: millis.parse()?,
-            seq: seq.parse()?,
-        })
+        write!(f, "{}", self.0)
     }
 }
 
@@ -127,32 +122,31 @@ pub enum BlockPart {
 pub struct Events {
     /// The events after the position asked for, oldest first.
     pub events: Vec<(EventId, UnsafeEvent)>,
-    /// Events after the position asked for may have been trimmed from the stream (it keeps
-    /// about the newest ten thousand): the reader must read the state again. Can be set when
-    /// nothing was lost; never set for [`EventId::START`].
+    /// Events after the position asked for were dropped (the store keeps the newest ten
+    /// thousand): the reader must read the state again. Never set for [`EventId::START`].
     pub missed: bool,
 }
 
 /// Live blocks not yet committed to L1, with fork choice.
 ///
-/// Every remote call has a timeout and nothing is retried; some methods make several calls.
-/// Every write is idempotent, so a caller may retry it. The returned futures are `Send`, so a
-/// store can be driven from any task. Dropping a future never corrupts the store.
+/// Nothing is retried. Every write is idempotent, so a caller may retry it. The returned
+/// futures are `Send`, so a store can be driven from any task. Dropping a future never corrupts
+/// the store.
 pub trait UnsafeStore {
     /// Stores a block and applies fork choice, atomically.
     ///
     /// A block that is already stored, or is at or below the safe head, is not stored again:
     /// the outcome has `stored = false` and no events.
     ///
-    /// An insert that timed out may still have been applied. Retrying it is safe, but the
-    /// retry then reports `stored = false` and no events: the events of the first attempt went
-    /// to the event stream only. A caller that needs them re-reads [`Self::head`].
+    /// An insert that failed after it was applied (its journal write failed) is safe to retry,
+    /// but the retry then reports `stored = false` and no events: the events of the first
+    /// attempt went to the readers only. A caller that needs them re-reads [`Self::head`].
     ///
     /// # Errors
     ///
     /// Returns [`StorageError::InvalidBlock`] or [`StorageError::UnsupportedTransaction`] for a
     /// block the store cannot hold (nothing is stored then), and another [`StorageError`] if
-    /// the store cannot be reached or the block cannot be encoded.
+    /// the journal cannot be written.
     fn insert(
         &self,
         block: &DecodedBlock,
@@ -163,8 +157,8 @@ pub trait UnsafeStore {
     /// # Errors
     ///
     /// Returns [`StorageError::InvalidBlock`] if the receipts do not match the stored block (not
-    /// one per transaction, or `block` gives another number than the stored one), and another
-    /// [`StorageError`] if the store cannot be reached or the receipts cannot be encoded.
+    /// one per transaction, not its header's receipts root, or `block` gives another number
+    /// than the stored one), and another [`StorageError`] if the journal cannot be written.
     fn set_receipts(
         &self,
         block: BlockRef,
@@ -178,13 +172,11 @@ pub trait UnsafeStore {
     ///
     /// Returns [`StorageError::MissingAncestor`] if a block in the range is no longer stored,
     /// [`StorageError::AncestryTooLong`] if the range is longer than the store returns in one
-    /// call, and another [`StorageError`] if the store cannot be reached or stored data cannot
-    /// be decoded.
+    /// call, and another [`StorageError`] if stored data cannot be decoded.
     ///
     /// # Cancel safety
     ///
-    /// Reads only, in several calls under one overall deadline. A dropped future changes
-    /// nothing; call it again.
+    /// Reads only. A dropped future changes nothing; call it again.
     fn ancestry(
         &self,
         head: BlockRef,
@@ -199,22 +191,19 @@ pub trait UnsafeStore {
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError::Timeout`] if the whole prune exceeds its deadline, and another
-    /// [`StorageError`] if the store cannot be reached. Blocks removed before the error stay
-    /// removed.
+    /// Returns [`StorageError`] if the journal cannot be written; the blocks are gone from
+    /// memory anyway, and a restart removes them again.
     ///
     /// # Cancel safety
     ///
-    /// Removes in several steps within one call. A call that returned an error, or a future
-    /// dropped part-way, leaves the remaining blocks stored; calling it again with the same
-    /// `up_to` finishes the job.
+    /// The prune runs to its end once started, on a blocking thread.
     fn prune(&self, up_to: BlockRef) -> impl Future<Output = Result<(), StorageError>> + Send;
 
     /// Returns the unsafe head, or `None` if the store is empty.
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError`] if the store cannot be reached or stored data cannot be decoded.
+    /// Returns [`StorageError`] if stored data cannot be decoded.
     fn head(&self) -> impl Future<Output = Result<Option<BlockRef>, StorageError>> + Send;
 
     /// Returns the lowest height with a canonical block, or `None` if the store is empty:
@@ -222,14 +211,14 @@ pub trait UnsafeStore {
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError`] if the store cannot be reached or the height does not parse.
+    /// Never fails in memory; the error is the trait's.
     fn lowest(&self) -> impl Future<Output = Result<Option<BlockNumber>, StorageError>> + Send;
 
     /// Returns the stored block with this hash, canonical or not.
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError`] if the store cannot be reached or stored data cannot be decoded.
+    /// Returns [`StorageError`] if stored data cannot be decoded.
     fn block(
         &self,
         hash: BlockHash,
@@ -240,7 +229,7 @@ pub trait UnsafeStore {
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError`] if the store cannot be reached or stored data cannot be decoded.
+    /// Returns [`StorageError`] if stored data cannot be decoded.
     fn canonical(
         &self,
         number: BlockNumber,
@@ -250,7 +239,7 @@ pub trait UnsafeStore {
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError`] if the store cannot be reached or the height does not parse.
+    /// Never fails in memory; the error is the trait's.
     fn canonical_number(
         &self,
         hash: BlockHash,
@@ -259,12 +248,11 @@ pub trait UnsafeStore {
     /// Returns up to `count` consecutive canonical headers from height `from`, rising or
     /// falling, each in its consensus encoding (RLP). The run ends at the first height with no
     /// canonical block, a block no longer stored, or a block that does not link by parent hash
-    /// to the one before (a reorg between the store's two reads). Two round trips.
+    /// to the one before.
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError`] if the store cannot be reached or stored data cannot be
-    /// decoded.
+    /// Returns [`StorageError`] if stored data cannot be decoded.
     fn canonical_headers(
         &self,
         from: BlockNumber,
@@ -275,12 +263,12 @@ pub trait UnsafeStore {
     /// Returns the bodies or receipts of the leading blocks of `hashes` that are canonical and
     /// stored (with their receipts, for [`BlockPart::Receipts`]), each in its consensus
     /// encoding, in order. The run ends at the first that is not, or that follows the one
-    /// before by height without naming it as its parent. Two round trips at most.
+    /// before by height without naming it as its parent. Each was checked against its
+    /// header's roots when it was stored.
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError`] if the store cannot be reached or stored data cannot be
-    /// decoded.
+    /// Returns [`StorageError`] if stored data cannot be decoded.
     fn canonical_items(
         &self,
         hashes: &[BlockHash],
@@ -293,14 +281,11 @@ pub trait UnsafeStore {
     /// receipts yet. At most `max` heights are looked at. `None` if no block qualifies.
     ///
     /// The canonical chain is linked by parent hash wherever its heights are unbroken (fork
-    /// choice keeps it so), so the run is one chain, every block of it with its receipts. It is
-    /// read in chunks of 256 heights, two round trips each, every chunk checked to continue
-    /// the one before: a run that does not continue `above`, or whose receipts lag, costs one
-    /// chunk, not `max` heights.
+    /// choice keeps it so), so the run is one chain, every block of it with its receipts.
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError`] if the store cannot be reached or stored data does not parse.
+    /// Never fails in memory; the error is the trait's.
     fn canonical_run(
         &self,
         above: BlockRef,
@@ -311,29 +296,27 @@ pub trait UnsafeStore {
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError`] if the store cannot be reached.
+    /// Returns [`StorageError`] if the journal cannot be written.
     fn set_l1_heads(&self, heads: L1Heads)
     -> impl Future<Output = Result<(), StorageError>> + Send;
 
-    /// Returns the id of the newest event in the stream, or [`EventId::START`] if it is empty:
+    /// Returns the id of the newest event, or [`EventId::START`] if there is none yet:
     /// where a reader that has just read the store's state starts following [`Self::events`].
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError`] if the store cannot be reached or the id does not parse.
+    /// Never fails in memory; the error is the trait's.
     fn last_event_id(&self) -> impl Future<Output = Result<EventId, StorageError>> + Send;
 
     /// Returns up to `count` events after `after`, oldest first, every write's events in the
     /// order the writes were applied (docs/storage.md section 3.3). Waits up to `block_for` for
     /// the first one when there is none yet (not at all when it is zero); empty if none came.
     ///
-    /// Runs on a connection of its own, so a wait does not hold up the store's other calls.
-    /// Clones share that connection: concurrent calls of this method wait for each other.
+    /// A wait holds up nothing else: readers wait on their own.
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError`] if the store cannot be reached, does not answer within
-    /// `block_for` and the request timeout, or an event does not decode.
+    /// Never fails in memory; the error is the trait's.
     ///
     /// # Cancel safety
     ///
@@ -357,9 +340,8 @@ pub trait UnsafeStore {
 /// The returned futures are `Send`, so a store can be driven from any task.
 pub trait ArchiveStore {
     /// Appends consecutive blocks, oldest first, in their original encoding with their
-    /// senders. (For bulk loads the fjall archive also has `FjallArchive::bulk_append`.) The
-    /// bytes are stored unchanged, so they must be bytes the caller has verified (import,
-    /// range sync) or encoded from a verified block that survives the round trip (promoted
+    /// senders. The bytes are stored unchanged, so they must be bytes the caller has verified
+    /// (range sync) or encoded from a verified block that survives the round trip (promoted
     /// gossip blocks), and the senders must be the ones recovered from them. A block with
     /// receipts stores them at once.
     ///
@@ -472,7 +454,7 @@ pub trait ArchiveStore {
     ) -> impl Future<Output = Result<(Vec<BlockRef>, u64), StorageError>> + Send;
 
     /// Returns the number of the archived block with this hash: of a block the archive holds,
-    /// never of what an interrupted bulk load left above the tip.
+    /// never of what an earlier importer's interrupted bulk load left above the tip.
     ///
     /// # Errors
     ///

@@ -22,7 +22,7 @@ COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --locked --recipe-path recipe.json
 
 COPY . .
-RUN cargo build --release --locked --bin op-indexer
+RUN cargo build --release --locked --bin indexer
 
 # ---- Runtime ----------------------------------------------------------------
 FROM debian:${DEBIAN_RELEASE}-slim AS runtime
@@ -33,7 +33,7 @@ RUN apt-get update \
     && useradd --system --uid 10001 --home-dir /nonexistent --shell /usr/sbin/nologin indexer \
     && install -d -o indexer -g indexer /data
 
-COPY --from=builder /app/target/release/op-indexer /usr/local/bin/op-indexer
+COPY --from=builder /app/target/release/indexer /usr/local/bin/indexer
 
 USER indexer
 
@@ -52,4 +52,4 @@ ENV OP_INDEXER_STREAM_LISTEN_ADDR=0.0.0.0:50051
 # on 50051.
 EXPOSE 9222/tcp 9222/udp 30303/tcp 30303/udp 30304/tcp 30304/udp 9001/tcp 9001/udp 50051/tcp
 
-ENTRYPOINT ["/usr/local/bin/op-indexer"]
+ENTRYPOINT ["/usr/local/bin/indexer"]

@@ -1,7 +1,8 @@
-//! Imports a block range from an external archive into the stores the indexer serves from.
+//! Imports a block range from an external archive and exports it to object storage, where
+//! servers read history from.
 //!
 //! ```text
-//! archive service ─▶ download ─▶ <state>/raw ─▶ verify ─▶ <state>/verified ─▶ load ─▶ stores
+//! archive service ─▶ download ─▶ <state>/raw ─▶ verify ─▶ <state>/verified ─▶ export ─▶ R2
 //! ```
 //!
 //! - `download` ([`mod@download`]) decides the range, records it, fetches it in chunks from
@@ -10,23 +11,23 @@
 //!   service left out and fetches the ones it can from the chain's RPC ([`mod@fill`], [`rpc`]).
 //! - `verify` ([`mod@verify`]) rebuilds every block's consensus encoding from the downloaded rows
 //!   and checks it: header hash, parent links up to a trusted anchor, transactions root and
-//!   receipts root (senders are checked later, by `load`). What passes is written as the exact
+//!   receipts root (senders are checked later, by `export`). What passes is written as the exact
 //!   verified bytes ([`chunk`]).
-//! - `load` ([`load`]) recovers every sender from its signature, checks it against the one the
-//!   service reported, and appends the verified chunks, with those senders, to the block
-//!   archive the node serves from.
+//! - `export` ([`mod@export`]) recovers every sender from its signature, checks it against the
+//!   one the service reported, and seals the verified blocks into chunks, uploaded to R2 with
+//!   their manifest and hash index (`crates/chunks`).
 //!
-//! Every step is resumable: a chunk's file exists only when the chunk is complete. The
-//! indexer never links this binary and never talks to the archive service. See
-//! `docs/import.md`.
+//! Every step is resumable: a chunk's file exists only when the chunk is complete, and the
+//! manifest lists only chunks fully uploaded. The indexer never links this binary and never
+//! talks to the archive service. See `docs/import.md`.
 
 mod backoff;
 mod chunk;
 mod cli;
 mod download;
+mod export;
 mod fill;
 mod game;
-mod load;
 mod progress;
 mod rows;
 mod rpc;
@@ -78,12 +79,12 @@ async fn main() -> eyre::Result<()> {
             let plan = recorded_plan(&state)?;
             verify(&args.verify, args.from_block, &state, &plan, &cancel).await
         }
-        Command::Load(args) => load::run(&args, &state, &recorded_plan(&state)?, &cancel).await,
+        Command::Export(args) => export::run(&args, &state, &recorded_plan(&state)?, &cancel).await,
         Command::Run(args) => {
             let steps = async {
                 let plan = download(&args.download, &state, &cancel).await?;
                 verify(&args.verify, None, &state, &plan, &cancel).await?;
-                load::run(&args.load, &state, &plan, &cancel).await
+                export::run(&args.export, &state, &plan, &cancel).await
             };
             steps.await
         }

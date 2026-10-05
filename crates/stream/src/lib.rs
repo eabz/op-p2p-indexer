@@ -14,6 +14,7 @@
 //!
 //! [`StreamServer`] is the component; it only reads the stores.
 
+mod auth;
 mod convert;
 mod flight;
 mod follower;
@@ -82,6 +83,9 @@ pub struct StreamConfig {
     /// Whether range sync is on: it fills the archive from its tip up, so heights missing
     /// between the archive and the unsafe store are waited for, not refused.
     pub sync: bool,
+    /// API keys a request must carry as `authorization: Bearer <key>`, on the stream and
+    /// Flight alike; empty: no check (a local, single-user node).
+    pub api_keys: Vec<String>,
 }
 
 /// Why the server stopped.
@@ -171,9 +175,17 @@ where
             max_flights = config.max_flights,
             "stream server listening"
         );
+        let keys = auth::ApiKeys::new(&config.api_keys);
         let stream = proto::stream_server::StreamServer::new(service)
             .max_encoding_message_size(MAX_MESSAGE_BYTES);
-        let flight = arrow_flight::flight_service_server::FlightServiceServer::new(flight);
+        let stream = tonic::service::interceptor::InterceptedService::new(stream, {
+            let keys = keys.clone();
+            move |request| keys.check(request)
+        });
+        let flight = arrow_flight::flight_service_server::FlightServiceServer::with_interceptor(
+            flight,
+            move |request| keys.check(request),
+        );
         let serving = tonic::transport::Server::builder()
             // Finds connections whose peer is gone without closing them.
             .http2_keepalive_interval(Some(KEEPALIVE_INTERVAL))

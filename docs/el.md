@@ -212,9 +212,9 @@ The node answers peers from its own stores, so that another node can sync from i
 
 - `el` does not depend on `storage`. It defines the `BlockProvider` trait (`read` a run of
   headers, bodies or receipts within `ReadLimits`, and the held `range`), and the binary
-  implements it (`NodeProvider`, `bin/op-indexer/src/provider.rs`):
+  implements it (`NodeProvider`, `crates/node/src/provider.rs`):
   - Committed blocks come from the archive. The canonical unsafe blocks above its tip come
-    from the unsafe store (Redis), because peers syncing the tip need those most: op-node
+    from the unsafe store (in memory), because peers syncing the tip need those most: op-node
     relies on execution-layer sync to fill unsafe gaps.
   - **One chain per answer.** A run that crosses the archive's tip, or continues in the
     unsafe store, is checked by parent hash as it is read, and ends at the first block that
@@ -236,9 +236,9 @@ The node answers peers from its own stores, so that another node can sync from i
     them (`docs/pipeline.md` section 4b): until then the advertised range ends below it (the
     lowest such block within the archive caps `latest`), and the node fills it within
     minutes, so the range only briefly shrinks.
-  - **Cost.** The unsafe part of a headers answer is two Redis round trips. Bodies and
-    receipts are read 16 hashes at a time (two round trips each), stopping at the byte limit;
-    decoding and the root checks run on a blocking thread. Each read decodes only the header, the transactions or the receipts asked for.
+  - **Cost.** The unsafe part of an answer is read from memory, the bytes held, without
+    decoding (their roots were checked when they were stored). Bodies and receipts are read 16
+    hashes at a time, stopping at the byte limit.
 - `serve.rs`: one `Server` task reads from the provider. A session driver never waits for it:
   it hands a request over with `try_send` and writes the answer when it arrives on the
   session's own answer channel, so serving does not delay the tip fetcher. A peer that reads

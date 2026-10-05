@@ -19,15 +19,15 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
+use crate::Archive;
 use alloy_primitives::{BlockHash, BlockNumber, Bytes, keccak256};
 use op_indexer_el::BlockProvider;
 use op_indexer_p2p::{BlockFuture, PayloadSource};
 use op_indexer_primitives::{
     BlockRead, BlockRef, BlockStart, EncodedBlock, ItemConvert, ReadLimits,
 };
-use op_indexer_storage::archive_store::FjallArchive;
-use op_indexer_storage::unsafe_store::RedisStore;
-use op_indexer_storage::{ArchiveStore, BlockPart, CanonicalItem, StorageError, UnsafeStore};
+use op_indexer_storage::unsafe_store::MemoryStore;
+use op_indexer_storage::{BlockPart, CanonicalItem, StorageError, UnsafeStore};
 
 /// Most unsafe heights looked at, past the last known end, to find the end of the advertised
 /// range: past this the range is advertised shorter than what is held, which promises nothing
@@ -47,9 +47,9 @@ const UNSAFE_ITEMS_PER_READ: usize = 16;
 
 /// The blocks this node holds, as the execution network reads them.
 #[derive(Debug, Clone)]
-pub(crate) struct NodeProvider {
-    archive: FjallArchive,
-    unsafe_store: RedisStore,
+pub(crate) struct NodeProvider<A> {
+    archive: A,
+    unsafe_store: MemoryStore,
     /// The end of the advertised range found last, from which the next search continues: the
     /// range is read again on every new head, and the run below a block that is still
     /// canonical has not changed (a reorg would have replaced it) nor lost its receipts.
@@ -64,8 +64,8 @@ struct Answer {
     convert: Option<ItemConvert>,
 }
 
-impl NodeProvider {
-    pub(crate) fn new(archive: FjallArchive, unsafe_store: RedisStore) -> Self {
+impl<A: Archive> NodeProvider<A> {
+    pub(crate) fn new(archive: A, unsafe_store: MemoryStore) -> Self {
         Self {
             archive,
             unsafe_store,
@@ -326,7 +326,7 @@ impl Answer {
     }
 }
 
-impl BlockProvider for NodeProvider {
+impl<A: Archive> BlockProvider for NodeProvider<A> {
     type Error = StorageError;
 
     async fn read(
@@ -396,7 +396,7 @@ impl BlockProvider for NodeProvider {
     }
 }
 
-impl NodeProvider {
+impl<A: Archive> NodeProvider<A> {
     /// The canonical block at `number`, header and body only (no receipts): the archive's
     /// when it holds it, else the unsafe store's canonical block there. Neither decompresses
     /// receipts nor decodes senders or receipts.
@@ -443,7 +443,7 @@ impl NodeProvider {
 }
 
 /// The consensus layer's `payload_by_number` server reads blocks by number through this.
-impl PayloadSource for NodeProvider {
+impl<A: Archive> PayloadSource for NodeProvider<A> {
     fn canonical_block(&self, number: BlockNumber) -> BlockFuture<'_> {
         Box::pin(async move {
             Self::canonical_block(self, number)

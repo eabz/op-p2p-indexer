@@ -7,8 +7,8 @@ of work. Update it when a decision changes; link the spec for each piece instead
 
 Be a source of OP Stack chain data: blocks, headers, transactions, receipts and logs, synced
 from the p2p networks and streamed to consumers (data pipelines, other indexers) over gRPC. Live
-blocks come from the unsafe store (Redis), committed history from the local block archive
-(fjall). The node takes nothing from an RPC or an external database, and gives back to the
+blocks come from the unsafe chain (in memory, journaled to fjall), committed history from the
+local block archive (fjall). The node takes nothing from an RPC or an external database, and gives back to the
 networks it reads from.
 
 ## Decisions
@@ -48,7 +48,7 @@ networks it reads from.
 | # | Crate | Role | Spec | Status |
 |---|---|---|---|---|
 | 0 | `p2p`, `chainspec`, `primitives` | L2 gossip: discovery, validation, unsafe blocks on a channel | crate docs | merged |
-| 1 | `storage` | Unsafe store on Redis with fork choice, local block archive (the committed store from now on), connectors. The ClickHouse committed store is removed. | [storage.md](storage.md) | merged; ClickHouse removal in progress |
+| 1 | `storage` | Unsafe store with fork choice (on Redis, then in memory with a fjall journal: D0 of serving.md), local block archive (the committed store from now on). The ClickHouse committed store is removed. | [storage.md](storage.md) | merged; ClickHouse removal in progress |
 | 2 | `pipeline` | Decode gossip payloads into blocks, write them to the unsafe store, promote to the committed store when L1 commits, append committed blocks to the archive. Owns the retry policy. | [pipeline.md](pipeline.md) | merged |
 | 7 | ~~`query`~~ (replaced by `stream`) | The read path: block by number or hash, transaction by hash, logs by filter, the heads. Routes by the safe head (above it the unsafe store, at or below it the committed store), reads the unsafe store first across the promotion boundary, and labels every result unsafe, safe or finalized. Needs read methods on `CommittedStore` that do not exist yet. A transport (JSON-RPC or REST) sits on top of it. | not written | |
 | 4 | `el` (execution p2p) | Connect to L2 execution peers over devp2p. Fetch receipts for each block and verify them against the header's receipts root, then attach them (`UnsafeStore::set_receipts`). Fetch headers and bodies by number to backfill blocks missed on gossip, verified by the hash chain. | [el.md](el.md) | built; receipts at the tip run live, range sync never run |

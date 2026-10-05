@@ -11,12 +11,14 @@
 //! |---|---|---|---|
 //! | `op_indexer_storage_operations_total` | counter | `store`, `operation`, `outcome` | Store operations. `outcome` is `ok`, or the error's [`Severity`]: `transient`, `expected` or `fatal`. |
 //! | `op_indexer_storage_operation_duration_seconds` | histogram | `store`, `operation`, `outcome` | Time one store operation took. |
-//! | `op_indexer_storage_blocks_inserted_total` | counter | `store` | Blocks written. In Redis, blocks already stored are not counted. |
+//! | `op_indexer_storage_blocks_inserted_total` | counter | `store` | Blocks written. In the unsafe store, blocks already stored are not counted. |
 //! | `op_indexer_storage_reorgs_total` | counter | | Unsafe-store reorgs. |
 //! | `op_indexer_storage_reorg_depth` | histogram | | Blocks replaced by one unsafe-store reorg. |
-//! | `op_indexer_storage_receipts_attached_total` | counter | | Blocks that got receipts after they were stored in Redis. |
-//! | `op_indexer_storage_blocks_pruned_total` | counter | | Blocks removed from Redis by pruning. |
-//! | `op_indexer_storage_root_mismatches_total` | counter | | Unsafe blocks not served because their transactions or receipts do not hash to the header's root. |
+//! | `op_indexer_storage_receipts_attached_total` | counter | | Blocks that got receipts after they were stored in the unsafe store. |
+//! | `op_indexer_storage_blocks_pruned_total` | counter | | Blocks removed from the unsafe store by pruning. |
+//! | `op_indexer_storage_unsafe_bytes` | gauge | | Memory the unsafe chain's blocks take, roughly. |
+//! | `op_indexer_storage_unsafe_blocks` | gauge | | Blocks the unsafe chain holds. |
+//! | `op_indexer_storage_unsafe_evicted_blocks_total` | counter | | Unsafe blocks dropped by retention (a day behind the newest) or the memory cap. |
 //! | `op_indexer_storage_retries_total` | counter | `store` | Store calls repeated by `retry` after a transient error. |
 //! | `op_indexer_storage_archive_disk_bytes` | gauge | | Size of the archive directory, journal and blob files included. |
 //! | `op_indexer_storage_archive_fragmented_blob_bytes` | gauge | | Stale bytes in the archive's blob files, which blob garbage collection will reclaim. |
@@ -38,7 +40,9 @@ const REORG_DEPTH: &str = "op_indexer_storage_reorg_depth";
 const RECEIPTS_ATTACHED: &str = "op_indexer_storage_receipts_attached_total";
 const BLOCKS_PRUNED: &str = "op_indexer_storage_blocks_pruned_total";
 const RETRIES: &str = "op_indexer_storage_retries_total";
-const ROOT_MISMATCHES: &str = "op_indexer_storage_root_mismatches_total";
+const UNSAFE_BYTES: &str = "op_indexer_storage_unsafe_bytes";
+const UNSAFE_BLOCKS: &str = "op_indexer_storage_unsafe_blocks";
+const UNSAFE_EVICTED: &str = "op_indexer_storage_unsafe_evicted_blocks_total";
 const ARCHIVE_DISK_BYTES: &str = "op_indexer_storage_archive_disk_bytes";
 const ARCHIVE_FRAGMENTED_BLOB_BYTES: &str = "op_indexer_storage_archive_fragmented_blob_bytes";
 const ARCHIVE_ACTIVE_COMPACTIONS: &str = "op_indexer_storage_archive_active_compactions";
@@ -46,14 +50,10 @@ const ARCHIVE_ACTIVE_COMPACTIONS: &str = "op_indexer_storage_archive_active_comp
 /// A store operation, the `operation` label.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Operation {
-    /// Connecting, with the ping and (Redis) the schema check.
-    Connect,
     /// [`UnsafeStore::insert`](crate::UnsafeStore::insert).
     Insert,
     /// [`ArchiveStore::append_batch`](crate::ArchiveStore::append_batch).
     AppendBatch,
-    /// [`FjallArchive::bulk_append`](crate::archive_store::FjallArchive::bulk_append).
-    BulkAppend,
     /// [`ArchiveStore::number_of`](crate::ArchiveStore::number_of).
     NumberOf,
     /// [`ArchiveStore::range`](crate::ArchiveStore::range).
@@ -64,24 +64,6 @@ pub(crate) enum Operation {
     Ancestry,
     /// [`UnsafeStore::prune`](crate::UnsafeStore::prune).
     Prune,
-    /// [`UnsafeStore::head`](crate::UnsafeStore::head).
-    Head,
-    /// [`UnsafeStore::lowest`](crate::UnsafeStore::lowest).
-    Lowest,
-    /// [`UnsafeStore::canonical_number`](crate::UnsafeStore::canonical_number).
-    CanonicalNumber,
-    /// [`UnsafeStore::canonical_headers`](crate::UnsafeStore::canonical_headers).
-    CanonicalHeaders,
-    /// [`UnsafeStore::canonical_items`](crate::UnsafeStore::canonical_items).
-    CanonicalItems,
-    /// [`UnsafeStore::canonical_run`](crate::UnsafeStore::canonical_run).
-    CanonicalRun,
-    /// [`UnsafeStore::last_event_id`](crate::UnsafeStore::last_event_id).
-    LastEventId,
-    /// [`UnsafeStore::events`](crate::UnsafeStore::events).
-    Events,
-    /// `block` of the unsafe store or the archive.
-    Block,
     /// [`ArchiveStore::read`](crate::ArchiveStore::read).
     Read,
     /// [`ArchiveStore::blocks`](crate::ArchiveStore::blocks).
@@ -98,25 +80,14 @@ pub(crate) enum Operation {
 impl Operation {
     const fn as_str(self) -> &'static str {
         match self {
-            Self::Connect => "connect",
             Self::Insert => "insert",
             Self::Read => "read",
             Self::AppendBatch => "append_batch",
-            Self::BulkAppend => "bulk_append",
             Self::NumberOf => "number_of",
             Self::Range => "range",
             Self::SetReceipts => "set_receipts",
             Self::Ancestry => "ancestry",
             Self::Prune => "prune",
-            Self::Head => "head",
-            Self::Lowest => "lowest",
-            Self::CanonicalNumber => "canonical_number",
-            Self::CanonicalHeaders => "canonical_headers",
-            Self::CanonicalItems => "canonical_items",
-            Self::CanonicalRun => "canonical_run",
-            Self::LastEventId => "last_event_id",
-            Self::Events => "events",
-            Self::Block => "block",
             Self::Blocks => "blocks",
             Self::Heads => "heads",
             Self::PendingReceipts => "pending_receipts",
@@ -145,17 +116,23 @@ pub fn describe() {
     describe_counter!(
         RECEIPTS_ATTACHED,
         Unit::Count,
-        "Blocks that got receipts after they were stored in Redis"
+        "Blocks that got receipts after they were stored in the unsafe store"
     );
     describe_counter!(
         BLOCKS_PRUNED,
         Unit::Count,
-        "Blocks removed from Redis by pruning"
+        "Blocks removed from the unsafe store by pruning"
     );
+    describe_gauge!(
+        UNSAFE_BYTES,
+        Unit::Bytes,
+        "Memory the unsafe chain's blocks take, roughly"
+    );
+    describe_gauge!(UNSAFE_BLOCKS, Unit::Count, "Blocks the unsafe chain holds");
     describe_counter!(
-        ROOT_MISMATCHES,
+        UNSAFE_EVICTED,
         Unit::Count,
-        "Unsafe blocks not served because their transactions or receipts do not hash to the header's root"
+        "Unsafe blocks dropped by retention or the memory cap"
     );
     describe_counter!(
         RETRIES,
@@ -212,20 +189,25 @@ pub(crate) fn reorg(depth: usize) {
     histogram!(REORG_DEPTH).record(f64::from(u32::try_from(depth).unwrap_or(u32::MAX)));
 }
 
-/// Records receipts attached to a block already stored in Redis.
+/// Records receipts attached to a block already in the unsafe store.
 pub(crate) fn receipts_attached() {
     counter!(RECEIPTS_ATTACHED).increment(1);
 }
 
-/// Records blocks removed from Redis by pruning.
+/// Records blocks removed from the unsafe store by pruning.
 pub(crate) fn blocks_pruned(blocks: usize) {
     counter!(BLOCKS_PRUNED).increment(count(blocks));
 }
 
-/// Records a block refused because its transactions or receipts do not hash to its header's
-/// root.
-pub(crate) fn root_mismatch() {
-    counter!(ROOT_MISMATCHES).increment(1);
+/// Sets what the unsafe chain holds.
+pub(crate) fn unsafe_held(bytes: usize, blocks: usize) {
+    gauge!(UNSAFE_BYTES).set(gauge_value(count(bytes)));
+    gauge!(UNSAFE_BLOCKS).set(gauge_value(count(blocks)));
+}
+
+/// Records unsafe blocks dropped by retention or the memory cap.
+pub(crate) fn unsafe_evicted(blocks: usize) {
+    counter!(UNSAFE_EVICTED).increment(count(blocks));
 }
 
 /// Records a store call repeated after a transient error.

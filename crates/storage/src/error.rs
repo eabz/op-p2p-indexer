@@ -1,37 +1,24 @@
 //! The storage error and its classification by [`Severity`].
-//!
-//! A busy Redis is recognised here, by error code, and nowhere else.
 
 use std::fmt;
-use std::num::ParseIntError;
 use std::path::PathBuf;
 
-use alloy_primitives::hex::FromHexError;
 use alloy_primitives::{BlockHash, BlockNumber};
 use op_indexer_primitives::{BlockRef, ChainIdentity};
 
 use crate::Store;
 
-/// Redis error codes of a server that is busy or not ready; retrying can succeed.
-const REDIS_BUSY_CODES: [&str; 6] = [
-    "BUSY",
-    "LOADING",
-    "READONLY",
-    "TRYAGAIN",
-    "CLUSTERDOWN",
-    "MASTERDOWN",
-];
 /// How a caller should treat a [`StorageError`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Severity {
-    /// Retrying can succeed: the connection was lost, the call timed out, the server was busy,
-    /// or a read or write of the archive's local files failed.
+    /// Retrying can succeed: a read or write of the local files failed, or a remote store's
+    /// connection failed or timed out.
     Transient,
     /// Nothing is wrong with the store; the caller handles the outcome.
     Expected,
-    /// Needs an operator: bad credentials, a schema mismatch, undecodable stored data, or a
-    /// block that does not fit the schema.
+    /// Needs an operator: a schema or chain mismatch, undecodable stored data, or a block that
+    /// does not fit the schema.
     Fatal,
 }
 
@@ -49,8 +36,10 @@ pub enum InvalidBlockReason {
     Withdrawals,
     /// The number is not the parent's plus one.
     ParentNumber,
-    /// The number is beyond what the unsafe store can hold.
-    NumberRange,
+    /// The transactions do not hash to the header's transactions root.
+    TransactionsRoot,
+    /// The receipts do not hash to the header's receipts root.
+    ReceiptsRoot,
     /// The block is stored under another number than the one given.
     StoredNumber,
     /// The header does not hash to the block's hash.
@@ -61,12 +50,6 @@ pub enum InvalidBlockReason {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ParseError {
-    /// A number is not a decimal integer.
-    #[error(transparent)]
-    Number(#[from] ParseIntError),
-    /// A hash is not hex of the right length.
-    #[error(transparent)]
-    Hex(#[from] FromHexError),
     /// A value is not valid snappy.
     #[error(transparent)]
     Snappy(#[from] snap::Error),
@@ -81,16 +64,7 @@ pub enum ParseError {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum StorageError {
-    /// A Redis request failed.
-    #[error("redis {operation} failed")]
-    Redis {
-        /// The operation that was running.
-        operation: &'static str,
-        /// The client's error.
-        #[source]
-        source: redis::RedisError,
-    },
-    /// A fjall operation on the local block archive failed.
+    /// A fjall operation on the block archive or the unsafe chain's journal failed.
     #[error("fjall {operation} failed")]
     Fjall {
         /// The operation that was running.
@@ -98,6 +72,15 @@ pub enum StorageError {
         /// fjall's error.
         #[source]
         source: fjall::Error,
+    },
+    /// A remote store (the R2 archive of sealed chunks) failed; its client's error, wrapped.
+    #[error("remote {operation} failed")]
+    Remote {
+        /// The operation that was running.
+        operation: &'static str,
+        /// The client's error.
+        #[source]
+        source: std::io::Error,
     },
     /// A blocking task did not run to completion (it panicked or the runtime is shutting down).
     #[error("blocking task for {operation} failed")]
@@ -107,34 +90,6 @@ pub enum StorageError {
         /// The join error.
         #[source]
         source: tokio::task::JoinError,
-    },
-    /// A call did not finish within its timeout.
-    #[error("{store} {operation} timed out")]
-    Timeout {
-        /// The store that did not answer.
-        store: Store,
-        /// The operation that was running.
-        operation: &'static str,
-    },
-    /// A value could not be encoded for storage.
-    #[error("failed to encode {what}")]
-    Encode {
-        /// What was being encoded.
-        what: &'static str,
-        /// The encoder's error.
-        #[source]
-        source: serde_json::Error,
-    },
-    /// Stored data could not be decoded.
-    #[error("stored {what}{} is not decodable", of_block(*.block))]
-    Decode {
-        /// What was being decoded.
-        what: &'static str,
-        /// The block it belongs to, when known.
-        block: Option<BlockHash>,
-        /// The decoder's error.
-        #[source]
-        source: serde_json::Error,
     },
     /// A field the layout promises is absent from stored data.
     #[error("stored {field}{} is missing in {store}", of_block(*.block))]
@@ -188,13 +143,11 @@ pub enum StorageError {
         got: BlockRef,
     },
     /// The archive directory was written with another schema version. Nothing is deleted: the
-    /// operator loads a new archive from the importer's verified chunks, or runs the build
-    /// that wrote it.
+    /// operator starts a new archive, or runs the build that wrote it.
     #[error(
         "the block archive in {} has schema version {found}, this build reads version \
-         {expected}: the archive's layout changed. Move the directory away and load a new \
-         archive with `import load` from the verified chunks (no download needed), \
-         or keep running the build that wrote it",
+         {expected}: the archive's layout changed. Move the directory away and start with an \
+         empty archive, or keep running the build that wrote it",
         path.display()
     )]
     ArchiveSchema {
@@ -231,6 +184,23 @@ pub enum StorageError {
         /// The archive directory.
         path: PathBuf,
     },
+    /// The unsafe chain's journal records another chain (or a record that does not decode,
+    /// `found` `None`). Nothing is deleted.
+    #[error(
+        "the unsafe chain's journal in {} holds {}, but this node runs {expected}; use a data \
+         directory of chain {}, or delete this one",
+        path.display(),
+        found.as_ref().map_or_else(|| "an unreadable chain record".to_owned(), ToString::to_string),
+        expected.chain_id
+    )]
+    UnsafeChain {
+        /// The journal directory.
+        path: PathBuf,
+        /// The chain recorded there, if it decodes.
+        found: Option<Box<ChainIdentity>>,
+        /// The chain this node runs.
+        expected: Box<ChainIdentity>,
+    },
     /// A block to store does not fit the schema.
     #[error("block {number} cannot be stored: {reason}")]
     InvalidBlock {
@@ -266,7 +236,8 @@ impl fmt::Display for InvalidBlockReason {
             Self::Ommers => "it has ommers",
             Self::Withdrawals => "it has withdrawals",
             Self::ParentNumber => "its number is not its parent's plus one",
-            Self::NumberRange => "its number is beyond what the unsafe store can hold",
+            Self::TransactionsRoot => "its transactions do not match its header's root",
+            Self::ReceiptsRoot => "its receipts do not match its header's root",
             Self::StoredNumber => "it is stored with another number",
             Self::HeaderHash => "its header does not hash to its block hash",
         })
@@ -291,8 +262,6 @@ impl StorageError {
     #[must_use]
     pub fn severity(&self) -> Severity {
         let transient = match self {
-            Self::Redis { source, .. } => redis_is_transient(source),
-            Self::Timeout { .. } => true,
             Self::MissingAncestor { .. }
             | Self::AncestryTooLong { .. }
             | Self::NotContiguous { .. } => {
@@ -303,11 +272,23 @@ impl StorageError {
                 source,
                 fjall::Error::Io(_) | fjall::Error::Storage(fjall::LsmError::Io(_))
             ),
+            // A connection or a timeout can pass; anything else (refused credentials, a missing
+            // object, a malformed answer) needs an operator, or the caller's own handling.
+            Self::Remote { source, .. } => matches!(
+                source.kind(),
+                std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+            ),
             Self::BlockingTask { .. }
-            | Self::Encode { .. }
-            | Self::Decode { .. }
             | Self::MissingField { .. }
             | Self::InvalidData { .. }
+            | Self::UnsafeChain { .. }
             | Self::ArchiveSchema { .. }
             | Self::ArchiveChain { .. }
             | Self::ArchiveChainUnreadable { .. }
@@ -321,15 +302,6 @@ impl StorageError {
             Severity::Fatal
         }
     }
-}
-
-fn redis_is_transient(err: &redis::RedisError) -> bool {
-    err.is_io_error()
-        || err.is_timeout()
-        || err.is_connection_dropped()
-        || err
-            .code()
-            .is_some_and(|code| REDIS_BUSY_CODES.contains(&code))
 }
 
 /// ` of block 0x…` for an error message, or nothing when the block is not known.

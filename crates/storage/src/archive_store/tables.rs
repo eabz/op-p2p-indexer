@@ -8,7 +8,6 @@
 //! operation in its errors: [`Failure::into_storage_error`] attaches it.
 
 mod append;
-mod bulk;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -26,7 +25,6 @@ use tokio::sync::{Mutex, MutexGuard};
 use tracing::debug;
 
 pub(super) use self::append::{Entry, append_batch};
-pub(super) use self::bulk::{Prepared, bulk_append};
 use crate::{InvalidBlockReason, ParseError, StorageError, Store, metrics};
 
 /// Block cache shared by the keyspaces. It holds the index and filter blocks of the trees and
@@ -407,7 +405,8 @@ pub(super) fn number_of(tables: &Tables, hash: BlockHash) -> Result<Option<Block
         return Ok(None);
     };
     let number = decode_number(&number)?;
-    // Only a block whose header is held: a bulk load's leftovers above the tip are not.
+    // Only a block whose header is held: an earlier importer's bulk-load leftovers above the
+    // tip are not.
     let held = snapshot
         .get(&tables.headers, number.to_be_bytes())?
         .is_some();
@@ -526,6 +525,54 @@ pub(super) fn set_heads(tables: &Tables, heads: L1Heads) -> Result<(), Failure> 
     }
     batch.commit()?;
     Ok(())
+}
+
+/// Most blocks one batch of [`prune_below`] removes: each batch is one synced commit and one
+/// turn at the writer lock, so appends are not held up for long.
+const PRUNE_BATCH_BLOCKS: usize = 1024;
+
+/// Removes every block below `first_kept`: its header, body, receipts, senders, hash entry and
+/// pending-receipts entry, in synced batches of [`PRUNE_BATCH_BLOCKS`], lowest first. The
+/// heads stay. What is left is still one contiguous range ending at the same tip; an archive
+/// emptied takes any block next. Repeating it removes what an interrupted call left. Returns
+/// how many blocks it removed.
+pub(super) fn prune_below(tables: &Tables, first_kept: BlockNumber) -> Result<usize, Failure> {
+    let mut removed = 0_usize;
+    // Each batch starts after the last key removed, not at the tombstones before it.
+    let mut from = 0_u64;
+    loop {
+        let _writer = tables.lock();
+        let snapshot = tables.db.snapshot();
+        let mut batch = tables.durable_batch();
+        let mut in_batch = 0_usize;
+        for guard in snapshot
+            .range(
+                &tables.headers,
+                from.to_be_bytes()..first_kept.to_be_bytes(),
+            )
+            .take(PRUNE_BATCH_BLOCKS)
+        {
+            let (key, header) = guard.into_inner()?;
+            from = decode_number(&key)?.saturating_add(1);
+            let hash = keccak256(decompress(&header, "header", None)?);
+            for keyspace in [
+                &tables.headers,
+                &tables.bodies,
+                &tables.receipts,
+                &tables.senders,
+                &tables.pending,
+            ] {
+                batch.remove(keyspace, key.clone());
+            }
+            batch.remove(&tables.numbers, hash.0);
+            in_batch += 1;
+        }
+        if in_batch == 0 {
+            return Ok(removed);
+        }
+        batch.commit()?;
+        removed = removed.saturating_add(in_batch);
+    }
 }
 
 /// The senders as stored: 20 bytes each, concatenated.

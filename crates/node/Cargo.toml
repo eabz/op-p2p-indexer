@@ -1,6 +1,6 @@
 [package]
-name = "op-indexer"
-description = "Binary: configuration, tracing, and wiring of the indexer components"
+name = "op-indexer-node"
+description = "The node's wiring, shared by the indexer and server binaries"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -21,7 +21,6 @@ eyre.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync"] }
 tokio-util.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

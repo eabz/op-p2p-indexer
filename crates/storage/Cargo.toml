@@ -1,6 +1,6 @@
 [package]
 name = "op-indexer-storage"
-description = "Block storage: unsafe blocks (Redis) and the committed block archive (fjall)"
+description = "Block storage: unsafe blocks (in memory, journaled to fjall) and the committed block archive (fjall)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,24 +9,18 @@ publish.workspace = true
 [dependencies]
 op-indexer-primitives.workspace = true
 
-# `serde` on both: the Ethereum JSON-RPC field naming of the JSON stored in Redis.
-alloy-consensus = { workspace = true, features = ["serde"] }
-alloy-eips.workspace = true
+alloy-consensus.workspace = true
 alloy-rlp.workspace = true
-# `serde`: hashes and addresses in the JSON stored in Redis.
-alloy-primitives = { workspace = true, features = ["serde"] }
+alloy-primitives.workspace = true
 fastrand.workspace = true
 fjall.workspace = true
 metrics.workspace = true
-op-alloy-consensus = { workspace = true, features = ["serde"] }
-redis.workspace = true
-serde.workspace = true
-serde_json.workspace = true
+op-alloy-consensus.workspace = true
 snap.workspace = true
 thiserror.workspace = true
-# `rt` for `spawn_blocking` (fjall is synchronous) and `sync` for the archive's fair writer
-# lock, so two writers' appends take turns batch by batch; `macros` for the retry's
-# `select!` on cancellation.
+# `rt` for `spawn_blocking` (fjall is synchronous); `sync` for the archive's fair writer
+# lock, so two writers' appends take turns batch by batch, and the unsafe chain's watch of its
+# newest event; `macros` for the retry's `select!` on cancellation.
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 # `CancellationToken`, which ends a retry.
 tokio-util.workspace = true

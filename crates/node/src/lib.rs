@@ -1,17 +1,23 @@
-//! Indexer for the OP Stack peer-to-peer network.
+//! The node's wiring, shared by the `indexer` and `server` binaries.
 //!
-//! Wires the components together: loads config and the node identity, opens the block archive (the
-//! committed store), checks that Redis is reachable and its key layout current, and runs the p2p
-//! network next to the pipeline that stores the blocks it emits. When the execution network is
-//! enabled it runs too: it fetches the receipts the pipeline asks for and serves the archive's
-//! blocks to peers, and, when the range sync is on, fetches the blocks between the archive's last
-//! one and the chain from peers for the pipeline to store, round after round. When the L1 side is
-//! enabled, a beacon light client and an L1 execution p2p node read the chain's dispute games, and
-//! the pipeline promotes the blocks they commit to. Shuts down cleanly on Ctrl-C or SIGTERM: the
-//! networks first, then the pipeline, which stores what they had already delivered.
+//! [`run`] starts every component around a committed store the binary opened (the indexer's
+//! fjall archive, or the server's R2-backed one): the p2p network next to the pipeline that
+//! stores the blocks it emits; when enabled, the execution network, which fetches the receipts
+//! the pipeline asks for, serves the committed blocks to peers and, with the range sync on,
+//! fetches the blocks between the archive's last one and the chain round after round; and the
+//! L1 side, a beacon light client and an L1 execution p2p node that read the chain's dispute
+//! games, whose commitments the pipeline promotes. The binary may add tasks of its own
+//! ([`Task`]). Shuts down cleanly on Ctrl-C or SIGTERM: the networks first, then the
+//! pipeline, which stores what they had already delivered.
+//!
+//! This crate is the binaries' top-level wiring, so its errors are `eyre` reports, as at a
+//! binary's edge.
 
 mod config;
 mod provider;
+
+use std::future::Future;
+use std::pin::Pin;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,18 +30,16 @@ use op_indexer_l1::{BeaconConfig, L1Config, L1Network, LightClient};
 use op_indexer_p2p::{Network, NodeStore, PayloadSource, StoreError};
 use op_indexer_pipeline::{Pipeline, ReceiptsChannels};
 use op_indexer_primitives::{BlockRef, EncodedBlock, ExecutionPeer, L1Games, L1Heads, SyncRange};
-use op_indexer_storage::archive_store::FjallArchive;
-use op_indexer_storage::unsafe_store::RedisStore;
+use op_indexer_storage::unsafe_store::MemoryStore;
 use op_indexer_storage::{ArchiveStore, StorageConfig, UnsafeStore};
 use op_indexer_stream::StreamServer;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
-use tracing_subscriber::EnvFilter;
-use tracing_subscriber::fmt::time::ChronoUtc;
 
-use crate::config::{Config, ElSettings, L1Settings, NODE_DIR};
+pub use crate::config::Config;
+use crate::config::{ElSettings, L1Settings, NODE_DIR};
 use crate::provider::NodeProvider;
 
 /// Unsafe blocks waiting for the pipeline. Blocks arrive every 2 s on OP Mainnet and every
@@ -82,26 +86,31 @@ const SYNC_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Verified checkpoints of a range sync waiting to be saved; the sync waits when it is full.
 const SYNC_CHECKPOINT_CAPACITY: usize = 16;
 
-/// Log timestamp: UTC time of day with milliseconds, e.g. `13:04:12.345`.
-const LOG_TIME_FORMAT: &str = "%H:%M:%S%.3f";
+/// A task of the binary's own, run next to the node's components: it gets the token that
+/// stops the networks, and must end when it fires. It ending earlier stops the node.
+pub type Task = Box<
+    dyn FnOnce(CancellationToken) -> Pin<Box<dyn Future<Output = eyre::Result<()>> + Send>> + Send,
+>;
 
-#[tokio::main]
-async fn main() -> eyre::Result<()> {
-    tracing_subscriber::fmt()
-        .with_timer(ChronoUtc::new(LOG_TIME_FORMAT.to_owned()))
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+/// What every committed store the node runs on must be.
+pub trait Archive: ArchiveStore + Clone + std::fmt::Debug + Send + Sync + 'static {}
 
-    let config = Config::from_env()?;
+impl<A: ArchiveStore + Clone + std::fmt::Debug + Send + Sync + 'static> Archive for A {}
 
-    // Startup-only blocking I/O, before any task runs.
-    std::fs::create_dir_all(&config.data_dir).wrap_err("failed to create data dir")?;
-    // The local stores first, so a data directory of another chain fails before any
-    // connection; the archive before the node store, so a refused archive leaves the node
-    // store without a record.
-    let archive = open_archive(&config.storage)?;
+/// Runs the node on `archive`, the committed store, which the binary has opened for
+/// `config`'s chain, with the binary's own `tasks` (each named), until a signal arrives or
+/// a component stops.
+///
+/// # Errors
+///
+/// Returns an error if a store or a network cannot be set up, or a component fails.
+pub async fn run<A: Archive>(
+    config: Config,
+    archive: A,
+    tasks: Vec<(&'static str, Task)>,
+) -> eyre::Result<()> {
+    // The archive is opened first by the binary, so a refused archive leaves the node store
+    // without a record. Startup-only blocking I/O, before any task runs.
     let store = NodeStore::open(config.data_dir.join(NODE_DIR), config.storage.chain)
         .wrap_err("failed to open node store")?;
     let stores = prepare_storage(&config.storage, archive).await?;
@@ -207,7 +216,15 @@ async fn main() -> eyre::Result<()> {
         safe_number_rx,
         payloads,
     );
-    run(network, execution, l1, (pipeline, stream), followers, saves).await
+    run_components(
+        network,
+        execution,
+        l1,
+        (pipeline, stream),
+        (followers, tasks),
+        saves,
+    )
+    .await
 }
 
 /// Spawns `task` into `followers`, named for the error if it ends before the node stops.
@@ -286,19 +303,22 @@ fn l1_side(
 /// Runs the components until one stops or a signal arrives, then stops the others in order:
 /// the networks first, on their own token, so the pipeline can still store what they
 /// delivered.
-async fn run(
+async fn run_components<A: Archive>(
     network: Network,
-    execution: Option<ExecutionNetwork<NodeProvider>>,
+    execution: Option<ExecutionNetwork<NodeProvider<A>>>,
     l1: Option<(L1Network, LightClient)>,
-    (pipeline, stream): (
-        Pipeline<RedisStore, FjallArchive>,
-        StreamServer<RedisStore, FjallArchive>,
-    ),
-    mut followers: JoinSet<&'static str>,
+    (pipeline, stream): (Pipeline<MemoryStore, A>, StreamServer<MemoryStore, A>),
+    (mut followers, tasks): (JoinSet<&'static str>, Vec<(&'static str, Task)>),
     saves: Vec<JoinHandle<()>>,
 ) -> eyre::Result<()> {
     let cancel = CancellationToken::new();
     let networks_cancel = cancel.child_token();
+    // The binary's own tasks, stopped with the networks.
+    let mut extra = JoinSet::new();
+    for (name, task) in tasks {
+        let task = task(networks_cancel.clone());
+        extra.spawn(async move { (name, task.await) });
+    }
     let mut network = Some(tokio::spawn(network.run(networks_cancel.clone())));
     let mut execution =
         execution.map(|execution| tokio::spawn(execution.run(networks_cancel.clone())));
@@ -343,6 +363,15 @@ async fn run(
             Ok(task) => Err(eyre::eyre!("the {task} ended before shutdown")),
             Err(err) => Err(err).wrap_err("a node task panicked"),
         },
+        Some(ended) = extra.join_next() => match ended {
+            Ok((task, result)) => {
+                warn!(task, "a node task stopped unexpectedly");
+                result
+                    .and_then(|()| Err(eyre::eyre!("ended before shutdown")))
+                    .wrap_err_with(|| format!("the {task} failed"))
+            }
+            Err(err) => Err(err).wrap_err("a node task panicked"),
+        },
     };
 
     networks_cancel.cancel();
@@ -358,6 +387,14 @@ async fn run(
     let (stream, pipeline) = tokio::join!(join(stream), join(pipeline));
     let stream = stream.wrap_err("stream server failed");
     let pipeline = pipeline.wrap_err("pipeline failed");
+    // Stopped with the networks.
+    while let Some(ended) = extra.join_next().await {
+        match ended {
+            Ok((task, Err(err))) => warn!(task, %err, "a node task failed while stopping"),
+            Ok((_, Ok(()))) => {}
+            Err(err) => warn!(%err, "a node task panicked"),
+        }
+    }
     // Their inputs are gone with the networks and the pipeline, so they end.
     while let Some(ended) = followers.join_next().await {
         if let Err(err) = ended {
@@ -407,8 +444,8 @@ where
 }
 
 /// The execution network with everything that goes with it.
-struct Execution {
-    network: ExecutionNetwork<NodeProvider>,
+struct Execution<A: Archive> {
+    network: ExecutionNetwork<NodeProvider<A>>,
     /// The pipeline's ends of the receipts channels.
     receipts: ReceiptsChannels,
     /// The batches of the range sync, for the pipeline, when a range is configured.
@@ -421,14 +458,14 @@ struct Execution {
 /// Peers are served from the archive. `head` is the
 /// newest block the node knows. With `sync`, the blocks between the archive and the chain's
 /// head are fetched from peers, planned by a task added to `followers`.
-fn execution_network(
+fn execution_network<A: Archive>(
     el: ElSettings,
-    sync: Option<SyncInputs>,
+    sync: Option<SyncInputs<A>>,
     store: &Arc<NodeStore>,
-    stores: &Stores,
+    stores: &Stores<A>,
     head: watch::Receiver<Option<BlockRef>>,
     followers: &mut JoinSet<&'static str>,
-) -> eyre::Result<Execution> {
+) -> eyre::Result<Execution<A>> {
     // A key of its own: the two networks must not share a node id.
     let key = store
         .execution_key()
@@ -488,11 +525,11 @@ fn execution_network(
 }
 
 /// What planning the range sync needs.
-struct SyncInputs {
+struct SyncInputs<A> {
     /// The archive the sync fills: its last block is where each round starts.
-    archive: FjallArchive,
+    archive: A,
     /// Where a block [`ANCHOR_DEPTH`] below the gossiped head is looked up.
-    unsafe_store: RedisStore,
+    unsafe_store: MemoryStore,
     /// The unsafe head gossip delivers.
     gossip_head: watch::Receiver<Option<BlockRef>>,
     /// The L1 heads, before promotion sees them: the safe block is the preferred anchor.
@@ -530,7 +567,11 @@ struct Rest {
 /// verified checkpoints are kept. After a round is given up the next waits
 /// [`ABANDONED_ANCHOR_WAIT`], doubled for each round given up in a row. Reads of the archive
 /// and the node store that fail are retried; the planner ends only when the node stops.
-async fn plan_sync(store: Arc<NodeStore>, mut inputs: SyncInputs, plans: mpsc::Sender<SyncPlan>) {
+async fn plan_sync<A: Archive>(
+    store: Arc<NodeStore>,
+    mut inputs: SyncInputs<A>,
+    plans: mpsc::Sender<SyncPlan>,
+) {
     let mut resume = {
         let store = Arc::clone(&store);
         let read = retried(&plans, "its saved anchor", move || store.sync_anchor());
@@ -615,8 +656,8 @@ async fn plan_sync(store: Arc<NodeStore>, mut inputs: SyncInputs, plans: mpsc::S
 /// Without it a round is needed while the archive is that far below the gossiped head, and is
 /// anchored on the block [`ANCHOR_DEPTH`] below it: an unsafe reorg deeper than that would
 /// leave the archive on a dead branch, which only rebuilding the archive repairs.
-async fn next_anchor(
-    inputs: &mut SyncInputs,
+async fn next_anchor<A: Archive>(
+    inputs: &mut SyncInputs<A>,
     from: BlockNumber,
     rest: Option<&Rest>,
     plans: &mpsc::Sender<SyncPlan>,
@@ -662,7 +703,7 @@ async fn next_anchor(
 
 /// The gossiped block [`ANCHOR_DEPTH`] below `head`, if the unsafe store holds the chain that
 /// far down (it does not right after a start: then the next head is tried).
-async fn below_head(unsafe_store: &RedisStore, head: BlockRef) -> Option<BlockRef> {
+async fn below_head(unsafe_store: &MemoryStore, head: BlockRef) -> Option<BlockRef> {
     let stop_at = head.number.checked_sub(ANCHOR_DEPTH.saturating_add(1))?;
     match unsafe_store.ancestry(head, stop_at).await {
         Ok(blocks) => blocks.first().map(|block| BlockRef {
@@ -678,8 +719,8 @@ async fn below_head(unsafe_store: &RedisStore, head: BlockRef) -> Option<BlockRe
 
 /// Waits until the archive holds `anchor`, or the execution network gives the round up
 /// (`end`).
-async fn round(
-    archive: &FjallArchive,
+async fn round<A: Archive>(
+    archive: &A,
     anchor: BlockRef,
     mut end: oneshot::Receiver<RoundEnd>,
     plans: &mpsc::Sender<SyncPlan>,
@@ -731,10 +772,10 @@ async fn round(
 /// the archive cannot be read, heads go straight to promotion. The finalized head is held
 /// with the safe one: promotion takes them together. Ends when the pipeline or the L1 source
 /// is gone.
-async fn forward_l1_heads(
+async fn forward_l1_heads<A: Archive>(
     mut heads: watch::Receiver<L1Heads>,
     promotion: watch::Sender<L1Heads>,
-    gate: Option<(FjallArchive, watch::Receiver<BlockNumber>)>,
+    gate: Option<(A, watch::Receiver<BlockNumber>)>,
 ) {
     loop {
         let current = *heads.borrow_and_update();
@@ -773,8 +814,8 @@ async fn forward_l1_heads(
 /// The archive's last block, `Some(None)` for an empty archive. A failing read is retried
 /// every [`SYNC_POLL_INTERVAL`] and warned about once per [`RETRY_WARN_INTERVAL`]. `None`
 /// when the node stops (`plans` closes).
-async fn archive_tip(
-    archive: &FjallArchive,
+async fn archive_tip<A: Archive>(
+    archive: &A,
     plans: &mpsc::Sender<SyncPlan>,
 ) -> Option<Option<BlockRef>> {
     let mut warned: Option<tokio::time::Instant> = None;
@@ -853,34 +894,32 @@ async fn save_sync_checkpoints(store: Arc<NodeStore>, mut verified: mpsc::Receiv
 }
 
 /// The two stores, connected and ready.
-struct Stores {
-    unsafe_store: RedisStore,
+struct Stores<A> {
+    unsafe_store: MemoryStore,
     /// The block archive, the committed store.
-    archive: FjallArchive,
+    archive: A,
     /// The archive's first and last block at startup; `None` when it is empty.
     archive_range: Option<(BlockRef, BlockRef)>,
 }
 
-/// Opens the block archive, checking that it holds the configured chain. Startup-only
-/// blocking I/O, like the node store.
-fn open_archive(config: &StorageConfig) -> eyre::Result<FjallArchive> {
-    FjallArchive::open(&config.archive.path, config.chain)
-        .wrap_err("failed to open the block archive")
-}
-
-/// Reads the range of `archive` (opened by [`open_archive`]), connects to Redis and runs its
-/// schema check, and returns the stores once both are ready, so an unreachable or mismatched
-/// store stops startup.
-async fn prepare_storage(config: &StorageConfig, archive: FjallArchive) -> eyre::Result<Stores> {
+/// Reads the range of `archive` (opened by the binary), opens the unsafe chain and replays its
+/// journal, and returns the stores once both are ready, so a mismatched store stops startup.
+async fn prepare_storage<A: Archive>(
+    config: &StorageConfig,
+    archive: A,
+) -> eyre::Result<Stores<A>> {
     op_indexer_storage::metrics::describe();
     let archive_range = archive
         .range()
         .await
         .wrap_err("failed to read the block archive")?;
     info!(range = ?archive_range, "block archive ready");
-    let unsafe_store = RedisStore::connect(&config.redis, config.chain.chain_id)
-        .await
-        .wrap_err("failed to connect to Redis")?;
+    let (unsafe_config, chain) = (config.unsafe_chain.clone(), config.chain);
+    let unsafe_store =
+        tokio::task::spawn_blocking(move || MemoryStore::open(&unsafe_config, chain))
+            .await
+            .wrap_err("the unsafe chain's opening panicked")?
+            .wrap_err("failed to open the unsafe chain")?;
     info!(?config, "storage ready");
     Ok(Stores {
         unsafe_store,
