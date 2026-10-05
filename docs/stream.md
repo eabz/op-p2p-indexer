@@ -1,7 +1,7 @@
 # Stream spec (`crates/stream`)
 
 Status: **built, not run**. It compiles and passes the lints; no consumer has subscribed yet,
-and the unsafe store's event stream has not been read against a live Redis. Decision:
+and the unsafe store's events have not been read on a live node. Decision:
 [roadmap.md](roadmap.md), 2026-10-04, "The node is a source of data, streamed out".
 
 The `stream` crate serves the chain to consumers over gRPC: history from the block archive,
@@ -10,8 +10,7 @@ changes as their own messages. It only reads: the archive, the unsafe store, and
 store's event stream. It depends on `primitives` and `storage` only.
 
 **There is no authentication and no TLS.** Anyone who can reach the port can subscribe. The
-binary listens on `127.0.0.1` by default, and docker compose publishes the port on the host's
-loopback unless told otherwise (section 5).
+binary listens on `127.0.0.1` by default (section 5).
 
 ## 1. Service
 
@@ -48,8 +47,8 @@ A message can be up to 64 MiB (a full block, decoded; the server's limit). gRPC 
 - `Heads`: the first event of every subscription, and again whenever the committed safe or
   finalized head moves. Every block sent at or below a head has that status from then on. The
   heads are the archive's (`ArchiveStore::heads`), which promotion records once the blocks up
-  to the safe head are in the archive: a `SAFE` block is a committed one. Redis has no events
-  for these heads.
+  to the safe head are in the archive: a `SAFE` block is a committed one. The unsafe store has
+  no events for these heads.
 
 Per subscription, blocks come in chain order, each height once per canonical chain: after a
 `Reorg` from `from`, the blocks from `from` are sent again, as their new versions.
@@ -69,10 +68,8 @@ Per subscription, blocks come in chain order, each height once per canonical cha
 
   It reads the stores' state only where the events do not say enough: **at start** (the
   stream's position first, then the heads; the head is its first block), **when the stream
-  trimmed events it had not read** (it keeps about the newest ten thousand: the follower reads
-  the state again and walks up from its last block), **when the stream went back** (Redis
-  restarted or lost it: its last event is older than the follower's position, checked after a
-  wait that brought nothing), **across a gap** (heights not held stop the walk until a `fill`
+  dropped events it had not read** (the unsafe store keeps the newest ten thousand: the
+  follower reads the state again and walks up from its last block), **across a gap** (heights not held stop the walk until a `fill`
   event), and when a block does not build on its last one (it finds the newest published block
   still canonical). A reorg event removes the published blocks from the first one it replaced:
   blocks of the new chain an earlier event of the same read already published stay. When it
@@ -140,8 +137,8 @@ execution network disabled no receipts come, and `Heads.receipts` says so.
   `RESOURCE_EXHAUSTED`.
 - HTTP/2 keepalive: the server pings a connection every 30 s and drops it if the answer takes
   more than 10 s, so a consumer that vanished does not hold a subscription.
-- One reader of the event stream per node (the follower); it waits on a Redis connection of its
-  own, so it does not hold up the pipeline's writes.
+- One reader of the unsafe store's events per node (the follower); it waits on the store's
+  watch of its newest event, in the process, so it holds up nothing.
 - On shutdown every subscription and Flight stream ends with `UNAVAILABLE`. The server stops
   with the networks, waits up to 5 s for open connections (a consumer that stops reading holds
   one), then up to 5 s for its tasks, then gives up on them; the pipeline is stopped at the same
@@ -151,13 +148,11 @@ execution network disabled no receipts come, and `Heads.receipts` says so.
 
 | Variable | Default | What |
 |---|---|---|
-| `OP_INDEXER_STREAM_LISTEN_ADDR` | `127.0.0.1:50051` | gRPC listen address: local only, since there is no authentication. The image sets `0.0.0.0:50051` inside the container. |
+| `OP_INDEXER_STREAM_LISTEN_ADDR` | `127.0.0.1:50051` | gRPC listen address: local only, since there is no authentication. |
 | `OP_INDEXER_STREAM_MAX_SUBSCRIPTIONS` | `64` | Concurrent subscriptions (at most `Semaphore::MAX_PERMITS`; more is lowered to it). |
 | `OP_INDEXER_STREAM_MAX_FLIGHTS` | `8` | Concurrent Arrow Flight `DoGet` streams (section 6), with the same ceiling. |
 
-docker compose: `OP_INDEXER_STREAM_PORT` (default `50051`) is the port inside and outside the
-container; `OP_INDEXER_STREAM_HOST_BIND` (default `127.0.0.1`) is the host address it is
-published on. Set it to `0.0.0.0` to expose the stream, knowingly: there is no authentication.
+Set it to `0.0.0.0:50051` to expose the stream, knowingly: there is no authentication.
 
 ## 6. Arrow Flight: bulk history
 

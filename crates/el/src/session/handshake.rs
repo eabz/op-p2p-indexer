@@ -98,19 +98,6 @@ pub(crate) enum SessionError {
     Timeout { stage: &'static str },
 }
 
-impl SessionError {
-    /// The handshake step that failed, as a metric label.
-    pub(crate) const fn stage(&self) -> &'static str {
-        match self {
-            Self::Tcp(_) => "tcp",
-            Self::Ecies => "ecies",
-            Self::Hello(_) | Self::NoSharedEth => "hello",
-            Self::Status { .. } | Self::ForkMismatch { .. } | Self::WrongChain => "status",
-            Self::Timeout { stage } => stage,
-        }
-    }
-}
-
 /// Dials `candidate` and performs the whole handshake, each step under its own timeout.
 ///
 /// The caller must run the returned driver (`driver.run(cancel)`) for the session to live.

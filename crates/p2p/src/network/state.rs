@@ -22,7 +22,6 @@ use tracing::{debug, info, trace, warn};
 
 use super::{Behaviour, BehaviourEvent, answer};
 use crate::block::{BlockError, BlockValidator, SeenBlocks};
-use crate::metrics::{self, DialOutcome};
 use crate::peers::ConnectedPeers;
 use crate::sync::Server;
 use crate::{NodeStore, StoreError};
@@ -170,7 +169,6 @@ impl State {
                 }
                 if self.validations.len() >= MAX_PENDING_VALIDATIONS {
                     self.ignored_overload += 1;
-                    metrics::block_ignored_backlog();
                     // Logged at 1, 2, 4, 8, ... so a flooding peer can't control our log volume.
                     if self.ignored_overload.is_power_of_two() {
                         warn!(
@@ -191,17 +189,13 @@ impl State {
                 self.validations.spawn_blocking(move || Validated {
                     id: message_id,
                     source: propagation_source,
-                    result: metrics::timed_validation(|| {
-                        validator.validate(version, message.data, now)
-                    }),
+                    result: validator.validate(version, message.data, now),
                 });
-                metrics::validations_pending(self.validations.len());
             }
             SwarmEvent::ConnectionEstablished {
                 peer_id, endpoint, ..
             } => {
                 debug!(peer = %peer_id, addr = %endpoint.get_remote_address(), "peer connected");
-                metrics::peer_connected(&endpoint);
                 self.peers.connected(peer_id, Instant::now());
                 if endpoint.is_dialer()
                     && let Ok(addr) = endpoint.get_remote_address().clone().with_p2p(peer_id)
@@ -210,14 +204,8 @@ impl State {
                 }
                 self.dial_queued_known_peers(swarm);
             }
-            SwarmEvent::ConnectionClosed {
-                peer_id,
-                endpoint,
-                cause,
-                ..
-            } => {
+            SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                 debug!(peer = %peer_id, ?cause, "peer disconnected");
-                metrics::peer_disconnected(&endpoint);
                 self.outbound.remove(&peer_id);
                 self.peers.disconnected(&peer_id);
                 self.update_peer_count(swarm);
@@ -227,7 +215,6 @@ impl State {
             )) => self.update_peer_count(swarm),
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                 debug!(peer = ?peer_id, err = %error, "dial failed");
-                metrics::dial(DialOutcome::Failed);
                 self.dial_queued_known_peers(swarm);
             }
             SwarmEvent::Behaviour(BehaviourEvent::Payloads(request_response::Event::Message {
@@ -258,7 +245,6 @@ impl State {
         swarm: &mut Swarm<Behaviour>,
         Validated { id, source, result }: Validated,
     ) {
-        metrics::validations_pending(self.validations.len());
         // A valid block is still rejected past the per-height limit; one already seen is `None`.
         let result = result.and_then(|block| {
             let is_new = self.seen.observe(block.number(), block.hash)?;
@@ -268,19 +254,16 @@ impl State {
             Ok(None) => {
                 report(swarm, &id, &source, MessageAcceptance::Ignore);
                 debug!(peer = %source, "ignored duplicate block");
-                metrics::block_duplicate();
             }
             Ok(Some(block)) => {
                 report(swarm, &id, &source, MessageAcceptance::Accept);
                 debug!(number = block.number(), hash = %block.hash, version = ?block.version, "received unsafe block");
-                metrics::block_accepted(&block, unix_now_secs());
                 self.check_gap(block.number());
                 self.remember(source, block.timestamp_secs());
                 match self.blocks.try_send(block) {
                     Ok(()) => {}
                     Err(TrySendError::Full(block)) => {
                         self.dropped_blocks += 1;
-                        metrics::block_dropped();
                         // Logged at 1, 2, 4, 8, ... drops, like the validation backlog warning.
                         if self.dropped_blocks.is_power_of_two() {
                             warn!(
@@ -331,7 +314,6 @@ impl State {
             missed,
             "missed unsafe blocks"
         );
-        metrics::gap_detected(missed);
     }
 
     /// Counts a block the sequencer signed that this build cannot read (`err` says how). At
@@ -374,7 +356,6 @@ impl State {
             .is_none_or(|at| now.duration_since(at) >= CLOCK_SKEW_WARN_INTERVAL);
         if due {
             self.clock_skew_warned = Some(now);
-            metrics::clock_skew_warned();
             warn!(
                 ahead_secs,
                 "sequencer block is dated in the future, check the local clock"
@@ -428,7 +409,6 @@ impl State {
     /// Publishes the number of connected peers subscribed to our block topics.
     fn update_peer_count(&self, swarm: &Swarm<Behaviour>) {
         let subscribed = self.subscribed_peers(swarm).count();
-        metrics::peers_subscribed(subscribed);
         self.peer_count.send_replace(subscribed);
     }
 
@@ -459,7 +439,6 @@ impl State {
         let acceptance = err.acceptance();
         let rejected = matches!(acceptance, MessageAcceptance::Reject);
         debug!(peer = %source, %err, rejected, "block message failed validation");
-        metrics::block_rejected(err);
         report(swarm, id, &source, acceptance);
         let score = swarm.behaviour().gossipsub.peer_score(&source);
         if rejected && !err.is_time_window() && score.is_some_and(|score| score < BAN_THRESHOLD) {
@@ -505,7 +484,6 @@ impl State {
         let subscribed: HashSet<PeerId> = self.subscribed_peers(swarm).copied().collect();
         for peer in self.peers.idle(now, |peer| subscribed.contains(peer)) {
             debug!(%peer, "disconnecting peer not subscribed to block topics");
-            metrics::peer_evicted();
             // `Err` only means the peer was already disconnected, which is what we want.
             let _disconnected = swarm.disconnect_peer_id(peer);
             self.back_off(peer, now + EVICTED_PEER_BACKOFF, now);
@@ -531,7 +509,6 @@ impl State {
         let now = Instant::now();
         if self.next_dial.get(&peer).is_some_and(|&next| next > now) || !self.has_backoff_room(now)
         {
-            metrics::dial(DialOutcome::Skipped);
             return;
         }
         let opts = DialOpts::peer_id(peer)
@@ -541,11 +518,9 @@ impl State {
         match swarm.dial(opts) {
             Ok(()) => {
                 self.back_off(peer, now + DIAL_BACKOFF, now);
-                metrics::dial(DialOutcome::Started);
             }
             Err(err) => {
                 debug!(%peer, %err, "skipped dial");
-                metrics::dial(DialOutcome::Skipped);
             }
         }
     }

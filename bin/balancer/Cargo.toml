@@ -1,0 +1,22 @@
+[package]
+name = "balancer"
+description = "Binary: the directory of a deployment's servers, telling clients which servers to read from"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+op-indexer-balancer.workspace = true
+op-indexer-chainspec.workspace = true
+op-indexer-chunks.workspace = true
+op-indexer-node.workspace = true
+
+eyre.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

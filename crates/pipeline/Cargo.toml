@@ -16,7 +16,6 @@ alloy-consensus = { workspace = true, features = ["secp256k1"] }
 alloy-primitives.workspace = true
 # The archive's header bytes, to compute our block's output root.
 alloy-rlp.workspace = true
-metrics.workspace = true
 # `k256` implements sender recovery for `OpTxEnvelope`; it then runs on libsecp256k1 (above).
 op-alloy-consensus = { workspace = true, features = ["k256"] }
 thiserror.workspace = true

@@ -36,7 +36,7 @@ use tokio_util::task::TaskTracker;
 use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status, Streaming};
 
-use self::tables::Table;
+pub use self::tables::Table;
 use crate::convert::Prepared;
 use crate::sink::Sink;
 use crate::source::{Source, read_status};
@@ -46,14 +46,14 @@ use crate::source::{Source, read_status};
 const BATCHES_AHEAD: usize = 1;
 /// The most blocks one `DoGet` covers; a longer range is cut, so one stream does not hold a
 /// permit for days.
-const MAX_FLIGHT_BLOCKS: u64 = 100_000;
+pub const MAX_FLIGHT_BLOCKS: u64 = 100_000;
 
 /// A response stream.
 type Responses<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
 /// How far a range may reach.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Cap {
+pub enum Cap {
     /// Up to the finalized head.
     Finalized,
     /// Up to the safe head.
@@ -66,7 +66,8 @@ enum Cap {
 impl Cap {
     const ALL: [Self; 3] = [Self::Finalized, Self::Safe, Self::Any];
 
-    const fn name(self) -> &'static str {
+    /// The cap's name in a ticket.
+    pub const fn name(self) -> &'static str {
         match self {
             Self::Finalized => "finalized",
             Self::Safe => "safe",
@@ -75,14 +76,17 @@ impl Cap {
     }
 }
 
-/// What a ticket or a descriptor asks for.
+/// What a ticket or a descriptor asks for: a table, an inclusive block range and a cap.
 #[derive(Debug, Clone, Copy)]
-struct Query {
-    table: Table,
+pub struct Query {
+    /// The table.
+    pub table: Table,
     /// `None` for the lowest block held.
-    from: Option<BlockNumber>,
-    to: BlockNumber,
-    cap: Cap,
+    pub from: Option<BlockNumber>,
+    /// The last block, inclusive.
+    pub to: BlockNumber,
+    /// How far the range may reach.
+    pub cap: Cap,
 }
 
 /// A request that names something not served.
@@ -92,7 +96,7 @@ fn not_served(what: &str, all: impl Iterator<Item = &'static str>) -> Status {
 
 impl Query {
     /// The whole of `table`, at any status.
-    const fn whole(table: Table) -> Self {
+    pub const fn whole(table: Table) -> Self {
         Self {
             table,
             from: None,
@@ -102,7 +106,11 @@ impl Query {
     }
 
     /// Reads `table:from:to[:cap]`.
-    fn parse(text: &[u8]) -> Result<Self, Status> {
+    ///
+    /// # Errors
+    ///
+    /// `INVALID_ARGUMENT` if the text is not a ticket, or names a table or cap not served.
+    pub fn parse(text: &[u8]) -> Result<Self, Status> {
         let invalid = || Status::invalid_argument("a ticket is `table:from:to[:cap]`");
         let text = std::str::from_utf8(text).map_err(|_not_text| invalid())?;
         let mut parts = text.split(':');
@@ -138,7 +146,9 @@ impl Query {
         })
     }
 
-    fn ticket(self) -> Ticket {
+    /// The ticket of the query: `table:from:to:cap`, `from` 0 when it names none.
+    #[must_use]
+    pub fn ticket(self) -> Ticket {
         let text = format!(
             "{}:{}:{}:{}",
             self.table.name(),

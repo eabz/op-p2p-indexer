@@ -17,9 +17,8 @@
 //! - `retry` is how store calls are made: transient store errors are retried with backoff
 //!   (storage's helper, without a time limit), everything else is decided by the task that
 //!   made the call.
-//! - [`metrics`] names and records what the tasks do.
 //!
-//! Generic over the two store traits, so it does not know about Redis or fjall,
+//! Generic over the two store traits, so it does not know how either store keeps its blocks,
 //! and it talks to the networks through channels, so it depends on neither. It does not fetch
 //! or verify receipts, it asks for them and stores the answers; it does not fetch missing
 //! blocks. The design is in `docs/pipeline.md`.
@@ -27,7 +26,6 @@
 mod commit;
 mod error;
 mod ingest;
-pub mod metrics;
 mod promote;
 mod range;
 mod receipts;
@@ -186,7 +184,6 @@ where
         shutdown: CancellationToken,
         cancel: CancellationToken,
     ) -> Result<(), PipelineError> {
-        metrics::describe();
         self.promoter.reconcile(&cancel).await?;
 
         // A child token, so a task that ends can stop the others without stopping the caller.

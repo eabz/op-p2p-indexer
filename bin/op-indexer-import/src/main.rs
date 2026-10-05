@@ -1,7 +1,8 @@
-//! Imports a block range from an external archive into the stores the indexer serves from.
+//! Imports a block range from an external archive and exports it to object storage, where
+//! servers read history from.
 //!
 //! ```text
-//! archive service ─▶ download ─▶ <state>/raw ─▶ verify ─▶ <state>/verified ─▶ load ─▶ stores
+//! archive service ─▶ download ─▶ <state>/raw ─▶ verify ─▶ <state>/verified ─▶ export ─▶ R2
 //! ```
 //!
 //! - `download` ([`mod@download`]) decides the range, records it, fetches it in chunks from
@@ -10,29 +11,32 @@
 //!   service left out and fetches the ones it can from the chain's RPC ([`mod@fill`], [`rpc`]).
 //! - `verify` ([`mod@verify`]) rebuilds every block's consensus encoding from the downloaded rows
 //!   and checks it: header hash, parent links up to a trusted anchor, transactions root and
-//!   receipts root (senders are checked later, by `load`). What passes is written as the exact
+//!   receipts root (senders are checked later, by `export`). What passes is written as the exact
 //!   verified bytes ([`chunk`]).
-//! - `load` ([`load`]) recovers every sender from its signature, checks it against the one the
-//!   service reported, and appends the verified chunks, with those senders, to the block
-//!   archive the node serves from.
+//! - `export` ([`mod@export`]) recovers every sender from its signature, checks it against the
+//!   one the service reported, and seals the verified blocks into chunks, uploaded to R2 with
+//!   their manifest and hash index (`crates/chunks`).
 //!
-//! Every step is resumable: a chunk's file exists only when the chunk is complete. The
-//! indexer never links this binary and never talks to the archive service. See
-//! `docs/import.md`.
+//! Every step is resumable: a chunk's file exists only when the chunk is complete, and the
+//! manifest lists only chunks fully uploaded. The indexer never links this binary and never
+//! talks to the archive service. See `docs/import.md`.
 
 mod backoff;
 mod chunk;
 mod cli;
 mod download;
+mod env_file;
+mod export;
 mod fill;
 mod game;
-mod load;
 mod progress;
 mod rows;
 mod rpc;
 mod source;
 mod state;
 mod verify;
+
+use std::path::PathBuf;
 
 use clap::Parser;
 use eyre::WrapErr;
@@ -42,7 +46,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::time::ChronoUtc;
 
-use crate::cli::{Cli, Command, DownloadArgs, VerifyArgs};
+use crate::cli::{Cli, Command, DownloadArgs, Secret, VerifyArgs};
 use crate::rpc::Rpc;
 use crate::source::HyperSync;
 use crate::state::{Anchor, Plan, State};
@@ -57,15 +61,28 @@ const DEFAULT_CHUNK_BLOCKS: u64 = 1000;
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-#[tokio::main]
-async fn main() -> eyre::Result<()> {
+fn main() -> eyre::Result<()> {
+    // First: loading sets environment variables, which is sound only before the runtime starts
+    // any thread, and the command line falls back to them.
+    let env_file = env_file::load(std::env::args_os().skip(1))?;
     let cli = Cli::parse();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .wrap_err("failed to start the tokio runtime")?
+        .block_on(run(cli, env_file))
+}
+
+async fn run(cli: Cli, env_file: Option<PathBuf>) -> eyre::Result<()> {
     tracing_subscriber::fmt()
         .with_timer(ChronoUtc::new(LOG_TIME_FORMAT.to_owned()))
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+    if let Some(path) = env_file {
+        info!(path = %path.display(), "loaded env file");
+    }
 
     // Startup-only blocking I/O, before any task runs.
     let state = State::open(&cli.state_dir).wrap_err("failed to open the state directory")?;
@@ -78,12 +95,12 @@ async fn main() -> eyre::Result<()> {
             let plan = recorded_plan(&state)?;
             verify(&args.verify, args.from_block, &state, &plan, &cancel).await
         }
-        Command::Load(args) => load::run(&args, &state, &recorded_plan(&state)?, &cancel).await,
+        Command::Export(args) => export::run(&args, &state, &recorded_plan(&state)?, &cancel).await,
         Command::Run(args) => {
             let steps = async {
                 let plan = download(&args.download, &state, &cancel).await?;
                 verify(&args.verify, None, &state, &plan, &cancel).await?;
-                load::run(&args.load, &state, &plan, &cancel).await
+                export::run(&args.export, &state, &plan, &cancel).await
             };
             steps.await
         }
@@ -104,7 +121,7 @@ fn recorded_plan(state: &State) -> eyre::Result<Plan> {
 
 /// The plan `download` works from: the recorded one, which the range flags must not
 /// contradict, or on the first run the one the flags describe, which is then recorded.
-async fn plan(args: &DownloadArgs, state: &State) -> eyre::Result<Plan> {
+async fn plan(args: &DownloadArgs, state: &State, api_token: &Secret) -> eyre::Result<Plan> {
     if let Some(plan) = state.read_plan()? {
         check_flags(args, &plan)?;
         return Ok(plan);
@@ -129,7 +146,7 @@ async fn plan(args: &DownloadArgs, state: &State) -> eyre::Result<Plan> {
     } else if let (Some(last), Some(hash)) = (args.last_block, args.anchor_hash) {
         (last, Anchor::Hash(hash))
     } else {
-        let l1 = HyperSync::new(&args.l1_endpoint, &args.api_token)?;
+        let l1 = HyperSync::new(&args.l1_endpoint, api_token)?;
         let game = game::newest_game(&l1, chain).await.wrap_err_with(|| {
             format!(
                 "the lookup of the newest dispute game on L1 ({}) failed. To go without it, \
@@ -176,7 +193,7 @@ fn check_flags(args: &DownloadArgs, plan: &Plan) -> eyre::Result<()> {
     });
     let disagreements = [
         (
-            "--chain",
+            "--chain (OP_INDEXER_CHAIN_ID)",
             args.chain.is_some_and(|chain| chain != plan.chain.chain_id),
         ),
         (
@@ -237,8 +254,9 @@ async fn download(
             })?
             .to_owned(),
     };
-    let plan = plan(args, state).await?;
-    let source = HyperSync::new(&endpoint, &args.api_token)?;
+    let api_token = args.api_token()?;
+    let plan = plan(args, state, &api_token).await?;
+    let source = HyperSync::new(&endpoint, &api_token)?;
     let requests = usize::try_from(args.requests).wrap_err("--requests is too large")?;
     download::ensure_open_files(args.requests)?;
     download::run(&source, state, &plan, requests, cancel).await?;

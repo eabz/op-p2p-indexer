@@ -1,0 +1,65 @@
+// The op-p2p-indexer balancer: a directory of the servers of one chain. No block data passes
+// through it: it tells clients which servers to read from. See docs/serving.md section 6.
+//
+// Every call carries `authorization: Bearer <key>` as metadata: `Register` a server key,
+// `Locate` (and Flight's `GetFlightInfo` and `ListFlights`, on the same listener) a user key.
+
+syntax = "proto3";
+
+package opindexer.balancer.v1;
+
+service Balancer {
+  // A server's registration. The server sends a heartbeat at once and then every 5 s; the
+  // balancer answers the first with one `Registered` and keeps the server in its table while
+  // the call is open and heartbeats arrive. Three missed heartbeats (15 s) end the call, and
+  // the server registers again. The balancer ends the call with:
+  // - FAILED_PRECONDITION for a heartbeat of another chain;
+  // - INVALID_ARGUMENT for a heartbeat without an id or with an invalid address, or with
+  //   another id than the first;
+  // - ALREADY_EXISTS when a newer registration took the same id;
+  // - DEADLINE_EXCEEDED after missed heartbeats;
+  // - UNAVAILABLE when it shuts down.
+  rpc Register(stream Heartbeat) returns (stream Registered);
+  // The servers to subscribe at, for a gRPC subscription from `from_block`: the servers
+  // caught up with the chain, least loaded first. Subscribe at the first; on failure,
+  // subscribe again at the next, from the last block received. UNAVAILABLE if none is.
+  rpc Locate(LocateRequest) returns (LocateResponse);
+}
+
+// A server's state, sent whole every time.
+message Heartbeat {
+  // The server's name, unique in the deployment.
+  string id = 1;
+  // The L2 chain id it follows; it must be the balancer's.
+  uint64 chain_id = 2;
+  // `host:port` where clients reach its stream and Flight services (one listener).
+  string address = 3;
+  // Health: false while it cannot serve (its reads fail): it is given no work.
+  bool healthy = 4;
+  // Its heads, by number, when known, and the last block of the sealed chunks it has read
+  // from the manifest.
+  optional uint64 unsafe_head = 5;
+  optional uint64 safe_head = 6;
+  optional uint64 finalized_head = 7;
+  optional uint64 last_sealed = 8;
+  // Load: requests in flight (subscriptions, Flight streams, lookups) and bytes it sends per
+  // second.
+  uint32 requests_in_flight = 9;
+  uint64 bytes_per_second = 10;
+}
+
+// The balancer took the registration.
+message Registered {}
+
+message LocateRequest {
+  // The L2 chain id; it must be the balancer's.
+  uint64 chain_id = 1;
+  // The first block the subscription asks for. Every server holds every sealed chunk and
+  // its own tail, so all of them serve it.
+  uint64 from_block = 2;
+}
+
+message LocateResponse {
+  // gRPC endpoints (`http://host:port`), least loaded first.
+  repeated string endpoints = 1;
+}

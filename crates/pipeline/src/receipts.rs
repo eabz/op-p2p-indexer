@@ -18,13 +18,11 @@ use op_indexer_primitives::{
 };
 use op_indexer_storage::{ArchiveStore, StorageError, Store, UnsafeStore};
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::{Instant, MissedTickBehavior, interval_at};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::PipelineError;
-use crate::metrics::{self, RequestOutcome, UnmatchedReason};
 use crate::retry::{RetryError, retry, settle};
 
 /// Most stored blocks checked for missing receipts at startup, newest first. The walk also
@@ -40,7 +38,7 @@ const ARCHIVE_RECEIPTS_PER_ROUND: usize = 64;
 #[derive(Debug)]
 pub struct ReceiptsChannels {
     /// Blocks whose receipts are wanted. Never waited on: a request that does not fit is
-    /// dropped and counted.
+    /// dropped.
     pub requests: mpsc::Sender<ReceiptsRequest>,
     /// Receipts the fetcher has verified against the block's receipts root.
     pub verified: mpsc::Receiver<VerifiedReceipts>,
@@ -54,13 +52,8 @@ pub(crate) fn request(requests: &mpsc::Sender<ReceiptsRequest>, block: &DecodedB
 
 /// Hands `request` to the fetcher without waiting. Returns whether it was taken.
 fn send(requests: &mpsc::Sender<ReceiptsRequest>, request: ReceiptsRequest) -> bool {
-    let outcome = match requests.try_send(request) {
-        Ok(()) => RequestOutcome::Sent,
-        // A full channel means the fetcher is behind; a closed one that it has stopped.
-        Err(TrySendError::Full(_) | TrySendError::Closed(_)) => RequestOutcome::Dropped,
-    };
-    metrics::receipts_requested(outcome);
-    matches!(outcome, RequestOutcome::Sent)
+    // A full channel means the fetcher is behind; a closed one that it has stopped.
+    requests.try_send(request).is_ok()
 }
 
 /// Requests the receipts of stored blocks that lack them, then attaches every verified answer
@@ -88,7 +81,8 @@ pub(crate) async fn run<U: UnsafeStore, A: ArchiveStore>(
     }
     // Where the next round of archived blocks starts: after the last one asked for.
     let mut next_archived = 0;
-    let Some(pending) = request_archived(&archive, &requests, &mut next_archived, &cancel).await?
+    let Some(mut pending) =
+        request_archived(&archive, &requests, &mut next_archived, &cancel).await?
     else {
         return Ok(());
     };
@@ -104,8 +98,13 @@ pub(crate) async fn run<U: UnsafeStore, A: ArchiveStore>(
             () = cancel.cancelled() => return Ok(()),
             _ = archived.tick() => {
                 let round = request_archived(&archive, &requests, &mut next_archived, &cancel);
-                if round.await?.is_none() {
+                let Some(now_pending) = round.await? else {
                     return Ok(());
+                };
+                // Logged when it changes: about every round while late receipts come in.
+                if now_pending != pending {
+                    info!(pending = now_pending, "archived blocks without receipts");
+                    pending = now_pending;
                 }
             }
             receipts = verified.recv() => {
@@ -182,7 +181,6 @@ async fn request_archived<A: ArchiveStore>(
     let Some((blocks, total)) = settle(pending.await, PENDING)? else {
         return Ok(None);
     };
-    metrics::archive_pending_receipts(total);
     for block in blocks {
         *next = block.number.saturating_add(1);
         let read = retry(cancel, Store::Archive, BLOCKS, || {
@@ -253,16 +251,15 @@ async fn attach<U: UnsafeStore, A: ArchiveStore>(
     if !held {
         // Pruned or expired in the meantime.
         debug!(number = block.number, hash = %block.hash, "dropped receipts for an unknown block");
-        metrics::receipts_unmatched(UnmatchedReason::UnknownBlock);
     }
     Ok(ControlFlow::Continue(()))
 }
 
-/// Runs one `set_receipts` call on `store` through the retry helper and records what came of
+/// Runs one `set_receipts` call on `store` through the retry helper and logs what came of
 /// it. Returns whether the store holds the block, or `None` if cancellation ended the retry.
 ///
 /// A store that holds the block but refuses the receipts counts as holding it: the refusal is
-/// logged and counted here. The fetcher verified the receipts against the receipts root, so a
+/// logged here. The fetcher verified the receipts against the receipts root, so a
 /// wrong count or number means the block reference does not name the block it claims to.
 async fn set<F, Fut>(
     cancel: &CancellationToken,
@@ -278,14 +275,12 @@ where
     match retry(cancel, store, operation, call).await {
         Ok(true) => {
             debug!(number = block.number, hash = %block.hash, %store, "attached receipts");
-            metrics::receipts_attached(store);
             Ok(Some(true))
         }
         Ok(false) => Ok(Some(false)),
         Err(RetryError::Cancelled) => Ok(None),
         Err(RetryError::Storage(err @ StorageError::InvalidBlock { .. })) => {
             warn!(number = block.number, hash = %block.hash, %err, "dropped receipts");
-            metrics::receipts_unmatched(UnmatchedReason::Refused);
             Ok(Some(true))
         }
         Err(RetryError::Storage(source)) => Err(PipelineError::Storage { operation, source }),

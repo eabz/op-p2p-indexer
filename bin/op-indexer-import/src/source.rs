@@ -126,8 +126,7 @@ const CURSOR_KEY: &[u8] = b"\"next_block\":";
 
 /// The content encodings asked for, cheapest to decode first.
 const ACCEPT_ENCODING: &str = "zstd, gzip;q=0.5";
-/// The service's endpoint of each chain this build knows, by chain id. Unichain's is the
-/// host the service's naming gives; it has not been reached from here.
+/// The service's endpoint of each chain this build knows, by chain id.
 const ENDPOINTS: &[(u64, &str)] = &[
     (10, "https://optimism.hypersync.xyz"),
     (130, "https://unichain.hypersync.xyz"),

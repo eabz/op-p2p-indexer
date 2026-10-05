@@ -16,7 +16,7 @@
 //!    ancestry call (1,024 blocks) at a time.
 //! 4. Part by part, oldest first: append them to the archive if they extend it, each block's
 //!    transactions and receipts roots checked first over exactly the bytes written; the part
-//!    ends before a block that does not match, which is logged as an error and counted.
+//!    ends before a block that does not match, which is logged as an error.
 //! 5. Record the heads in the archive: the marker that the range is committed. The heads never
 //!    name a block the archive lacks: the safe head recorded is the newest block of `S`'s chain
 //!    the archive holds (`S` when the whole range went in), and the finalized head only if it
@@ -48,7 +48,7 @@
 //! - A promoted range is appended only if it extends the archive's tip (blocks already held
 //!   are skipped). Otherwise it is not archived: the archive is behind (a gap that range sync
 //!   fills) or holds another chain at that height. This is logged, at most once per
-//!   [`ARCHIVE_WARN_INTERVAL`], and the blocks are counted.
+//!   [`ARCHIVE_WARN_INTERVAL`], with the number of blocks.
 //! - Startup removes nothing from the archive: blocks above `C` may be an import or a sync
 //!   that reached further, which cannot be told from a stopped promotion.
 //! - Nothing removes blocks: the archive keeps every block, and the heads only rise.
@@ -58,7 +58,7 @@
 //! - **Holes.** When the whole range cannot be read, the readable part next to `S` is promoted
 //!   and the rest, next to `C`, is left out: below a block missing from the unsafe store, or
 //!   beyond [`MAX_PROMOTED_PARTS`]. Everything from `S` down to the break is on `S`'s
-//!   chain, so it is safe. The hole is logged and counted with the blocks left out. The blocks
+//!   chain, so it is safe. The hole is logged, with the number of blocks left out. The blocks
 //!   after a hole do not extend the archive, so they are not archived and the recorded safe
 //!   head stays below the hole (step 5); the unsafe store keeps them until range sync has
 //!   filled the hole and a later promotion appends them, or until they expire. If `S` itself
@@ -84,7 +84,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::PipelineError;
-use crate::metrics::{self, HoleReason};
 use crate::retry::{RetryError, retry};
 
 /// Most ancestry calls one part of the range takes: one for all of what is left and up to three
@@ -509,7 +508,6 @@ where
                     "a promoted block's transactions or receipts do not match its header's roots; \
                      it and the blocks after it are not archived"
                 );
-                metrics::root_mismatch();
                 break;
             }
             encoded.push(archived);
@@ -527,7 +525,6 @@ where
         match appended.await {
             Ok(()) => {}
             Err(RetryError::Storage(StorageError::NotContiguous { expected, got })) => {
-                metrics::archive_skipped(blocks.len());
                 if self.archive_warning_due() {
                     warn!(
                         archive_tip = ?expected,
@@ -540,11 +537,6 @@ where
             }
             Err(other) => return Err(stop(APPEND)(other)),
         }
-        let without_receipts = blocks
-            .iter()
-            .filter(|block| block.receipts.is_none())
-            .count();
-        metrics::blocks_promoted(blocks.len(), without_receipts);
         Ok(Some(newest))
     }
 
@@ -607,7 +599,6 @@ where
         .await?;
         // No receiver is not an error: the value is kept for one that subscribes later.
         self.safe_number.send_replace(safe.number);
-        metrics::safe_block_number(safe.number);
         Ok(())
     }
 }
@@ -624,12 +615,22 @@ fn roots_match(block: &DecodedBlock, archived: &ArchivedBlock, canyon_time: u64)
         })
 }
 
-/// Promote now, backfill later: logs and counts the blocks above `base` (the block the range
+/// Why a promotion could not read its whole range.
+#[derive(Debug, Clone, Copy)]
+enum HoleReason {
+    /// A block of the range is not in the unsafe store: never received, or expired.
+    MissingAncestor,
+    /// The range is longer than one ancestry call returns. The blocks may all be stored.
+    TooLong,
+    /// The oldest block of the range does not build on the committed safe head.
+    ParentMismatch,
+}
+
+/// Promote now, backfill later: logs the blocks above `base` (the block the range
 /// was read above) up to `left_out_to` that are not promoted. With a parent mismatch none are
 /// left out, but the block at `base`'s height is another chain's.
 fn report_hole(reason: HoleReason, base: BlockRef, left_out_to: BlockNumber, safe: BlockRef) {
     let missing = left_out_to.saturating_sub(base.number);
-    metrics::promotion_hole(reason, missing);
     let why = match reason {
         HoleReason::MissingAncestor => "a block of the range is not in the unsafe store",
         HoleReason::TooLong => {

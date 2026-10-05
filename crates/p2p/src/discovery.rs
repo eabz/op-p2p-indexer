@@ -26,7 +26,6 @@ use tracing::{debug, info, warn};
 use unsigned_varint::encode as uvarint;
 
 use crate::Bootnode;
-use crate::metrics;
 
 /// ENR key of the OP Stack entry.
 const OPSTACK_ENR_KEY: &str = "opstack";
@@ -241,7 +240,6 @@ impl Discovery {
         if self.reported.len() >= MAX_REPORTED_PEERS {
             self.reported.clear();
         }
-        let candidate_count = candidates.len();
         let mut new_peers = 0;
         for addr in candidates {
             if peers.try_send(addr.clone()).is_err() {
@@ -249,7 +247,6 @@ impl Discovery {
             }
             new_peers += usize::from(self.reported.insert(addr));
         }
-        metrics::discovery_round(concurrency, candidate_count, new_peers);
         new_peers
     }
 }

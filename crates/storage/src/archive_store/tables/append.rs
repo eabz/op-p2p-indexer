@@ -5,10 +5,8 @@
 use alloy_primitives::{Address, BlockHash, Bytes};
 use op_indexer_primitives::BlockRef;
 
-use super::{
-    Failure, Tables, compress_values, decode_number, encode_senders, end_ref, extends, record_usage,
-};
-use crate::{StorageError, Store, metrics};
+use super::{Failure, Tables, compress_values, decode_number, encode_senders, end_ref, extends};
+use crate::StorageError;
 
 /// Most encoded bytes written in one batch by an append of many blocks (a single larger block
 /// still goes alone): an eighth of the journal limit, and one memtable. It bounds one journal
@@ -63,15 +61,10 @@ pub(in crate::archive_store) fn append_batch(
         Some(tip) => above(tables, blocks, tip)?,
         None => blocks,
     };
-    let mut appended = 0_usize;
     while !rest.is_empty() {
         let (chunk, tail) = rest.split_at(chunk_len(rest));
-        appended = appended.saturating_add(append_chunk(tables, chunk)?);
+        append_chunk(tables, chunk)?;
         rest = tail;
-    }
-    if appended > 0 {
-        metrics::blocks_inserted(Store::Archive, appended);
-        record_usage(tables);
     }
     Ok(())
 }
@@ -125,8 +118,7 @@ fn chunk_len(blocks: &[Entry]) -> usize {
 
 /// Writes the blocks of `chunk` (consecutive, not empty) above the tip in one durable batch,
 /// if they extend it; blocks another writer appended since the tip was read are skipped.
-/// Returns how many were written.
-fn append_chunk(tables: &Tables, chunk: &[Entry]) -> Result<usize, Failure> {
+fn append_chunk(tables: &Tables, chunk: &[Entry]) -> Result<(), Failure> {
     // Compressed before the lock is taken.
     let mut values = Vec::with_capacity(chunk.len());
     for block in chunk {
@@ -159,5 +151,5 @@ fn append_chunk(tables: &Tables, chunk: &[Entry]) -> Result<usize, Failure> {
         batch.insert(&tables.numbers, block.block.hash.0, key);
     }
     batch.commit()?;
-    Ok(new)
+    Ok(())
 }

@@ -17,8 +17,8 @@ use tracing::{Instrument, debug, warn};
 use super::context::SessionContext;
 use super::driver::{SessionDriver, SessionHandle};
 use super::handshake;
+use crate::ElError;
 use crate::warn_limit::WarnLimit;
-use crate::{ElError, metrics};
 
 /// Inbound connections whose handshake may be in progress at once; more are dropped.
 const MAX_PENDING_INBOUND: usize = 8;
@@ -95,7 +95,6 @@ pub(crate) async fn listen(
                     continue;
                 }
                 if handshakes.len() >= MAX_PENDING_INBOUND || from_ip >= MAX_PENDING_PER_IP {
-                    metrics::inbound_dropped(ctx.spec().label);
                     if let Some(held_back) = dropped.allow(DROP_WARN_INTERVAL) {
                         warn!(
                             held_back,
@@ -114,12 +113,10 @@ pub(crate) async fn listen(
                         Ok((handle, driver)) => {
                             if let Err(refused) = accepted.try_send(Accepted { handle, driver }) {
                                 let Accepted { driver, .. } = refused.into_inner();
-                                metrics::inbound_refused(ctx.spec().label);
                                 driver.reject(DisconnectReason::TooManyPeers).await;
                             }
                         }
                         Err(err) => {
-                            metrics::inbound_handshake_failed(ctx.spec().label, err.stage());
                             debug!(addr = %peer_addr, %err, "inbound handshake failed");
                         }
                     }

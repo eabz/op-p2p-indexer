@@ -24,7 +24,6 @@ use op_indexer_primitives::PayloadVersion;
 use sha2::{Digest, Sha256};
 
 use crate::block;
-use crate::metrics;
 
 /// Gossipsub behaviour with snappy decompression applied to every received message.
 pub(crate) type Behaviour = gossipsub::Behaviour<Snappy>;
@@ -224,7 +223,7 @@ pub(crate) struct Snappy;
 
 impl DataTransform for Snappy {
     fn inbound_transform(&self, raw: RawMessage) -> Result<Message, io::Error> {
-        let data = decompress(&raw.data).inspect_err(|_| metrics::gossip_decompress_failed())?;
+        let data = decompress(&raw.data)?;
         Ok(Message {
             source: raw.source,
             data,

@@ -21,8 +21,7 @@
 //! rewrites the trees and drops blob files nothing references. Disk use therefore runs above
 //! the live data by roughly a few blob files (64 MiB each) plus the journal (at most 128 MiB):
 //! a constant. In a small archive that constant dominates; in a full history it is a few
-//! percent. The `archive_*` gauges show disk use, stale blob bytes and running compactions
-//! after each write.
+//! percent.
 
 mod tables;
 
@@ -38,8 +37,9 @@ use op_indexer_primitives::{
     ReadLimits, encode_receipts, split_body,
 };
 
-use self::tables::{Entry, Failure, Prepared, Tables};
-use crate::metrics::{self, Operation};
+use tracing::debug;
+
+use self::tables::{Entry, Failure, Tables};
 use crate::{ArchiveStore, InvalidBlockReason, StorageError, Store};
 
 /// The block archive in one fjall database directory. Cheap to clone: clones share the open
@@ -90,91 +90,43 @@ impl FjallArchive {
         Ok(Self { tables })
     }
 
-    /// Runs `call` on a blocking thread with the keyspaces, timed as `operation`.
-    async fn blocking<T, F>(
-        &self,
-        operation: Operation,
-        name: &'static str,
-        call: F,
-    ) -> Result<T, StorageError>
+    /// Runs `call` on a blocking thread with the keyspaces; `name` names it in errors.
+    async fn blocking<T, F>(&self, name: &'static str, call: F) -> Result<T, StorageError>
     where
         T: Send + 'static,
         F: FnOnce(&Tables) -> Result<T, Failure> + Send + 'static,
     {
         let tables = self.tables.clone();
-        metrics::timed(Store::Archive, operation, async move {
-            tokio::task::spawn_blocking(move || call(&tables))
-                .await
-                .map_err(|source| StorageError::BlockingTask {
-                    operation: name,
-                    source,
-                })?
-                .map_err(|failure| failure.into_storage_error(name))
-        })
-        .await
+        tokio::task::spawn_blocking(move || call(&tables))
+            .await
+            .map_err(|source| StorageError::BlockingTask {
+                operation: name,
+                source,
+            })?
+            .map_err(|failure| failure.into_storage_error(name))
     }
 }
 
 impl FjallArchive {
-    /// Appends blocks the importer prepared, for its bulk load only: written straight into
-    /// new table and blob files, all keyspaces at once, without the journal. Several times
-    /// faster than [`ArchiveStore::append_batch`] for long lists, and as durable when it
-    /// returns; each call writes new files, so it is for lists of hundreds of megabytes, not
-    /// a few blocks. A crash during a call leaves the held range as it was (see
-    /// `tables::bulk`). Not retried by its caller: a failed call can leave unregistered files,
-    /// which the next open of the archive removes.
-    ///
-    /// `blocks` must be consecutive, oldest first, and extend the archive's last block (or
-    /// the archive is empty). No other write may run at the same time; the writer lock
-    /// ensures it in this process.
+    /// Removes every block below `first_kept` (header, body, receipts, senders, its hash entry
+    /// and its pending-receipts entry), for an archive that keeps only a tail of the chain.
+    /// The recorded heads stay. Afterwards [`ArchiveStore::range`] starts at `first_kept`, or
+    /// is `None` if nothing is left, and appends continue above the tip as before; an emptied
+    /// archive takes any block next. Durable, in batches that take turns with appends; a call
+    /// cut short is finished by the next.
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError::NotContiguous`] if `blocks` do not extend the archive, and
-    /// [`StorageError::Fjall`] if writing fails.
-    pub async fn bulk_append(&self, blocks: Vec<PreparedBlock>) -> Result<(), StorageError> {
-        self.blocking(Operation::BulkAppend, "bulk_append", move |tables| {
-            let blocks: Vec<Prepared> = blocks.into_iter().map(|block| block.0).collect();
-            tables::bulk_append(tables, &blocks)
-        })
-        .await
-    }
-}
-
-/// A block checked and compressed for [`FjallArchive::bulk_append`], off the writer: its
-/// header hashes to its hash, it has one sender per transaction, and its number and parent are
-/// read from it.
-#[derive(Debug)]
-pub struct PreparedBlock(Prepared);
-
-impl PreparedBlock {
-    /// Prepares `block`. CPU work only (decoding the header, hashing it, compressing the
-    /// values): call it on a blocking thread, as many in parallel as there are cores.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StorageError::InvalidData`] if the header or the body does not decode,
-    /// [`StorageError::InvalidBlock`] if the header does not hash to the block's hash or the
-    /// senders are not one per transaction, and [`StorageError::Oversized`] if a value is too
-    /// large to compress.
-    pub fn new(block: &ArchivedBlock) -> Result<Self, StorageError> {
-        let ArchivedBlock {
-            encoded: block,
-            senders,
-        } = block;
-        let checked = checked(block, senders)?;
-        let prepared = Prepared::new(
-            BlockRef {
-                number: checked.number,
-                hash: block.hash,
-            },
-            checked.parent_hash,
-            &block.header,
-            &block.body,
-            block.receipts.as_ref().map(|receipts| &receipts[..]),
-            senders,
-        )?;
-        Ok(Self(prepared))
+    /// Returns [`StorageError::Fjall`] if the archive cannot be written, and
+    /// [`StorageError::InvalidData`] if a header to remove does not decompress.
+    pub async fn prune_below(&self, first_kept: BlockNumber) -> Result<(), StorageError> {
+        let removed = self
+            .blocking("prune_below", move |tables| {
+                tables::prune_below(tables, first_kept)
+            })
+            .await?;
+        debug!(first_kept, removed, "archive pruned below a block");
+        Ok(())
     }
 }
 
@@ -182,7 +134,7 @@ impl ArchiveStore for FjallArchive {
     /// Hashes, compresses and writes on a blocking thread. One batch holds at most 16 MiB of
     /// RLP, and the writer lock is taken once per batch.
     async fn append_batch(&self, blocks: Vec<ArchivedBlock>) -> Result<(), StorageError> {
-        self.blocking(Operation::AppendBatch, "append_batch", move |tables| {
+        self.blocking("append_batch", move |tables| {
             let entries: Vec<Entry> = blocks.into_iter().map(entry).collect::<Result<_, _>>()?;
             tables::append_batch(tables, &entries)
         })
@@ -196,7 +148,7 @@ impl ArchiveStore for FjallArchive {
     ) -> Result<bool, StorageError> {
         let count = receipts.len();
         let receipts = encode_receipts(receipts);
-        self.blocking(Operation::SetReceipts, "set_receipts", move |tables| {
+        self.blocking("set_receipts", move |tables| {
             tables::set_receipts(tables, block, &receipts, count)
         })
         .await
@@ -208,7 +160,7 @@ impl ArchiveStore for FjallArchive {
         limits: ReadLimits,
         convert: Option<ItemConvert>,
     ) -> Result<Vec<Bytes>, StorageError> {
-        self.blocking(Operation::Read, "read", move |tables| {
+        self.blocking("read", move |tables| {
             tables::read(tables, &read, limits, convert)
         })
         .await
@@ -219,10 +171,8 @@ impl ArchiveStore for FjallArchive {
         from: BlockNumber,
         limits: ReadLimits,
     ) -> Result<Vec<ArchivedBlock>, StorageError> {
-        self.blocking(Operation::Blocks, "blocks", move |tables| {
-            tables::blocks(tables, from, limits)
-        })
-        .await
+        self.blocking("blocks", move |tables| tables::blocks(tables, from, limits))
+            .await
     }
 
     async fn pending_receipts(
@@ -230,36 +180,28 @@ impl ArchiveStore for FjallArchive {
         from: BlockNumber,
         limit: usize,
     ) -> Result<(Vec<BlockRef>, u64), StorageError> {
-        self.blocking(
-            Operation::PendingReceipts,
-            "pending_receipts",
-            move |tables| tables::pending_receipts(tables, from, limit),
-        )
+        self.blocking("pending_receipts", move |tables| {
+            tables::pending_receipts(tables, from, limit)
+        })
         .await
     }
 
     async fn heads(&self) -> Result<L1Heads, StorageError> {
-        self.blocking(Operation::Heads, "heads", tables::heads)
-            .await
+        self.blocking("heads", tables::heads).await
     }
 
     async fn set_heads(&self, heads: L1Heads) -> Result<(), StorageError> {
-        self.blocking(Operation::SetL1Heads, "set_heads", move |tables| {
-            tables::set_heads(tables, heads)
-        })
-        .await
+        self.blocking("set_heads", move |tables| tables::set_heads(tables, heads))
+            .await
     }
 
     async fn number_of(&self, hash: BlockHash) -> Result<Option<BlockNumber>, StorageError> {
-        self.blocking(Operation::NumberOf, "number_of", move |tables| {
-            tables::number_of(tables, hash)
-        })
-        .await
+        self.blocking("number_of", move |tables| tables::number_of(tables, hash))
+            .await
     }
 
     async fn range(&self) -> Result<Option<(BlockRef, BlockRef)>, StorageError> {
-        self.blocking(Operation::Range, "range", tables::range)
-            .await
+        self.blocking("range", tables::range).await
     }
 }
 

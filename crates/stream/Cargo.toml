@@ -24,6 +24,7 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 tokio-stream.workspace = true
 tokio-util = { workspace = true, features = ["rt"] }
+subtle.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true
 tracing.workspace = true

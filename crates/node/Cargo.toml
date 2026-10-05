@@ -1,0 +1,27 @@
+[package]
+name = "op-indexer-node"
+description = "The node's wiring, shared by the indexer and server binaries"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+op-indexer-chainspec.workspace = true
+op-indexer-el.workspace = true
+op-indexer-l1.workspace = true
+op-indexer-p2p.workspace = true
+op-indexer-pipeline.workspace = true
+op-indexer-primitives.workspace = true
+op-indexer-storage.workspace = true
+op-indexer-stream.workspace = true
+
+alloy-primitives.workspace = true
+dotenvy.workspace = true
+eyre.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync"] }
+tokio-util.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

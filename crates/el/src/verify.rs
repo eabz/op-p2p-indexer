@@ -30,8 +30,6 @@ use alloy_primitives::B256;
 use op_alloy_consensus::OpReceiptEnvelope;
 use op_indexer_primitives::{ReceiptsRequest, receipts_root};
 
-use crate::metrics::VerificationFailure;
-
 /// Why a list of receipts is not the block's.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum VerifyError {
@@ -51,16 +49,6 @@ pub(crate) enum VerifyError {
         /// The root of the receipts received.
         computed: B256,
     },
-}
-
-impl VerifyError {
-    /// The failure as a metric label.
-    pub(crate) const fn kind(&self) -> VerificationFailure {
-        match self {
-            Self::Count { .. } => VerificationFailure::Count,
-            Self::Root { .. } => VerificationFailure::Root,
-        }
-    }
 }
 
 /// Checks that `receipts` are the receipts of the block in `request`: one per transaction,

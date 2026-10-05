@@ -1,7 +1,7 @@
 //! The pipeline's error: what stops it.
 //!
 //! Transient store errors never reach here (they are retried), and neither do blocks that are
-//! dropped or ranges that cannot be promoted (they are logged and counted).
+//! dropped or ranges that cannot be promoted (they are logged).
 
 use op_indexer_storage::StorageError;
 use tokio::task::JoinError;

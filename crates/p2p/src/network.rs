@@ -32,7 +32,6 @@ pub(crate) use self::state::unix_now_secs;
 use crate::block::BlockValidator;
 use crate::discovery::{Discovery, DiscoveryError};
 use crate::gossip::{self, GossipError};
-use crate::metrics;
 use crate::{NetworkConfig, NodeStore, PayloadSource};
 
 /// Peers found by discovery and waiting to be dialed. Each lookup round reports the routing
@@ -206,7 +205,6 @@ impl Network {
             payloads,
         } = self;
         let chain = config.chain;
-        metrics::describe();
 
         let mut discovery = Discovery::new(
             &keypair,
@@ -266,7 +264,7 @@ impl Network {
                 },
                 Some(addr) = discovered_rx.recv() => state.dial(&mut swarm, addr),
                 Some(result) = state.persists.join_next() => match result {
-                    Ok(Ok(())) => metrics::known_peer_saved(),
+                    Ok(Ok(())) => {}
                     Ok(Err(err)) => warn!(%err, "failed to save known peer"),
                     Err(err) => warn!(%err, "known peer save task failed"),
                 },

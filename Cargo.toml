@@ -10,11 +10,15 @@ publish = false
 
 [workspace.dependencies]
 # Internal crates.
+op-indexer-balancer = { path = "crates/balancer" }
 op-indexer-chainspec = { path = "crates/chainspec" }
+op-indexer-chunks = { path = "crates/chunks" }
 op-indexer-el = { path = "crates/el" }
 op-indexer-l1 = { path = "crates/l1" }
+op-indexer-node = { path = "crates/node" }
 op-indexer-p2p = { path = "crates/p2p" }
 op-indexer-pipeline = { path = "crates/pipeline" }
+op-indexer-server = { path = "crates/server" }
 op-indexer-primitives = { path = "crates/primitives" }
 op-indexer-storage = { path = "crates/storage" }
 op-indexer-stream = { path = "crates/stream" }
@@ -23,14 +27,13 @@ op-indexer-stream = { path = "crates/stream" }
 alloy-primitives = { version = "1.7", default-features = false, features = ["std", "k256"] }
 # Cheaply cloneable payload buffers passed between tasks.
 bytes = "1"
-# Block, transaction and receipt types, so no crate redefines them. The storage crate adds
-# `serde` for the JSON it keeps in Redis.
+# Block, transaction and receipt types, so no crate redefines them.
 alloy-consensus = { version = "2", default-features = false, features = ["std"] }
 op-alloy-consensus = { version = "2", default-features = false, features = ["std"] }
 # RLP of headers, bodies and receipts in the block archive, the encoding peers ask for
 # (already in the tree through alloy).
 alloy-rlp = { version = "0.3", default-features = false, features = ["std"] }
-# `Withdrawals` to rebuild a block body read back from Redis, and the EIP-2718 encodings.
+# The EIP-2718 encodings and the EIP-7702 authorization lists.
 alloy-eips = { version = "2", default-features = false, features = ["std"] }
 # Ethereum mainnet's hardfork schedule, for the fork id the `l1` crate shows L1 peers.
 alloy-hardforks = { version = "0.4", default-features = false }
@@ -84,12 +87,11 @@ blst = { version = "0.3", default-features = false }
 # Gossip payloads and archived blocks are snappy block-compressed; gossip message IDs are
 # SHA-256 (0.10, as op-alloy).
 sha2 = "0.10"
+# Constant-time comparison of API keys (the stream).
+subtle = { version = "2.6", default-features = false }
 snap = "1.1"
 
-# Unsafe store client: `tokio-comp` and `connection-manager` for one multiplexed connection that
-# reconnects on its own, `script` to run the Lua fork-choice scripts by hash.
-redis = { version = "1", default-features = false, features = ["tokio-comp", "connection-manager", "script"] }
-# Redis values are JSON, as are the importer's state files.
+# The importer's state files are JSON.
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 
@@ -103,8 +105,6 @@ eyre = "0.6"
 thiserror = "2"
 # Structured logging.
 tracing = "0.1"
-# Metrics facade (as in reth): recording is a no-op until the binary installs a recorder.
-metrics = { version = "0.24", default-features = false }
 # Jitter: storage's retry backoff, the importer's download retries, and the peer schedules of
 # `el` and `l1` (already in the tree through fjall).
 fastrand = { version = "2", default-features = false, features = ["std"] }
@@ -145,9 +145,17 @@ flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 rustix = { version = "1", default-features = false, features = ["std", "fs", "process"] }
 # Compression of the downloaded and verified chunks on disk (already in the tree).
 zstd = { version = "0.13", default-features = false }
+# Object storage (Cloudflare R2, through its S3 API) for sealed block chunks, in `crates/chunks`
+# only: Apache Arrow's maintained client, with pooled keep-alive connections over reqwest and
+# ranged GETs; `aws` is the S3 backend (no Azure, GCP or HTTP), `fs` a local directory with the
+# same layout, for tests and the bench without credentials.
+object_store = { version = "0.14", default-features = false, features = ["aws", "fs"] }
 # The importer's allocator: `verify` builds rows and receipts on every core at once, and is
 # about 9% faster with it at eight threads than with the system allocator.
 mimalloc = { version = "0.1", default-features = false }
+# Reads the `.env` file each binary loads at startup (`NAME=value` lines, the process
+# environment winning); maintained fork of `dotenv`, no dependencies.
+dotenvy = { version = "0.15", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

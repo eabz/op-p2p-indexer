@@ -1,0 +1,94 @@
+# Builds the Linux binaries and publishes them as a GitHub Release.
+#
+# A pushed `v*` tag (made by scripts/bump-version.sh) builds and publishes the release. A manual
+# run (workflow_dispatch) builds the same archive and keeps it as a workflow artifact only. The
+# build runs with a read-only token; only the publish job may write.
+#
+# The build runs on Ubuntu 22.04, so the binaries need glibc 2.35: Ubuntu 22.04 and newer.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # The toolchain the repository is checked with; bump it on purpose.
+  RUST_TOOLCHAIN: "1.99.0"
+  BINARIES: indexer server import balancer
+
+jobs:
+  build:
+    name: build x86_64-linux
+    runs-on: ubuntu-22.04
+    outputs:
+      name: ${{ steps.package.outputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The runner is x86_64-unknown-linux-gnu: a native build, into target/release.
+      - name: Read the version, check the tag matches it
+        run: |
+          version=$(cargo metadata --no-deps --locked --format-version 1 |
+            jq -r '.packages[] | select(.name == "indexer") | .version')
+          echo "VERSION=$version" >>"$GITHUB_ENV"
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the workspace version $version (Cargo.toml)"
+            exit 1
+          fi
+
+      - name: Build
+        run: |
+          bins=""
+          for bin in $BINARIES; do bins="$bins --bin $bin"; done
+          # shellcheck disable=SC2086 # one --bin flag per word
+          cargo build --release --locked $bins
+
+      - name: Package
+        id: package
+        run: |
+          name="op-p2p-indexer-v$VERSION-x86_64-linux"
+          mkdir -p "dist/$name"
+          for bin in $BINARIES; do
+            cp "target/release/$bin" "dist/$name/"
+          done
+          cp .env.example README.md LICENSE "dist/$name/"
+          cd dist
+          tar -czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" >"$name.tar.gz.sha256"
+          cat "$name.tar.gz.sha256"
+          echo "name=$name" >>"$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/*.tar.gz*
+          if-no-files-found: error
+
+  publish:
+    name: publish the release
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.name }}
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: "*.tar.gz*"

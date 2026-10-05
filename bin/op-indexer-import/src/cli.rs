@@ -1,30 +1,34 @@
 //! The command line: subcommands, flags with their environment fallbacks, and defaults.
 //!
 //! The range is decided by the flags of [`DownloadArgs`]; chain parameters come from the
-//! chainspec. Does not read files or connect anywhere.
+//! chainspec. Does not read files or connect anywhere; reads the environment only through clap,
+//! and for the API token's former name.
 
-use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::{env, fmt};
 
 use alloy_primitives::B256;
 use clap::{Args, Parser, Subcommand};
+use eyre::eyre;
+use tracing::warn;
 
-use crate::load::LoadArgs;
+/// The former name of `OP_INDEXER_IMPORT_API_TOKEN`, still read.
+const DEPRECATED_API_TOKEN_VAR: &str = "ENVIO_API_TOKEN";
 
-/// Downloads a chain's blocks from an external archive, verifies every block, and loads
-/// them into the block archive the node serves from. No database is needed.
+/// Downloads a chain's blocks from an external archive, verifies every block, and exports
+/// them as sealed chunks to object storage (Cloudflare R2), where servers read history from.
 ///
-/// Run `download`, then `verify`, then `load`, or `run` for all three. Every step keeps its
-/// progress in the state directory and can be stopped and started again: nothing completed
-/// is redone.
+/// Run `download`, then `verify`, then `export`, or `run` for all three. Every step keeps its
+/// progress (the state directory, and the manifest in the bucket) and can be stopped and
+/// started again: nothing completed is redone.
 ///
 /// `download` decides the range on its first run and records it in the state directory;
-/// `verify` and `load` read it from there. By default the range is OP Mainnet from block 0 to
+/// `verify` and `export` read it from there. By default the range is OP Mainnet from block 0 to
 /// the last block known to be committed to L1: the block of the newest dispute game. Blocks
 /// come from Envio `HyperSync`.
 #[derive(Debug, Parser)]
-#[command(name = "import", version)]
+#[command(name = "import", version, arg = crate::env_file::arg())]
 pub(crate) struct Cli {
     /// Directory for the plan and the downloaded and verified chunks. Use the same one for
     /// every step.
@@ -48,27 +52,66 @@ pub(crate) enum Command {
     /// the chain's RPC endpoint (`--rpc-endpoint`).
     Download(DownloadArgs),
     /// Check every downloaded chunk offline: header hashes and parent links up to the anchor,
-    /// transactions roots and receipts roots. Senders are checked by `load`.
+    /// transactions roots and receipts roots. Senders are checked by `export`.
     Verify(VerifyCommand),
-    /// Recover every transaction's sender from its signature, check it against the verified
-    /// chunk, and append the verified range to the block archive the node serves from. Stops at
-    /// the first sender that differs. Needs the whole range accepted by `verify`. The indexer
-    /// must not be running.
-    Load(LoadArgs),
-    /// `download`, `verify`, then `load`, stopping at the first step that cannot finish.
-    Run(RunArgs),
+    /// Convert the verified range into sealed chunks, their manifest and the hash index, and
+    /// upload them to object storage (R2). Recovers every transaction's sender from its
+    /// signature and checks it against the verified chunk first; stops at the first that
+    /// differs. Resumable from the manifest. Needs the whole range accepted by `verify`.
+    Export(ExportArgs),
+    /// `download`, `verify`, then `export`, stopping at the first step that cannot finish.
+    Run(Box<RunArgs>),
+}
+
+/// Settings of `export`: where the chunks go. The R2 keys are read from the environment (a
+/// flag shows in the process list), never logged or written to disk.
+#[derive(Debug, Clone, Args)]
+pub(crate) struct ExportArgs {
+    /// Write to this local directory instead of R2, in the layout the bucket would hold
+    /// (`<dir>/<prefix>/…`; for a test or the bench without credentials).
+    #[arg(long)]
+    pub(crate) to_dir: Option<PathBuf>,
+    /// R2 account id: the endpoint is `https://<account id>.r2.cloudflarestorage.com`.
+    #[arg(long, env = "OP_INDEXER_R2_ACCOUNT_ID")]
+    pub(crate) r2_account_id: Option<String>,
+    /// R2 bucket. Default: `<chain>-snapshot` (`op-snapshot`, `unichain-snapshot`,
+    /// `base-snapshot`).
+    #[arg(long, env = "OP_INDEXER_R2_BUCKET")]
+    pub(crate) r2_bucket: Option<String>,
+    /// Folder in the bucket the chunks, manifest and index go under (`<prefix>/chunks/…`,
+    /// `<prefix>/manifest/…`, `<prefix>/index/…`).
+    #[arg(long, env = "OP_INDEXER_R2_PREFIX", default_value = "archive")]
+    pub(crate) r2_prefix: String,
+    /// R2 access key id (an API token with write access to the bucket).
+    #[arg(long, env = "OP_INDEXER_R2_ACCESS_KEY_ID", hide_env_values = true)]
+    pub(crate) r2_access_key_id: Option<Secret>,
+    /// R2 secret access key. A flag is visible in the process list; the variable is not.
+    #[arg(long, env = "OP_INDEXER_R2_SECRET_ACCESS_KEY", hide_env_values = true)]
+    pub(crate) r2_secret_access_key: Option<Secret>,
+    /// Another endpoint than the account's (an S3-compatible store).
+    #[arg(long, env = "OP_INDEXER_R2_ENDPOINT")]
+    pub(crate) r2_endpoint: Option<String>,
+    /// Verified chunks prepared at once (read, senders recovered, receipts encoded; default:
+    /// one per CPU).
+    #[arg(long, env = "OP_INDEXER_IMPORT_EXPORT_THREADS")]
+    pub(crate) threads: Option<usize>,
+    /// Chunks uploaded at once.
+    #[arg(long, env = "OP_INDEXER_IMPORT_EXPORT_UPLOADS", default_value_t = 4)]
+    pub(crate) uploads: usize,
 }
 
 /// Settings of `download`. The range flags are read on the first run only, when the plan is
 /// recorded; on later runs a flag that disagrees with the recorded plan is refused.
 #[derive(Debug, Clone, Args)]
 pub(crate) struct DownloadArgs {
-    /// API token of the archive service. A flag is visible in the process list and the shell
-    /// history; the environment variable is not. It is never logged or written to disk.
-    #[arg(long, env = "ENVIO_API_TOKEN", hide_env_values = true)]
-    pub(crate) api_token: Secret,
+    /// API token of the archive service, required by `download`. A flag is visible in the
+    /// process list and the shell history; the environment variable is not. It is never logged
+    /// or written to disk. `ENVIO_API_TOKEN`, its former variable, is still read, with a
+    /// warning.
+    #[arg(long, env = "OP_INDEXER_IMPORT_API_TOKEN", hide_env_values = true)]
+    pub(crate) api_token: Option<Secret>,
     /// Chain id of the chain to import [default: 10, OP Mainnet].
-    #[arg(long, env = "OP_INDEXER_IMPORT_CHAIN")]
+    #[arg(long, env = "OP_INDEXER_CHAIN_ID")]
     pub(crate) chain: Option<u64>,
     /// First block of the range [default: 0].
     #[arg(long, env = "OP_INDEXER_IMPORT_FIRST_BLOCK")]
@@ -100,9 +143,8 @@ pub(crate) struct DownloadArgs {
     )]
     pub(crate) chunk_blocks: Option<u64>,
     /// `HyperSync` endpoint of the chain [default: by chain, `https://optimism.hypersync.xyz`
-    /// for OP Mainnet (10) and `https://unichain.hypersync.xyz` for Unichain (130), the host
-    /// the service's naming gives, not yet reached from here]. Needed for a chain not in
-    /// that list.
+    /// for OP Mainnet (10), `https://unichain.hypersync.xyz` for Unichain (130) and
+    /// `https://base.hypersync.xyz` for Base (8453)]. Needed for a chain not in that list.
     #[arg(long, env = "OP_INDEXER_IMPORT_ENDPOINT")]
     pub(crate) endpoint: Option<String>,
     /// JSON-RPC endpoint of the chain, read-only, for what the archive service leaves out of
@@ -129,6 +171,27 @@ pub(crate) struct DownloadArgs {
     pub(crate) requests: u64,
 }
 
+impl DownloadArgs {
+    /// The API token: `--api-token` or `OP_INDEXER_IMPORT_API_TOKEN`, else the former
+    /// `ENVIO_API_TOKEN`, with a deprecation warning.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if none is set, or `ENVIO_API_TOKEN` is blank.
+    pub(crate) fn api_token(&self) -> eyre::Result<Secret> {
+        if let Some(token) = &self.api_token {
+            return Ok(token.clone());
+        }
+        let token = env::var(DEPRECATED_API_TOKEN_VAR).map_err(|_unset| {
+            eyre!("the API token is required: set OP_INDEXER_IMPORT_API_TOKEN, or --api-token")
+        })?;
+        warn!("{DEPRECATED_API_TOKEN_VAR} is deprecated: rename it OP_INDEXER_IMPORT_API_TOKEN");
+        token
+            .parse()
+            .map_err(|err| eyre!("{DEPRECATED_API_TOKEN_VAR}: {err}"))
+    }
+}
+
 /// Settings of `verify`.
 #[derive(Debug, Clone, Args)]
 pub(crate) struct VerifyArgs {
@@ -144,7 +207,7 @@ pub(crate) struct VerifyCommand {
     pub(crate) verify: VerifyArgs,
     /// Verify only the chunks from this block on, and do not link or accept the range: a
     /// quick check of one part of the chain. The chunks it verifies are kept; `verify`
-    /// without this flag must still run before `load`. Not taken by `run`, whose `load`
+    /// without this flag must still run before `export`. Not taken by `run`, whose `export`
     /// needs the whole range accepted.
     #[arg(long, env = "OP_INDEXER_IMPORT_VERIFY_FROM_BLOCK")]
     pub(crate) from_block: Option<u64>,
@@ -158,7 +221,7 @@ pub(crate) struct RunArgs {
     #[command(flatten)]
     pub(crate) verify: VerifyArgs,
     #[command(flatten)]
-    pub(crate) load: LoadArgs,
+    pub(crate) export: ExportArgs,
 }
 
 /// A credential given on the command line: the archive service's API token. `Debug` never

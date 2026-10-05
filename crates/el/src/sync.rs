@@ -55,7 +55,6 @@ use tracing::{Instrument, debug, info, warn};
 use self::headers::HEADERS_PER_REQUEST;
 use self::schedule::Schedule;
 use crate::ElError;
-use crate::metrics::{self, SyncOutcome};
 use crate::peers::{Peers, Report, closed};
 use crate::session::{RequestError, SessionHandle};
 
@@ -277,19 +276,6 @@ impl From<RequestError> for Failure {
             RequestError::SessionClosed => Self::Closed,
             RequestError::Malformed(reason) => Self::Malformed(reason),
             excess @ RequestError::Excess { .. } => Self::Invalid(excess.to_string()),
-        }
-    }
-}
-
-impl Failure {
-    const fn outcome(&self) -> SyncOutcome {
-        match self {
-            Self::NotHeld => SyncOutcome::NotHeld,
-            Self::Invalid(_) => SyncOutcome::Invalid,
-            Self::Malformed(_) | Self::Undecodable(_) => SyncOutcome::Malformed,
-            Self::Unsupported(_) | Self::Panicked(_) => SyncOutcome::Unsupported,
-            Self::Timeout => SyncOutcome::Timeout,
-            Self::Closed => SyncOutcome::Closed,
         }
     }
 }
@@ -655,7 +641,6 @@ impl Syncer {
                 (segment.first, segment.top.number, failure)
             }
         };
-        metrics::sync_request(failure.outcome());
         if let Some(report) = self.schedule.finished(peer, Some(&failure)) {
             self.peers.report(report);
         }
@@ -686,7 +671,6 @@ impl Syncer {
     }
 
     fn succeeded(&mut self, peer: PeerId) {
-        metrics::sync_request(SyncOutcome::Verified);
         self.indexer_misses.remove(&peer);
         // A success is never reported to the peer set.
         let _report = self.schedule.finished(peer, None);
@@ -696,11 +680,9 @@ impl Syncer {
     /// has to stop.
     async fn hand_on(&mut self, cancel: &CancellationToken) -> bool {
         while let Some((segment, blocks)) = self.ready.remove(&self.next_emit) {
-            let count = blocks.len();
             if !send(&self.blocks, blocks, "blocks", cancel).await {
                 return false;
             }
-            metrics::sync_blocks(count, segment.top.number);
             self.next_emit = segment.top.number.saturating_add(1);
             self.outstanding = self.outstanding.saturating_sub(1);
             self.checkpoints = self.checkpoints.split_off(&self.next_emit);

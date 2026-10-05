@@ -15,8 +15,18 @@ use tokio::time::Instant;
 use tracing::debug;
 
 use crate::discovery::Candidate;
-use crate::metrics::{self, DialOutcome};
 use crate::session::SessionError;
+
+/// How a dial attempt failed, as the dial status line counts it.
+#[derive(Debug, Clone, Copy)]
+enum DialOutcome {
+    /// The peer is full: it said so, or dropped the encrypted handshake without a reason.
+    Full,
+    /// A step of the handshake timed out.
+    TimedOut,
+    /// Unreachable, another fork or chain, another protocol version, or another failure.
+    Other,
+}
 
 /// Base wait before dialing a peer again after a TCP failure, a timeout, a failed hello or
 /// status, or a session that ended for an ordinary reason. Full peers are retried sooner.
@@ -61,13 +71,9 @@ pub(super) struct DialTally {
 impl DialTally {
     fn failed(&mut self, outcome: DialOutcome) {
         let counter = match outcome {
-            DialOutcome::TooManyPeers | DialOutcome::HandshakeDropped => &mut self.full,
-            DialOutcome::Timeout => &mut self.timed_out,
-            DialOutcome::Connected
-            | DialOutcome::Unreachable
-            | DialOutcome::WrongFork
-            | DialOutcome::Incompatible
-            | DialOutcome::Failed => &mut self.other,
+            DialOutcome::Full => &mut self.full,
+            DialOutcome::TimedOut => &mut self.timed_out,
+            DialOutcome::Other => &mut self.other,
         };
         *counter = counter.saturating_add(1);
     }
@@ -76,8 +82,6 @@ impl DialTally {
 /// Whom to dial and when.
 #[derive(Debug)]
 pub(super) struct Schedule {
-    /// The network, as the metrics label.
-    network: &'static str,
     /// Peers discovery told us about, by id. At most [`MAX_KNOWN_PEERS`].
     known: HashMap<PeerId, Known>,
     /// Peers not to dial or accept, with when the ban ends. At most [`MAX_BANNED_PEERS`].
@@ -118,7 +122,7 @@ impl Schedule {
 
     /// A schedule that knows the peers `saved` from an earlier run, due at once: they are
     /// dialed as soon as a tip is known, before discovery has found anyone.
-    pub(super) fn new(network: &'static str, saved: &[ExecutionPeer]) -> Self {
+    pub(super) fn new(saved: &[ExecutionPeer]) -> Self {
         let now = Instant::now();
         let known = saved
             .iter()
@@ -141,7 +145,6 @@ impl Schedule {
             })
             .collect();
         Self {
-            network,
             known,
             banned: HashMap::new(),
             recent_dials: VecDeque::new(),
@@ -255,24 +258,21 @@ impl Schedule {
         // The outcome, the wait after a first failure, and whether failures in a row double it.
         let (outcome, base, grows) = match err {
             // A full peer: its slots churn, so ask again soon, but less often each time it is
-            // still full, so a full node is not asked every minute for ever.
+            // still full, so a full node is not asked every minute for ever. An encrypted
+            // handshake dropped without a reason is how a full reth node refuses: the same.
             SessionError::Hello(Some(DisconnectReason::TooManyPeers))
             | SessionError::Status {
                 reason: Some(DisconnectReason::TooManyPeers),
-            } => (DialOutcome::TooManyPeers, FULL_PEER_RETRY, true),
-            // How a full reth node refuses: the same, but back off if it keeps happening.
-            SessionError::Ecies => (DialOutcome::HandshakeDropped, FULL_PEER_RETRY, true),
-            SessionError::Tcp(_) => (DialOutcome::Unreachable, REDIAL_INTERVAL, true),
-            SessionError::Timeout { .. } => (DialOutcome::Timeout, REDIAL_INTERVAL, true),
-            SessionError::Hello(_) | SessionError::Status { .. } => {
-                (DialOutcome::Failed, REDIAL_INTERVAL, true)
             }
-            SessionError::ForkMismatch { .. } | SessionError::WrongChain => {
-                (DialOutcome::WrongFork, LONG_BACKOFF, false)
+            | SessionError::Ecies => (DialOutcome::Full, FULL_PEER_RETRY, true),
+            SessionError::Timeout { .. } => (DialOutcome::TimedOut, REDIAL_INTERVAL, true),
+            SessionError::Tcp(_) | SessionError::Hello(_) | SessionError::Status { .. } => {
+                (DialOutcome::Other, REDIAL_INTERVAL, true)
             }
-            SessionError::NoSharedEth => (DialOutcome::Incompatible, LONG_BACKOFF, false),
+            SessionError::ForkMismatch { .. }
+            | SessionError::WrongChain
+            | SessionError::NoSharedEth => (DialOutcome::Other, LONG_BACKOFF, false),
         };
-        metrics::dial(self.network, outcome);
         self.tally.failed(outcome);
         debug!(%peer, %err, "dial failed");
         let Some(known) = self.known.get_mut(&peer) else {

@@ -1,11 +1,10 @@
 //! The ingest task: gossiped blocks into the unsafe store, in arrival order.
 //!
-//! For each block: recover the senders, insert, log and count what the store's fork choice did
+//! For each block: recover the senders, insert, log what the store's fork choice did
 //! with it. It does not order or deduplicate blocks (the store does) and does not promote them
 //! (the promotion task does).
 
 use std::ops::ControlFlow;
-use std::time::UNIX_EPOCH;
 
 use op_indexer_primitives::{BlockRef, ReceiptsRequest, UnsafeBlock, UnsafeEvent};
 use op_indexer_storage::{StorageError, Store, UnsafeStore};
@@ -14,7 +13,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::PipelineError;
-use crate::metrics::{self, DropReason};
 use crate::receipts;
 use crate::recover::{RecoverError, recover};
 use crate::retry::{RetryError, retry};
@@ -50,7 +48,6 @@ pub(crate) async fn run<U: UnsafeStore>(
             block = blocks.recv() => {
                 // A closed channel is the network shutting down.
                 let Some(block) = block else { return Ok(()) };
-                metrics::channel_depth(blocks.len());
                 let ingested = ingest(&store, block, receipts, head, &cancel);
                 if ingested.await?.is_break() {
                     return Ok(());
@@ -75,14 +72,13 @@ async fn ingest<U: UnsafeStore>(
     head: Option<&watch::Sender<Option<BlockRef>>>,
     cancel: &CancellationToken,
 ) -> Result<ControlFlow<()>, PipelineError> {
-    let (number, hash, timestamp_secs) = (block.number(), block.hash, block.timestamp_secs());
+    let (number, hash) = (block.number(), block.hash);
     let block = match recover(block).await {
         Ok(block) => block,
         Err(RecoverError::Task(err)) => return Err(PipelineError::Task(err)),
         // The sequencer signed the block, so this is not expected.
         Err(err @ (RecoverError::Sender { .. } | RecoverError::Decode { .. })) => {
             warn!(number, %hash, %err, "dropped block");
-            metrics::block_dropped(DropReason::SenderRecovery);
             return Ok(ControlFlow::Continue(()));
         }
     };
@@ -92,30 +88,27 @@ async fn ingest<U: UnsafeStore>(
         Err(RetryError::Cancelled) => return Ok(ControlFlow::Break(())),
         Err(RetryError::Storage(err)) => {
             // The store refuses this block, not the store itself: drop it and carry on.
-            let reason = if matches!(err, StorageError::InvalidBlock { .. }) {
-                DropReason::Invalid
-            } else if matches!(err, StorageError::UnsupportedTransaction { .. }) {
-                DropReason::Unsupported
-            } else {
+            if !matches!(
+                err,
+                StorageError::InvalidBlock { .. } | StorageError::UnsupportedTransaction { .. }
+            ) {
                 return Err(PipelineError::Storage {
                     operation: INSERT,
                     source: err,
                 });
-            };
+            }
             warn!(number, %hash, %err, "dropped block");
-            metrics::block_dropped(reason);
             return Ok(ControlFlow::Continue(()));
         }
     };
 
     // Not stored: a retry of an insert that had been applied, or a block the store already
     // had or no longer wants. Its events, if any, went to the stream the first time.
-    if outcome.stored {
-        metrics::ingest_lag(unix_now_secs().saturating_sub(timestamp_secs));
-        if let Some(requests) = receipts {
-            // Never waited on; a dropped request is counted and asked again at the next start.
-            let _sent = receipts::request(requests, &block);
-        }
+    if outcome.stored
+        && let Some(requests) = receipts
+    {
+        // Never waited on; a dropped request is asked again at the next start.
+        let _sent = receipts::request(requests, &block);
     }
     debug!(number, %hash, stored = outcome.stored, "ingested block");
     for event in &outcome.events {
@@ -132,7 +125,7 @@ async fn ingest<U: UnsafeStore>(
     Ok(ControlFlow::Continue(()))
 }
 
-/// Logs and counts one thing fork choice did.
+/// Logs one thing fork choice did.
 fn record(event: &UnsafeEvent) {
     match event {
         UnsafeEvent::NewHead { head, gap: true } => {
@@ -152,14 +145,8 @@ fn record(event: &UnsafeEvent) {
         }
         UnsafeEvent::Filled(block) => {
             info!(number = block.number, hash = %block.hash, "gap in the unsafe chain filled");
-            metrics::fill(1);
         }
         // Insert does not produce these.
         UnsafeEvent::Receipts(_) | UnsafeEvent::Pruned { .. } => {}
     }
-}
-
-/// Current Unix time in seconds; block timestamps are wall-clock.
-fn unix_now_secs() -> u64 {
-    UNIX_EPOCH.elapsed().map_or(0, |elapsed| elapsed.as_secs())
 }

@@ -8,7 +8,7 @@ verifies into the safe and finalized heads. Store calls go through storage's ret
 (`op_indexer_storage::retry`), without a time limit.
 
 It does not depend on `p2p`: the binary hands it a channel. It is generic over the two store
-traits, so it does not know about Redis or fjall.
+traits, so it does not know how either store keeps its blocks.
 
 ## 1. Inputs and outputs
 
@@ -83,8 +83,7 @@ Runs whenever the L1 heads change. `C` is the safe head recorded in the archive
 4. `ArchiveStore::append_batch` of the blocks, with their senders, if they extend the
    archive's tip. Each block's transactions root, and receipts root when it has receipts, is
    computed over exactly the bytes about to be written and compared with its header; the list
-   ends before the first block that does not match, which is not appended (error log,
-   `op_indexer_pipeline_root_mismatches_total`) and so stays the hole above the recorded safe
+   ends before the first block that does not match, which is not appended (error log) and so stays the hole above the recorded safe
    head.
 5. `ArchiveStore::set_heads(heads)`: the marker that the range is committed. Written after
    the data, so a crash before it repeats the range. **The recorded heads never name a block
@@ -141,8 +140,7 @@ everything else, including the gap below a promoted range that did not connect.
 
 - A promoted range that does not extend the archive's tip (`NotContiguous`: the archive is
   behind, or holds another chain at that height) is not archived. It is logged at most once
-  in ten minutes with the archive's tip and the block, and counted
-  (`op_indexer_pipeline_archive_skipped_blocks_total`). Nothing is removed to make room.
+  in ten minutes with the archive's tip and the block. Nothing is removed to make room.
   Blocks the archive already holds are skipped by `append_batch`, so a range that range sync
   or an import stored first is fine.
 - Nothing removes blocks: the archive keeps every block (no retention window), and the heads
@@ -229,7 +227,7 @@ gives to the execution network as the newest block the node knows.
 ## 5. Startup
 
 1. Read `C` from the archive. If there is none, start both tasks.
-2. Write the heads to the unsafe store (Redis may have been wiped by a layout change), prune it
+2. Write the heads to the unsafe store (its journal may have been emptied by a layout change), prune it
    up to `C` (the last run may have stopped between the marker and the prune), and publish
    `C`'s number to `p2p`.
 3. Start both tasks.
@@ -274,14 +272,16 @@ events went to the stream.
 
 ## 8. Metrics
 
-Through the `metrics` facade, like storage: blocks ingested, blocks dropped (by reason), reorgs
-and their depth, fills, retries (by store), blocks promoted, promotion holes (blocks missing),
-ingest lag (now minus block timestamp), channel depth.
+None (user decision, 2026-10-04: the metric modules were removed, to be re-added later where
+needed). What an operator must see is logged: dropped blocks, reorgs, fills, retries,
+promotion holes and root mismatches, game mismatches, and the archived blocks still without
+receipts (when that number changes).
 
 ## 9. What has been verified
 
-- **Ingest**: live, on mainnet gossip. Blocks, transactions and senders appear in Redis; reorg
-  and fill events show in the log and the event stream.
+- **Ingest**: live, on mainnet gossip, with the Redis store this replaced (D0): blocks,
+  transactions and senders were stored; reorg and fill events showed in the log and the event
+  stream. Not yet run on the in-memory unsafe chain.
 - **Promotion**: with a throwaway driver outside the repo that feeds safe heads trailing the
   unsafe head, including a step back (L1 reorg), a missing block, and a kill between each pair
   of steps. Not run on heads from the L1 side.
@@ -290,7 +290,7 @@ ingest lag (now minus block timestamp), channel depth.
 ## 10. Not done
 
 The unsafe store's reconciliation when the safe head contradicts it (`docs/storage.md`, the
-safe-head gap), a metrics exporter. Reading data back is the `stream` crate's.
+safe-head gap). Reading data back is the `stream` crate's.
 
 ## 11. Modules and API
 
@@ -305,7 +305,6 @@ safe-head gap), a metrics exporter. Reading data back is the `stream` crate's.
 | `commit.rs` | The commitment task: verified dispute games checked against our blocks, into L1 heads (section 4b). |
 | `retry.rs` | Storage's `retry` without a time limit, and `settle`, which ends a task on what it returns. |
 | `error.rs` | `PipelineError`. |
-| `metrics.rs` | Names, descriptions and recording functions (section 8), like `storage::metrics`. |
 
 `Pipeline::new` takes the unsafe store, the archive, the chain's Canyon time (for the receipts
 roots promotion checks), the block receiver, the L1 heads receiver, the safe-number

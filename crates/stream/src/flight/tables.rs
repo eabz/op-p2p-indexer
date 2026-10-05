@@ -29,10 +29,14 @@ use crate::proto;
 
 /// A table Flight serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Table {
+pub enum Table {
+    /// One row per block: the header.
     Blocks,
+    /// One row per transaction.
     Transactions,
+    /// One row per receipt.
     Receipts,
+    /// One row per log.
     Logs,
 }
 
@@ -41,10 +45,10 @@ type Column = (&'static str, ArrayRef, bool);
 
 impl Table {
     /// Every table, in the order they are listed.
-    pub(crate) const ALL: [Self; 4] =
-        [Self::Blocks, Self::Transactions, Self::Receipts, Self::Logs];
+    pub const ALL: [Self; 4] = [Self::Blocks, Self::Transactions, Self::Receipts, Self::Logs];
 
-    pub(crate) const fn name(self) -> &'static str {
+    /// The table's name, in descriptors and tickets.
+    pub const fn name(self) -> &'static str {
         match self {
             Self::Blocks => "blocks",
             Self::Transactions => "transactions",
@@ -53,12 +57,17 @@ impl Table {
         }
     }
 
-    pub(crate) fn parse(name: &str) -> Option<Self> {
+    /// The table named `name`.
+    pub fn parse(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|table| table.name() == name)
     }
 
     /// The table's schema: its columns for no blocks.
-    pub(crate) fn schema(self) -> Result<SchemaRef, FlightError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns the Arrow error if the empty batch cannot be built, which would be a bug.
+    pub fn schema(self) -> Result<SchemaRef, FlightError> {
         Ok(self.batch(&[], &L1Heads::default())?.schema())
     }
 
