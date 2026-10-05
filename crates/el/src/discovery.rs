@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use alloy_eip2124::ForkId;
 use alloy_rlp::Decodable;
-use discv5::{ConfigBuilder, Discv5, Enr, ListenConfig, QueryError};
+use discv5::{ConfigBuilder, Discv5, Enr, ListenConfig, ProtocolIdentity, QueryError};
 use enr::{CombinedKey, CombinedPublicKey, EnrPublicKey, NodeId};
 use futures_util::future::join_all;
 use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -150,6 +150,12 @@ impl Discovery {
         let enr = builder.build(&key).map_err(ElError::Enr)?;
 
         let mut config = ConfigBuilder::new(ListenConfig::from(listen));
+        // The chain's discovery network: its protocol id, with the default version, as Base's
+        // own nodes set it.
+        config.protocol_identity(ProtocolIdentity {
+            protocol_id: ctx.spec().discovery_id,
+            ..ProtocolIdentity::default()
+        });
         if advertised.is_some() {
             // discv5 must neither replace a configured address with what peers report nor
             // withdraw it when nobody dials in.
@@ -388,7 +394,7 @@ impl Discovery {
                 continue;
             }
             // A node on our fork announcing a next fork we do not know: this build is behind.
-            if fork_id.next != 0 && !self.ctx.spec().knows_fork_time(fork_id.next) {
+            if self.ctx.spec().is_unknown_next(fork_id) {
                 self.ctx.warn_build_behind(fork_id, "node record");
             }
             let Some(candidate) = candidate(enr) else {

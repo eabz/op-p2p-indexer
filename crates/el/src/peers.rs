@@ -265,6 +265,7 @@ impl PeerSet {
         let mut status_tick = interval(STATUS_INTERVAL);
         status_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut last_status = None;
+        self.ctx.horizon().log(true);
         let outcome = loop {
             tokio::select! {
                 biased;
@@ -291,6 +292,7 @@ impl PeerSet {
                 _ = dial_tick.tick() => {}
                 _ = status_tick.tick() => {
                     self.log_status(&mut last_status);
+                    self.ctx.horizon().log(false);
                     self.release_idle();
                 }
             }

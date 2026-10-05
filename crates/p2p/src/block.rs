@@ -75,8 +75,20 @@ pub(crate) fn topic(chain_id: ChainId, version: PayloadVersion) -> String {
 pub(crate) enum BlockError {
     #[error("message is {len} bytes, shorter than the minimum {min}")]
     TooShort { len: usize, min: usize },
-    #[error("payload is not valid SSZ: {0:?}")]
-    InvalidPayload(ssz::DecodeError),
+    #[error("payload is not valid SSZ: {reason:?}")]
+    InvalidPayload {
+        reason: ssz::DecodeError,
+        /// Whether the sequencer signed it and it decodes as no payload version this build
+        /// knows: then the payload's format changed under this build.
+        protocol_change: bool,
+    },
+    /// A payload the sequencer signed, sent on the topic of another payload version than its
+    /// own: a genuine block replayed by the peer ([block validation]: the payload must decode
+    /// for its topic).
+    ///
+    /// [block validation]: https://specs.optimism.io/protocol/rollup-node-p2p.html#block-validation
+    #[error("payload of version {version:?} sent on another version's topic")]
+    WrongTopic { version: PayloadVersion },
     #[error("block {number} is {age_secs}s old")]
     Stale {
         number: BlockNumber,
@@ -114,12 +126,17 @@ pub(crate) enum BlockError {
         number: BlockNumber,
         #[source]
         source: OpPayloadError,
+        /// Whether it came on the topic the current time requires (the sequencer signed it):
+        /// then the block's format changed under this build.
+        protocol_change: bool,
     },
     #[error("block {number} claims hash {claimed} but hashes to {computed}")]
     HashMismatch {
         number: BlockNumber,
         claimed: BlockHash,
         computed: BlockHash,
+        /// As for [`Self::InvalidBlock`].
+        protocol_change: bool,
     },
     /// A field the block's topic rules out ([block validation]).
     ///
@@ -128,6 +145,9 @@ pub(crate) enum BlockError {
     ForkRule {
         number: BlockNumber,
         rule: &'static str,
+        /// Whether the sequencer signed it and it came on the topic the current time requires:
+        /// then the chain's rules changed under this build.
+        protocol_change: bool,
     },
     #[error("block {number} is at a height with more than {MAX_BLOCKS_PER_HEIGHT} distinct blocks")]
     TooManyAtHeight { number: BlockNumber },
@@ -147,7 +167,23 @@ impl BlockError {
     pub(crate) const fn acceptance(&self) -> MessageAcceptance {
         match self {
             Self::TooShort { .. }
-            | Self::InvalidPayload(_)
+            | Self::WrongTopic { .. }
+            | Self::InvalidPayload {
+                protocol_change: false,
+                ..
+            }
+            | Self::ForkRule {
+                protocol_change: false,
+                ..
+            }
+            | Self::InvalidBlock {
+                protocol_change: false,
+                ..
+            }
+            | Self::HashMismatch {
+                protocol_change: false,
+                ..
+            }
             | Self::Stale {
                 signed_by_sequencer: false,
                 ..
@@ -159,9 +195,6 @@ impl BlockError {
             | Self::InvalidRecoveryId { .. }
             | Self::MalformedSignature { .. }
             | Self::WrongSigner { .. }
-            | Self::InvalidBlock { .. }
-            | Self::HashMismatch { .. }
-            | Self::ForkRule { .. }
             | Self::TooManyAtHeight { .. } => MessageAcceptance::Reject,
             // A block the sequencer signed, outside our time window: the spec (and op-node)
             // reject it, but it points at our clock, not the peer. op-node scores no topic, so
@@ -176,7 +209,58 @@ impl BlockError {
                 signed_by_sequencer: true,
                 ..
             }
+            // A block the sequencer signed that this build cannot read
+            // ([`Self::is_protocol_change`]): the peer forwarded a genuine block and is not at
+            // fault.
+            | Self::InvalidPayload {
+                protocol_change: true,
+                ..
+            }
+            | Self::ForkRule {
+                protocol_change: true,
+                ..
+            }
+            | Self::InvalidBlock {
+                protocol_change: true,
+                ..
+            }
+            | Self::HashMismatch {
+                protocol_change: true,
+                ..
+            }
             | Self::UndecodableTransaction { .. } => MessageAcceptance::Ignore,
+        }
+    }
+
+    /// Whether this is evidence that the protocol changed under this build (a fork it does not
+    /// know), which only the sequencer can produce: a payload it signed that decodes as no
+    /// known version; one on the topic the current time requires that breaks a fork rule or
+    /// does not rebuild to its hash; or a block holding a transaction of a type this build does
+    /// not know. A genuine payload replayed on another topic is not: it decodes as its own
+    /// version ([`Self::WrongTopic`]).
+    pub(crate) const fn is_protocol_change(&self) -> bool {
+        match self {
+            Self::InvalidPayload {
+                protocol_change, ..
+            }
+            | Self::ForkRule {
+                protocol_change, ..
+            }
+            | Self::InvalidBlock {
+                protocol_change, ..
+            }
+            | Self::HashMismatch {
+                protocol_change, ..
+            } => *protocol_change,
+            Self::UndecodableTransaction { .. } => true,
+            Self::TooShort { .. }
+            | Self::WrongTopic { .. }
+            | Self::Stale { .. }
+            | Self::TooFarInFuture { .. }
+            | Self::InvalidRecoveryId { .. }
+            | Self::MalformedSignature { .. }
+            | Self::WrongSigner { .. }
+            | Self::TooManyAtHeight { .. } => false,
         }
     }
 
@@ -229,9 +313,12 @@ impl BlockValidator {
 
     /// Decodes and validates a decompressed block message received on a `version` topic.
     ///
-    /// Checks run cheapest first: length, SSZ decoding, timestamp window, the sequencer signature,
-    /// then the block hash. The hash check rebuilds the header (including the transactions root),
-    /// so it only runs for messages the sequencer signed. A block outside the time window also
+    /// Checks run cheapest first: length, SSZ decoding, timestamp window, the sequencer
+    /// signature, then the block hash. A message that fails decoding or a fork rule has its
+    /// signature checked too (it covers the bytes, not the topic), to tell junk and a replay on
+    /// another version's topic from a block the sequencer signed in a format this build does
+    /// not know ([`BlockError::is_protocol_change`]). The hash check rebuilds the header
+    /// (including the transactions root), so it only runs for messages the sequencer signed. A block outside the time window also
     /// has its signature checked, only to report whether the sequencer signed it (then our
     /// clock is the likelier fault, and the message is ignored, not rejected). `now_secs` is
     /// the current Unix time. CPU-bound: run off the async runtime.
@@ -254,20 +341,37 @@ impl BlockValidator {
             .then(|| B256::from_slice(&message.split_to(PARENT_BEACON_BLOCK_ROOT_LEN)));
         let payload = message;
 
-        let decoded = decode_payload(version, &payload).map_err(BlockError::InvalidPayload)?;
+        let signed_by_sequencer = || self.verify_signature(0, &signature_bytes, &signed).is_ok();
+        // Evidence of a protocol change only on the topic the current time requires.
+        let current_topic = || version == self.version_at(now_secs);
+        let decoded = match decode_payload(version, &payload) {
+            Ok(decoded) => decoded,
+            Err(reason) => {
+                let signed_by_sequencer = signed_by_sequencer();
+                // A genuine payload of another version: replayed on the wrong topic.
+                if signed_by_sequencer && let Some(version) = other_version(version, &signed) {
+                    return Err(BlockError::WrongTopic { version });
+                }
+                return Err(BlockError::InvalidPayload {
+                    reason,
+                    protocol_change: signed_by_sequencer,
+                });
+            }
+        };
         let number = decoded.block_number();
         let timestamp = decoded.timestamp();
         let hash = decoded.block_hash();
         if let Some(rule) = self.fork_rule(&decoded, timestamp) {
-            return Err(BlockError::ForkRule { number, rule });
+            return Err(BlockError::ForkRule {
+                number,
+                rule,
+                protocol_change: current_topic() && signed_by_sequencer(),
+            });
         }
 
         let age_secs = now_secs.saturating_sub(timestamp);
         if age_secs > MAX_AGE_SECS {
-            let signed_by_sequencer = age_secs <= MAX_IGNORED_AGE_SECS
-                && self
-                    .verify_signature(number, &signature_bytes, &signed)
-                    .is_ok();
+            let signed_by_sequencer = age_secs <= MAX_IGNORED_AGE_SECS && signed_by_sequencer();
             return Err(BlockError::Stale {
                 number,
                 age_secs,
@@ -276,9 +380,7 @@ impl BlockValidator {
         }
         let ahead_secs = timestamp.saturating_sub(now_secs);
         if ahead_secs > MAX_FUTURE_SECS {
-            let signed_by_sequencer = self
-                .verify_signature(number, &signature_bytes, &signed)
-                .is_ok();
+            let signed_by_sequencer = signed_by_sequencer();
             return Err(BlockError::TooFarInFuture {
                 number,
                 ahead_secs,
@@ -289,13 +391,18 @@ impl BlockValidator {
 
         let block = decoded
             .into_block_with_sidecar_raw(&sidecar(version, parent_beacon_block_root))
-            .map_err(|source| BlockError::InvalidBlock { number, source })?;
+            .map_err(|source| BlockError::InvalidBlock {
+                number,
+                source,
+                protocol_change: current_topic(),
+            })?;
         let computed = block.header.hash_slow();
         if computed != hash {
             return Err(BlockError::HashMismatch {
                 number,
                 claimed: hash,
                 computed,
+                protocol_change: current_topic(),
             });
         }
 
@@ -309,6 +416,21 @@ impl BlockValidator {
             hash,
             block,
         })
+    }
+
+    /// The payload version the chain's blocks have at `now_secs`: V1 before Canyon, V2 from
+    /// it, V3 from Ecotone, V4 from Isthmus.
+    fn version_at(self, now_secs: u64) -> PayloadVersion {
+        let chain = self.chain;
+        if now_secs >= chain.isthmus_time() {
+            PayloadVersion::V4
+        } else if now_secs >= chain.ecotone_time() {
+            PayloadVersion::V3
+        } else if now_secs >= chain.canyon_time() {
+            PayloadVersion::V2
+        } else {
+            PayloadVersion::V1
+        }
     }
 
     /// The topic rule `payload` breaks, if any, of those its payload type does not already
@@ -328,7 +450,7 @@ impl BlockValidator {
         if v3.excess_blob_gas != 0 {
             return Some("a non-zero excess blob gas");
         }
-        if timestamp < self.chain.jovian_time && v3.blob_gas_used != 0 {
+        if timestamp < self.chain.jovian_time() && v3.blob_gas_used != 0 {
             return Some("a non-zero blob gas used before Jovian");
         }
         None
@@ -409,6 +531,22 @@ const fn header_len(version: PayloadVersion) -> usize {
     } else {
         SIGNATURE_LEN
     }
+}
+
+/// The payload version other than `version` that `signed` (a message after its signature)
+/// decodes as, each in its own layout, if any.
+fn other_version(version: PayloadVersion, signed: &[u8]) -> Option<PayloadVersion> {
+    VERSIONS
+        .into_iter()
+        .filter(|&other| other != version)
+        .find(|&other| {
+            let payload = if has_parent_beacon_block_root(other) {
+                signed.get(PARENT_BEACON_BLOCK_ROOT_LEN..)
+            } else {
+                Some(signed)
+            };
+            payload.is_some_and(|payload| decode_payload(other, payload).is_ok())
+        })
 }
 
 /// Whether messages of `version` carry a parent beacon block root before the payload.

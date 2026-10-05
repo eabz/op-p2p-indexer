@@ -32,7 +32,8 @@ impl Backoff {
         }
     }
 
-    /// For requests refused for their rate (HTTP 429): the same attempts, longer waits.
+    /// For requests refused for their rate (HTTP 429, or an answer saying so): the same
+    /// attempts, longer waits.
     pub(crate) const fn rate_limited() -> Self {
         Self {
             attempt: 1,

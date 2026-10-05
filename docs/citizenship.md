@@ -30,7 +30,7 @@ are its headings), and op-node's implementation where the spec is silent or diff
 | Gossip parameters D 8, D_low 6, D_high 12, D_lazy 6, heartbeat 0.5 s, fanout_ttl 24 s, mcache 12/3, seen_ttl 130 heartbeats | "Heartbeat and parameters" | yes | `p2p/gossip.rs`. |
 | Topics `/optimism/<chain>/0..3/blocks` | "Topic configuration", "blocksv1" to "blocksv4" | yes | All four, as op-node. |
 | Validate before relaying, report ACCEPT / IGNORE / REJECT, relay what is accepted | "Topic validation", "Block validation" | yes | Manual validation in gossipsub; accepted blocks are relayed. |
-| Every block-validation rule, in its class | "Block validation" | built | One deviation: a block outside the time window (60 s old, 5 s ahead) that the sequencer signed is IGNOREd, not REJECTed as the spec and op-node do, when it is dated ahead of us or at most 120 s old; an older one is a replay and REJECTed (without checking its signature), but never a reason to ban. It points at our clock, and unlike op-node we score invalid deliveries per topic, so rejecting it would graylist every honest peer while our clock is off. Compression, encoding, timestamp window (60 s / 5 s), block hash, the per-version field rules (types enforce most), more than 5 at a height, already seen (IGNORE), signature. Added: from V2 an empty withdrawals list, from V3 no excess blob gas, and before Jovian no blob gas used. From Jovian, blob gas used is the DA footprint (`jovian/exec-engine.md`), so that rule stops at Jovian. |
+| Every block-validation rule, in its class | "Block validation" | built | One deviation: a block outside the time window (60 s old, 5 s ahead) that the sequencer signed is IGNOREd, not REJECTed as the spec and op-node do, when it is dated ahead of us or at most 120 s old; an older one is a replay and REJECTed (without checking its signature), but never a reason to ban. It points at our clock, and unlike op-node we score invalid deliveries per topic, so rejecting it would graylist every honest peer while our clock is off. A second deviation: a block the sequencer signed that this build cannot read is IGNOREd, not REJECTed: the sequencer does not sign invalid blocks, so the protocol changed under this build and the peer is not at fault; three distinct such blocks within ten minutes stop the node, asking for an upgrade. Only what the sequencer alone can produce counts: a signed payload that decodes as no known payload version; one on the topic the current time requires that breaks a fork rule or does not rebuild to its hash; a transaction type this build does not know. A signed payload sent on another version's topic, which decodes as its own version (a replay: the signature covers the bytes, not the topic), is REJECTed as the peer's fault. Compression, encoding, timestamp window (60 s / 5 s), block hash, the per-version field rules (types enforce most), more than 5 at a height, already seen (IGNORE), signature. Added: from V2 an empty withdrawals list, from V3 no excess blob gas, and before Jovian no blob gas used. From Jovian, blob gas used is the DA footprint (`jovian/exec-engine.md`), so that rule stops at Jovian. |
 | Sequencer signature over `keccak256(domain ++ chain_id ++ payload_hash)`, y-parity 0 or 1 | "Block signatures" | yes | `p2p/block.rs`. |
 | Peer scoring | "Block topic scoring parameters" (TODO in the spec) | yes | op-node's light parameters. |
 | Tide-based peer count, grace period, prune by score at high tide | "Peer management" | built (partly) | Discovery searches harder below 8 peers; a hard cap (`OP_INDEXER_MAX_PEERS`, at most half inbound) instead of score-based pruning; 30 s to subscribe. |
@@ -73,6 +73,25 @@ execution-layer sync to fill unsafe gaps
 | Verify what peers send before using it | eth, "Block Encoding and Validity", "Receipt Encoding and Validity" | built | Header hash chain to a trusted anchor, transactions root, receipts root by era. |
 | Accept inbound sessions up to the cap and serve them | — (network health) | built | `OP_INDEXER_EL_MAX_SESSIONS` (default 4) each way; a full node refuses with "too many peers". |
 | Do not hoard full nodes' slots; back off from full peers; pace requests | — (network health) | built | Policy in [el.md](el.md) §6: unused outbound sessions released after 10 minutes (2 kept); a full peer retried after 60 to 90 s, doubling to 8 to 12 minutes, other failed dials after 5 minutes doubling to 40 to 60; 30 dials a minute; 200 ms between our requests per peer. |
+
+## Base (chain 8453): where it differs
+
+Base left the OP Stack for its own client (`docs/base.md`). Every row above applies to it as
+written, except these.
+
+| Duty | Spec section | Status | Notes |
+|---|---|---|---|
+| Discover execution peers on the chain's own discovery network: discv5 with protocol id `basev0`, apart from the consensus nodes, seeded with Base's execution bootnodes | Base `node.rs` (`BASE_V0_PROTOCOL_VERSION`); `docs/base.md` §3 | built | `el/discovery.rs` sets discv5's protocol identity from `ChainSpec::execution_discovery_id` (version left at the default, as Base does) and uses `ChainSpec::execution_bootnodes` (5 enodes, discv5 on port 9200). Our record keeps `opel`, `eth` and `opidx`: Base reads `opel`, and ignores keys it does not know (ENR, "Record Structure"). |
+| Announce the fork id Base peers announce | EIP-2124 | built | `68647e86`, next 0, computed from the chain spec's forks (Azul, Beryl, Cobalt and no Karst); equal to Base's `eth_config` on 2026-10-04. Not yet confirmed by a peer. |
+| Find execution peers through discv4 (Base still runs it) | devp2p discv4 | no (deliberate) | As for the OP Stack: discv5 alone. |
+| Serve `payload_by_number` | "Req-Resp" | built (unused by Base) | Base's consensus client neither serves nor asks it; we keep serving it for op-node peers and never depend on it. Gaps in the unsafe chain fill through execution range sync. |
+| Gossip on every block topic | "Gossip topics" | built | Base carries blocks only on v3 (`/optimism/8453/3/blocks`) and retires older topics; we subscribe to all and stay correct. |
+
+## Unknown hardforks (every chain)
+
+| Duty | Spec section | Status | Notes |
+|---|---|---|---|
+| Notice a fork this build does not know before it activates, and tell the operator to upgrade | EIP-2124 (`FORK_NEXT`) | built | The known-forks horizon (`el/horizon.rs`, `docs/el.md` §5), information only: it takes three distinct hosts (IPv4 addresses or IPv6 /48s, each counting for one time) announcing the same unknown `next` in their eth status, and setting it only produces a warning and a metric. It never refuses blocks or stops the node. |
 
 ## Ethereum L1 (beacon light client over libp2p; L1 execution over devp2p)
 

@@ -319,7 +319,7 @@ impl Syncer {
             .collect();
         checkpoints.insert(anchor.number, anchor.hash);
         let mut syncer = Self {
-            canyon_time: chain.canyon_time,
+            canyon_time: chain.canyon_time(),
             indexers_only_below: chain.bedrock_block,
             peers,
             schedule: Schedule::default(),

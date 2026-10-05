@@ -290,7 +290,8 @@ fn version(version: PayloadVersion) -> &'static str {
 fn reason(err: &BlockError) -> &'static str {
     match err {
         BlockError::TooShort { .. } => "too_short",
-        BlockError::InvalidPayload(_) => "invalid_payload",
+        BlockError::InvalidPayload { .. } => "invalid_payload",
+        BlockError::WrongTopic { .. } => "wrong_topic",
         BlockError::Stale { .. } => "stale",
         BlockError::TooFarInFuture { .. } => "too_far_in_future",
         BlockError::InvalidRecoveryId { .. } => "invalid_recovery_id",

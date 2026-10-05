@@ -27,9 +27,10 @@
 //! - **Games**: `DisputeGameFactory.create(GameType, Claim rootClaim, bytes extraData)` emits
 //!   `DisputeGameCreated(address indexed disputeProxy, GameType indexed gameType, Claim indexed
 //!   rootClaim)` ([dispute game interface]). `GameType` is a `uint32`, `Claim` a `bytes32`.
-//! - **A game says which L2 block it is about in its extra data**, in one of two forms. Which
-//!   one a game type uses is a table in `op-indexer-chainspec` (`claim_format`); a game of a
-//!   type that is not in it is refused by name, never guessed from the shape of its data:
+//! - **A game says which L2 block it is about in its extra data**, in a form set by its game
+//!   type, per chain, in `op-indexer-chainspec` (read through `ChainSpec::game_claim`); a game
+//!   of a type the chain does not list is refused by name, never guessed from the shape of its
+//!   data:
 //!   - *Fault dispute games* (types 0, 1, 8, ...): one 32-byte word, the L2 block number, and
 //!     the root claim is that block's output root (`FaultDisputeGame.l2BlockNumber()` and
 //!     `extraData()`).
@@ -39,6 +40,9 @@
 //!     (`SuperFaultDisputeGame`, which rejects a game whose extra data does not hash to its
 //!     root claim; `Encoding.encodeSuperRootProof`). The claim for this chain is the output
 //!     root next to its chain id, about its block at that timestamp.
+//!   - *Aggregate games* (type 621, Base's `AggregateVerifier`, created with
+//!     `createWithInitData`): the L2 block number, the parent game and intermediate roots, and
+//!     the root claim is that block's output root (`docs/base.md` section 4).
 //!
 //!   Both read in `packages/contracts-bedrock/src` of the Optimism monorepo, `develop` branch
 //!   (`dispute/FaultDisputeGame.sol`, `dispute/SuperFaultDisputeGame.sol`,

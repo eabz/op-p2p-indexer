@@ -113,7 +113,7 @@ pub(crate) struct RpcLog {
 pub(crate) enum RpcError {
     #[error("request failed: {0}")]
     Transport(#[from] reqwest::Error),
-    #[error("the endpoint is rate limiting (HTTP 429)")]
+    #[error("the endpoint is limiting the request rate")]
     RateLimited {
         /// How long the endpoint asks to wait (`Retry-After`, in seconds), if it says.
         retry_after: Option<Duration>,
@@ -349,7 +349,12 @@ impl Rpc {
             serde_json::from_slice(&body).map_err(|err| RpcError::Malformed(err.to_string()))?;
         let mut answers = match answers {
             Answers::Batch(answers) => answers,
-            // One error for the whole batch (too large, say): the call is refused.
+            // One error for the whole batch: the rate, or the call refused (too large, say).
+            Answers::One(Answer {
+                error: Some(error), ..
+            }) if error.is_rate_limit() => {
+                return Err(RpcError::RateLimited { retry_after: None });
+            }
             Answers::One(Answer {
                 error: Some(error), ..
             }) => return Err(error.into()),
@@ -364,6 +369,13 @@ impl Rpc {
                 "{} answers to {count} calls",
                 answers.len()
             )));
+        }
+        // A call refused for the rate is the whole request's to wait for, not that call's.
+        if answers
+            .iter()
+            .any(|answer| answer.error.as_ref().is_some_and(CallError::is_rate_limit))
+        {
+            return Err(RpcError::RateLimited { retry_after: None });
         }
         Ok(answers
             .into_iter()
@@ -434,6 +446,17 @@ struct Answer {
 struct CallError {
     code: i64,
     message: String,
+}
+
+impl CallError {
+    /// Whether the call was refused for the request rate: some endpoints say so in the answer
+    /// rather than with HTTP 429 (Base's public endpoint: -32016 "over rate limit"). Told by the
+    /// message, not the code: -32005 is a rate limit with some providers and "too many results"
+    /// with others.
+    fn is_rate_limit(&self) -> bool {
+        let message = self.message.to_ascii_lowercase();
+        message.contains("rate limit") || message.contains("too many requests")
+    }
 }
 
 impl From<CallError> for RpcError {

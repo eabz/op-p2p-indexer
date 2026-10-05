@@ -172,7 +172,7 @@ async fn main() -> eyre::Result<()> {
     let pipeline = Pipeline::new(
         stores.unsafe_store,
         stores.archive,
-        config.network.chain.canyon_time,
+        config.network.chain.canyon_time(),
         blocks_rx,
         l1_heads_rx,
         safe_number_tx,
@@ -193,7 +193,7 @@ async fn main() -> eyre::Result<()> {
         Some(settings) => {
             let l1 = l1_side(settings, config.network.chain, &store)?;
             saves.push(l1.served);
-            let isthmus_time = config.network.chain.isthmus_time;
+            let isthmus_time = config.network.chain.isthmus_time();
             let pipeline = pipeline.with_l1_games(l1.games, l1_source_tx, isthmus_time);
             (Some((l1.network, l1.light_client)), pipeline, None)
         }
@@ -266,7 +266,7 @@ fn l1_side(
             checkpoint: settings.checkpoint,
             listen_addr: settings.beacon_listen_addr,
             // Beacon nodes share the discovery network of the chain's bootnodes.
-            bootnodes: chain.bootnodes().map(str::to_owned).collect(),
+            bootnodes: chain.consensus_bootnodes().map(str::to_owned).collect(),
         },
         trusted_tx,
     );

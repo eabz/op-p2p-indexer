@@ -65,9 +65,13 @@ bodies of a range come from the same stack: range sync, section 12.
 
 ## 3. Parts
 
-1. **Discovery**: discv5 in the global DHT, filtered by the chain's fork id in the node
-   record (`eth` and `opel` keys), seeded with the execution bootnodes (one Superchain list
-   for every chain).
+1. **Discovery**: discv5, filtered by the chain's fork id in the node record (`eth` and
+   `opel` keys), seeded with the chain's execution bootnodes. The discv5 protocol id is the
+   chain's (`ChainSpec::execution_discovery_id`): `discv5` on OP Mainnet and Unichain, whose
+   execution nodes share the global DHT and the Superchain bootnode list; `basev0` on Base,
+   whose execution nodes run a discv5 network of their own since Azul, apart from its
+   consensus nodes, with their own bootnodes (a node on the default id cannot decrypt their
+   packets). Ethereum's network (the L1 side) uses `discv5`.
 2. **Session**: RLPx (ECIES handshake, framing), the p2p hello, the eth status exchange.
 3. **Peer set**: a small number of peers kept connected, with redial and backoff, preferring
    peers at the tip; "too many peers" is retried politely, not hammered.
@@ -94,10 +98,27 @@ this project keeps current (in `chainspec`), not something taken from a crate al
 | Chain | Fork hash | Status |
 |---|---|---|
 | OP Mainnet (10) | `c29239af` | observed from peers (2026-10-04) |
+| Base (8453) | `68647e86` | computed from the chain spec (genesis `0xf712…73dd`; Canyon through Jovian, Azul, Beryl, Cobalt); equal to what Base reports through `eth_config` (`docs/base.md` §3); not yet confirmed by a peer |
 | Unichain (130) | `1faa456e` | computed (2026-10-04: genesis `0x3425…befe`; Holocene, Isthmus, Jovian, Karst); not yet confirmed by a peer: a 4-minute run found no Unichain peer, execution or gossip, while the same setup found OP Mainnet peers in 50 s |
 
-The node should also notice when most peers reject its fork id or announce a `next`
-fork it does not know, and say so loudly: that is the sign the build is behind.
+**The known-forks horizon** (`horizon.rs`), information only. A peer whose fork id announces a
+`next` time this build does not know is on a fork that is coming and that the node cannot
+follow: it warns at once ("execution peers are on a hardfork this build does not know"), from a
+node record or an eth status. Once three distinct hosts announce the same unknown time in a
+completed eth status on our chain, that time is the horizon, and the node warns "execution
+peers announce a hardfork at this time that this build does not know: upgrade before then".
+- A host is an IPv4 address or an IPv6 /48 (a free tunnel hands out a /48), and counts for one
+  time only, the last it announced. A node record does not count (anyone can write one), nor
+  a time already past or more than a year ahead. Times that have passed are forgotten; at
+  most 1,024 hosts are remembered.
+- The horizon is recomputed from what hosts announce now: the earliest time three of them
+  share, or none.
+- It never refuses a block and never stops the node: a few hosts agreeing would otherwise be a
+  lever on any node. What is stored is guarded by verification; a change of the block format
+  is caught by the protocol-change stop on gossip (sequencer-signed blocks that do not decode).
+- Metric `op_indexer_el_fork_horizon_seconds{network}` (0 while there is none). The peer set
+  logs at startup that there is none (with the newest fork time this build knows), and,
+  while one is set, the warning again every ten minutes.
 
 ## 6. Being a polite peer
 

@@ -9,7 +9,8 @@
 //! nothing, but on mainnet it is a weak filter: blooms are about three quarters full, and
 //! about one header in six passes (measured 2026-10-04). So the transactions are fetched next
 //! (checked against the header), and only a block with a transaction to the factory has its
-//! receipts fetched (checked too); the game is read from the event and that `create` call.
+//! receipts fetched (checked too); the game is read from the event and that call (`create`,
+//! or `createWithInitData` for a format that says so, Base's games).
 //! A game created through another contract is not found: it would be refused anyway.
 //!
 //! It publishes the most recent games ([`MAX_RECENT_GAMES`]) on the chain linked by parent

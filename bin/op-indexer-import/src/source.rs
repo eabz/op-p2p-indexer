@@ -131,6 +131,7 @@ const ACCEPT_ENCODING: &str = "zstd, gzip;q=0.5";
 const ENDPOINTS: &[(u64, &str)] = &[
     (10, "https://optimism.hypersync.xyz"),
     (130, "https://unichain.hypersync.xyz"),
+    (8453, "https://base.hypersync.xyz"),
 ];
 
 /// The service's endpoint of chain `chain_id`, if this build knows it.

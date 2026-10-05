@@ -174,7 +174,7 @@ impl Config {
                 .split(',')
                 .map(|node| parse_bootnode(node.trim()))
                 .collect::<eyre::Result<Vec<_>>>(),
-            None => chain.bootnodes().map(parse_bootnode).collect(),
+            None => chain.consensus_bootnodes().map(parse_bootnode).collect(),
         }?;
 
         let data_dir = match var("OP_INDEXER_DATA_DIR") {
@@ -226,7 +226,7 @@ impl Config {
             storage: StorageConfig {
                 redis: RedisConfig {
                     url: var_or("OP_INDEXER_REDIS_URL", DEFAULT_REDIS_URL),
-                    canyon_time: chain.canyon_time,
+                    canyon_time: chain.canyon_time(),
                 },
                 archive,
                 chain: ChainIdentity {

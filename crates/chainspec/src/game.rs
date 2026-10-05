@@ -21,7 +21,16 @@
 //!
 //! All read in `packages/contracts-bedrock/src` of the Optimism monorepo, `develop` branch.
 //!
+//! - Base's `AggregateVerifier` games (type 621, from Azul) are created with
+//!   `createWithInitData(GameType, Claim rootClaim, bytes extraData, bytes initData)`. Their
+//!   extra data is packed: `uint256 l2BlockNumber ‖ address parentGame ‖ bytes32
+//!   intermediateRoot` once per interval, the last of which is the root claim, the output root
+//!   of that block ([proof contracts], [proposer]). Read 2026-10-04; the type and the call were
+//!   also read from L1 (`docs/base.md`).
+//!
 //! [dispute game interface]: https://specs.optimism.io/fault-proof/stage-one/dispute-game-interface.html
+//! [proof contracts]: https://docs.base.org/specifications/base-protocol/proofs/proof-contracts
+//! [proposer]: https://docs.base.org/specifications/base-protocol/proofs/proposer
 
 use alloy_primitives::{Address, B256, BlockNumber, U256, keccak256};
 
@@ -29,14 +38,13 @@ use crate::ChainSpec;
 
 /// `DisputeGameFactory.create`.
 const CREATE_SIGNATURE: &str = "create(uint32,bytes32,bytes)";
+/// `DisputeGameFactory.createWithInitData`, Base's.
+const CREATE_WITH_INIT_DATA_SIGNATURE: &str = "createWithInitData(uint32,bytes32,bytes,bytes)";
 /// The factory's event for a new game.
 const CREATED_SIGNATURE: &str = "DisputeGameCreated(address,uint32,bytes32)";
 
 /// An ABI word.
 const WORD: usize = 32;
-/// Bytes of `create`'s calldata before the extra data: the selector, the game type, the root
-/// claim, the offset of the extra data and its length.
-const CREATE_HEAD_BYTES: usize = 4 + 4 * WORD;
 /// The version byte of a super root's preimage.
 const SUPER_ROOT_VERSION: u8 = 1;
 /// Bytes of a super root's preimage before its chains: the version and the timestamp.
@@ -44,13 +52,28 @@ const SUPER_ROOT_HEAD_BYTES: usize = 1 + 8;
 
 /// How a dispute game on L1 states the L2 block it is about and the output root it claims.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ClaimFormat {
+pub(crate) enum ClaimFormat {
     /// A fault dispute game: its extra data is one word, the L2 block number, and its root
     /// claim is that block's output root.
     OutputRoot,
     /// A super fault dispute game: its extra data is the preimage of a super root (a timestamp
     /// and one output root per chain) and its root claim is the hash of that preimage.
     SuperRoot,
+    /// Base's `AggregateVerifier` game, created with `createWithInitData`: its extra data is
+    /// the L2 block number, the parent game and the intermediate output roots, and its root
+    /// claim, the last of them, is that block's output root.
+    AggregateProposal,
+}
+
+impl ClaimFormat {
+    /// The factory function that creates games of this format, and how many ABI words its
+    /// arguments take before their dynamic data.
+    const fn create_call(self) -> (&'static str, usize) {
+        match self {
+            Self::OutputRoot | Self::SuperRoot => (CREATE_SIGNATURE, 3),
+            Self::AggregateProposal => (CREATE_WITH_INIT_DATA_SIGNATURE, 4),
+        }
+    }
 }
 
 /// What a game claims about one chain.
@@ -71,8 +94,8 @@ pub enum ClaimError {
     /// The game is of a type whose claim format this build does not know.
     #[error("game type {0} is not known to this build")]
     UnknownGameType(u32),
-    /// The transaction is not a plain call of the factory's `create` for this game.
-    #[error("it was not created by a plain call of the factory's `create` for this game")]
+    /// The transaction is not a plain call of the factory's creating function for this game.
+    #[error("it was not created by a plain call of the factory for this game")]
     NotPlainCall,
     /// The extra data is not of the game type's format.
     #[error("its extra data is not what a game of its type carries")]
@@ -85,21 +108,34 @@ pub enum ClaimError {
     BeforeBedrock,
 }
 
-/// The claim format of the dispute games of `game_type`, or `None` for a type this build does
-/// not know how to read.
+/// The game types of the OP Stack and their claim formats; a type not listed is one this
+/// build does not know how to read.
 ///
-/// Game types are the same on every OP Stack chain. The fault dispute games are `CANNON` (0),
-/// `PERMISSIONED_CANNON` (1), `ASTERISC` (2), `ASTERISC_KONA` (3) and `CANNON_KONA` (8); the
-/// super ones are `SUPER_CANNON` (4), `SUPER_PERMISSIONED` (5), `SUPER_ASTERISC_KONA` (7) and
-/// `SUPER_CANNON_KONA` (9), which OP Mainnet creates as of 2026-10. The validity-proof games
-/// (6, 10) and the test games are not listed: their claims were not read.
-const fn claim_format(game_type: u32) -> Option<ClaimFormat> {
-    match game_type {
-        0..=3 | 8 => Some(ClaimFormat::OutputRoot),
-        4 | 5 | 7 | 9 => Some(ClaimFormat::SuperRoot),
-        _ => None,
-    }
-}
+/// The fault dispute games are `CANNON` (0), `PERMISSIONED_CANNON` (1), `ASTERISC` (2),
+/// `ASTERISC_KONA` (3) and `CANNON_KONA` (8); the super ones are `SUPER_CANNON` (4),
+/// `SUPER_PERMISSIONED` (5), `SUPER_ASTERISC_KONA` (7) and `SUPER_CANNON_KONA` (9), which OP
+/// Mainnet creates as of 2026-10. The validity-proof games (6, 10) and the test games are not
+/// listed: their claims were not read.
+pub(crate) const OP_STACK_GAMES: &[(u32, ClaimFormat)] = &[
+    (0, ClaimFormat::OutputRoot),
+    (1, ClaimFormat::OutputRoot),
+    (2, ClaimFormat::OutputRoot),
+    (3, ClaimFormat::OutputRoot),
+    (8, ClaimFormat::OutputRoot),
+    (4, ClaimFormat::SuperRoot),
+    (5, ClaimFormat::SuperRoot),
+    (7, ClaimFormat::SuperRoot),
+    (9, ClaimFormat::SuperRoot),
+];
+
+/// Base's game types: the fault dispute games it created before Azul (`CANNON`,
+/// `PERMISSIONED_CANNON`), and `AggregateVerifier` (621), which its factory creates since:
+/// `gameImpls(621)` is the `AggregateVerifier` on Base's contract page (L1 read 2026-10-04).
+pub(crate) const BASE_GAMES: &[(u32, ClaimFormat)] = &[
+    (0, ClaimFormat::OutputRoot),
+    (1, ClaimFormat::OutputRoot),
+    (621, ClaimFormat::AggregateProposal),
+];
 
 /// Topic 0 of the factory's `DisputeGameCreated` event.
 #[must_use]
@@ -141,10 +177,11 @@ impl ChainSpec {
     /// Reads what `game` claims about this chain from the transaction that created it: `to`
     /// is the address it was sent to and `input` its calldata.
     ///
-    /// The transaction must be a plain call of this chain's factory's `create` for this game:
-    /// sent to the factory, with the game type and root claim of the event. Anything else (a
-    /// game created through another contract, or extra data that is not of the type's format)
-    /// is an error rather than a block number misread.
+    /// The transaction must be a plain call of this chain's factory's function for the game's
+    /// type (`create`, or `createWithInitData` for Base's games) for this game: sent to the
+    /// factory, with the game type and root claim of the event. Anything else (a game created
+    /// through another contract, or extra data that is not of the type's format) is an error
+    /// rather than a block number misread.
     ///
     /// # Errors
     ///
@@ -161,19 +198,25 @@ impl ChainSpec {
             root_claim,
             ..
         } = *game;
-        let format = claim_format(game_type).ok_or(ClaimError::UnknownGameType(game_type))?;
-        let selector = keccak256(CREATE_SIGNATURE);
+        let format = self
+            .games
+            .iter()
+            .find_map(|(listed, format)| (*listed == game_type).then_some(*format))
+            .ok_or(ClaimError::UnknownGameType(game_type))?;
+        let (signature, head_words) = format.create_call();
+        let selector = keccak256(signature);
+        // The extra data is the first dynamic argument, right after the head.
         let plain_call = to == Some(self.dispute_game_factory)
             && input.get(..4) == selector.get(..4)
             && argument(input, 0) == Some(U256::from(game_type))
             && argument(input, 1) == Some(U256::from_be_bytes(root_claim.0))
-            && argument(input, 2) == Some(U256::from(3 * WORD));
+            && argument(input, 2) == Some(U256::from(head_words * WORD));
         if !plain_call {
             return Err(ClaimError::NotPlainCall);
         }
-        let extra = argument(input, 3)
+        let extra = argument(input, head_words)
             .and_then(|length| usize::try_from(length).ok())
-            .and_then(|length| input.get(CREATE_HEAD_BYTES..)?.get(..length))
+            .and_then(|length| input.get(4 + (head_words + 1) * WORD..)?.get(..length))
             .ok_or(ClaimError::NotPlainCall)?;
         match format {
             // The block number, and the root claim is its output root.
@@ -204,8 +247,30 @@ impl ChainSpec {
                     timestamp: Some(timestamp),
                 })
             }
+            ClaimFormat::AggregateProposal => Ok(Claim {
+                l2_block: aggregate_block(extra, root_claim)?,
+                output_root: root_claim,
+                timestamp: None,
+            }),
         }
     }
+}
+
+/// Reads the L2 block of an `AggregateVerifier` game's extra data: whole intermediate roots
+/// after the head, at least one, the last of which must be `root_claim`.
+fn aggregate_block(extra: &[u8], root_claim: B256) -> Result<BlockNumber, ClaimError> {
+    // The block number, then the parent game's address.
+    let (number, rest) = extra
+        .split_first_chunk::<WORD>()
+        .ok_or(ClaimError::ExtraData)?;
+    let (_parent, roots) = rest
+        .split_first_chunk::<20>()
+        .ok_or(ClaimError::ExtraData)?;
+    let (roots, rest) = roots.as_chunks::<WORD>();
+    if !rest.is_empty() || roots.last() != Some(&root_claim.0) {
+        return Err(ClaimError::ExtraData);
+    }
+    u64::try_from(U256::from_be_bytes(*number)).map_err(|_overflow| ClaimError::ExtraData)
 }
 
 /// Reads a super root's preimage, which must hash to `root_claim`: its timestamp and the

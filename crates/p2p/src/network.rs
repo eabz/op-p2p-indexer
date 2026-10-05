@@ -67,6 +67,16 @@ pub enum NetworkError {
     /// The listen address could not be bound.
     #[error("failed to listen on {0}")]
     Listen(Multiaddr, #[source] libp2p::TransportError<std::io::Error>),
+    /// Several blocks the sequencer signed could not be read: the chain activated a change
+    /// this build does not know.
+    #[error(
+        "blocks the sequencer signed cannot be read by this build (the last: {last}): the chain \
+         activated a change this build does not know; upgrade the indexer"
+    )]
+    ProtocolChanged {
+        /// Why the last of them could not be read.
+        last: String,
+    },
 }
 
 /// The p2p node: discovers OP Stack peers, joins block gossip, and emits validated unsafe blocks.
@@ -274,6 +284,9 @@ impl Network {
             if state.consumer_closed() {
                 info!("block consumer closed");
                 break Ok(());
+            }
+            if let Some(last) = state.protocol_change() {
+                break Err(NetworkError::ProtocolChanged { last });
             }
         };
 
