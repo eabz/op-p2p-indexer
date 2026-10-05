@@ -10,39 +10,36 @@
 //!    and through them every transaction and receipt (none of the three is downloaded);
 //! 4. its parent hash must be the previous block's hash.
 //!
-//! The bytes that passed are what is written (see `chunk`): nothing is encoded again later.
+//! The bytes that passed are what is sealed: nothing is encoded again later.
 //!
 //! `fields` lists what this rebuild needs from a row, for `download`'s one-pass report: a field
 //! the rebuild starts to need, or to default, goes there too.
 
-use std::io;
 use std::path::Path;
 
 use alloy_consensus::{EMPTY_OMMER_ROOT_HASH, Header};
 use alloy_eips::eip7685::EMPTY_REQUESTS_HASH;
 use alloy_primitives::{B256, Bloom, keccak256};
 use op_indexer_primitives::{
-    EncodedBlock, encode_body, encode_receipts, receipts_root, transactions_root,
+    ArchivedBlock, EncodedBlock, encode_body, encode_receipts, receipts_root, transactions_root,
 };
 
 use tracing::info;
 
 use super::receipt::BloomHashes;
 use super::{Check, ChunkError, Forks, Stats, receipt, transaction};
-use crate::chunk::{self, Link, VerifiedBlock};
 use crate::fill::{self, Fill};
 use crate::rows::{self, BlockRow, LogRow, TransactionRow};
 use crate::state::{Chunk, read_json};
 
-/// Verifies the downloaded chunk at `raw`, with what its fill at `fill` holds, and writes it
-/// to `verified`. Blocking, CPU-bound.
+/// Verifies the downloaded chunk at `raw`, with what its fill at `fill` holds, and returns its
+/// blocks as verified, in block order. Blocking, CPU-bound.
 pub(super) fn verify_chunk(
     forks: &Forks,
     chunk: Chunk,
     raw: &Path,
     fill: &Path,
-    verified: &Path,
-) -> Result<Stats, ChunkError> {
+) -> Result<(Stats, Vec<ArchivedBlock>), ChunkError> {
     let mut rows = rows::read(raw).map_err(|source| ChunkError::Rows {
         from: chunk.from,
         to: chunk.to,
@@ -57,8 +54,7 @@ pub(super) fn verify_chunk(
     let mut logs = rows.logs.as_slice();
 
     let mut hashes = BloomHashes::default();
-    let mut blocks = Vec::new();
-    let mut link: Option<Link> = None;
+    let mut blocks: Vec<ArchivedBlock> = Vec::new();
     for number in chunk.from..chunk.to {
         let failed = |check| ChunkError::Block { number, check };
         // Rows of blocks outside the chunk, if the service sent any, are not used.
@@ -80,18 +76,14 @@ pub(super) fn verify_chunk(
             &mut stats,
         )
         .map_err(failed)?;
-        if let Some(link) = &link
-            && link.last_hash != row.parent_hash
+        if let Some(previous) = blocks.last()
+            && previous.encoded.hash != row.parent_hash
         {
             return Err(failed(Check::ParentLink {
                 parent: row.parent_hash,
-                previous: link.last_hash,
+                previous: previous.encoded.hash,
             }));
         }
-        link = Some(Link {
-            first_parent: link.map_or(row.parent_hash, |link| link.first_parent),
-            last_hash: row.hash,
-        });
         stats.blocks = stats.blocks.saturating_add(1);
         stats.transactions = stats
             .transactions
@@ -106,11 +98,7 @@ pub(super) fn verify_chunk(
             "blocks without `mix_hash` rebuilt with zero, proven by their hash"
         );
     }
-    if let Some(link) = link {
-        chunk::write(verified, link, &blocks)?;
-        stats.disk_bytes = std::fs::metadata(verified)?.len();
-    }
-    Ok(stats)
+    Ok((stats, blocks))
 }
 
 /// Rebuilds one block from its rows and checks it against the reported block hash. Returns
@@ -123,7 +111,7 @@ fn verify_block(
     mut logs: &[LogRow],
     hashes: &mut BloomHashes,
     stats: &mut Stats,
-) -> Result<VerifiedBlock, Check> {
+) -> Result<ArchivedBlock, Check> {
     // Every block after the Bedrock block has the L1-attributes deposit: none is a block whose
     // rows the service left out, which the fill brings.
     if transactions.is_empty() && row.number > forks.bedrock_block {
@@ -189,7 +177,7 @@ fn verify_block(
         });
     }
 
-    let block = VerifiedBlock {
+    let block = ArchivedBlock {
         encoded: EncodedBlock {
             hash: row.hash,
             header: header.into(),
@@ -247,11 +235,4 @@ fn take_while<'a, T>(rows: &mut &'a [T], belongs: impl Fn(&T) -> bool) -> &'a [T
     let (taken, rest) = rows.split_at(count);
     *rows = rest;
     taken
-}
-
-/// Maps a failed write of the verified chunk.
-impl From<io::Error> for ChunkError {
-    fn from(err: io::Error) -> Self {
-        Self::Io(err)
-    }
 }

@@ -10,7 +10,7 @@
 //!   deposit, so a block without transactions is one the service left out; the whole block's
 //!   transactions and receipts are fetched.
 //!
-//! After the chunks are downloaded, every chunk not verified yet is read, several at once
+//! After the chunks are downloaded, every chunk not sealed yet is read, several at once
 //! within `verify`'s memory bound ([`IN_FLIGHT_BYTES`]), and
 //! checked for every field its rows lack ([`crate::verify::missing`]): all of them are logged
 //! in one summary, so they can be dealt with together rather than one `verify` failure at a
@@ -39,11 +39,10 @@ use tokio::time::{MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::chunk::{self, ChunkFile};
 use crate::progress::{self, Rate};
 use crate::rows::{self, LogRow, Rows, TransactionRow};
 use crate::rpc::{BATCH_CALLS, FilledBlock, Rpc, Wanted};
-use crate::state::{Chunk, Plan, State, read_json, write_json};
+use crate::state::{Chunk, Plan, State, covered, read_json, write_json};
 use crate::verify::{Forks, IN_FLIGHT_BYTES, Missing, encode_access_list, holes, missing};
 
 /// Requests to the RPC endpoint in flight at once: it is a public endpoint, used politely.
@@ -191,7 +190,7 @@ fn tally(tally: &mut Tally, field: Missing, count: u64, first: u64) {
     entry.1 = entry.1.min(first);
 }
 
-/// Lists every field the rows of the downloaded chunks not verified yet lack, logs them, and
+/// Lists every field the rows of the downloaded chunks not sealed yet lack, logs them, and
 /// fetches what can be fetched (authorization lists, holes) from `rpc` into the chunks' fills.
 /// Up to `threads`
 /// chunks are read at once, within [`IN_FLIGHT_BYTES`] of downloaded bytes.
@@ -315,18 +314,17 @@ fn report(chunks: usize, started: Instant, lacking: &Tally, lists: usize, holes:
     }
 }
 
-/// The chunks downloaded and not verified yet, with the size of their download. Blocking.
+/// The chunks downloaded and not sealed yet, with the size of their download. Blocking.
 fn to_scan(state: &State, plan: &Plan) -> io::Result<Vec<(Chunk, u64)>> {
+    let sealed = state.sealed_through()?;
     let mut chunks = Vec::new();
-    for chunk in plan.chunks() {
+    for chunk in plan.chunks().filter(|chunk| !covered(sealed, *chunk)) {
         let bytes = match state.raw_path(chunk).metadata() {
             Ok(file) => file.len(),
             Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
             Err(err) => return Err(err),
         };
-        if chunk::check(&state.verified_path(chunk))? != ChunkFile::Present {
-            chunks.push((chunk, bytes));
-        }
+        chunks.push((chunk, bytes));
     }
     Ok(chunks)
 }

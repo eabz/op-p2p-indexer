@@ -28,11 +28,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::backoff::Backoff;
-use crate::chunk::{self, ChunkFile};
 use crate::progress::{self, Rate};
 use crate::source::{Encoding, HyperSync, Meters, SourceError};
 use crate::state::{
-    Chunk, LOW_SPACE_BYTES, MIN_SPACE_BYTES, Plan, State, remove_if_exists, write_atomic,
+    Chunk, LOW_SPACE_BYTES, MIN_SPACE_BYTES, Plan, State, covered, remove_if_exists, write_atomic,
 };
 
 /// Pieces of an answer waiting to be written, per chunk. A piece is what the HTTP client
@@ -140,11 +139,10 @@ pub(crate) async fn run(
         let (state, plan) = (state.clone(), *plan);
         tokio::task::spawn_blocking(move || {
             let mut missing = Vec::new();
+            // A chunk `verify` sealed and uploaded needs no download: its file is gone.
+            let sealed = state.sealed_through()?;
             for chunk in plan.chunks() {
-                // A chunk already verified needs no download, even if `raw/` was deleted.
-                if !state.raw_path(chunk).try_exists()?
-                    && chunk::check(&state.verified_path(chunk))? != ChunkFile::Present
-                {
+                if !state.raw_path(chunk).try_exists()? && !covered(sealed, chunk) {
                     // A fill belongs to the download it was fetched for: one left from an
                     // earlier download of the chunk goes before the new one is written.
                     remove_if_exists(&state.fill_path(chunk))?;
