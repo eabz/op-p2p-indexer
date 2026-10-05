@@ -15,19 +15,24 @@
 //! reads (D5: the chunk's root and each segment's sha256, header hashes and parent links; no
 //! root is recomputed) and keeps no block data: only the manifest and indexes the caller holds.
 //!
+//! [`ChunkSigner`] signs GET URLs of whole chunks a client downloads straight from the bucket,
+//! and [`decode_chunk`] checks and decodes one so downloaded.
+//!
 //! This is the one crate that talks to an external service besides the importer (`CLAUDE.md`).
 
 mod config;
 mod format;
 mod hash_index;
 mod manifest;
+mod raw;
 mod store;
 
 pub use config::R2ConfigError;
 pub use format::{ChunkIndex, ChunkRecord, ChunkWriter, SealedChunk};
 pub use hash_index::{IndexBuilder, IndexGeneration};
 pub use manifest::{ChunkEntry, Manifest};
-pub use store::{BlockStream, ChunkStore, R2Config, ReadOptions};
+pub use raw::{ChunkSigner, decode_chunk};
+pub use store::{BlockStream, ChunkStore, Lend, R2Config, ReadOptions, StreamReads};
 
 use alloy_primitives::B256;
 

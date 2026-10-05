@@ -571,12 +571,22 @@ R2 Standard, from Cloudflare's pricing page (read 2026-10-04):
 
 A ranged GET is a GET; the page does not say otherwise.
 
-- **Streaming**: as built, a stream reads runs of segments of 8 MiB per GET
-  (`ReadOptions::range_bytes`), four at once, for read-ahead and parallel transfer. So 1 TB
-  served (compressed bytes read from R2) is about 125,000 GETs, about **$0.05 per TB**. Whole
-  39 MB chunks per GET would be about 26,000 GETs, $0.01 per TB. Reading one segment (about
-  150 KB compressed) per GET would be about 6.7 million GETs, $2.40 per TB, so streams never do
-  that.
+- **Streaming**: as built, a chunk stream of the server reads about a segment (1 MiB) per GET
+  (`StreamReads::range_bytes`), two GETs always in flight and up to twelve while the read
+  budget lends room (`crates/server/src/feed.rs`): a GET takes 100 to 200 ms, so a stream's
+  speed is its bytes in flight per round trip. Each GET runs on its own task, and at most two
+  ranges are decoded at once, in order, so what a stream holds stays small however many GETs
+  it has out. So 1 TB served (compressed bytes read from R2) is about 1 million GETs, about
+  **$0.36 per TB**. Near a chunk's end (its last 128 MiB decoded) the feed opens the next
+  chunk's stream, if the budget has a place to spare, so its index and first ranges are read
+  before the boundary. Measured locally with 150 ms added to every GET (2,000 OP blocks,
+  20 MB of chunks, about 146 MB decoded; 2026-10-05), MB/s decoded per stream, before and
+  after: one chunk, one stream 63 and 247 (about 35 MB/s compressed after), 8 streams 63 and
+  177, 32 streams 63 and 78 (10 cores, CPU-bound); the same blocks in four 5 MB chunks, one
+  stream 49 and 100 (90 without the read-ahead across chunks: these chunks take less to read
+  than the 0.3 s a stream needs to start, which full chunks do not), 8 streams 48 and 97. Peak
+  RSS stays the budget plus about 100 MB (32 readers: 128 MiB 221 MB, 256 MiB 343 MB,
+  1 GiB 944 MB).
 - **Random single blocks**: two GETs each (footer, segment), $0.72 per million blocks; by hash,
   two or three more.
 - **Storage**: OP Mainnet's ~500 GB of chunks plus a 2.5 GB index generation is about
@@ -624,6 +634,69 @@ environment and are never logged. TLS is not part of this design.
 - **Shared dependencies**: process setup and API utilities live in lightweight crates. The
   balancer uses those directly instead of depending on the full node and stream server.
   See [architecture.md](architecture.md) for current boundaries and verification status.
+
+### 6.8 Raw chunk download (2026-10-05)
+
+A client that wants whole history (a backfill, a mirror) can skip the servers and download the
+sealed chunks straight from R2: no server CPU or egress, and R2 egress is free.
+
+- **Plan.** `GetFlightInfo` on the balancer with the command `raw:from:to` (or the path `raw`
+  for every sealed chunk) answers one `FlightEndpoint` per sealed chunk the range touches, at
+  most 1,024 per plan (well under gRPC's 4 MB message limit; ask again from the block after the
+  last for more). Each endpoint's location is a **presigned GET URL** of the chunk's object,
+  good for 10 minutes; its app metadata is the chunk's manifest entry as JSON (`first`, `last`,
+  `first_parent`, `last_hash`, `sha256` the root, `size`, `footer_offset`, `level`); its
+  ticket `raw:first:last` is a label. `total_bytes` is the plan's size. Same user key as any
+  Flight call. The part above the last sealed chunk is not in a raw plan: read it from a server.
+- **Signing.** `ChunkSigner` (`crates/chunks/src/raw.rs`) signs with object_store's S3 signer,
+  locally, no request made. The URL carries the key's id, never its secret. The key is the
+  balancer's `OP_INDEXER_R2_PRESIGN_ACCESS_KEY_ID` / `OP_INDEXER_R2_PRESIGN_SECRET_ACCESS_KEY`:
+  give it a **read-only** R2 token (a URL is good for whoever holds it until it expires).
+  Without them the balancer refuses raw plans (`FAILED_PRECONDITION`).
+- **Client.** `import fetch --balancer <url> --from <n> --to <n> [--out fetched]
+  [--downloads 8] [--api-key …]` asks for the plan, downloads the chunks in parallel (in
+  order of use, `--downloads` at once), checks each and writes `<out>/<first>-<last>.rlp`: the
+  range's blocks of the chunk, each an RLP list of its header, body and receipts (each as the
+  eth protocol carries it). A file is written whole (through a temporary one); one already
+  there is kept, so a stopped fetch goes on. A refused GET (403: the URL expired) asks the
+  balancer for a new plan from that chunk on. Past the last sealed chunk it stops with a
+  warning (the rest is a server's to stream). No state directory, archive service or R2 key.
+- **Checks** (`decode_chunk`, then the importer): the object's size and footer against the
+  entry, the index frame against the root, every segment against the index, every header
+  against its hash, the parent links from the entry's first parent through its last hash;
+  every block's transactions root and receipts root against its header; between chunks each
+  first parent against the last hash before it. The entries are the balancer's, trusted as a
+  server is for what it streams (it read them from the hash-chained manifest).
+- Arrow IPC output is not built: for columns, use the servers' Flight `DoGet`.
+
+### 6.9 Optional Cloudflare cache in front of R2 (2026-10-05)
+
+R2 GETs cost $0.36 per million and every server read goes to R2. With
+`OP_INDEXER_R2_PUBLIC_URL` set (a custom domain on the bucket, behind Cloudflare's cache, e.g.
+`https://chunks.example.com`), the servers read **sealed chunk** ranges from it over plain
+HTTPS (`https://<domain>/<prefix>/chunks/…`, ranged GETs; Cloudflare serves ranges from the
+cached object), and a cache hit costs no R2 operation. On any error (after one quick retry)
+the read goes through the S3 API as before, logged at debug. The manifest and the hash index
+are always read through the S3 API: the manifest changes, and the index is small.
+
+Chunks are immutable (their names carry their root) and checked on read (1.5), so a cache can
+only serve the right bytes or bytes that fail the check.
+
+Setup, in the Cloudflare dashboard:
+1. R2 → the chain's bucket → Settings → Custom Domains: connect a domain of a zone on the
+   account (e.g. `chunks.example.com`). That is the bucket's only public access: leave the
+   `r2.dev` subdomain disabled.
+2. Only chunks should be public. Add a WAF custom rule on that hostname that blocks every
+   path but the chunks: `http.host eq "chunks.example.com" and not starts_with(http.request.uri.path, "/archive/chunks/")` → Block.
+3. Caching → Cache Rules: on that hostname with path starting `/archive/chunks/`, eligible
+   for cache, edge TTL a long fixed time (e.g. a month; chunks never change), browser TTL
+   respected or short. Objects above the plan's cacheable size limit (512 MB on Free/Pro) are
+   not cached; a chunk is about 40 MB.
+4. Set `OP_INDEXER_R2_PUBLIC_URL=https://chunks.example.com` on the servers (the importer,
+   exporter and balancer do not read chunks through it; setting it there is harmless).
+
+The public domain makes the chunks world-readable. They are the chain's public history, and
+the raw download (6.8) hands them out anyway; the manifest and index stay private.
 
 ## 7. The bench (3 to 4 small droplets, one R2 bucket)
 

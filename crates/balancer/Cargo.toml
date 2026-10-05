@@ -15,6 +15,7 @@ op-indexer-chainspec.workspace = true
 op-indexer-chunks.workspace = true
 op-indexer-api.workspace = true
 prost.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 tokio-stream = { workspace = true, features = ["time"] }

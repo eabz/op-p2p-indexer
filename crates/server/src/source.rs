@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use alloy_primitives::{B256, BlockHash, BlockNumber};
 use futures_util::stream::BoxStream;
-use op_indexer_chunks::SealedChunk;
+use op_indexer_chunks::{SealedChunk, StreamReads};
 use op_indexer_primitives::ArchivedBlock;
 
 /// A sealed chunk as the manifest lists it: a contiguous range of blocks.
@@ -42,11 +42,12 @@ pub trait ChunkSource: Clone + std::fmt::Debug + Send + Sync + 'static {
     fn refresh(&self) -> impl Future<Output = io::Result<Vec<ChunkRange>>> + Send;
 
     /// Streams the blocks of `chunk` from `from` to its end, each verified before it is
-    /// yielded. Dropping the stream stops its reads.
+    /// yielded, reading as `reads` says. Dropping the stream stops its reads.
     fn stream(
         &self,
         chunk: &ChunkRange,
         from: BlockNumber,
+        reads: StreamReads,
     ) -> BoxStream<'static, io::Result<ArchivedBlock>>;
 
     /// The number of the sealed block with `hash`, if one is sealed.

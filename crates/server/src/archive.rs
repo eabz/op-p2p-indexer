@@ -111,7 +111,7 @@ impl<S: ChunkSource> R2Archive<S> {
         check_links(&chunks, None)?;
         let first = match chunks.first() {
             Some(chunk) => source
-                .stream(chunk, chunk.first)
+                .stream(chunk, chunk.first, crate::feed::ONE_RANGE)
                 .next()
                 .await
                 .transpose()
@@ -489,7 +489,9 @@ impl<'a, S: ChunkSource> Cursor<'a, S> {
                 let Some(chunk) = self.sealed.find(number) else {
                     return Ok(None);
                 };
-                self.archive.source.stream(chunk, number)
+                self.archive
+                    .source
+                    .stream(chunk, number, crate::feed::PEER_READS)
             }
         };
         // A chunk's stream yields its blocks in order from the one asked for.

@@ -30,6 +30,10 @@ alloy-rlp.workspace = true
 # libsecp256k1 (alloy-consensus's `secp256k1` above takes precedence).
 op-alloy-consensus = { workspace = true, features = ["k256"] }
 
+# `fetch`: a balancer's `GetFlightInfo` (one unary call), over a plain gRPC channel.
+arrow-flight.workspace = true
+tonic = { workspace = true, features = ["channel"] }
+
 bytes.workspace = true
 clap.workspace = true
 eyre.workspace = true

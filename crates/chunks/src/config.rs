@@ -1,7 +1,9 @@
 //! Shared R2 settings at application boundaries; credentials are never included in errors.
 
-use crate::R2Config;
+use object_store::aws::AmazonS3Builder;
 use op_indexer_chainspec::ChainSpec;
+
+use crate::R2Config;
 
 /// A required R2 setting was absent or empty.
 #[derive(Debug, thiserror::Error)]
@@ -11,6 +13,21 @@ pub struct R2ConfigError {
 }
 
 impl R2Config {
+    /// An S3 client of the bucket with the key: R2's endpoint for the account, or the one set.
+    pub(crate) fn s3(&self) -> AmazonS3Builder {
+        let endpoint = self
+            .endpoint
+            .clone()
+            .unwrap_or_else(|| format!("https://{}.r2.cloudflarestorage.com", self.account_id));
+        AmazonS3Builder::new()
+            .with_endpoint(endpoint)
+            // R2 takes any region; "auto" is its documented one.
+            .with_region("auto")
+            .with_bucket_name(&self.bucket)
+            .with_access_key_id(&self.access_key_id)
+            .with_secret_access_key(&self.secret_access_key)
+    }
+
     /// Reads the shared `OP_INDEXER_R2_*` settings from the process environment.
     ///
     /// # Errors
@@ -44,6 +61,7 @@ impl R2Config {
                 name: "OP_INDEXER_R2_SECRET_ACCESS_KEY",
             })?,
             endpoint: lookup("OP_INDEXER_R2_ENDPOINT"),
+            public_url: lookup("OP_INDEXER_R2_PUBLIC_URL"),
         })
     }
 }

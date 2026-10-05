@@ -10,10 +10,6 @@ use op_indexer_chainspec::ChainSpec;
 use op_indexer_chunks::{R2Config, ReadOptions};
 use op_indexer_runtime::env_file;
 use op_indexer_runtime::env_var as var;
-/// Bytes of one ranged chunk read: about a segment (1 MiB compressed).
-const RANGE_BYTES: u64 = 1 << 20;
-/// Ranged reads of one chunk stream in flight at once.
-const RANGES_IN_FLIGHT: usize = 2;
 /// Default memory for consumers' reads of sealed history, in MiB.
 const DEFAULT_READ_BUDGET_MB: u64 = 1024;
 /// The exporter's name in the manifest when none is configured.
@@ -59,6 +55,9 @@ impl ServerConfig {
     ///   `archive`).
     /// - `OP_INDEXER_R2_ENDPOINT`: the S3 endpoint (default
     ///   `https://<account id>.r2.cloudflarestorage.com`).
+    /// - `OP_INDEXER_R2_PUBLIC_URL`: the bucket's public custom domain behind Cloudflare's
+    ///   cache; sealed chunks are read from it, the S3 API taking over on errors
+    ///   (`docs/serving.md` 6.9). Default: none, every read through the S3 API.
     /// - `OP_INDEXER_SERVER_READ_BUDGET_MB`: memory, in MiB, that streams and Flight reads of
     ///   sealed history may hold in all, whatever the number of readers: decoded blocks read
     ///   ahead and chunk streams open (default 1024). Past it readers wait.
@@ -128,13 +127,9 @@ impl ServerConfig {
         Ok(Self {
             balancer,
             chunks,
-            // A segment or so per ranged read, two at once: what one open chunk stream holds
-            // stays small (see `op_indexer_server`'s read budget).
-            read: ReadOptions {
-                range_bytes: RANGE_BYTES,
-                ranges_in_flight: RANGES_IN_FLIGHT,
-                ..ReadOptions::default()
-            },
+            // How wide a chunk stream reads is the read budget's to decide (the server's
+            // `feed`): the store's own options only set what every GET does.
+            read: ReadOptions::default(),
             read_budget: var("OP_INDEXER_SERVER_READ_BUDGET_MB")
                 .map(|mib| mib.parse::<u64>())
                 .transpose()

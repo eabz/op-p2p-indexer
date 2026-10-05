@@ -13,7 +13,8 @@
 //! - `service`: the gRPC service, `Register` (server key) and `Locate` (user key).
 //! - `flight`: Arrow Flight's `GetFlightInfo` and `ListFlights` (user key): a range cut into
 //!   one endpoint per sealed chunk, each naming servers by load, and the part above the last
-//!   sealed chunk naming the servers whose head covers it with no hole below it.
+//!   sealed chunk naming the servers whose head covers it with no hole below it; or, for a
+//!   `raw` descriptor, presigned R2 URLs of the sealed chunks themselves.
 //! - [`register`]: the server's side, the client that keeps a server registered.
 //!
 //! [`Balancer`] is the component.
@@ -30,7 +31,7 @@ use std::time::Duration;
 
 use op_indexer_api::ApiKeys;
 use op_indexer_chainspec::ChainSpec;
-use op_indexer_chunks::{ChunkEntry, ChunkStore, Manifest};
+use op_indexer_chunks::{ChunkEntry, ChunkSigner, ChunkStore, Manifest};
 use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
@@ -121,6 +122,7 @@ pub struct Balancer {
     chain: &'static ChainSpec,
     store: ChunkStore,
     manifest: Manifest,
+    signer: Option<ChunkSigner>,
 }
 
 impl Balancer {
@@ -137,7 +139,16 @@ impl Balancer {
             chain,
             store,
             manifest,
+            signer: None,
         }
+    }
+
+    /// Hands out raw chunk plans, their URLs signed by `signer` (`docs/serving.md`, raw chunk
+    /// download).
+    #[must_use]
+    pub fn with_raw_chunks(mut self, signer: ChunkSigner) -> Self {
+        self.signer = Some(signer);
+        self
     }
 
     /// Serves until `cancel` fires, then ends every registration (`UNAVAILABLE`) and waits
@@ -152,6 +163,7 @@ impl Balancer {
             chain,
             store,
             manifest,
+            signer,
         } = self;
         let (chunks, chunks_rx) = watch::channel(sealed(&manifest));
         let table = Table::default();
@@ -175,6 +187,7 @@ impl Balancer {
         let flight = Flight {
             table,
             chunks: chunks_rx,
+            signer,
         };
         let addr = config.listen_addr;
         info!(%addr, chain = chain.name, "balancer listening");

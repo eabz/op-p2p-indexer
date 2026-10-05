@@ -149,9 +149,10 @@ rustix = { version = "1", default-features = false, features = ["std", "fs", "pr
 zstd = { version = "0.13", default-features = false }
 # Object storage (Cloudflare R2, through its S3 API) for sealed block chunks, in `crates/chunks`
 # only: Apache Arrow's maintained client, with pooled keep-alive connections over reqwest and
-# ranged GETs; `aws` is the S3 backend (no Azure, GCP or HTTP), `fs` a local directory with the
-# same layout, for tests and the bench without credentials.
-object_store = { version = "0.14", default-features = false, features = ["aws", "fs"] }
+# ranged GETs; `aws` is the S3 backend (no Azure or GCP), `fs` a local directory with the
+# same layout, for tests and the bench without credentials, `http` plain HTTPS reads of chunks
+# from the bucket's public domain behind Cloudflare's cache (no new crates: the same client).
+object_store = { version = "0.14", default-features = false, features = ["aws", "fs", "http"] }
 # The importer's allocator: `verify` builds rows and receipts on every core at once, and is
 # about 9% faster with it at eight threads than with the system allocator.
 mimalloc = { version = "0.1", default-features = false }

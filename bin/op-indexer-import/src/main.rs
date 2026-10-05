@@ -16,6 +16,9 @@
 //!   chunks covering it are uploaded, and lists them in the manifest, with the hash index, once
 //!   the last block matches the anchor.
 //!
+//! - `fetch` ([`mod@fetch`]) is the other way round: it downloads sealed chunks straight from
+//!   R2 through URLs a balancer signs, checks them and writes the blocks out.
+//!
 //! Every step is resumable: a downloaded chunk's file exists only when it is complete, a
 //! sealed chunk is recorded in the state directory once uploaded, and the manifest lists only
 //! chunks of a range proven up to its anchor. The indexer never links this binary and never
@@ -25,6 +28,7 @@ mod backoff;
 mod cli;
 mod download;
 use op_indexer_runtime::env_file;
+mod fetch;
 mod fill;
 mod game;
 mod progress;
@@ -68,16 +72,20 @@ fn main() -> eyre::Result<()> {
 
 async fn run(cli: Cli, env_file: Option<PathBuf>) -> eyre::Result<()> {
     op_indexer_runtime::init_tracing(env_file.as_deref());
-
-    // Startup-only blocking I/O, before any task runs.
-    let state = State::open(&cli.state_dir).wrap_err("failed to open the state directory")?;
+    // Startup-only blocking I/O, before any task runs; `fetch` needs no state directory.
+    let open = || State::open(&cli.state_dir).wrap_err("failed to open the state directory");
 
     let cancel = CancellationToken::new();
     let signal = tokio::spawn(cancel_on_signal(cancel.clone()));
-    let result = match cli.command {
-        Command::Download(args) => download(&args, &state, &cancel).await.map(|_plan| ()),
-        Command::Verify(args) => verify::run(&args, &state, &recorded_plan(&state)?, &cancel).await,
+    let result = match &cli.command {
+        Command::Download(args) => download(args, &open()?, &cancel).await.map(|_plan| ()),
+        Command::Verify(args) => {
+            let state = open()?;
+            verify::run(args, &state, &recorded_plan(&state)?, &cancel).await
+        }
+        Command::Fetch(args) => fetch::run(args).await,
         Command::Run(args) => {
+            let state = open()?;
             let steps = async {
                 let plan = download(&args.download, &state, &cancel).await?;
                 verify::run(&args.verify, &state, &plan, &cancel).await

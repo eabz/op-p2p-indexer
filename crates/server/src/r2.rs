@@ -13,7 +13,9 @@ use std::sync::{Arc, PoisonError, RwLock};
 use alloy_primitives::{BlockHash, BlockNumber};
 use futures_util::StreamExt;
 use futures_util::stream::{self, BoxStream};
-use op_indexer_chunks::{ChunkEntry, ChunkStore, ChunksError, IndexBuilder, Manifest, SealedChunk};
+use op_indexer_chunks::{
+    ChunkEntry, ChunkStore, ChunksError, IndexBuilder, Manifest, SealedChunk, StreamReads,
+};
 use op_indexer_primitives::ArchivedBlock;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -151,12 +153,13 @@ impl ChunkSource for R2Chunks {
         &self,
         chunk: &ChunkRange,
         from: BlockNumber,
+        reads: StreamReads,
     ) -> BoxStream<'static, io::Result<ArchivedBlock>> {
         let (manifest, _) = self.snapshot();
         match manifest.find(chunk.first) {
             Some(entry) => self
                 .store
-                .stream(entry, from)
+                .stream(entry, from, reads)
                 .map(|block| block.map_err(to_io))
                 .boxed(),
             None => stream::once(async { Err(io::Error::from(io::ErrorKind::NotFound)) }).boxed(),

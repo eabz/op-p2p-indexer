@@ -20,6 +20,8 @@ pub(crate) struct BalancerSettings {
     pub(crate) balancer: BalancerConfig,
     /// The chain's bucket, read-only: the manifest.
     pub(crate) r2: R2Config,
+    /// The chain's bucket with the presign key, if one is set: raw chunk plans.
+    pub(crate) presign: Option<R2Config>,
     pub(crate) read: ReadOptions,
 }
 
@@ -41,6 +43,10 @@ impl BalancerSettings {
     ///   `OP_INDEXER_R2_SECRET_ACCESS_KEY` (required), `OP_INDEXER_R2_BUCKET`,
     ///   `OP_INDEXER_R2_PREFIX`, `OP_INDEXER_R2_ENDPOINT`: the chain's bucket, as for `server`;
     ///   a read-only key is enough.
+    /// - `OP_INDEXER_R2_PRESIGN_ACCESS_KEY_ID`, `OP_INDEXER_R2_PRESIGN_SECRET_ACCESS_KEY`: a
+    ///   read-only R2 key the balancer signs raw chunk URLs with (`docs/serving.md`, raw chunk
+    ///   download). Both or neither; without them raw plans are refused. Never logged; a URL
+    ///   carries the key's id, never its secret.
     ///
     /// # Errors
     ///
@@ -81,6 +87,23 @@ impl BalancerSettings {
             return Err(eyre!("OP_INDEXER_BALANCER_SERVER_KEYS is required"));
         }
         let r2 = R2Config::from_env(chain)?;
+        let presign = match (
+            var("OP_INDEXER_R2_PRESIGN_ACCESS_KEY_ID"),
+            var("OP_INDEXER_R2_PRESIGN_SECRET_ACCESS_KEY"),
+        ) {
+            (Some(access_key_id), Some(secret_access_key)) => Some(R2Config {
+                access_key_id,
+                secret_access_key,
+                ..r2.clone()
+            }),
+            (None, None) => None,
+            _ => {
+                return Err(eyre!(
+                    "set both OP_INDEXER_R2_PRESIGN_ACCESS_KEY_ID and \
+                     OP_INDEXER_R2_PRESIGN_SECRET_ACCESS_KEY, or neither"
+                ));
+            }
+        };
         Ok(Self {
             chain,
             balancer: BalancerConfig {
@@ -89,6 +112,7 @@ impl BalancerSettings {
                 server_keys,
             },
             r2,
+            presign,
             read: ReadOptions::default(),
         })
     }

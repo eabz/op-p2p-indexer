@@ -8,6 +8,12 @@
 //!   (`contiguous_through`: a server without range sync has a gap above the sealed chunks),
 //!   serves it.
 //!
+//! A `raw` descriptor (`raw:from:to`, or the path `raw`) asks for whole sealed chunks
+//! instead: one endpoint per chunk, its location a presigned GET URL of the chunk's object on
+//! R2 (good for [`RAW_URL_TTL`]), its app metadata the chunk's manifest entry as JSON (size,
+//! root, first parent, last hash), from which the client checks what it downloads. No server
+//! is involved; the balancer needs a presign key for it ([`ChunkSigner`]).
+//!
 //! Every job is also cut to the servers' own limit, [`ticket::MAX_FLIGHT_BLOCKS`] blocks.
 //!
 //! Each job names up to [`LOCATIONS`] servers, the least loaded first
@@ -20,6 +26,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use alloy_primitives::BlockNumber;
 use arrow_flight::flight_service_server::FlightService;
@@ -28,7 +35,7 @@ use arrow_flight::{
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
 };
 use op_indexer_api::ticket::{self, Cap, Query};
-use op_indexer_chunks::ChunkEntry;
+use op_indexer_chunks::{ChunkEntry, ChunkSigner};
 use tokio::sync::watch;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status, Streaming};
@@ -37,6 +44,11 @@ use crate::table::{Slot, Table};
 
 /// Servers named by each job: the client moves to the next if one fails.
 const LOCATIONS: usize = 3;
+/// How long a presigned chunk URL is good for: time to start every download of a plan.
+const RAW_URL_TTL: Duration = Duration::from_mins(10);
+/// Chunks in one raw plan (about 40 MB each, ~1 KB of plan each): the client asks again from
+/// the block after the last for more, and the plan stays well under a gRPC message's 4 MB.
+const MAX_RAW_CHUNKS: usize = 1024;
 
 /// A response stream.
 type Responses<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
@@ -47,6 +59,8 @@ pub(crate) struct Flight {
     pub(crate) table: Table,
     /// The sealed chunks, in block order, as the manifest last read lists them.
     pub(crate) chunks: watch::Receiver<Arc<[ChunkEntry]>>,
+    /// Signs the raw plans' URLs; none: raw plans are refused.
+    pub(crate) signer: Option<ChunkSigner>,
 }
 
 /// One job: an inclusive block range and the addresses of the servers to fetch it from, in
@@ -128,6 +142,63 @@ impl Flight {
         Ok(jobs)
     }
 
+    /// The raw plan of `from..=to` (`from` none: the first sealed chunk): an endpoint per
+    /// sealed chunk it touches, at most [`MAX_RAW_CHUNKS`].
+    ///
+    /// # Errors
+    ///
+    /// `FAILED_PRECONDITION` without a signer; `OUT_OF_RANGE` if no sealed chunk holds `from`;
+    /// `INTERNAL` if a URL cannot be signed.
+    async fn raw(
+        &self,
+        (from, to): (Option<BlockNumber>, BlockNumber),
+        descriptor: FlightDescriptor,
+    ) -> Result<FlightInfo, Status> {
+        let Some(signer) = &self.signer else {
+            return Err(Status::failed_precondition(
+                "this balancer hands out no raw chunks (it has no presign key)",
+            ));
+        };
+        let chunks = Arc::clone(&self.chunks.borrow());
+        let from = from.unwrap_or(0);
+        let first = chunks.partition_point(|chunk| chunk.last < from);
+        let touched: Vec<ChunkEntry> = chunks
+            .get(first..)
+            .unwrap_or_default()
+            .iter()
+            .take_while(|chunk| chunk.first <= to)
+            .take(MAX_RAW_CHUNKS)
+            .copied()
+            .collect();
+        if touched.is_empty() {
+            return Err(Status::out_of_range(format!(
+                "no sealed chunk holds block {from}"
+            )));
+        }
+        let endpoints = futures_util::future::try_join_all(touched.iter().map(|entry| async {
+            let url = signer
+                .url(entry, RAW_URL_TTL)
+                .await
+                .map_err(|err| Status::internal(format!("failed to sign a chunk URL: {err}")))?;
+            let metadata = serde_json::to_vec(entry)
+                .map_err(|err| Status::internal(format!("failed to encode a chunk: {err}")))?;
+            Ok::<_, Status>(
+                FlightEndpoint::new()
+                    .with_ticket(Ticket::new(format!("raw:{}:{}", entry.first, entry.last)))
+                    .with_location(url.as_str())
+                    .with_app_metadata(metadata),
+            )
+        }))
+        .await?;
+        let bytes = touched.iter().map(|entry| entry.size).sum::<u64>();
+        Ok(FlightInfo::new()
+            .with_descriptor(descriptor)
+            .with_endpoints(endpoints)
+            .with_ordered(true)
+            .with_total_records(-1)
+            .with_total_bytes(i64::try_from(bytes).unwrap_or(i64::MAX)))
+    }
+
     /// The `FlightInfo` of `jobs` for `table` under `cap`.
     fn info(
         table: ticket::Table,
@@ -176,6 +247,37 @@ fn pieces(from: BlockNumber, to: BlockNumber) -> impl Iterator<Item = (BlockNumb
     })
 }
 
+/// The range of a raw descriptor: the path `raw` (every sealed chunk), or the command
+/// `raw:from:to`. `None` for any other descriptor.
+fn raw_range(
+    descriptor: &FlightDescriptor,
+) -> Result<Option<(Option<BlockNumber>, BlockNumber)>, Status> {
+    if let [path] = descriptor.path.as_slice() {
+        return Ok((path == RAW).then_some((None, BlockNumber::MAX)));
+    }
+    let Some(range) = descriptor
+        .cmd
+        .strip_prefix(RAW.as_bytes())
+        .and_then(|rest| rest.strip_prefix(b":"))
+    else {
+        return Ok(None);
+    };
+    let invalid = || Status::invalid_argument("a raw ticket is `raw:from:to`");
+    let range = std::str::from_utf8(range).map_err(|_not_text| invalid())?;
+    let (from, to) = range.split_once(':').ok_or_else(invalid)?;
+    let (from, to) = (
+        from.parse::<BlockNumber>().map_err(|_number| invalid())?,
+        to.parse::<BlockNumber>().map_err(|_number| invalid())?,
+    );
+    if to < from {
+        return Err(Status::invalid_argument("`to` is below `from`"));
+    }
+    Ok(Some((Some(from), to)))
+}
+
+/// The table name of raw chunk plans.
+const RAW: &str = "raw";
+
 fn unimplemented<T>() -> Result<T, Status> {
     Err(Status::unimplemented(
         "the balancer only plans: GetFlightInfo and ListFlights; DoGet each endpoint at the \
@@ -222,6 +324,9 @@ impl FlightService for Flight {
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
         let descriptor = request.into_inner();
+        if let Some(range) = raw_range(&descriptor)? {
+            return self.raw(range, descriptor).await.map(Response::new);
+        }
         let query = Query::try_from(&descriptor)?;
         let jobs = self.jobs(query)?;
         Self::info(query.table, query.cap, &jobs, descriptor).map(Response::new)

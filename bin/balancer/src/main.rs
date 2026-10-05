@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use eyre::WrapErr;
 use op_indexer_balancer::Balancer;
-use op_indexer_chunks::{ChunkStore, Manifest};
+use op_indexer_chunks::{ChunkSigner, ChunkStore, Manifest};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
@@ -44,7 +44,13 @@ async fn run(env_file: Option<PathBuf>) -> eyre::Result<()> {
     );
 
     let cancel = CancellationToken::new();
-    let run = Balancer::new(settings.balancer, settings.chain, store, manifest).run(cancel.clone());
+    let mut balancer = Balancer::new(settings.balancer, settings.chain, store, manifest);
+    if let Some(presign) = &settings.presign {
+        let signer = ChunkSigner::r2(presign).wrap_err("failed to set up the chunk URL signer")?;
+        balancer = balancer.with_raw_chunks(signer);
+        info!("raw chunk plans on: chunk URLs are signed with the presign key");
+    }
+    let run = balancer.run(cancel.clone());
     tokio::pin!(run);
     // Until a signal arrives, or the balancer stops on its own (it could not listen).
     tokio::select! {

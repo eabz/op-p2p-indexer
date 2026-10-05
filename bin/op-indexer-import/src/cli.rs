@@ -60,6 +60,38 @@ pub(crate) enum Command {
     Verify(VerifyArgs),
     /// `download`, then `verify`, stopping at the first step that cannot finish.
     Run(Box<RunArgs>),
+    /// Download sealed chunks of a range straight from R2, through URLs a balancer signs
+    /// (a `raw` plan), check every block and write them out as RLP, one file per chunk.
+    /// Needs no state directory, archive service or R2 key. Files already written are kept.
+    Fetch(FetchArgs),
+}
+
+/// Settings of `fetch`.
+#[derive(Debug, Clone, Args)]
+pub(crate) struct FetchArgs {
+    /// The balancer's gRPC URL.
+    #[arg(long, env = "OP_INDEXER_BALANCER_URL")]
+    pub(crate) balancer: String,
+    /// User key, sent as `authorization: Bearer <key>` (none if the balancer checks none).
+    #[arg(long, env = "OP_INDEXER_API_KEY", hide_env_values = true)]
+    pub(crate) api_key: Option<Secret>,
+    /// Chain id of the chain [default: 10, OP Mainnet]: its Canyon time for the receipts
+    /// roots.
+    #[arg(long, env = "OP_INDEXER_CHAIN_ID")]
+    pub(crate) chain: Option<u64>,
+    /// First block.
+    #[arg(long)]
+    pub(crate) from: u64,
+    /// Last block (inclusive).
+    #[arg(long)]
+    pub(crate) to: u64,
+    /// Directory the files go to: `<first>-<last>.rlp`, each block an RLP list of its header,
+    /// body and receipts (each its own RLP, as the eth protocol carries them).
+    #[arg(long, default_value = "fetched")]
+    pub(crate) out: PathBuf,
+    /// Chunks downloaded at once (about 40 MB each).
+    #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u64).range(1..=64))]
+    pub(crate) downloads: u64,
 }
 
 /// Settings of `verify`: threads, and where the chunks go. The R2 keys are read from the
@@ -251,8 +283,8 @@ pub(crate) struct RunArgs {
     pub(crate) verify: VerifyArgs,
 }
 
-/// A credential given on the command line: the archive service's API token. `Debug` never
-/// shows it.
+/// A credential given on the command line: the archive service's API token, a balancer's user
+/// key. `Debug` never shows it.
 #[derive(Clone)]
 pub(crate) struct Secret(String);
 

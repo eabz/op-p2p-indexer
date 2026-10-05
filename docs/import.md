@@ -435,6 +435,14 @@ In order:
   written. The downloaded chunks shrink as the run goes. `verify` refuses to start with less
   than 16 GiB free. An old `<state>/verified/` directory is not read and can be deleted.
 
+### 3.3 `fetch`: whole chunks from R2, the other way
+
+`import fetch --balancer <url> --from <n> --to <n>` downloads the sealed chunks of a range
+straight from R2, through presigned URLs a balancer hands out (`raw` plans), checks every
+block (chunk root, segments, header hashes and links, transactions and receipts roots) and
+writes them as RLP files. It needs no state directory, archive service or R2 key. See
+`docs/serving.md` 6.8.
+
 ## 4. The local history store (removed)
 
 `load` appended the verified blocks to the node's fjall archive through a bulk path
