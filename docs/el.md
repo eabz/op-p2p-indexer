@@ -116,8 +116,7 @@ peers announce a hardfork at this time that this build does not know: upgrade be
 - It never refuses a block and never stops the node: a few hosts agreeing would otherwise be a
   lever on any node. What is stored is guarded by verification; a change of the block format
   is caught by the protocol-change stop on gossip (sequencer-signed blocks that do not decode).
-- Metric `op_indexer_el_fork_horizon_seconds{network}` (0 while there is none). The peer set
-  logs at startup that there is none (with the newest fork time this build knows), and,
+- The peer set logs at startup that there is none (with the newest fork time this build knows), and,
   while one is set, the warning again every ten minutes.
 
 ## 6. Being a polite peer
@@ -130,7 +129,7 @@ network it joins (the OP Stack chain's and, with the L1 side, Ethereum's):
 | | Policy | Where |
 |---|---|---|
 | Sessions | 4 dialed and 4 accepted (`OP_INDEXER_EL_MAX_SESSIONS`; the L1 side uses the default); on the OP Stack network one more each way, not counted against these, for an op-p2p-indexer with blocks before Bedrock (section 13) | `PeerConfig::max_sessions` |
-| Inbound connections | at most 8 handshakes at once, 2 from one host (an IPv4 address or an IPv6 /64), with 5 s each for the encrypted handshake, the hello and the status; further connections are closed, counted (`op_indexer_el_inbound_dropped_total`) and warned about once a minute; one established inbound session per host | `session/listener.rs`, `peers.rs` |
+| Inbound connections | at most 8 handshakes at once, 2 from one host (an IPv4 address or an IPv6 /64), with 5 s each for the encrypted handshake, the hello and the status; further connections are closed and warned about once a minute, with a count; one established inbound session per host | `session/listener.rs`, `peers.rs` |
 | Unused sessions | an outbound session we have not sent a request on for 10 minutes is closed ("disconnect requested"), keeping the 2 used most recently (the receipts of new blocks) and the session in the indexer slot; the outbound target then drops to 2, so no other peer is dialed in their place, and goes back up only after every kept session has been busy (used within a minute) for 5 minutes in a row; a released peer is not dialed again for 30 minutes; sessions peers opened are theirs and stay | `peers.rs` `IDLE_RELEASE`, `KEEP_IDLE`, `BUSY`, `BUSY_TICKS`, `RELEASED_REDIAL` |
 | Dials | at most 8 at once, 30 a minute, no peer more often than once a minute | `peers.rs`, `peers/schedule.rs` |
 | A full peer | a dial refused with "too many peers" (or a dropped handshake): again after 60 to 90 s, doubling with each refusal in a row, up to 8 to 12 minutes; a session the peer ended with "too many peers": again after 60 to 90 s | `FULL_PEER_RETRY` |
@@ -144,8 +143,7 @@ network it joins (the OP Stack chain's and, with the L1 side, Ethereum's):
 Snap sync, transaction gossip, state.
 
 Receipts that arrive after their block was promoted are attached in the archive, the
-committed store; the blocks promoted before them are counted
-(`op_indexer_pipeline_blocks_promoted_without_receipts_total`).
+committed store; the number of archived blocks still waiting for them is logged when it changes.
 
 Known limit: at startup the pipeline reads up to 1024 stored blocks in full to learn which
 lack receipts, because the unsafe store has no lighter call. It runs in its own task and does
@@ -178,7 +176,6 @@ not delay ingest; a small storage call (parent hash plus has-receipts) would rem
 | `verify.rs` | The receipt count and the receipts root against the header, with the per-fork rules |
 | `serve.rs`, `serve/{provider,session}.rs` | Serving: the `BlockProvider` trait, the server task, per-session answering and limits (section 11) |
 | `sync.rs`, `sync/{headers,schedule,segment}.rs` | Range sync: the header walk, the per-segment fetch, scheduling across sessions (section 12) |
-| `metrics.rs` | Names and recording functions, like the other crates |
 
 Elsewhere: `chainspec` holds the genesis hash, the fork activations and the fork id;
 `primitives` the channel types; the pipeline has a receipts task and sends requests; the
@@ -296,8 +293,6 @@ The node answers peers from its own stores, so that another node can sync from i
   requests are answered empty without reading and the advertised range stays where it was,
   until a read of the held range succeeds again. A failed request read does not count: one
   corrupt stored block that peers keep asking for fails their requests only.
-- Metrics: `op_indexer_el_served_requests_total{kind,outcome}`,
-  `op_indexer_el_served_items_total{kind}`, `op_indexer_el_served_bytes_total{kind}`.
 - Serving itself has not run live.
 
 ## 12. Range sync

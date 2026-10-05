@@ -20,11 +20,11 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info_span};
 
+use crate::ElError;
 use crate::discovery::Discovery;
 use crate::peers::{PeerSet, Peers, Report};
 use crate::serve::{self, Serving};
 use crate::session::{self, SessionContext, SessionHandle, unix_now};
-use crate::{ElError, metrics};
 
 /// Discovered peers waiting for the peer set. Discovery repeats what does not fit.
 const CANDIDATES_CAPACITY: usize = 256;
@@ -44,7 +44,7 @@ pub(crate) const INDEXER_RECORD_VERSION: u8 = 1;
 /// What identifies one devp2p `eth` network to its peers.
 #[derive(Debug, Clone)]
 pub struct NetworkSpec {
-    /// A short name for the network in metrics and logs: `op` or `l1`.
+    /// A short name for the network in logs: `op` or `l1`.
     pub label: &'static str,
     /// The network id of the eth status (the chain id, for the networks used here).
     pub network_id: u64,
@@ -227,7 +227,6 @@ impl PeerNetwork {
             reports,
             published,
         } = self;
-        metrics::describe();
         let discovery =
             Discovery::new(Arc::clone(&ctx), config.listen_addr, config.advertised_addr)?;
         let (candidates_tx, candidates_rx) = mpsc::channel(CANDIDATES_CAPACITY);

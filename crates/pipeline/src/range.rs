@@ -19,9 +19,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+use crate::PipelineError;
 use crate::recover::{RecoverError, recover_encoded};
 use crate::retry::retry;
-use crate::{PipelineError, metrics};
 
 const APPEND: &str = "archive append_batch";
 
@@ -72,7 +72,6 @@ pub(crate) async fn run<A: ArchiveStore>(
         match append.await {
             Ok(()) => {
                 debug!(blocks = count, last, "stored a batch of the range sync");
-                metrics::range_stored(count, last);
             }
             Err(RetryError::Cancelled) => return Ok(()),
             Err(RetryError::Storage(StorageError::NotContiguous { expected, got })) => {

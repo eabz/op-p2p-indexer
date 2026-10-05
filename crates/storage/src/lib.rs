@@ -11,7 +11,6 @@
 //!   [`archive_store`] hold the in-memory and fjall implementations.
 //! - [`StorageConfig`] is plain data filled by the binary; [`StorageError`] classifies failures
 //!   by [`Severity`]: transient, expected or fatal.
-//! - [`metrics`] names and records every metric of the two stores.
 //!
 //! Takes blocks that are already decoded or verified, with or without their receipts. Does not
 //! decode gossip payloads, execute transactions, know about L1 or networking, or retry: moving
@@ -21,7 +20,6 @@
 pub mod archive_store;
 mod config;
 mod error;
-pub mod metrics;
 mod retry;
 pub mod unsafe_store;
 mod validate;
@@ -40,7 +38,7 @@ pub use config::{ArchiveConfig, StorageConfig, UnsafeConfig};
 pub use error::{InvalidBlockReason, ParseError, Severity, StorageError};
 pub use retry::{RetryError, retry};
 
-/// One of the two stores, for errors and metric labels.
+/// One of the two stores, for errors and logs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Store {

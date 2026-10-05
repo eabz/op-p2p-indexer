@@ -14,7 +14,6 @@ alloy-rlp.workspace = true
 alloy-primitives.workspace = true
 fastrand.workspace = true
 fjall.workspace = true
-metrics.workspace = true
 op-alloy-consensus.workspace = true
 snap.workspace = true
 thiserror.workspace = true

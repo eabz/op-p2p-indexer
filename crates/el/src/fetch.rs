@@ -20,7 +20,7 @@
 //! a block well below its head, the fetcher remembers that height as the peer's floor and does
 //! not ask it for older blocks again while the session lasts.
 //!
-//! The queue is bounded: when it is full the oldest block is dropped, counted. Per-peer state
+//! The queue is bounded: when it is full the oldest block is dropped, with a warning at most once a minute. Per-peer state
 //! exists only for open sessions.
 
 use std::collections::{BTreeMap, HashMap};
@@ -39,16 +39,18 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, warn};
 
 use crate::ElError;
-use crate::metrics;
 use crate::pacing::{Pacing, REQUEST_SPACING};
 use crate::peers::{Peers, Report, closed};
 use crate::session::{RequestError, SessionHandle};
 use crate::verify::{VerifyError, verify_receipts};
+use crate::warn_limit::WarnLimit;
 use crate::wire::{self, ReceiptsError};
 
 /// Most blocks waiting for receipts. About two hours of blocks; beyond it the oldest is dropped
 /// and the pipeline asks again for stored blocks without receipts when it restarts.
 const MAX_QUEUED: usize = 4096;
+/// Shortest time between two warnings that the queue is full.
+const FULL_WARN_INTERVAL: Duration = Duration::from_mins(1);
 /// How often waiting blocks and rested peers are looked at again: the request spacing, so a
 /// backlog moves at that pace. With nothing due this does no I/O.
 const DISPATCH_TICK: Duration = REQUEST_SPACING;
@@ -81,6 +83,8 @@ pub(crate) struct Fetcher {
     peer_states: HashMap<PeerId, PeerState>,
     /// Requests being answered and verified.
     in_flight: JoinSet<Result<Answer, JoinError>>,
+    /// Limits the warning that the queue is full.
+    full_warned: WarnLimit,
 }
 
 /// A queued block: by number, so the queue is in block order, then hash.
@@ -135,20 +139,6 @@ enum Outcome {
     Closed,
 }
 
-impl Outcome {
-    /// The outcome as the `outcome` label of the request counter.
-    const fn label(&self) -> &'static str {
-        match self {
-            Self::Verified(_) => "verified",
-            Self::Empty { .. } => "empty",
-            Self::Invalid(_) => "invalid",
-            Self::Malformed(_) => "malformed",
-            Self::Timeout => "timeout",
-            Self::Closed => "closed",
-        }
-    }
-}
-
 impl Fetcher {
     /// Creates the fetcher. Sends nothing until [`Self::run`].
     pub(crate) fn new(
@@ -165,6 +155,7 @@ impl Fetcher {
             queue: BTreeMap::new(),
             peer_states: HashMap::new(),
             in_flight: JoinSet::new(),
+            full_warned: WarnLimit::default(),
         }
     }
 
@@ -233,7 +224,14 @@ impl Fetcher {
                 .iter()
                 .find(|(_, pending)| !pending.in_flight)
                 .map(|(key, _)| *key);
-            metrics::queue_dropped();
+            if let Some(held_back) = self.full_warned.allow(FULL_WARN_INTERVAL) {
+                warn!(
+                    queued = MAX_QUEUED,
+                    held_back,
+                    "the receipts queue is full: the oldest waiting block is dropped (its \
+                     receipts are asked for again from the archive later)"
+                );
+            }
             match oldest {
                 Some(oldest) if oldest < key => {
                     self.queue.remove(&oldest);
@@ -253,7 +251,6 @@ impl Fetcher {
                 retry_wait: FIRST_RETRY,
             },
         );
-        metrics::queue_depth(self.queue.len());
         true
     }
 
@@ -306,7 +303,6 @@ impl Fetcher {
     /// receipts.
     async fn answered(&mut self, answer: Answer, cancel: &CancellationToken) -> bool {
         let Answer { key, peer, outcome } = answer;
-        metrics::request(outcome.label());
         let timely = !matches!(outcome, Outcome::Timeout | Outcome::Empty { slow: true });
         let unresponsive = self
             .peer_states
@@ -326,9 +322,7 @@ impl Fetcher {
                 let Some(pending) = self.queue.remove(&key) else {
                     return true;
                 };
-                metrics::queue_depth(self.queue.len());
                 let waited = pending.queued_at.elapsed();
-                metrics::delivered(receipts.len(), waited);
                 debug!(
                     %peer,
                     number = key.0,
@@ -344,7 +338,6 @@ impl Fetcher {
                 self.try_another(key, Some(peer));
             }
             Outcome::Invalid(err) => {
-                metrics::verification_failed(err.kind());
                 warn!(%peer, number = key.0, hash = %key.1, %err, "receipts failed verification");
                 self.peers.report(Report::BadData(peer));
                 self.try_another(key, Some(peer));

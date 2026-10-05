@@ -87,8 +87,8 @@ The committed store is the archive's trait, `ArchiveStore` (section 9.2).
 - **Cancel safety.** Dropping a future never corrupts a store: the unsafe store's writes run to
   their end on a blocking thread, its reads are immediate.
 - Module layout: `storage::unsafe_store` (`MemoryStore`; `chain` holds the state and fork
-  choice, `journal` the fjall journal, `layout` every limit), `storage::archive_store` (fjall),
-  `storage::metrics`; the traits, the configuration types, `StorageError`, `Severity`,
+  choice, `journal` the fjall journal, `layout` every limit), `storage::archive_store` (fjall);
+  the traits, the configuration types, `StorageError`, `Severity`,
   `InvalidBlockReason` and `Store` are exported from the crate root.
 
 ## 3. The unsafe chain (unsafe store)
@@ -121,9 +121,7 @@ header over exactly those bytes; a mismatch is `InvalidBlock` (`TransactionsRoot
 day (`RETENTION_SECS`) older than the newest block, a few lowest heights per insert, the
 backstop for when nothing prunes (no L1); and when the blocks take more than
 `UnsafeConfig::max_bytes` (`OP_INDEXER_UNSAFE_MAX_BYTES`, default 2 GiB), lowest heights first,
-never the head's. Both are counted (`op_indexer_storage_unsafe_evicted_blocks_total`), and
-`op_indexer_storage_unsafe_bytes` / `_blocks` show what is held. Readers must not expect blocks
-older than that.
+never the head's. Evictions are logged. Readers must not expect blocks older than that.
 
 **Measured** (2026-10-04, synthetic, release build, Apple M-series): 3,600 linked blocks of 20
 EIP-1559 transactions with two logs each, 31 KB per block encoded (header, body and receipts;
@@ -374,10 +372,8 @@ docker compose -p unichain --env-file unichain.env.example up -d
 `unichain.env.example` shifts every port by 100 and names the data directory. A second
 instance of the same chain needs the same: its own ports and data directory.
 
-`storage::metrics` follows `crates/p2p/src/metrics.rs` (the binary calls its `describe()` at
-startup): operation counts and durations by store, operation and outcome (`ok`, `transient`,
-`expected`, `fatal`), blocks inserted, reorgs and their depth, receipts attached, blocks pruned,
-the unsafe chain's memory, blocks and evictions, and the archive's disk gauges.
+Storage has no metrics (removed 2026-10-04, to be re-added later where needed): retries,
+reorgs, evictions and failed operations are logged.
 
 ## 7. Open points
 
@@ -557,9 +553,7 @@ pub trait ArchiveStore {
   blocking thread). `range` takes one snapshot, so both ends come from one point in time.
 - Space overhead is roughly constant: a journal of at most 128 MiB plus a few 64 MiB blob
   files that are dropped only once wholly stale. A small archive therefore looks many times
-  its live data (measured: 250 to 400 MB for 37 MB live); at 20 GB it was 1.02x. The
-  archive's disk use, stale blob bytes and running compactions are recorded as gauges
-  (exported once the binary installs a recorder).
+  its live data (measured: 250 to 400 MB for 37 MB live); at 20 GB it was 1.02x.
 - fjall is synchronous: the implementation (`FjallArchive`, cheap to clone) runs each call on
   a blocking thread, so the trait is async like the other two.
 - On open: a directory holding an archive of another `schema_version` (or blocks and no

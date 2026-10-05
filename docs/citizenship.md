@@ -91,7 +91,7 @@ written, except these.
 
 | Duty | Spec section | Status | Notes |
 |---|---|---|---|
-| Notice a fork this build does not know before it activates, and tell the operator to upgrade | EIP-2124 (`FORK_NEXT`) | built | The known-forks horizon (`el/horizon.rs`, `docs/el.md` §5), information only: it takes three distinct hosts (IPv4 addresses or IPv6 /48s, each counting for one time) announcing the same unknown `next` in their eth status, and setting it only produces a warning and a metric. It never refuses blocks or stops the node. |
+| Notice a fork this build does not know before it activates, and tell the operator to upgrade | EIP-2124 (`FORK_NEXT`) | built | The known-forks horizon (`el/horizon.rs`, `docs/el.md` §5), information only: it takes three distinct hosts (IPv4 addresses or IPv6 /48s, each counting for one time) announcing the same unknown `next` in their eth status, and setting it only produces a warning. It never refuses blocks or stops the node. |
 
 ## Ethereum L1 (beacon light client over libp2p; L1 execution over devp2p)
 

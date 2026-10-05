@@ -21,7 +21,6 @@ mod discovery;
 mod error;
 mod fetch;
 mod horizon;
-mod metrics;
 mod network;
 mod pacing;
 mod peers;

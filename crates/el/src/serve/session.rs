@@ -11,8 +11,7 @@ use op_indexer_primitives::BlockRef;
 use reth_eth_wire_types::{BlockRangeUpdate, EthVersion};
 use tokio::sync::{mpsc, watch};
 
-use super::{HeldRange, MAX_ITEMS, Request, response, response_id};
-use crate::metrics::{self, ServeKind, ServeOutcome};
+use super::{HeldRange, MAX_ITEMS, Request, ServeKind, response, response_id};
 use crate::wire;
 
 /// Requests answered from the provider per peer per [`RATE_WINDOW`]; further ones get an empty
@@ -173,16 +172,13 @@ impl SessionServing {
             return empty();
         };
         if body.len() > MAX_REQUEST_BYTES {
-            metrics::served(kind, ServeOutcome::Malformed);
             return empty();
         }
         if !self.within_rate() {
-            metrics::served(kind, ServeOutcome::RateLimited);
             return empty();
         }
         // No free place means the peer already has its share of requests being answered.
         let Ok(answer) = self.answers.clone().try_reserve_owned() else {
-            metrics::served(kind, ServeOutcome::Busy);
             return empty();
         };
         let request = Request {
@@ -195,7 +191,6 @@ impl SessionServing {
         };
         // Full: the server is behind. Closed: it has stopped.
         if self.requests.try_send(request).is_err() {
-            metrics::served(kind, ServeOutcome::Busy);
             return empty();
         }
         Handled::Later

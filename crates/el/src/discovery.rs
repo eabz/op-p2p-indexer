@@ -33,9 +33,9 @@ use tokio::time::{Instant, MissedTickBehavior, interval, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::ElError;
 use crate::network::{INDEXER_RECORD_KEY, INDEXER_RECORD_VERSION};
 use crate::session::{SessionContext, unix_now};
-use crate::{ElError, metrics};
 
 /// Time between lookup rounds after the fast phase. The viability test found about one new
 /// peer every two minutes at this pace.
@@ -412,7 +412,6 @@ impl Discovery {
                 .is_none()
             {
                 new_peers += 1;
-                metrics::candidate_discovered(self.ctx.spec().label);
                 // A full channel means the peer set is busy; the next report sends it.
                 let _sent = candidates.try_send(candidate);
             }

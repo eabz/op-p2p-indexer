@@ -908,7 +908,6 @@ async fn prepare_storage<A: Archive>(
     config: &StorageConfig,
     archive: A,
 ) -> eyre::Result<Stores<A>> {
-    op_indexer_storage::metrics::describe();
     let archive_range = archive
         .range()
         .await

@@ -22,10 +22,9 @@ use op_indexer_primitives::{
     L1Heads, ReadLimits, split_body,
 };
 use tokio::sync::{Mutex, MutexGuard};
-use tracing::debug;
 
 pub(super) use self::append::{Entry, append_batch};
-use crate::{InvalidBlockReason, ParseError, StorageError, Store, metrics};
+use crate::{InvalidBlockReason, ParseError, StorageError, Store};
 
 /// Block cache shared by the keyspaces. It holds the index and filter blocks of the trees and
 /// recently read data blocks; serving peers is not latency-critical, so it stays small and fixed
@@ -595,21 +594,6 @@ pub(super) fn range(tables: &Tables) -> Result<Option<(BlockRef, BlockRef)>, Fai
     let first = end_ref(snapshot.first_key_value(&tables.headers))?;
     let last = end_ref(snapshot.last_key_value(&tables.headers))?;
     Ok(first.zip(last))
-}
-
-/// Samples fjall's own counters into the archive gauges: disk use (journal, trees and blob
-/// files), blob bytes no longer referenced, and running compactions. All are cheap reads of
-/// fjall's metadata.
-fn record_usage(tables: &Tables) {
-    let fragmented = tables
-        .bodies
-        .fragmented_blob_bytes()
-        .saturating_add(tables.receipts.fragmented_blob_bytes());
-    match tables.db.disk_space() {
-        Ok(disk) => metrics::archive_usage(disk, fragmented, tables.db.active_compactions()),
-        // A gauge left stale is better than failing a write that already succeeded.
-        Err(err) => debug!(%err, "could not read the archive's disk use; gauges not updated"),
-    }
 }
 
 /// The block whose header entry is `guard` (first or last of `headers`), identified by its hash.

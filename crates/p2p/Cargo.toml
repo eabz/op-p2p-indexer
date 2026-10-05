@@ -20,7 +20,6 @@ ethereum_ssz.workspace = true
 fjall.workspace = true
 governor.workspace = true
 libp2p = { workspace = true, features = ["ping", "request-response"] }
-metrics.workspace = true
 op-alloy-consensus.workspace = true
 op-alloy-rpc-types-engine.workspace = true
 sha2.workspace = true

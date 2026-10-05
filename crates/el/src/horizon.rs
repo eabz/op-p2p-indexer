@@ -1,6 +1,6 @@
 //! The known-forks horizon: the activation time of a fork this build does not know, once
-//! enough peers agree on it. Information only: it warns and is exported as a metric, and
-//! never refuses a block or stops the node.
+//! enough peers agree on it. Information only: it warns, and never refuses a block or stops
+//! the node.
 //!
 //! Execution peers announce their next fork as `next` in their fork id ([EIP-2124]). A `next`
 //! this build does not know means a fork is coming that it cannot follow. Once
@@ -19,7 +19,6 @@ use std::time::Duration;
 
 use tracing::{info, warn};
 
-use crate::metrics;
 use crate::session::{host, unix_now};
 use crate::warn_limit::WarnLimit;
 
@@ -37,7 +36,7 @@ const REMIND_INTERVAL: Duration = Duration::from_mins(10);
 /// Tracks unknown fork times announced by peers, and warns about the horizon they set.
 #[derive(Debug)]
 pub(crate) struct Horizon {
-    /// The network's name, the metric's label.
+    /// The network's name, for the warning.
     network: &'static str,
     /// The newest known fork time of this build, for the log.
     newest_known: Option<u64>,
@@ -56,7 +55,6 @@ struct State {
 impl Horizon {
     /// A horizon not set yet; `newest_known` is this build's last known fork time.
     pub(crate) fn new(network: &'static str, newest_known: Option<u64>) -> Self {
-        metrics::fork_horizon(network, 0);
         Self {
             network,
             newest_known,
@@ -92,9 +90,8 @@ impl Horizon {
         }
         state.horizon = horizon;
         drop(state);
-        metrics::fork_horizon(self.network, horizon.unwrap_or(0));
         if let Some(fork_time) = horizon {
-            warn_upgrade(fork_time);
+            warn_upgrade(self.network, fork_time);
         }
     }
 
@@ -112,15 +109,16 @@ impl Horizon {
                 "no unknown hardfork announced by execution peers"
             ),
             Some(fork_time) if self.reminded.allow(REMIND_INTERVAL).is_some() => {
-                warn_upgrade(fork_time);
+                warn_upgrade(self.network, fork_time);
             }
             _ => {}
         }
     }
 }
 
-fn warn_upgrade(fork_time: u64) {
+fn warn_upgrade(network: &str, fork_time: u64) {
     warn!(
+        network,
         fork_time,
         "execution peers announce a hardfork at this time that this build does not know: \
          upgrade before then"

@@ -59,7 +59,6 @@ use self::schedule::{
 };
 use crate::ElError;
 use crate::discovery::Candidate;
-use crate::metrics::{self, DialOutcome, DropReason, EndLabel};
 use crate::network::PeerConfig;
 use crate::session::{
     self, Accepted, Direction, EndReason, SessionContext, SessionDriver, SessionEnd, SessionError,
@@ -231,7 +230,7 @@ impl PeerSet {
         reports: mpsc::Receiver<Report>,
         published: watch::Sender<Arc<[SessionHandle]>>,
     ) -> Self {
-        let schedule = Schedule::new(ctx.spec().label, &config.saved_peers);
+        let schedule = Schedule::new(&config.saved_peers);
         Self {
             ctx,
             candidates,
@@ -411,7 +410,6 @@ impl PeerSet {
                 self.dialing.remove(&peer);
                 match *result {
                     Ok((handle, driver)) => {
-                        metrics::dial(self.ctx.spec().label, DialOutcome::Connected);
                         if self.sessions.contains_key(&peer) {
                             // The peer dialed us while we dialed it.
                             self.refuse(driver, DisconnectReason::AlreadyConnected);
@@ -450,7 +448,6 @@ impl PeerSet {
             || self.sessions.contains_key(&peer)
             || self.schedule.is_banned(&peer)
         {
-            metrics::inbound_refused(self.ctx.spec().label);
             self.refuse(driver, DisconnectReason::TooManyPeers);
             return;
         }
@@ -460,7 +457,7 @@ impl PeerSet {
     /// Adds a session to the set and runs its driver.
     fn keep(&mut self, handle: SessionHandle, driver: SessionDriver, cancel: &CancellationToken) {
         let status = handle.status();
-        let (peer, direction) = (status.peer_id, status.direction);
+        let peer = status.peer_id;
         info!(
             %peer,
             addr = %status.addr,
@@ -486,7 +483,6 @@ impl PeerSet {
             }
             .in_current_span(),
         );
-        metrics::session_opened(self.ctx.spec().label, direction);
         self.publish();
     }
 
@@ -512,22 +508,18 @@ impl PeerSet {
             self.sessions.remove(&peer);
             self.publish();
         }
-        let (label, wait, detail) = match &end.reason {
-            EndReason::Cancelled => (EndLabel::Cancelled, REDIAL_INTERVAL, None),
-            EndReason::PeerDisconnected(DisconnectReason::TooManyPeers) => {
-                (EndLabel::TooManyPeers, FULL_PEER_RETRY, None)
+        let (wait, detail) = match &end.reason {
+            EndReason::PeerDisconnected(DisconnectReason::TooManyPeers) => (FULL_PEER_RETRY, None),
+            // Useless to it, or it asked for data and did not read it.
+            EndReason::PeerDisconnected(DisconnectReason::UselessPeer) | EndReason::Stalled => {
+                (LONG_BACKOFF, None)
             }
-            EndReason::PeerDisconnected(DisconnectReason::UselessPeer) => {
-                (EndLabel::UselessPeer, LONG_BACKOFF, None)
+            EndReason::Cancelled | EndReason::PeerDisconnected(_) | EndReason::Closed => {
+                (REDIAL_INTERVAL, None)
             }
-            EndReason::PeerDisconnected(_) => (EndLabel::Disconnected, REDIAL_INTERVAL, None),
-            EndReason::Closed => (EndLabel::Closed, REDIAL_INTERVAL, None),
-            EndReason::Io(err) => (EndLabel::Io, REDIAL_INTERVAL, Some(err.as_str())),
-            EndReason::Protocol(err) => (EndLabel::Protocol, LONG_BACKOFF, Some(err.as_str())),
-            // It asked for data and did not read it.
-            EndReason::Stalled => (EndLabel::Stalled, LONG_BACKOFF, None),
+            EndReason::Io(err) => (REDIAL_INTERVAL, Some(err.as_str())),
+            EndReason::Protocol(err) => (LONG_BACKOFF, Some(err.as_str())),
         };
-        metrics::session_ended(self.ctx.spec().label, label, end.lasted);
         info!(
             %peer,
             reason = ?end.reason,
@@ -546,19 +538,24 @@ impl PeerSet {
             Report::BadData(peer) => {
                 self.schedule.ban(peer);
                 let tell = DisconnectReason::ProtocolBreach;
-                (peer, DropReason::BadData, tell, BAN_DURATION)
+                (peer, "its answer failed verification", tell, BAN_DURATION)
             }
             Report::Undecodable(peer) => {
                 let tell = DisconnectReason::UselessPeer;
-                (peer, DropReason::Undecodable, tell, LONG_BACKOFF)
+                (peer, "its answer could not be decoded", tell, LONG_BACKOFF)
             }
             Report::NotHolding(peer) => {
                 let tell = DisconnectReason::UselessPeer;
-                (peer, DropReason::NotHolding, tell, LONG_BACKOFF)
+                (
+                    peer,
+                    "it does not hold the blocks before Bedrock it advertises",
+                    tell,
+                    LONG_BACKOFF,
+                )
             }
             Report::Unresponsive(peer) => {
                 let tell = DisconnectReason::UselessPeer;
-                (peer, DropReason::Unresponsive, tell, REDIAL_INTERVAL)
+                (peer, "it stopped answering", tell, REDIAL_INTERVAL)
             }
         };
         // Set here, not when the driver ends: the peer would otherwise be due at once and be
@@ -570,8 +567,7 @@ impl PeerSet {
             return;
         };
         live.handle.disconnect(tell);
-        metrics::peer_dropped(self.ctx.spec().label, reason);
-        warn!(%peer, ?reason, client = %live.handle.status().client, "dropped execution peer");
+        warn!(%peer, reason, client = %live.handle.status().client, "dropped execution peer");
         self.publish();
     }
 

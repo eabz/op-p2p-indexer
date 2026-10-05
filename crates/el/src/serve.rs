@@ -52,7 +52,6 @@ pub use self::provider::BlockProvider;
 use self::provider::HeldRange;
 pub(crate) use self::session::{Handled, Serving, SessionServing};
 use crate::ElError;
-use crate::metrics::{self, ServeKind, ServeOutcome};
 use crate::warn_limit::WarnLimit;
 use crate::wire;
 
@@ -279,6 +278,27 @@ enum Fault<E> {
     Provider(E),
 }
 
+/// What a peer asked for.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ServeKind {
+    /// `GetBlockHeaders`.
+    Headers,
+    /// `GetBlockBodies`.
+    Bodies,
+    /// `GetReceipts`.
+    Receipts,
+}
+
+impl ServeKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Headers => "headers",
+            Self::Bodies => "bodies",
+            Self::Receipts => "receipts",
+        }
+    }
+}
+
 /// The message id of the response to a request of `kind`.
 const fn response_id(kind: ServeKind) -> u8 {
     match kind {
@@ -304,23 +324,17 @@ async fn answer<P: BlockProvider>(provider: Arc<P>, health: Arc<Health>, request
     } else {
         gather(&*provider, kind, lowest, version, &body).await
     };
-    let (items, outcome) = match items {
-        Ok(items) if items.is_empty() => (items, ServeOutcome::Empty),
-        Ok(items) => (items, ServeOutcome::Answered),
+    let items = match items {
+        Ok(items) => items,
         Err(Fault::Malformed(err)) => {
             debug!(?kind, %err, "malformed request from an execution peer");
-            (Vec::new(), ServeOutcome::Malformed)
+            Vec::new()
         }
         Err(Fault::Provider(err)) => {
             health.failed(Some(kind), &err);
-            (Vec::new(), ServeOutcome::Failed)
+            Vec::new()
         }
     };
-    let bytes = items
-        .iter()
-        .fold(0_usize, |sum, item| sum.saturating_add(item.len()));
-    metrics::served(kind, outcome);
-    metrics::served_items(kind, items.len(), bytes);
     // If the session has ended, the answer is dropped with its channel.
     drop(answer.send(response(response_id(kind), id, &items)));
 }

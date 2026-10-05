@@ -14,7 +14,7 @@
 //! Every recent game is judged, not only the newest: anyone who posts the bond can create a
 //! game, and one that claims a block that is not ours must not hide the honest ones. A claim
 //! that does not match our block is logged as an error with both values (once per game and
-//! block) and counted: either L1 commits to another chain than the one we hold, or the claim is
+//! block): either L1 commits to another chain than the one we hold, or the claim is
 //! wrong. Games are judged again whenever they change and every [`RECHECK_INTERVAL`], so a game
 //! about a block we do not hold yet, or one whose height our canonical chain has since changed
 //! at, is decided by the block we hold then.
@@ -54,7 +54,6 @@ use tokio::time::{MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::metrics::{self, GameOutcome};
 use crate::retry::{retry, settle};
 use crate::{PipelineError, PipelineError::Storage};
 
@@ -235,7 +234,6 @@ fn judge(
         ours.withdrawals_root,
     );
     let Err(err) = checked else {
-        metrics::game(GameOutcome::Matched);
         info!(
             l2_block = game.l2_block,
             hash = %ours.hash,
@@ -254,7 +252,6 @@ fn judge(
     }
     if let ClaimMismatch::NoStorageRoot { .. } = err {
         // Before Isthmus the header does not carry what the claim commits to.
-        metrics::game(GameOutcome::Unchecked);
         warn!(
             l2_block = game.l2_block,
             game = %game.game,
@@ -262,7 +259,6 @@ fn judge(
             "a dispute game cannot be checked against our block; it does not raise a head"
         );
     } else {
-        metrics::game(GameOutcome::Mismatch);
         error!(
             l2_block = game.l2_block,
             our_hash = %ours.hash,

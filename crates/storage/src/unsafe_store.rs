@@ -36,7 +36,6 @@ use tracing::{debug, info, warn};
 use self::chain::{Chain, Inserted, Stored};
 use self::journal::{Changes, Journal};
 use self::layout::{EVENTS_KEPT, MAX_ANCESTRY_BLOCKS};
-use crate::metrics::{self, Operation};
 use crate::validate::validate_block;
 use crate::{
     BlockPart, CanonicalItem, EventId, Events, InvalidBlockReason, StorageError, Store,
@@ -120,7 +119,6 @@ impl MemoryStore {
             millis = started.elapsed().as_millis(),
             "unsafe chain replayed from its journal"
         );
-        metrics::unsafe_held(state.chain.bytes(), state.chain.len());
         Ok(Self {
             inner: Arc::new(Inner {
                 state: Mutex::new(state),
@@ -170,7 +168,6 @@ impl Inner {
         state.next_seq = state.next_seq.saturating_add(1);
         let evicted = state.chain.retain(self.max_bytes);
         if !evicted.is_empty() {
-            metrics::unsafe_evicted(evicted.len());
             debug!(
                 blocks = evicted.len(),
                 "unsafe blocks left by retention or the memory cap"
@@ -183,7 +180,6 @@ impl Inner {
             delete: evicted,
             heads: None,
         })?;
-        metrics::unsafe_held(state.chain.bytes(), state.chain.len());
         self.publish(&mut state, &events);
         Ok(InsertOutcome {
             stored: true,
@@ -209,22 +205,13 @@ impl Inner {
 
 impl UnsafeStore for MemoryStore {
     async fn insert(&self, block: &DecodedBlock) -> Result<InsertOutcome, StorageError> {
-        metrics::timed(Store::Unsafe, Operation::Insert, async {
-            validate_block(block)?;
-            let stored = stored(block, self.inner.canyon_time)?;
-            let outcome = self.blocking("insert", move |inner| inner.insert(stored)).await?;
-            if outcome.stored {
-                metrics::blocks_inserted(Store::Unsafe, 1);
-            }
-            for event in &outcome.events {
-                if let UnsafeEvent::Reorg(reorg) = event {
-                    metrics::reorg(reorg.replaced.len());
-                }
-            }
-            debug!(number = block.block.header.number, hash = %block.hash, stored = outcome.stored, events = ?outcome.events, "inserted block");
-            Ok(outcome)
-        })
-        .await
+        validate_block(block)?;
+        let stored = stored(block, self.inner.canyon_time)?;
+        let outcome = self
+            .blocking("insert", move |inner| inner.insert(stored))
+            .await?;
+        debug!(number = block.block.header.number, hash = %block.hash, stored = outcome.stored, events = ?outcome.events, "inserted block");
+        Ok(outcome)
     }
 
     async fn set_receipts(
@@ -232,50 +219,39 @@ impl UnsafeStore for MemoryStore {
         block: BlockRef,
         receipts: &[OpReceiptEnvelope],
     ) -> Result<bool, StorageError> {
-        metrics::timed(Store::Unsafe, Operation::SetReceipts, async {
-            let canyon_time = self.inner.canyon_time;
-            let receipts = receipts.to_vec();
-            let attached = self
-                .blocking("set_receipts", move |inner| {
-                    let mut state = inner.state();
-                    let invalid = |reason| StorageError::InvalidBlock {
-                        number: block.number,
-                        reason,
-                    };
-                    let Some(stored) = state.chain.get(&block.hash) else {
-                        return Ok(false);
-                    };
-                    if stored.number != block.number {
-                        return Err(invalid(InvalidBlockReason::StoredNumber));
-                    }
-                    if stored.senders.len() != receipts.len() {
-                        return Err(invalid(InvalidBlockReason::ReceiptCount));
-                    }
-                    let header = header(stored)?;
-                    if receipts_root(&receipts, header.timestamp, canyon_time)
-                        != header.receipts_root
-                    {
-                        return Err(invalid(InvalidBlockReason::ReceiptsRoot));
-                    }
-                    let event = state
-                        .chain
-                        .set_receipts(block, encode_receipts(&receipts))
-                        .map_err(invalid)?;
-                    if let Some(stored) = state.chain.get(&block.hash) {
-                        inner.journal.write(&Changes {
-                            put: Some(stored),
-                            ..Changes::default()
-                        })?;
-                    }
-                    metrics::unsafe_held(state.chain.bytes(), state.chain.len());
-                    inner.publish(&mut state, event.as_slice());
-                    Ok(event.is_some())
-                })
-                .await?;
-            if attached {
-                metrics::receipts_attached();
+        let canyon_time = self.inner.canyon_time;
+        let receipts = receipts.to_vec();
+        self.blocking("set_receipts", move |inner| {
+            let mut state = inner.state();
+            let invalid = |reason| StorageError::InvalidBlock {
+                number: block.number,
+                reason,
+            };
+            let Some(stored) = state.chain.get(&block.hash) else {
+                return Ok(false);
+            };
+            if stored.number != block.number {
+                return Err(invalid(InvalidBlockReason::StoredNumber));
             }
-            Ok(attached)
+            if stored.senders.len() != receipts.len() {
+                return Err(invalid(InvalidBlockReason::ReceiptCount));
+            }
+            let header = header(stored)?;
+            if receipts_root(&receipts, header.timestamp, canyon_time) != header.receipts_root {
+                return Err(invalid(InvalidBlockReason::ReceiptsRoot));
+            }
+            let event = state
+                .chain
+                .set_receipts(block, encode_receipts(&receipts))
+                .map_err(invalid)?;
+            if let Some(stored) = state.chain.get(&block.hash) {
+                inner.journal.write(&Changes {
+                    put: Some(stored),
+                    ..Changes::default()
+                })?;
+            }
+            inner.publish(&mut state, event.as_slice());
+            Ok(event.is_some())
         })
         .await
     }
@@ -285,63 +261,51 @@ impl UnsafeStore for MemoryStore {
         head: BlockRef,
         stop_at: BlockNumber,
     ) -> Result<Vec<DecodedBlock>, StorageError> {
-        metrics::timed(Store::Unsafe, Operation::Ancestry, async {
-            let requested = head.number.saturating_sub(stop_at);
-            if requested > MAX_ANCESTRY_BLOCKS {
-                return Err(StorageError::AncestryTooLong {
-                    requested,
-                    max: MAX_ANCESTRY_BLOCKS,
-                });
+        let requested = head.number.saturating_sub(stop_at);
+        if requested > MAX_ANCESTRY_BLOCKS {
+            return Err(StorageError::AncestryTooLong {
+                requested,
+                max: MAX_ANCESTRY_BLOCKS,
+            });
+        }
+        let blocks = {
+            let state = self.inner.state();
+            let mut blocks = Vec::new();
+            let mut next = head;
+            while next.number > stop_at {
+                let block = state
+                    .chain
+                    .get(&next.hash)
+                    .filter(|block| block.number == next.number)
+                    .ok_or(StorageError::MissingAncestor {
+                        hash: next.hash,
+                        number: next.number,
+                    })?;
+                next = BlockRef {
+                    // Above `stop_at`, so at least 1.
+                    number: next.number.saturating_sub(1),
+                    hash: block.parent_hash,
+                };
+                blocks.push(block.clone());
             }
-            let blocks = {
-                let state = self.inner.state();
-                let mut blocks = Vec::new();
-                let mut next = head;
-                while next.number > stop_at {
-                    let block = state
-                        .chain
-                        .get(&next.hash)
-                        .filter(|block| block.number == next.number)
-                        .ok_or(StorageError::MissingAncestor {
-                            hash: next.hash,
-                            number: next.number,
-                        })?;
-                    next = BlockRef {
-                        // Above `stop_at`, so at least 1.
-                        number: next.number.saturating_sub(1),
-                        hash: block.parent_hash,
-                    };
-                    blocks.push(block.clone());
-                }
-                blocks
-            };
-            // Decoding is CPU work: off the runtime.
-            let decoded = self
-                .blocking("ancestry", move |_inner| {
-                    blocks.into_iter().rev().map(decode).collect()
-                })
-                .await?;
-            Ok(decoded)
+            blocks
+        };
+        // Decoding is CPU work: off the runtime.
+        self.blocking("ancestry", move |_inner| {
+            blocks.into_iter().rev().map(decode).collect()
         })
         .await
     }
 
     async fn prune(&self, up_to: BlockRef) -> Result<(), StorageError> {
-        metrics::timed(Store::Unsafe, Operation::Prune, async {
-            let removed = self
-                .blocking("prune", move |inner| {
-                    let mut state = inner.state();
-                    let removed = state.chain.prune(up_to.number);
-                    inner.journal.write(&Changes {
-                        delete: removed.clone(),
-                        ..Changes::default()
-                    })?;
-                    metrics::unsafe_held(state.chain.bytes(), state.chain.len());
-                    inner.publish(&mut state, &[UnsafeEvent::Pruned { up_to }]);
-                    Ok(removed.len())
-                })
-                .await?;
-            metrics::blocks_pruned(removed);
+        self.blocking("prune", move |inner| {
+            let mut state = inner.state();
+            let removed = state.chain.prune(up_to.number);
+            inner.journal.write(&Changes {
+                delete: removed,
+                ..Changes::default()
+            })?;
+            inner.publish(&mut state, &[UnsafeEvent::Pruned { up_to }]);
             Ok(())
         })
         .await
@@ -477,16 +441,13 @@ impl UnsafeStore for MemoryStore {
 
     /// A `None` head is unknown, not absent: the one recorded stays.
     async fn set_l1_heads(&self, heads: L1Heads) -> Result<(), StorageError> {
-        metrics::timed(Store::Unsafe, Operation::SetL1Heads, async {
-            self.blocking("set_l1_heads", move |inner| {
-                let mut state = inner.state();
-                state.chain.set_heads(heads);
-                inner.journal.write(&Changes {
-                    heads: Some(state.chain.heads()),
-                    ..Changes::default()
-                })
+        self.blocking("set_l1_heads", move |inner| {
+            let mut state = inner.state();
+            state.chain.set_heads(heads);
+            inner.journal.write(&Changes {
+                heads: Some(state.chain.heads()),
+                ..Changes::default()
             })
-            .await
         })
         .await
     }

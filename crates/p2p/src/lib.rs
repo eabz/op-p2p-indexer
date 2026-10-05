@@ -20,7 +20,6 @@ mod bootnode;
 mod config;
 mod discovery;
 mod gossip;
-mod metrics;
 mod network;
 mod peers;
 mod store;

@@ -10,7 +10,7 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use crate::{Severity, StorageError, Store, metrics};
+use crate::{Severity, StorageError, Store};
 
 /// Wait before the first retry.
 const INITIAL_BACKOFF: Duration = Duration::from_millis(200);
@@ -72,7 +72,6 @@ where
         let half = backoff / 2;
         // A random duration between half of the backoff and all of it.
         let delay = half + half.mul_f64(fastrand::f64());
-        metrics::retried(store);
         warn!(%store, operation, attempt, ?delay, ?err, "store call failed, retrying");
         tokio::select! {
             biased;

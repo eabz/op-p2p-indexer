@@ -104,8 +104,6 @@ eyre = "0.6"
 thiserror = "2"
 # Structured logging.
 tracing = "0.1"
-# Metrics facade (as in reth): recording is a no-op until the binary installs a recorder.
-metrics = { version = "0.24", default-features = false }
 # Jitter: storage's retry backoff, the importer's download retries, and the peer schedules of
 # `el` and `l1` (already in the tree through fjall).
 fastrand = { version = "2", default-features = false, features = ["std"] }

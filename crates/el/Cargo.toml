@@ -19,7 +19,6 @@ enr.workspace = true
 fastrand.workspace = true
 futures-util.workspace = true
 libp2p-identity.workspace = true
-metrics.workspace = true
 op-alloy-consensus.workspace = true
 reth-ecies.workspace = true
 reth-eth-wire.workspace = true
