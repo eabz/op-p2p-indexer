@@ -337,7 +337,7 @@ pub(crate) async fn run(
     // those read early wait here for the one before.
     let mut order: VecDeque<u64> = chunks.iter().map(|(chunk, _)| chunk.from).collect();
     let mut ready: BTreeMap<u64, (Chunk, u64, Scanned)> = BTreeMap::new();
-    let mut rebuilding = Rebuilding::start(state, l1, rpc, plan.chain).await?;
+    let mut rebuilding = l1.map(|l1| Rebuilding::new(l1, rpc, *plan));
     let mut queue = chunks.into_iter().peekable();
     let (mut scans, mut fetches) = (JoinSet::new(), JoinSet::new());
     let mut checks: JoinSet<Check> = JoinSet::new();
@@ -467,7 +467,8 @@ impl Ordered<'_, '_> {
         {
             self.order.pop_front();
             if let Some(rebuilding) = self.rebuilding.as_deref_mut()
-                && let Some((rebuilt, instead)) = rebuilding.chunk(state, &mut found, work).await?
+                && let Some((rebuilt, instead, note)) =
+                    rebuilding.chunk(state, chunk, &mut found, work).await?
             {
                 *self.in_flight_bytes = self.in_flight_bytes.saturating_add(bytes);
                 let (raw, fill) = (state.raw_path(chunk), state.fill_path(chunk));
@@ -477,7 +478,8 @@ impl Ordered<'_, '_> {
                         sources: rebuilt.sources.clone(),
                         ..Fill::default()
                     };
-                    let why = crate::verify::rebuild_error(&forks, chunk, &raw, &fill, overlay);
+                    let why = crate::verify::rebuild_error(&forks, chunk, &raw, &fill, overlay)
+                        .map(|why| why + &note);
                     (chunk, bytes, rebuilt, instead, why)
                 });
             }
@@ -490,80 +492,69 @@ impl Ordered<'_, '_> {
 /// The rebuild from L1, chunk after chunk in block order.
 struct Rebuilding<'a> {
     l1: &'a HyperSync,
-    /// For the parent of a run's first block when it is not kept: one header.
+    /// For the parent of a run's first block when the chunk before is not on disk: one header.
     rpc: Option<&'a Rpc>,
-    chain: &'static op_indexer_chainspec::ChainSpec,
+    plan: Plan,
     data: L1Data,
-    /// The block before the next chunk's first, for its base fee; kept in the state directory
-    /// after each chunk, for the next run.
+    /// The block before the next chunk's first, for its base fee.
     parent: Option<Parent>,
 }
 
 impl<'a> Rebuilding<'a> {
-    /// Starts from the parent block the last run kept, if any; `None` without `l1`, when
-    /// nothing is rebuilt.
-    async fn start(
-        state: &State,
-        l1: Option<&'a HyperSync>,
-        rpc: Option<&'a Rpc>,
-        chain: &'static op_indexer_chainspec::ChainSpec,
-    ) -> eyre::Result<Option<Self>> {
-        let Some(l1) = l1 else {
-            return Ok(None);
-        };
-        let parent = {
-            let state = state.clone();
-            tokio::task::spawn_blocking(move || state.read_parent::<Parent>()).await??
-        };
-        Ok(Some(Self {
+    const fn new(l1: &'a HyperSync, rpc: Option<&'a Rpc>, plan: Plan) -> Self {
+        Self {
             l1,
             rpc,
-            chain,
+            plan,
             data: L1Data::default(),
-            parent,
-        }))
+            parent: None,
+        }
     }
 
-    /// Rebuilds what the rows of `found` lack, and returns it as a fill, to check before it is
-    /// written, with what to fetch instead if it does not hash; or, when a block cannot be
-    /// rebuilt (counted in `work`) or the chunk needs the RPC for anything else, lists it all in
-    /// `found`'s fetch.
+    /// Rebuilds what the rows of `found` (`chunk`'s) lack, and returns it as a fill, to check
+    /// before it is written, with what to fetch instead and what to say if it does not hash;
+    /// or, when a block cannot be rebuilt (counted in `work`) or the chunk needs the RPC for
+    /// anything else, lists it all in `found`'s fetch.
     async fn chunk(
         &mut self,
         state: &State,
+        chunk: Chunk,
         found: &mut Scanned,
         work: &mut Work,
-    ) -> eyre::Result<Option<(Fill, Fetch)>> {
+    ) -> eyre::Result<Option<(Fill, Fetch, String)>> {
         let rows = std::mem::take(&mut found.header_rows);
-        // The first block lacking its base fee needs its parent's: the chunk before, read
-        // earlier in this run or kept by the last; else, with an endpoint, read from it.
-        if let Some(first) = rows.first()
-            && first.lacks.contains(&"base_fee_per_gas")
-            && self
-                .parent
+        // The first block lacking its base fee needs its parent's: the chunk before's last
+        // block, rebuilt earlier in this run, else as downloaded and filled (its fill written
+        // only once checked), else, with an endpoint, read from it.
+        let orphan = |parent: &Option<Parent>| {
+            parent
                 .as_ref()
-                .is_none_or(|parent| !parent.precedes(first.number))
-            && let Some(rpc) = self.rpc
+                .is_none_or(|parent| !parent.precedes(chunk.from))
+        };
+        if rows
+            .first()
+            .is_some_and(|first| first.lacks.contains(&"base_fee_per_gas"))
+            && orphan(&self.parent)
         {
-            let parent = BlockNumHash::new(first.number.saturating_sub(1), first.parent_hash);
-            let headers = rpc
-                .headers(&[parent])
-                .await
-                .wrap_err("failed to read the parent of the run's first block from the RPC")?;
-            self.parent = headers.first().and_then(Parent::of);
+            self.parent = tokio::task::block_in_place(|| last_before(state, &self.plan, chunk))
+                .wrap_err("failed to read the chunk before for its last block's base fee")?;
+            if orphan(&self.parent)
+                && let (Some(rpc), Some(first)) = (self.rpc, rows.first())
+            {
+                let parent = BlockNumHash::new(first.number.saturating_sub(1), first.parent_hash);
+                let headers = rpc.headers(&[parent]).await.wrap_err(
+                    "failed to read the parent of the run's first block from the RPC",
+                )?;
+                self.parent = headers.first().and_then(Parent::of);
+            }
         }
         if let Some((first, last)) = derive::l1_range(&rows) {
             self.data
-                .read(self.l1, self.chain, first, last)
+                .read(self.l1, self.plan.chain, first, last)
                 .await
                 .wrap_err("failed to read L1 headers and deposits for the fields to rebuild")?;
         }
-        let rebuilt = derive::rebuild(self.chain, &rows, &self.data, &mut self.parent);
-        if let Some(parent) = &self.parent {
-            let parent = parent.clone();
-            tokio::task::block_in_place(|| state.write_parent(&parent))
-                .wrap_err("failed to keep the parent block for the next run")?;
-        }
+        let rebuilt = derive::rebuild(self.plan.chain, &rows, &self.data, &mut self.parent);
         if rebuilt.blocks.is_empty() && rebuilt.left.is_empty() {
             return Ok(None);
         }
@@ -579,11 +570,47 @@ impl<'a> Rebuilding<'a> {
             found.fetch.sources.extend(instead.sources);
             return Ok(None);
         }
+        let from_logs: Vec<String> = rebuilt.from_logs.iter().map(ToString::to_string).collect();
+        let note = if from_logs.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; user deposits rebuilt from L1 deposit logs: {}",
+                from_logs.join(", ")
+            )
+        };
         Ok(Some((
             Fill::rebuilt(rebuilt.headers, &rebuilt.sources),
             instead,
+            note,
         )))
     }
+}
+
+/// The last block of the chunk before `chunk`, as downloaded and filled, if that chunk is still
+/// on disk and the block has its base fee. Blocking.
+fn last_before(state: &State, plan: &Plan, chunk: Chunk) -> eyre::Result<Option<Parent>> {
+    let Some(before) = plan
+        .chunks()
+        .take_while(|before| before.to <= chunk.from)
+        .last()
+        .filter(|before| before.to == chunk.from)
+    else {
+        return Ok(None);
+    };
+    let raw = state.raw_path(before);
+    if !raw.try_exists()? {
+        return Ok(None);
+    }
+    let mut rows = rows::read(&raw)?;
+    if let Some(fill) = read_json(&state.fill_path(before))? {
+        apply(&mut rows, fill);
+    }
+    Ok(rows
+        .blocks
+        .last()
+        .filter(|block| block.number.saturating_add(1) == chunk.from)
+        .and_then(Parent::of_row))
 }
 
 /// What the RPC is asked for `rows`' missing header fields and source hashes: a block lacking
@@ -639,6 +666,8 @@ struct Work {
     fetch_rate: Rate,
     /// The first fetch that failed for good.
     failure: Option<String>,
+    /// Without an endpoint: the first chunk whose fields rebuilt from L1 do not hash.
+    unhashing: Option<String>,
 }
 
 impl Work {
@@ -661,6 +690,7 @@ impl Work {
             scan_rate: Rate::new(),
             fetch_rate: Rate::new(),
             failure: None,
+            unhashing: None,
         }
     }
 
@@ -698,13 +728,8 @@ impl Work {
         let blocks = u64::try_from(instead.blocks()).unwrap_or(u64::MAX);
         self.unrebuilt_blocks = self.unrebuilt_blocks.saturating_add(blocks);
         if !self.keep {
-            self.failure.get_or_insert_with(|| {
-                format!(
-                    "blocks {}..{}: the fields rebuilt from L1 do not hash ({why}); give \
-                     --rpc-endpoint to fetch them",
-                    chunk.from, chunk.to
-                )
-            });
+            self.unhashing
+                .get_or_insert_with(|| format!("blocks {}..{}: {why}", chunk.from, chunk.to));
             return;
         }
         warn!(
@@ -761,6 +786,12 @@ impl Work {
                 "fetching from {} failed: {failure}; run `download` again, or give another \
                  endpoint with --rpc-endpoint",
                 rpc.map_or("the RPC endpoint", Rpc::url)
+            );
+        }
+        if let Some(unhashing) = self.unhashing {
+            eyre::bail!(
+                "the fields rebuilt from L1 do not hash, so none of that chunk's were written: \
+                 {unhashing}. Give --rpc-endpoint to fetch them instead"
             );
         }
         eyre::ensure!(
