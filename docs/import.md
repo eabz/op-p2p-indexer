@@ -197,11 +197,61 @@ any.
   filled and hole transactions added) in `verify`'s; each hole is also a
   `block`/`transactions` line of the missing-field report.
 - Not done: asking HyperSync again for a hole's chunk before using the RPC; the RPC answer is
-  proven the same way. And, if the endpoint is too slow for Base's millions of headers, the
-  header fields could be derived instead of fetched: `mix_hash` and the parent beacon block
-  root from the L1 origin's header (from L1's HyperSync), the base fee from EIP-1559 with the
-  chain's parameters, the withdrawals root and the blob gas fields as their constants; the
-  header hash would prove them the same way. Not built.
+  proven the same way.
+
+**Header fields rebuilt from L1** (`--headers-from l1`, the default;
+`OP_INDEXER_IMPORT_HEADERS_FROM`; `rpc` fetches them all as above). Reading Base's millions of
+headers from a public endpoint takes days, while each missing field follows from what the
+download and L1 have (`bin/op-indexer-import/src/fill/derive.rs`):
+
+- **`mix_hash`** is the L1 origin's `mix_hash` (`prevrandao`), and from Ecotone on the **parent
+  beacon block root** is the L1 origin's own `parent_beacon_block_root`. The L1 origin is named
+  by the block's L1-attributes deposit (its first transaction): its number at bytes 28..36 of
+  the calldata and its hash at 100..132, the same bytes in the Bedrock form (ABI words) and in
+  the packed forms of Ecotone, Isthmus and later. The L1 header read for that number must have
+  that hash. L1 headers come from L1's HyperSync (`--l1-endpoint`, the API token's), a span of
+  at least 10,000 L1 blocks per request (about a week of L2 blocks), paged and retried like
+  the rest.
+- **The base fee** follows from the parent's by EIP-1559: the gas target is the gas limit over
+  the elasticity (6), the change at most one denominator-th per block (50, and 250 from Canyon:
+  `ChainSpec::eip1559`), and from Holocene on with the elasticity and denominator in the
+  parent's `extraData`. Computed in block order across chunks, from the block before the run's
+  first (the chunk read before it, or, when that chunk is sealed and gone, that one header
+  from the RPC). Not from Jovian on (its minimum base fee and data footprint are not rebuilt):
+  those blocks go to the RPC.
+- **The withdrawals root** from Canyon is the empty trie's root until Isthmus; from Isthmus it
+  is the message passer's storage root, which cannot be rebuilt (RPC). **The blob gas used**
+  and **the excess blob gas** from Ecotone are zero (the blob gas used until Jovian, which makes
+  it the data availability footprint: RPC).
+- **Checked before written.** The chunks are read in parallel and rebuilt in block order. A
+  chunk's rebuilt fields are kept in memory while the chunk is rebuilt whole, as `verify` does,
+  with them on top of its fill (on every core, within the same 256 MiB bound); only if every
+  block hashes are they written to the fill. If a block does not hash, the chunk's headers are
+  fetched from the RPC instead; without an endpoint the run stops naming the chunk and the
+  block. Nothing unchecked is written, so a stopped run leaves nothing behind that would hide
+  a missing field from the next scan. A chunk that needs the RPC for anything else (a block
+  whose field cannot be rebuilt, as above, an L1 origin not found, a list, a hole) has all its
+  header fields fetched with it.
+- **One base fee leads to the next**: a stretch without base fees is rebuilt from the block
+  before it, block after block, so a block that cannot be rebuilt (or one wrong, caught by its
+  chunk's check) leaves the rest of its chunk to the RPC; the next chunk starts again from a
+  parent read from the RPC.
+- **Counted**: `l1_rebuilt_headers` and `l1_rebuilt_not_hashing` in `download`'s summary.
+- **Checked against Base**, 2026-10-05, from its public endpoint and an L1 one (not through the
+  importer): blocks 1.04 M (Bedrock deposit, denominator 50), 11.5 M (Canyon, empty-trie
+  withdrawals root), 12.52 M (Ecotone deposit, parent beacon block root, blob gas zero) and
+  30 M (Holocene `extraData`): every field as rebuilt here, every L1 origin hash matching.
+- **Run through the importer**, 2026-10-05, on OP Mainnet blocks 140,000,063 to 140,000,162
+  (Isthmus deposits, Holocene base fees) with `mix_hash`, the base fee and the parent beacon
+  block root taken out of all 100 header rows, and L1 HyperSync replaced by a local stub
+  answering with the 16 L1 headers recorded from a public L1 endpoint (this machine may not
+  call HyperSync): one L1 request, 100 headers rebuilt and all hashing, the fill pass 0.49 s
+  with its check (one RPC call: the first block's parent), `verify` accepted the chunk. With one
+  recorded L1 `mix_hash` corrupted, the check caught block 140,000,090 and the chunk's headers
+  were fetched from the RPC instead (3.3 s), then `verify` accepted it; without an endpoint the
+  run stopped with the message. Not run: against L1 HyperSync itself, on Base's own rows, a
+  Bedrock-form or pre-Holocene chunk through the importer (the rules for those are the ones
+  checked against Base above), or from Jovian on.
 
 Checked on 2026-10-04, offline but for the endpoint: a chunk of block 16,068,511 built from
 the endpoint's block and receipts in HyperSync's row format, without `authorization_list`.
@@ -376,7 +426,8 @@ machine: `cargo build --release -p op-indexer-import` produces one file to copy.
   `_LAST_BLOCK`, `_ANCHOR_HASH`, `_LEGACY_ONLY`), the chunk size
   (`OP_INDEXER_IMPORT_CHUNK_BLOCKS`), requests in flight (`OP_INDEXER_IMPORT_REQUESTS`), the
   RPC's batch size and requests in flight (`OP_INDEXER_IMPORT_RPC_BATCH`,
-  `OP_INDEXER_IMPORT_RPC_REQUESTS`; section 3.1a), and for `verify`: `--to-dir`, the bucket and its keys (`OP_INDEXER_R2_ACCOUNT_ID`,
+  `OP_INDEXER_IMPORT_RPC_REQUESTS`; section 3.1a), where missing header fields come from
+  (`OP_INDEXER_IMPORT_HEADERS_FROM`, `l1` or `rpc`), and for `verify`: `--to-dir`, the bucket and its keys (`OP_INDEXER_R2_ACCOUNT_ID`,
   `OP_INDEXER_R2_BUCKET`, `OP_INDEXER_R2_PREFIX`, `OP_INDEXER_R2_ACCESS_KEY_ID`,
   `OP_INDEXER_R2_SECRET_ACCESS_KEY`, `OP_INDEXER_R2_ENDPOINT`; section 3.2), its threads
   (`--threads`, `OP_INDEXER_IMPORT_VERIFY_THREADS`, one per CPU) and its uploads (`--uploads`,
@@ -635,12 +686,13 @@ What differs (`docs/base.md`):
   621), created with `createWithInitData`, whose extra data starts with the L2 block number and
   whose root claim is that block's output root, read through the chain spec's claim formats
   like the other types.
-- **Header fields from the RPC.** HyperSync's Base rows lack `mix_hash` and the base fee in
-  large stretches before block 13.5 M (section 3.1a), so `download` fetches millions of
-  headers. The endpoint defaults to `https://mainnet.base.org`; at the defaults
-  (`--rpc-batch 10 --rpc-requests 4`) a public endpoint gives tens to a hundred-odd blocks a
-  second, so hours to days for millions; a provider of your own with larger batches and more
-  requests is much faster. Two public ones work: `https://mainnet.base.org` (Base's own; it has no `eth_getBlockReceipts`, so a hole's
+- **Header fields.** HyperSync's Base rows lack `mix_hash` and the base fee in large stretches
+  before block 13.5 M (section 3.1a). By default `download` rebuilds them from L1 (one
+  HyperSync request per 10,000 L1 blocks, and `verify`'s own work to check them); with
+  `--headers-from rpc` it fetches them, which at the defaults (`--rpc-batch 10 --rpc-requests
+  4`) gives tens to a hundred-odd blocks a second from a public endpoint, so hours to days for
+  millions. The endpoint (for what L1 cannot give, and the fallback) defaults to
+  `https://mainnet.base.org`. Two public ones work: `https://mainnet.base.org` (Base's own; it has no `eth_getBlockReceipts`, so a hole's
   receipts are read one by one, and it limits the rate with an error in the answer, which is
   waited out like HTTP 429) and `https://base.drpc.org` (has it).
 - **Size.** The archive was estimated at 2 to 3.5 TB (`docs/base.md` section 6). The download

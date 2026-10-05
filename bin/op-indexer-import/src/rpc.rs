@@ -52,7 +52,7 @@ pub(crate) struct Wanted {
 
 /// The header fields of a block the service may leave out, in the RPC's form; each absent
 /// where the block's fork has none.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RpcHeader {
     pub(crate) number: U64,
@@ -71,6 +71,36 @@ pub(crate) struct RpcHeader {
     pub(crate) excess_blob_gas: Option<U64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) parent_beacon_block_root: Option<B256>,
+    /// What a child's base fee is computed from (`fill`'s rebuild from L1); not kept in the
+    /// fill.
+    #[serde(default, skip_serializing)]
+    pub(crate) timestamp: Option<U64>,
+    #[serde(default, skip_serializing)]
+    pub(crate) gas_limit: Option<U64>,
+    #[serde(default, skip_serializing)]
+    pub(crate) gas_used: Option<U64>,
+    #[serde(default, skip_serializing)]
+    pub(crate) extra_data: Option<Bytes>,
+}
+
+impl RpcHeader {
+    /// A header of block `number` with none of the fields: the rebuild from L1 fills them.
+    pub(crate) fn new(number: u64) -> Self {
+        Self {
+            number: U64::from(number),
+            hash: B256::ZERO,
+            mix_hash: None,
+            base_fee_per_gas: None,
+            withdrawals_root: None,
+            blob_gas_used: None,
+            excess_blob_gas: None,
+            parent_beacon_block_root: None,
+            timestamp: None,
+            gas_limit: None,
+            gas_used: None,
+            extra_data: None,
+        }
+    }
 }
 
 /// A whole block's transactions and receipts, in the RPC's form: the parts the rebuild reads.

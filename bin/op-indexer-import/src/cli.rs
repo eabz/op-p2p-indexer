@@ -158,6 +158,17 @@ pub(crate) struct DownloadArgs {
     /// (8453); none for OP Mainnet, whose rows need none so far].
     #[arg(long, env = "OP_INDEXER_IMPORT_RPC_ENDPOINT")]
     pub(crate) rpc_endpoint: Option<String>,
+    /// Where the header fields the archive service left out come from: `l1` rebuilds them from
+    /// the L1 origin's header (read from `--l1-endpoint`, a span of blocks per request) and
+    /// the parent's base fee, and fetches from `--rpc-endpoint` only what it cannot rebuild or
+    /// what does not hash; `rpc` fetches them all from `--rpc-endpoint`.
+    #[arg(
+        long,
+        env = "OP_INDEXER_IMPORT_HEADERS_FROM",
+        value_enum,
+        default_value_t = HeadersFrom::L1
+    )]
+    pub(crate) headers_from: HeadersFrom,
     /// Calls per request to `--rpc-endpoint`, as one JSON-RPC batch. Public endpoints cap it
     /// (Unichain's at 10); a provider of your own may take more.
     #[arg(
@@ -212,6 +223,15 @@ impl DownloadArgs {
             .parse()
             .map_err(|err| eyre!("{DEPRECATED_API_TOKEN_VAR}: {err}"))
     }
+}
+
+/// Where `download` takes the header fields the archive service left out from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum HeadersFrom {
+    /// Rebuilt from L1 and the parent block, the RPC for the rest.
+    L1,
+    /// Fetched from the chain's RPC.
+    Rpc,
 }
 
 /// Settings of `run`: those of every step.

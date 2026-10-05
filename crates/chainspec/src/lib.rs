@@ -100,11 +100,35 @@ pub struct ChainSpec {
     pub last_legacy_hash: Option<B256>,
     /// Seconds between two blocks from Bedrock on.
     pub block_time_secs: u64,
+    /// The base fee's EIP-1559 parameters until Holocene, from which a block's `extraData`
+    /// carries them.
+    pub eip1559: Eip1559,
     /// The chain's `DisputeGameFactory` on L1, whose games claim the chain's output roots.
     pub dispute_game_factory: Address,
     /// The claim format of each game type the chain's factory creates.
     games: &'static [(u32, ClaimFormat)],
 }
+
+/// The EIP-1559 parameters of an OP Stack chain's base fee: the gas target is the gas limit
+/// over `elasticity`, and the base fee moves by at most one `denominator`-th per block
+/// (`denominator_canyon` from Canyon on).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Eip1559 {
+    /// Gas limit over gas target.
+    pub elasticity: u64,
+    /// Inverse of the largest change per block, before Canyon.
+    pub denominator: u64,
+    /// The same from Canyon on.
+    pub denominator_canyon: u64,
+}
+
+/// The Superchain registry's EIP-1559 parameters, which OP Mainnet, Unichain and Base use
+/// (checked for Base on 2026-10-05 against its headers at blocks 1.04 M and 11.5 M).
+const SUPERCHAIN_EIP1559: Eip1559 = Eip1559 {
+    elasticity: 6,
+    denominator: 50,
+    denominator_canyon: 250,
+};
 
 /// op-node's default bootnodes, shared by every Superchain chain: discovery is one network,
 /// and peers are filtered by their `opstack` ENR entry. All are resolved and added at once, so
@@ -165,6 +189,7 @@ pub const OP_MAINNET: ChainSpec = ChainSpec {
         "0x21a168dfa5e727926063a28ba16fd5ee84c814e847c81a699c7a0ea551e4ca50"
     )),
     block_time_secs: 2,
+    eip1559: SUPERCHAIN_EIP1559,
     // `DisputeGameFactoryProxy` in `superchain/configs/mainnet/op.toml` of the registry.
     dispute_game_factory: address!("0xe5965Ab5962eDc7477C8520243A95517CD252fA9"),
     games: OP_STACK_GAMES,
@@ -208,6 +233,7 @@ pub const UNICHAIN: ChainSpec = ChainSpec {
     bedrock_time: UNICHAIN_GENESIS_TIME,
     last_legacy_hash: None,
     block_time_secs: 1,
+    eip1559: SUPERCHAIN_EIP1559,
     // `DisputeGameFactoryProxy`. Its games are super games (type 9, the portal's respected
     // type), whose super root holds an entry for chain id 130.
     dispute_game_factory: address!("0x2F12d621a16e2d3285929C9996f478508951dFe4"),
@@ -259,6 +285,7 @@ pub const BASE: ChainSpec = ChainSpec {
     bedrock_time: BASE_GENESIS_TIME,
     last_legacy_hash: None,
     block_time_secs: 2,
+    eip1559: SUPERCHAIN_EIP1559,
     // `DisputeGameFactoryProxy` in `base.toml`, unchanged on Base's contract page
     // (<https://docs.base.org/specifications/reference/base-contracts>).
     dispute_game_factory: address!("0x43edB88C4B80fDD2AdFF2412A7BebF9dF42cB40e"),
@@ -328,6 +355,12 @@ impl ChainSpec {
     #[must_use]
     pub const fn ecotone_time(&self) -> u64 {
         self.activation_or_never(Hardfork::Ecotone)
+    }
+
+    /// Activation time of Holocene ([`Hardfork::Holocene`]).
+    #[must_use]
+    pub const fn holocene_time(&self) -> u64 {
+        self.activation_or_never(Hardfork::Holocene)
     }
 
     /// Activation time of Isthmus ([`Hardfork::Isthmus`]).

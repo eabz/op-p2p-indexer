@@ -46,7 +46,7 @@ pub(crate) use self::fields::{Missing, holes, missing};
 pub(crate) use self::lists::encode_access_list;
 use crate::cli::VerifyArgs;
 use crate::rows::RowsError;
-use crate::state::{MIN_SPACE_BYTES, Plan, State, covered};
+use crate::state::{Chunk, MIN_SPACE_BYTES, Plan, State, covered};
 
 /// Compressed size of the downloaded chunks `verify` (and `fill`) reads at once, whatever the
 /// number of threads; one chunk is always allowed. A chunk takes about twenty times its
@@ -172,6 +172,21 @@ impl Stats {
             .rpc_filled_transactions
             .saturating_add(other.rpc_filled_transactions);
     }
+}
+
+/// Rebuilds the downloaded chunk at `raw` with its fill at `fill` and then `overlay` as
+/// `verify` does, and says why it does not rebuild to its hashes, if it does not: `fill`'s
+/// check of the header fields it rebuilt, before it writes them. Blocking, CPU-bound.
+pub(crate) fn rebuild_error(
+    forks: &Forks,
+    chunk: Chunk,
+    raw: &std::path::Path,
+    fill: &std::path::Path,
+    overlay: crate::fill::Fill,
+) -> Option<String> {
+    block::verify_chunk(forks, chunk, raw, fill, Some(overlay))
+        .err()
+        .map(|err| err.to_string())
 }
 
 /// Verifies, seals and uploads the blocks of `plan` the store does not list yet, then, once

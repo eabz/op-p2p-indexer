@@ -29,6 +29,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::mpsc;
 
+use crate::backoff::Backoff;
 use crate::cli::Secret;
 use crate::game::{L1Log, LogFilter};
 use crate::rows::{L1TransactionRow, LogRow};
@@ -529,6 +530,102 @@ impl HyperSync {
             from = answer.next_block;
         }
     }
+}
+
+/// An L1 block header's fields an L2 header takes from its L1 origin.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub(crate) struct L1Header {
+    pub(crate) number: u64,
+    pub(crate) hash: B256,
+    /// `prevrandao` since the Merge: an L2 block's `mix_hash`.
+    pub(crate) mix_hash: Option<B256>,
+    /// From Dencun on: an L2 block's own from Ecotone on.
+    pub(crate) parent_beacon_block_root: Option<B256>,
+}
+
+/// The L1 chain's endpoint: block headers, for the L2 header fields the archive service left
+/// out (`fill`'s derivation).
+impl HyperSync {
+    /// Returns the headers of blocks `from..to` (`to` excluded), in block order, following the
+    /// service's pages; fewer if the service does not have them all yet. Retries what may
+    /// pass, with the importer's backoff.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SourceError::Lookup`], naming the request, once a page fails for good.
+    pub(crate) async fn l1_headers(
+        &self,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<L1Header>, SourceError> {
+        let mut headers = Vec::new();
+        let mut next = from;
+        while next < to {
+            let query = json!({
+                "from_block": next,
+                "to_block": to,
+                "include_all_blocks": true,
+                "field_selection": {
+                    "block": ["number", "hash", "mix_hash", "parent_beacon_block_root"],
+                },
+            });
+            let answer = self
+                .retried(&query)
+                .await
+                .map_err(|err| SourceError::Lookup {
+                    request: format!("POST {} {query}", self.query_url),
+                    source: Box::new(err),
+                })?;
+            headers.extend(answer.data.into_iter().flat_map(|batch| batch.blocks));
+            if answer.next_block <= next {
+                break;
+            }
+            next = answer.next_block;
+        }
+        headers.sort_unstable_by_key(|header| header.number);
+        headers.dedup_by_key(|header| header.number);
+        Ok(headers)
+    }
+
+    /// Sends `query` until it is answered, retrying what may pass.
+    async fn retried(&self, query: &serde_json::Value) -> Result<L1HeaderAnswer, SourceError> {
+        let (mut backoff, mut limited) = (Backoff::new(), Backoff::rate_limited());
+        loop {
+            let answer = async {
+                let body = self.query(query).await?;
+                serde_json::from_slice::<L1HeaderAnswer>(&body)
+                    .map_err(|err| SourceError::Malformed(err.to_string()))
+            };
+            let err = match answer.await {
+                Ok(answer) => return Ok(answer),
+                Err(err) => err,
+            };
+            let wait = if matches!(err, SourceError::RateLimited) {
+                limited.next()
+            } else if err.is_retryable() {
+                backoff.next()
+            } else {
+                return Err(err);
+            };
+            let Some(wait) = wait else {
+                return Err(err);
+            };
+            tokio::time::sleep(wait).await;
+        }
+    }
+}
+
+/// An answer to an L1 header query.
+#[derive(Debug, Deserialize)]
+struct L1HeaderAnswer {
+    data: Vec<L1HeaderBatch>,
+    next_block: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct L1HeaderBatch {
+    #[serde(default)]
+    blocks: Vec<L1Header>,
 }
 
 /// The answer to the height request.

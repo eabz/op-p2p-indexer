@@ -33,13 +33,14 @@ use crate::fill::{self, Fill};
 use crate::rows::{self, BlockRow, LogRow, TransactionRow};
 use crate::state::{Chunk, read_json};
 
-/// Verifies the downloaded chunk at `raw`, with what its fill at `fill` holds, and returns its
-/// blocks as verified, in block order. Blocking, CPU-bound.
+/// Verifies the downloaded chunk at `raw`, with what its fill at `fill` holds and then
+/// `overlay`, and returns its blocks as verified, in block order. Blocking, CPU-bound.
 pub(super) fn verify_chunk(
     forks: &Forks,
     chunk: Chunk,
     raw: &Path,
     fill: &Path,
+    overlay: Option<Fill>,
 ) -> Result<(Stats, Vec<ArchivedBlock>), ChunkError> {
     let mut rows = rows::read(raw).map_err(|source| ChunkError::Rows {
         from: chunk.from,
@@ -49,6 +50,10 @@ pub(super) fn verify_chunk(
     let mut stats = Stats::default();
     if let Some(fill) = read_json::<Fill>(fill).map_err(ChunkError::Fill)? {
         stats.rpc_filled_transactions = fill::apply(&mut rows, fill);
+    }
+    // What `fill` checks before writing it.
+    if let Some(overlay) = overlay {
+        fill::apply(&mut rows, overlay);
     }
     let mut block_rows = rows.blocks.iter().peekable();
     let mut transactions = rows.transactions.as_slice();

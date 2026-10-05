@@ -44,7 +44,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::time::ChronoUtc;
 
-use crate::cli::{Cli, Command, DownloadArgs, Secret};
+use crate::cli::{Cli, Command, DownloadArgs, HeadersFrom, Secret};
 use crate::rpc::Rpc;
 use crate::source::HyperSync;
 use crate::state::{Anchor, Plan, State};
@@ -262,15 +262,13 @@ async fn download(
     let rpc = rpc_endpoint.map(|url| Rpc::new(url, batch)).transpose()?;
     let rpc_requests =
         usize::try_from(args.rpc_requests).wrap_err("--rpc-requests is too large")?;
-    fill::run(
-        state,
-        &plan,
-        rpc.as_ref(),
-        rpc_requests,
-        threads(None),
-        cancel,
-    )
-    .await?;
+    // Header fields rebuilt from L1, the RPC for the rest, unless asked otherwise.
+    let l1 = match args.headers_from {
+        HeadersFrom::L1 => Some(HyperSync::new(&args.l1_endpoint, &api_token)?),
+        HeadersFrom::Rpc => None,
+    };
+    let (rpc, l1) = (rpc.as_ref(), l1.as_ref());
+    fill::run(state, &plan, rpc, l1, rpc_requests, threads(None), cancel).await?;
     Ok(plan)
 }
 
