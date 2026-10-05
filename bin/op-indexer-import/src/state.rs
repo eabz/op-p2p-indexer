@@ -6,6 +6,7 @@
 //! <state>/raw/<from>-<to>.fill.json     fields the service left out, from the chain's RPC (`fill`)
 //! <state>/sealed/<first>-<last>.json    a sealed chunk `verify` uploaded: its manifest entry
 //! <state>/index-build/                  the hash index being built (`verify`)
+//! <state>/rebuild-parent.json           the block `download`'s rebuild from L1 left off at
 //! <state>/lock                          held by the one process working on the directory
 //! ```
 //!
@@ -35,6 +36,10 @@ use crate::game::GameAnchor;
 /// Version of the state directory's layout and file formats. A directory written with another
 /// version is refused.
 const LAYOUT_VERSION: u32 = 1;
+
+/// The block `download`'s rebuild from L1 left off at (`fill`): what the next base fee is
+/// computed from.
+const PARENT_FILE: &str = "rebuild-parent.json";
 
 /// Free space below which a step warns with its progress.
 pub(crate) const LOW_SPACE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
@@ -271,6 +276,30 @@ impl State {
     /// As [`Self::read_sealed`].
     pub(crate) fn sealed_through(&self) -> io::Result<Option<u64>> {
         Ok(self.read_sealed()?.last().map(|entry| entry.last))
+    }
+
+    /// Reads the block `download`'s rebuild from L1 left off at, for the next base fee;
+    /// `None` if none is kept. Blocking.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidData` if the file is damaged, and the I/O error of reading it.
+    pub(crate) fn read_parent<T: DeserializeOwned>(&self) -> io::Result<Option<T>> {
+        read_json(&self.root.join(PARENT_FILE))
+    }
+
+    /// Keeps the block the rebuild from L1 left off at. Written after every chunk, so not
+    /// synced: one lost to a crash is one that no longer follows, and the rebuild then reads
+    /// that parent from the RPC or leaves the base fee to it. Blocking.
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error of writing the file.
+    pub(crate) fn write_parent(&self, parent: &impl Serialize) -> io::Result<()> {
+        let path = self.root.join(PARENT_FILE);
+        let temporary = path.with_extension("tmp");
+        fs::write(&temporary, serde_json::to_vec(parent)?)?;
+        fs::rename(&temporary, path)
     }
 
     /// Records that the sealed chunk `entry` is uploaded, durably. Blocking.

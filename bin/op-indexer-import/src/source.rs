@@ -18,7 +18,7 @@ use std::io::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256};
 use bytes::Bytes;
 use reqwest::header::{
     ACCEPT_ENCODING as ACCEPT_ENCODING_HEADER, AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE,
@@ -543,30 +543,55 @@ pub(crate) struct L1Header {
     pub(crate) parent_beacon_block_root: Option<B256>,
 }
 
-/// The L1 chain's endpoint: block headers, for the L2 header fields the archive service left
-/// out (`fill`'s derivation).
+/// `keccak256("TransactionDeposited(address,address,uint256,bytes)")`: the `OptimismPortal`'s
+/// event of a user deposit.
+const DEPOSIT_EVENT: B256 =
+    alloy_primitives::b256!("0xb3813568d9991fc951961fcb4c784893574240a28925604d09fc577c55bb7c32");
+
+/// A user deposit on L1: its block and its log's index in the block.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub(crate) struct DepositLog {
+    pub(crate) block_number: u64,
+    pub(crate) log_index: u64,
+}
+
+/// What a span of L1 gives the L2 header fields and deposits the archive service left out.
+#[derive(Debug, Default)]
+pub(crate) struct L1Span {
+    /// The headers, in block order.
+    pub(crate) headers: Vec<L1Header>,
+    /// The `TransactionDeposited` logs of the chain's portal, in block and log order.
+    pub(crate) deposits: Vec<DepositLog>,
+}
+
+/// The L1 chain's endpoint: block headers and the portal's deposit logs, for what the archive
+/// service left out of L2 rows (`fill`'s rebuild from L1).
 impl HyperSync {
-    /// Returns the headers of blocks `from..to` (`to` excluded), in block order, following the
-    /// service's pages; fewer if the service does not have them all yet. Retries what may
-    /// pass, with the importer's backoff.
+    /// Returns the headers of blocks `from..to` (`to` excluded) and the `TransactionDeposited`
+    /// logs of `portal` in them, in one query per page, following the service's pages; fewer
+    /// if the service does not have them all yet. Retries what may pass, with the importer's
+    /// backoff.
     ///
     /// # Errors
     ///
     /// Returns [`SourceError::Lookup`], naming the request, once a page fails for good.
-    pub(crate) async fn l1_headers(
+    pub(crate) async fn l1_span(
         &self,
         from: u64,
         to: u64,
-    ) -> Result<Vec<L1Header>, SourceError> {
-        let mut headers = Vec::new();
+        portal: Address,
+    ) -> Result<L1Span, SourceError> {
+        let mut span = L1Span::default();
         let mut next = from;
         while next < to {
             let query = json!({
                 "from_block": next,
                 "to_block": to,
                 "include_all_blocks": true,
+                "logs": [{ "address": [portal], "topics": [[DEPOSIT_EVENT]] }],
                 "field_selection": {
                     "block": ["number", "hash", "mix_hash", "parent_beacon_block_root"],
+                    "log": ["block_number", "log_index"],
                 },
             });
             let answer = self
@@ -576,15 +601,22 @@ impl HyperSync {
                     request: format!("POST {} {query}", self.query_url),
                     source: Box::new(err),
                 })?;
-            headers.extend(answer.data.into_iter().flat_map(|batch| batch.blocks));
+            for batch in answer.data {
+                span.headers.extend(batch.blocks);
+                span.deposits.extend(batch.logs);
+            }
             if answer.next_block <= next {
                 break;
             }
             next = answer.next_block;
         }
-        headers.sort_unstable_by_key(|header| header.number);
-        headers.dedup_by_key(|header| header.number);
-        Ok(headers)
+        span.headers.sort_unstable_by_key(|header| header.number);
+        span.headers.dedup_by_key(|header| header.number);
+        span.deposits
+            .sort_unstable_by_key(|log| (log.block_number, log.log_index));
+        span.deposits
+            .dedup_by_key(|log| (log.block_number, log.log_index));
+        Ok(span)
     }
 
     /// Sends `query` until it is answered, retrying what may pass.
@@ -626,6 +658,8 @@ struct L1HeaderAnswer {
 struct L1HeaderBatch {
     #[serde(default)]
     blocks: Vec<L1Header>,
+    #[serde(default)]
+    logs: Vec<DepositLog>,
 }
 
 /// The answer to the height request.

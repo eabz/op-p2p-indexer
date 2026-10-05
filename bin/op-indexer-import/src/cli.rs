@@ -158,17 +158,18 @@ pub(crate) struct DownloadArgs {
     /// (8453); none for OP Mainnet, whose rows need none so far].
     #[arg(long, env = "OP_INDEXER_IMPORT_RPC_ENDPOINT")]
     pub(crate) rpc_endpoint: Option<String>,
-    /// Where the header fields the archive service left out come from: `l1` rebuilds them from
-    /// the L1 origin's header (read from `--l1-endpoint`, a span of blocks per request) and
-    /// the parent's base fee, and fetches from `--rpc-endpoint` only what it cannot rebuild or
-    /// what does not hash; `rpc` fetches them all from `--rpc-endpoint`.
+    /// Where the header fields and deposit source hashes the archive service left out come
+    /// from: `l1` rebuilds them from L1 (the L1 origins' headers and the portal's deposit logs,
+    /// read from `--l1-endpoint`, a span of blocks per query) and the parent block's base fee,
+    /// and uses an RPC only when `--rpc-endpoint` is given, for what it cannot rebuild or what
+    /// does not hash; `rpc` fetches them all from the RPC (by default the chain's public one).
     #[arg(
         long,
-        env = "OP_INDEXER_IMPORT_HEADERS_FROM",
+        env = "OP_INDEXER_IMPORT_FILL_FROM",
         value_enum,
-        default_value_t = HeadersFrom::L1
+        default_value_t = FillFrom::L1
     )]
-    pub(crate) headers_from: HeadersFrom,
+    pub(crate) fill_from: FillFrom,
     /// Calls per request to `--rpc-endpoint`, as one JSON-RPC batch. Public endpoints cap it
     /// (Unichain's at 10); a provider of your own may take more.
     #[arg(
@@ -225,10 +226,11 @@ impl DownloadArgs {
     }
 }
 
-/// Where `download` takes the header fields the archive service left out from.
+/// Where `download` takes the header fields and source hashes the archive service left out
+/// from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub(crate) enum HeadersFrom {
-    /// Rebuilt from L1 and the parent block, the RPC for the rest.
+pub(crate) enum FillFrom {
+    /// Rebuilt from L1 and the parent block; an RPC only if one is given.
     L1,
     /// Fetched from the chain's RPC.
     Rpc,

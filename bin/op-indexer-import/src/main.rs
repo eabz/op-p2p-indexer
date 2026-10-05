@@ -44,7 +44,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::time::ChronoUtc;
 
-use crate::cli::{Cli, Command, DownloadArgs, HeadersFrom, Secret};
+use crate::cli::{Cli, Command, DownloadArgs, FillFrom, Secret};
 use crate::rpc::Rpc;
 use crate::source::HyperSync;
 use crate::state::{Anchor, Plan, State};
@@ -254,18 +254,23 @@ async fn download(
     download::ensure_open_files(args.requests)?;
     download::run(&source, state, &plan, requests, cancel).await?;
     // What the service left out of the rows, from the chain's RPC.
-    let rpc_endpoint = args
-        .rpc_endpoint
-        .as_deref()
-        .or_else(|| rpc::default_endpoint(plan.chain.chain_id));
+    // Rebuilding from L1, an RPC is used only if one is given: the chain's public one is no
+    // fallback to count on.
+    let rpc_endpoint = match args.fill_from {
+        FillFrom::L1 => args.rpc_endpoint.as_deref(),
+        FillFrom::Rpc => args
+            .rpc_endpoint
+            .as_deref()
+            .or_else(|| rpc::default_endpoint(plan.chain.chain_id)),
+    };
     let batch = usize::try_from(args.rpc_batch).wrap_err("--rpc-batch is too large")?;
     let rpc = rpc_endpoint.map(|url| Rpc::new(url, batch)).transpose()?;
     let rpc_requests =
         usize::try_from(args.rpc_requests).wrap_err("--rpc-requests is too large")?;
-    // Header fields rebuilt from L1, the RPC for the rest, unless asked otherwise.
-    let l1 = match args.headers_from {
-        HeadersFrom::L1 => Some(HyperSync::new(&args.l1_endpoint, &api_token)?),
-        HeadersFrom::Rpc => None,
+    // What the rows lack, rebuilt from L1 unless asked otherwise.
+    let l1 = match args.fill_from {
+        FillFrom::L1 => Some(HyperSync::new(&args.l1_endpoint, &api_token)?),
+        FillFrom::Rpc => None,
     };
     let (rpc, l1) = (rpc.as_ref(), l1.as_ref());
     fill::run(state, &plan, rpc, l1, rpc_requests, threads(None), cancel).await?;

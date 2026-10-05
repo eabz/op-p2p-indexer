@@ -105,6 +105,9 @@ pub struct ChainSpec {
     pub eip1559: Eip1559,
     /// The chain's `DisputeGameFactory` on L1, whose games claim the chain's output roots.
     pub dispute_game_factory: Address,
+    /// The chain's `OptimismPortal` on L1, whose `TransactionDeposited` logs are the chain's
+    /// user deposits.
+    pub optimism_portal: Address,
     /// The claim format of each game type the chain's factory creates.
     games: &'static [(u32, ClaimFormat)],
 }
@@ -192,6 +195,8 @@ pub const OP_MAINNET: ChainSpec = ChainSpec {
     eip1559: SUPERCHAIN_EIP1559,
     // `DisputeGameFactoryProxy` in `superchain/configs/mainnet/op.toml` of the registry.
     dispute_game_factory: address!("0xe5965Ab5962eDc7477C8520243A95517CD252fA9"),
+    // Checked 2026-10-05: the source hashes of blocks 140,000,144 and 140,000,162.
+    optimism_portal: address!("0xbEb5Fc579115071764c7423A4f12eDde41f106Ed"),
     games: OP_STACK_GAMES,
 };
 
@@ -237,6 +242,8 @@ pub const UNICHAIN: ChainSpec = ChainSpec {
     // `DisputeGameFactoryProxy`. Its games are super games (type 9, the portal's respected
     // type), whose super root holds an entry for chain id 130.
     dispute_game_factory: address!("0x2F12d621a16e2d3285929C9996f478508951dFe4"),
+    // From the Superchain registry; not checked against Unichain's deposits.
+    optimism_portal: address!("0x0bd48f6B86a26D3a217d0Fa6FfE2B491B956A7a2"),
     games: OP_STACK_GAMES,
 };
 
@@ -289,6 +296,8 @@ pub const BASE: ChainSpec = ChainSpec {
     // `DisputeGameFactoryProxy` in `base.toml`, unchanged on Base's contract page
     // (<https://docs.base.org/specifications/reference/base-contracts>).
     dispute_game_factory: address!("0x43edB88C4B80fDD2AdFF2412A7BebF9dF42cB40e"),
+    // Checked 2026-10-05: the source hashes of blocks 11,500,013 and 11,500,037.
+    optimism_portal: address!("0x49048044D57e1C92A77f79988d21Fa8fAF74E97e"),
     games: BASE_GAMES,
 };
 

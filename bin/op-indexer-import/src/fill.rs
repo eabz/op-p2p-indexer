@@ -49,7 +49,7 @@ use tokio::time::{MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use self::derive::{HeaderRow, L1Headers, Parent};
+use self::derive::{HeaderRow, L1Data, L1Info, Parent};
 use crate::progress::{self, Rate};
 use crate::rows::{self, LogRow, Rows, TransactionRow};
 use crate::rpc::{FilledBlock, Rpc, RpcHeader, Wanted};
@@ -75,13 +75,34 @@ pub(crate) struct Fill {
 }
 
 impl Fill {
-    /// A fill of `headers` only: the header fields rebuilt from L1, checked on top of the
-    /// chunk's fill before they are added to it.
-    pub(crate) fn of_headers(headers: Vec<RpcHeader>) -> Self {
+    /// A fill of what was rebuilt from L1: checked on top of the chunk's fill before it is
+    /// added to it ([`Self::add`]).
+    fn rebuilt(headers: Vec<RpcHeader>, sources: &[derive::Source]) -> Self {
         Self {
             headers,
+            sources: sources
+                .iter()
+                .map(|source| FilledSource {
+                    block_number: source.number,
+                    transaction_index: source.index,
+                    source_hash: source.hash,
+                })
+                .collect(),
             ..Self::default()
         }
+    }
+
+    /// Adds what `other` holds of header fields and source hashes, replacing what it held for
+    /// the same blocks and deposits.
+    fn add(&mut self, other: Self) {
+        self.put_headers(other.headers);
+        self.sources.retain(|kept| {
+            other.sources.iter().all(|new| {
+                (new.block_number, new.transaction_index)
+                    != (kept.block_number, kept.transaction_index)
+            })
+        });
+        self.sources.extend(other.sources);
     }
 
     /// Adds `headers`, replacing what it held for the same blocks: a header fetched again (one
@@ -95,7 +116,7 @@ impl Fill {
 }
 
 /// One deposit's source hash.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct FilledSource {
     block_number: u64,
     transaction_index: u64,
@@ -301,7 +322,7 @@ pub(crate) async fn run(
     info!(
         chunks = chunks.len(),
         threads,
-        headers_from = if l1.is_some() { "l1" } else { "rpc" },
+        fill_from = if l1.is_some() { "l1" } else { "rpc" },
         endpoint = rpc.map(Rpc::url),
         rpc_batch = rpc.map(Rpc::batch_calls),
         rpc_requests = requests,
@@ -316,7 +337,7 @@ pub(crate) async fn run(
     // those read early wait here for the one before.
     let mut order: VecDeque<u64> = chunks.iter().map(|(chunk, _)| chunk.from).collect();
     let mut ready: BTreeMap<u64, (Chunk, u64, Scanned)> = BTreeMap::new();
-    let mut rebuilding = l1.map(|l1| Rebuilding::new(l1, rpc, plan.chain));
+    let mut rebuilding = Rebuilding::start(state, l1, rpc, plan.chain).await?;
     let mut queue = chunks.into_iter().peekable();
     let (mut scans, mut fetches) = (JoinSet::new(), JoinSet::new());
     let mut checks: JoinSet<Check> = JoinSet::new();
@@ -403,29 +424,24 @@ pub(crate) async fn run(
     work.finish(rpc, plan, cancel)
 }
 
-/// A running check of a chunk's rebuilt header fields: the chunk, its downloaded bytes (in
-/// flight while it runs), the blocks rebuilt, their headers, and why they do not hash, if so.
-type Check = (
-    Chunk,
-    u64,
-    Vec<BlockNumHash>,
-    Vec<RpcHeader>,
-    Option<String>,
-);
+/// A running check of what was rebuilt of a chunk: the chunk, its downloaded bytes (in
+/// flight while it runs), the rebuilt fill, what to fetch instead if it does not hash, and why
+/// it does not, if so.
+type Check = (Chunk, u64, Fill, Fetch, Option<String>);
 
-/// Takes a finished check: writes the rebuilt fields if every block hashes, else has them
-/// fetched. Returns the chunk's downloaded bytes, no longer in flight.
+/// Takes a finished check: writes the rebuilt fill if every block hashes, else has the chunk's
+/// fields fetched. Returns the chunk's downloaded bytes, no longer in flight.
 fn take_check(state: &State, work: &mut Work, check: Check) -> eyre::Result<u64> {
-    let (chunk, bytes, blocks, headers, why) = check;
+    let (chunk, bytes, rebuilt, instead, why) = check;
     match why {
         // Every block hashes: only now are the fields written.
         None => {
             let path = state.fill_path(chunk);
-            work.rebuilt(headers.len());
-            tokio::task::block_in_place(|| add_headers(&path, headers))
+            work.rebuilt(rebuilt.headers.len(), rebuilt.sources.len());
+            tokio::task::block_in_place(|| add_rebuilt(&path, rebuilt))
                 .wrap_err_with(|| format!("failed to write {}", path.display()))?;
         }
-        Some(why) => work.unrebuilt(chunk, blocks, &why),
+        Some(why) => work.unrebuilt(chunk, instead, &why),
     }
     Ok(bytes)
 }
@@ -451,14 +467,18 @@ impl Ordered<'_, '_> {
         {
             self.order.pop_front();
             if let Some(rebuilding) = self.rebuilding.as_deref_mut()
-                && let Some((blocks, headers)) = rebuilding.chunk(&mut found).await?
+                && let Some((rebuilt, instead)) = rebuilding.chunk(state, &mut found, work).await?
             {
                 *self.in_flight_bytes = self.in_flight_bytes.saturating_add(bytes);
                 let (raw, fill) = (state.raw_path(chunk), state.fill_path(chunk));
                 self.checks.spawn_blocking(move || {
-                    let overlay = Fill::of_headers(headers.clone());
+                    let overlay = Fill {
+                        headers: rebuilt.headers.clone(),
+                        sources: rebuilt.sources.clone(),
+                        ..Fill::default()
+                    };
                     let why = crate::verify::rebuild_error(&forks, chunk, &raw, &fill, overlay);
-                    (chunk, bytes, blocks, headers, why)
+                    (chunk, bytes, rebuilt, instead, why)
                 });
             }
             work.scanned(chunk, found);
@@ -467,43 +487,56 @@ impl Ordered<'_, '_> {
     }
 }
 
-/// The rebuild of header fields from L1, chunk after chunk in block order.
+/// The rebuild from L1, chunk after chunk in block order.
 struct Rebuilding<'a> {
     l1: &'a HyperSync,
-    /// For the parent of a run's first block, whose chunk is sealed: one header.
+    /// For the parent of a run's first block when it is not kept: one header.
     rpc: Option<&'a Rpc>,
     chain: &'static op_indexer_chainspec::ChainSpec,
-    headers: L1Headers,
-    /// The block before the next chunk's first, for its base fee.
+    data: L1Data,
+    /// The block before the next chunk's first, for its base fee; kept in the state directory
+    /// after each chunk, for the next run.
     parent: Option<Parent>,
 }
 
 impl<'a> Rebuilding<'a> {
-    fn new(
-        l1: &'a HyperSync,
+    /// Starts from the parent block the last run kept, if any; `None` without `l1`, when
+    /// nothing is rebuilt.
+    async fn start(
+        state: &State,
+        l1: Option<&'a HyperSync>,
         rpc: Option<&'a Rpc>,
         chain: &'static op_indexer_chainspec::ChainSpec,
-    ) -> Self {
-        Self {
+    ) -> eyre::Result<Option<Self>> {
+        let Some(l1) = l1 else {
+            return Ok(None);
+        };
+        let parent = {
+            let state = state.clone();
+            tokio::task::spawn_blocking(move || state.read_parent::<Parent>()).await??
+        };
+        Ok(Some(Self {
             l1,
             rpc,
             chain,
-            headers: L1Headers::default(),
-            parent: None,
-        }
+            data: L1Data::default(),
+            parent,
+        }))
     }
 
-    /// Rebuilds the header fields the rows of `found` lack, and returns the blocks rebuilt with
-    /// their headers, to check before they are written; or lists them all in `found`'s fetch
-    /// when a block cannot be rebuilt or the chunk needs the RPC for anything else.
+    /// Rebuilds what the rows of `found` lack, and returns it as a fill, to check before it is
+    /// written, with what to fetch instead if it does not hash; or, when a block cannot be
+    /// rebuilt (counted in `work`) or the chunk needs the RPC for anything else, lists it all in
+    /// `found`'s fetch.
     async fn chunk(
         &mut self,
+        state: &State,
         found: &mut Scanned,
-    ) -> eyre::Result<Option<(Vec<BlockNumHash>, Vec<RpcHeader>)>> {
+        work: &mut Work,
+    ) -> eyre::Result<Option<(Fill, Fetch)>> {
         let rows = std::mem::take(&mut found.header_rows);
         // The first block lacking its base fee needs its parent's: the chunk before, read
-        // earlier in this run, or, when that one is sealed and gone (or after a gap), the parent
-        // from the RPC.
+        // earlier in this run or kept by the last; else, with an endpoint, read from it.
         if let Some(first) = rows.first()
             && first.lacks.contains(&"base_fee_per_gas")
             && self
@@ -520,35 +553,62 @@ impl<'a> Rebuilding<'a> {
             self.parent = headers.first().and_then(Parent::of);
         }
         if let Some((first, last)) = derive::l1_range(&rows) {
-            self.headers
-                .read(self.l1, first, last)
+            self.data
+                .read(self.l1, self.chain, first, last)
                 .await
-                .wrap_err("failed to read L1 headers for the L2 header fields to rebuild")?;
+                .wrap_err("failed to read L1 headers and deposits for the fields to rebuild")?;
         }
-        let rebuilt = derive::rebuild(self.chain, &rows, &self.headers, &mut self.parent);
-        if rebuilt.headers.is_empty() && rebuilt.left.is_empty() {
+        let rebuilt = derive::rebuild(self.chain, &rows, &self.data, &mut self.parent);
+        if let Some(parent) = &self.parent {
+            let parent = parent.clone();
+            tokio::task::block_in_place(|| state.write_parent(&parent))
+                .wrap_err("failed to keep the parent block for the next run")?;
+        }
+        if rebuilt.blocks.is_empty() && rebuilt.left.is_empty() {
             return Ok(None);
         }
+        for (block, field) in &rebuilt.left {
+            work.unrebuildable(field, block.number);
+        }
+        // What the RPC would be asked for this chunk's rebuilt and unrebuilt blocks.
+        let instead = rpc_fetch(&rows);
         // A chunk the RPC is read for anyway (a block not rebuilt, a list, a hole) has all its
-        // header fields read from it: what is rebuilt is only used once checked whole.
-        found.fetch.headers.extend(rebuilt.left);
-        if !found.fetch.is_empty() {
-            found.fetch.headers.extend(rebuilt.blocks);
-            found
-                .fetch
-                .headers
-                .sort_unstable_by_key(|block| block.number);
+        // fields read from it: what is rebuilt is only used once checked whole.
+        if !rebuilt.left.is_empty() || !found.fetch.is_empty() {
+            found.fetch.headers.extend(instead.headers);
+            found.fetch.sources.extend(instead.sources);
             return Ok(None);
         }
-        Ok(Some((rebuilt.blocks, rebuilt.headers)))
+        Ok(Some((
+            Fill::rebuilt(rebuilt.headers, &rebuilt.sources),
+            instead,
+        )))
     }
 }
 
-/// Adds `headers` to the fill at `path`, replacing what it held for the same blocks.
-/// Blocking.
-fn add_headers(path: &Path, headers: Vec<RpcHeader>) -> io::Result<()> {
+/// What the RPC is asked for `rows`' missing header fields and source hashes: a block lacking
+/// source hashes is read with its transactions, which bring its header fields too.
+fn rpc_fetch(rows: &[HeaderRow]) -> Fetch {
+    let mut fetch = Fetch::default();
+    for row in rows {
+        let block = BlockNumHash::new(row.number, row.hash);
+        if !row.lacking_sources.is_empty() {
+            fetch.sources.push(Wanted {
+                number: row.number,
+                hash: row.hash,
+                indexes: row.lacking_sources.clone(),
+            });
+        } else if !row.lacks.is_empty() {
+            fetch.headers.push(block);
+        }
+    }
+    fetch
+}
+
+/// Adds the checked `rebuilt` fill to the fill at `path`. Blocking.
+fn add_rebuilt(path: &Path, rebuilt: Fill) -> io::Result<()> {
     let mut fill = read_json::<Fill>(path)?.unwrap_or_default();
-    fill.put_headers(headers);
+    fill.add(rebuilt);
     write_json(path, &fill)
 }
 
@@ -571,7 +631,10 @@ struct Work {
     filled_headers: u64,
     /// Header rows rebuilt from L1, and those of them that did not hash, fetched instead.
     rebuilt_headers: u64,
-    unrebuilt_headers: u64,
+    rebuilt_sources: u64,
+    unrebuilt_blocks: u64,
+    /// The fields that cannot be rebuilt from L1: how many blocks, and the first.
+    unrebuildable: BTreeMap<&'static str, (u64, u64)>,
     scan_rate: Rate,
     fetch_rate: Rate,
     /// The first fetch that failed for good.
@@ -592,7 +655,9 @@ impl Work {
             filled_transactions: 0,
             filled_headers: 0,
             rebuilt_headers: 0,
-            unrebuilt_headers: 0,
+            rebuilt_sources: 0,
+            unrebuilt_blocks: 0,
+            unrebuildable: BTreeMap::new(),
             scan_rate: Rate::new(),
             fetch_rate: Rate::new(),
             failure: None,
@@ -613,23 +678,29 @@ impl Work {
         }
     }
 
-    /// Counts `count` headers rebuilt from L1, checked and written.
-    fn rebuilt(&mut self, count: usize) {
-        self.rebuilt_headers = self
-            .rebuilt_headers
-            .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+    /// Counts headers and source hashes rebuilt from L1, checked and written.
+    fn rebuilt(&mut self, headers: usize, sources: usize) {
+        let count = |count: usize| u64::try_from(count).unwrap_or(u64::MAX);
+        self.rebuilt_headers = self.rebuilt_headers.saturating_add(count(headers));
+        self.rebuilt_sources = self.rebuilt_sources.saturating_add(count(sources));
     }
 
-    /// Takes the headers of `chunk` rebuilt from L1 (`rebuilt`) that do not hash (`why`): they
-    /// are fetched instead, if there is an endpoint; nothing of them was written.
-    fn unrebuilt(&mut self, chunk: Chunk, rebuilt: Vec<BlockNumHash>, why: &str) {
-        self.unrebuilt_headers = self
-            .unrebuilt_headers
-            .saturating_add(u64::try_from(rebuilt.len()).unwrap_or(u64::MAX));
+    /// Counts a block whose `field` cannot be rebuilt from L1.
+    fn unrebuildable(&mut self, field: &'static str, block: u64) {
+        let entry = self.unrebuildable.entry(field).or_insert((0, block));
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = entry.1.min(block);
+    }
+
+    /// Takes what was rebuilt of `chunk` that does not hash (`why`): `instead` is fetched, if
+    /// there is an endpoint; nothing rebuilt was written.
+    fn unrebuilt(&mut self, chunk: Chunk, instead: Fetch, why: &str) {
+        let blocks = u64::try_from(instead.blocks()).unwrap_or(u64::MAX);
+        self.unrebuilt_blocks = self.unrebuilt_blocks.saturating_add(blocks);
         if !self.keep {
             self.failure.get_or_insert_with(|| {
                 format!(
-                    "blocks {}..{}: the header fields rebuilt from L1 do not hash ({why}): give \
+                    "blocks {}..{}: the fields rebuilt from L1 do not hash ({why}); give \
                      --rpc-endpoint to fetch them",
                     chunk.from, chunk.to
                 )
@@ -640,15 +711,10 @@ impl Work {
             from = chunk.from,
             to = chunk.to,
             %why,
-            "header fields rebuilt from L1 do not hash: fetching them from the RPC"
+            "fields rebuilt from L1 do not hash: fetching them from the RPC"
         );
-        let fetch = Fetch {
-            headers: rebuilt,
-            ..Fetch::default()
-        };
-        let blocks = u64::try_from(fetch.blocks()).unwrap_or(u64::MAX);
         self.queued_blocks = self.queued_blocks.saturating_add(blocks);
-        self.to_fetch.push_back((chunk, fetch));
+        self.to_fetch.push_back((chunk, instead));
     }
 
     fn fetched(&mut self, fetched: Fetched) {
@@ -702,6 +768,17 @@ impl Work {
             "stopped while checking the downloaded rows: run `download` again, which goes on \
              where it stopped"
         );
+        if rpc.is_none() && !self.unrebuildable.is_empty() {
+            let fields: Vec<String> = self
+                .unrebuildable
+                .iter()
+                .map(|(field, (count, first))| format!("{field} ({count} blocks from {first})"))
+                .collect();
+            eyre::bail!(
+                "these fields cannot be rebuilt from L1: {}; give --rpc-endpoint to fetch them",
+                fields.join(", ")
+            );
+        }
         if rpc.is_none() && self.queued_blocks > 0 {
             eyre::bail!(
                 "the archive service left out what {} block reads need (authorization lists, \
@@ -725,7 +802,8 @@ impl Work {
             rpc_filled_transactions = self.filled_transactions,
             rpc_filled_headers = self.filled_headers,
             l1_rebuilt_headers = self.rebuilt_headers,
-            l1_rebuilt_not_hashing = self.unrebuilt_headers,
+            l1_rebuilt_sources = self.rebuilt_sources,
+            l1_rebuilt_not_hashing = self.unrebuilt_blocks,
             "downloaded rows checked"
         );
         for (field, (count, first_block)) in &self.lacking {
@@ -755,10 +833,11 @@ fn to_scan(state: &State, plan: &Plan) -> io::Result<Vec<(Chunk, u64)>> {
     Ok(chunks)
 }
 
-/// Every block's header row as the rebuild from L1 reads it, with the fields `lacking` lists
-/// for it (block by block, in block order).
+/// Every block's rows as the rebuild from L1 reads them, with the header fields `lacking`
+/// lists for it (block by block, in block order) and its deposits.
 fn header_rows(rows: &Rows, lacking: Vec<(u64, Vec<&'static str>)>) -> Vec<HeaderRow> {
     let mut lacking = lacking.into_iter().peekable();
+    let mut transactions = rows.transactions.as_slice();
     rows.blocks
         .iter()
         .map(|block| {
@@ -766,20 +845,34 @@ fn header_rows(rows: &Rows, lacking: Vec<(u64, Vec<&'static str>)>) -> Vec<Heade
                 .next_if(|(number, _)| *number == block.number)
                 .map(|(_, fields)| fields)
                 .unwrap_or_default();
-            // The L1-attributes deposit is the block's first transaction.
-            let from_l1 = lacks
+            // Transactions come in block order; a block's deposits are its first ones.
+            while transactions
+                .first()
+                .is_some_and(|tx| tx.block_number < block.number)
+            {
+                transactions = transactions.get(1..).unwrap_or_default();
+            }
+            let count = transactions
                 .iter()
-                .any(|field| matches!(*field, "mix_hash" | "parent_beacon_block_root"));
-            let l1_origin = from_l1
-                .then(|| {
-                    let at = rows
-                        .transactions
-                        .binary_search_by_key(&(block.number, 0), |tx| {
-                            (tx.block_number, tx.transaction_index)
-                        })
-                        .ok()?;
-                    derive::l1_origin(&rows.transactions.get(at)?.input)
-                })
+                .take_while(|tx| tx.block_number == block.number)
+                .count();
+            let (own, rest) = transactions.split_at(count);
+            transactions = rest;
+            let deposits: Vec<_> = own
+                .iter()
+                .take_while(|tx| tx.kind == Some(op_alloy_consensus::DEPOSIT_TX_TYPE_ID))
+                .collect();
+            let lacking_sources: Vec<u64> = deposits
+                .iter()
+                .filter(|tx| tx.source_hash.is_none())
+                .map(|tx| tx.transaction_index)
+                .collect();
+            let from_l1 = !lacking_sources.is_empty()
+                || lacks
+                    .iter()
+                    .any(|field| matches!(*field, "mix_hash" | "parent_beacon_block_root"));
+            let l1_info = from_l1
+                .then(|| L1Info::of(&deposits.first()?.input))
                 .flatten();
             HeaderRow {
                 number: block.number,
@@ -791,15 +884,17 @@ fn header_rows(rows: &Rows, lacking: Vec<(u64, Vec<&'static str>)>) -> Vec<Heade
                 base_fee: block.base_fee_per_gas.map(|fee| fee.to()),
                 extra_data: block.extra_data.clone(),
                 lacks,
-                l1_origin,
+                l1_info,
+                deposits: u64::try_from(deposits.len()).unwrap_or(u64::MAX),
+                lacking_sources,
             }
         })
         .collect()
 }
 
 /// Reads one downloaded chunk with its fill and lists what its rows lack. Blocking.
-/// With `rebuild`, the header rows are kept for the rebuild from L1 and no header is listed to
-/// fetch: the rebuild decides.
+/// With `rebuild`, the rows are kept for the rebuild from L1 and no header field or source
+/// hash is listed to fetch: the rebuild decides.
 fn scan(forks: &Forks, raw: &Path, fill: &Path, rebuild: bool) -> eyre::Result<Scanned> {
     let mut rows = rows::read(raw)?;
     if let Some(fill) = read_json(fill)? {
@@ -833,9 +928,12 @@ fn scan(forks: &Forks, raw: &Path, fill: &Path, rebuild: bool) -> eyre::Result<S
         .map(|block| BlockNumHash::new(block.number, block.hash))
         .collect();
     scanned.fetch.wanted = wanted(&rows, TransactionRow::lacks_authorization_list);
-    scanned.fetch.sources = wanted(&rows, |tx| {
-        tx.kind == Some(op_alloy_consensus::DEPOSIT_TX_TYPE_ID) && tx.source_hash.is_none()
-    });
+    // With the rebuild from L1, it decides what the RPC is asked for.
+    if !rebuild {
+        scanned.fetch.sources = wanted(&rows, |tx| {
+            tx.kind == Some(op_alloy_consensus::DEPOSIT_TX_TYPE_ID) && tx.source_hash.is_none()
+        });
+    }
     // A block read with its transactions for its deposits brings its header fields too.
     scanned.fetch.headers.retain(|header| {
         scanned
