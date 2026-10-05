@@ -29,6 +29,6 @@ pub use bootnode::{Bootnode, BootnodeError};
 pub use config::NetworkConfig;
 pub use discovery::DiscoveryError;
 pub use gossip::GossipError;
-pub use network::{Network, NetworkError};
+pub use network::{GossipServed, Network, NetworkError};
 pub use store::{NodeStore, StoreError};
 pub use sync::{BlockFuture, PayloadSource};

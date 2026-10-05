@@ -488,7 +488,14 @@ heartbeat:
   the execution network; sessions with L1 execution peers and the beacon light client's
   peers, unset without the L1 side. Read from what the node's networks publish as they run
   (`NodeView::peers`), nothing polled. For the status log only (6.3): routing does not use
-  them.
+  them;
+- served in the last minute: blocks relayed on the consensus gossip (`blocks_forwarded`) and
+  served there by number (`payloads_served`); on the chain's execution network the requests
+  answered with blocks (headers, bodies, receipts), the items sent and the peers served,
+  unset without the execution network. Each network counts as it serves and its own
+  per-minute line (`consensus peers`, `serving execution peers`) publishes the minute
+  (`NodeView::served`); [citizenship.md](citizenship.md), "Seeing the duties done", ties
+  each count to the duty it shows. For the status log only.
 
 The table holds no chunk ranges (corrected by the user, 2026-10-04): every server is stateless
 and reads the same bucket, so every server serves every sealed chunk. The balancer reads the
@@ -497,8 +504,8 @@ manifest itself, once per refresh (every 30 s), only for the chunk boundaries.
 ### 6.2 Registration
 
 A server opens a `Register` stream to the balancer and sends a heartbeat every 5 s with its
-health, heads, contiguity, load, stream limits and peers. Three missed heartbeats (15 s) mark
-it down and remove it.
+health, heads, contiguity, load, stream limits, peers and what it served. Three missed
+heartbeats (15 s) mark it down and remove it.
 
 ### 6.3 Health and failover
 
@@ -516,7 +523,9 @@ it down and remove it.
   last block received.
 - Every 30 s the balancer logs one `server status` line per server: its heads,
   `contiguous_through` and how far that is behind the newest head any server has, requests in
-  flight, bytes per second, Flight streams and subscriptions as `taken/max`, and its peers. It
+  flight, bytes per second, Flight streams and subscriptions as `taken/max`, its peers, and
+  what it served in the last minute (blocks forwarded, payloads served, execution requests,
+  items and peers served). It
   is a warning when the server is unhealthy, more than 64 blocks behind, or has had no consensus
   peer or no execution session for more than a minute: gossip, or receipts and gap fill, have
   stalled. `no server registered` is a warning too.

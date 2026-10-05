@@ -17,9 +17,11 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use eyre::WrapErr;
-use op_indexer_balancer::register::{HEARTBEAT_INTERVAL, PeerReport, Report, SlotReport};
+use op_indexer_balancer::register::{
+    HEARTBEAT_INTERVAL, PeerReport, Report, ServedReport, SlotReport,
+};
 use op_indexer_chunks::ChunkStore;
-use op_indexer_node::{Config, NodeView, PeerCounts, Task};
+use op_indexer_node::{Config, NodeServed, NodeView, PeerCounts, Task};
 use op_indexer_server::{ChunkSource, Exporter, R2Archive, R2Chunks};
 use op_indexer_storage::ArchiveStore;
 use op_indexer_storage::archive_store::FjallArchive;
@@ -165,6 +167,7 @@ async fn report<S: ChunkSource>(
             bytes_per_second,
             peers: peer_report(view.peers()),
             slots: slot_report(view),
+            served: served_report(view.served()),
         });
     }
 }
@@ -184,6 +187,18 @@ fn slot_report(view: &NodeView) -> SlotReport {
         flights_in_use: Some(count(flights.in_use)),
         max_subscriptions: Some(count(subscriptions.max)),
         subscriptions_in_use: Some(count(subscriptions.in_use)),
+    }
+}
+
+/// What the node served the networks in the last minute, as the heartbeat carries it.
+fn served_report(served: NodeServed) -> ServedReport {
+    let execution = served.execution;
+    ServedReport {
+        blocks_forwarded: Some(served.consensus.blocks_forwarded),
+        payloads_served: Some(served.consensus.payloads_served),
+        execution_requests_served: execution.map(|execution| execution.requests()),
+        execution_items_served: execution.map(|execution| execution.items),
+        execution_peers_served: execution.map(|execution| execution.peers),
     }
 }
 

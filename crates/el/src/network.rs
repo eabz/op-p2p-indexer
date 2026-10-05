@@ -23,7 +23,7 @@ use tracing::{Instrument, info_span};
 use crate::ElError;
 use crate::discovery::Discovery;
 use crate::peers::{PeerSet, Peers, Report};
-use crate::serve::{self, Serving};
+use crate::serve::{self, ExecutionServed, Serving};
 use crate::session::{self, SessionContext, SessionHandle, unix_now};
 
 /// Discovered peers waiting for the peer set. Discovery repeats what does not fit.
@@ -238,6 +238,13 @@ impl PeerNetwork {
             published,
         };
         Ok((network, peers))
+    }
+
+    /// What this node served on the network in the last minute ([`ExecutionServed`]), kept
+    /// current while it runs: on a network it does not serve, the requests it refused.
+    #[must_use]
+    pub fn serving(&self) -> watch::Receiver<ExecutionServed> {
+        self.ctx.serve_counters().subscribe()
     }
 
     /// Runs discovery, the listener and the peer set until `cancel` fires.

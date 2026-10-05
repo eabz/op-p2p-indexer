@@ -11,7 +11,7 @@ use op_indexer_primitives::BlockRef;
 use reth_eth_wire_types::{BlockRangeUpdate, EthVersion};
 use tokio::sync::{mpsc, watch};
 
-use super::{HeldRange, MAX_ITEMS, Request, ServeKind, response, response_id};
+use super::{HeldRange, MAX_ITEMS, Request, ServeCounters, ServeKind, response, response_id};
 use crate::wire;
 
 /// Requests answered from the provider per peer per [`RATE_WINDOW`]; further ones get an empty
@@ -61,12 +61,19 @@ pub(crate) struct Serving {
     pub(super) range: watch::Receiver<Option<HeldRange>>,
     /// Whether anything answers requests: `false` for a network the node only asks.
     pub(super) enabled: bool,
+    /// What was served, counted by the sessions and the server.
+    pub(super) counters: ServeCounters,
 }
 
 impl Serving {
     /// Whether this node serves blocks on this network.
     pub(crate) const fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// What was served on this network.
+    pub(crate) const fn counters(&self) -> &ServeCounters {
+        &self.counters
     }
 
     /// The serving side of one new session, and the channel its answers arrive on. `tip`
@@ -91,6 +98,8 @@ impl Serving {
             advertised_at: now,
             window_start: now,
             window_requests: 0,
+            counters: self.counters.clone(),
+            counted: None,
         };
         session.advertised = session.range();
         (session, answers_rx)
@@ -127,6 +136,9 @@ pub(crate) struct SessionServing {
     window_start: Instant,
     /// Requests handed to the server since `window_start`.
     window_requests: u32,
+    counters: ServeCounters,
+    /// The minute of [`ServeCounters`] this peer was last counted in as served.
+    counted: Option<u64>,
 }
 
 impl SessionServing {
@@ -167,19 +179,18 @@ impl SessionServing {
         let Some(request_id) = wire::request_id(body) else {
             return Handled::NotARequest;
         };
-        let empty = || Handled::Now(response(response_id, request_id, &[]));
         let Some(kind) = kind else {
-            return empty();
+            return self.refuse(response_id, request_id);
         };
         if body.len() > MAX_REQUEST_BYTES {
-            return empty();
+            return self.refuse(response_id, request_id);
         }
         if !self.within_rate() {
-            return empty();
+            return self.refuse(response_id, request_id);
         }
         // No free place means the peer already has its share of requests being answered.
         let Ok(answer) = self.answers.clone().try_reserve_owned() else {
-            return empty();
+            return self.refuse(response_id, request_id);
         };
         let request = Request {
             kind,
@@ -189,11 +200,18 @@ impl SessionServing {
             body: Bytes::copy_from_slice(body),
             answer,
         };
-        // Full: the server is behind. Closed: it has stopped.
+        // Full: the server is behind. Closed: it has stopped, or nothing serves.
         if self.requests.try_send(request).is_err() {
-            return empty();
+            return self.refuse(response_id, request_id);
         }
+        self.counters.taken(&mut self.counted);
         Handled::Later
+    }
+
+    /// An empty answer without a read, counted as refused.
+    fn refuse(&self, response_id: u8, request_id: u64) -> Handled {
+        self.counters.refused();
+        Handled::Now(response(response_id, request_id, &[]))
     }
 
     /// The `BlockRangeUpdate` to send now, if the range to advertise changed since the peer was

@@ -72,6 +72,16 @@ message Heartbeat {
   optional uint32 flights_in_use = 18;
   optional uint32 max_subscriptions = 19;
   optional uint32 subscriptions_in_use = 20;
+  // What it gave the networks in the last minute, for the balancer's status log: blocks
+  // relayed on the consensus gossip and served there by number (`payload_by_number`); and on
+  // the chain's execution network the requests answered with blocks (headers, bodies,
+  // receipts), the items sent and the peers served, unset without the execution network.
+  // Unset all, from a server built before they were sent.
+  optional uint32 blocks_forwarded = 21;
+  optional uint32 payloads_served = 22;
+  optional uint32 execution_requests_served = 23;
+  optional uint32 execution_items_served = 24;
+  optional uint32 execution_peers_served = 25;
 }
 
 // The balancer took the registration.

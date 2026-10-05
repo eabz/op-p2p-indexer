@@ -9,6 +9,24 @@ Status: **yes** (built and run against real peers), **built** (compiled, not yet
 peers), **no** (not built), **n/a** (does not apply to a node without state or a mempool, with the
 reason).
 
+## Seeing the duties done
+
+Every node (`indexer` and `server`) logs, once a minute, what it gave each network since the
+last line: counts kept as they happen (plain counters in the swarm task, atomics elsewhere; no
+lock on a hot path), so a duty marked built can be watched being met. A `server` also sends the
+main totals in its heartbeat, and the balancer shows them on each server's `server status`
+line ([serving.md](serving.md) §6.1).
+
+| Counter | Line | Duty it shows (row below) |
+|---|---|---|
+| `blocks_accepted`, `blocks_forwarded`, with `mesh` | `consensus peers` | Validate before relaying, relay what is accepted: a block is forwarded when gossipsub still holds it at acceptance, to the mesh peers that do not have it (how many is gossipsub's, not counted) |
+| `payloads_served`, `payloads_refused` | `consensus peers` | Serve `payload_by_number`: answered with a block, or without (throttled, not held, outside the range, the peer left) |
+| `inbound`, `new_inbound`, `outbound` | `consensus peers` | Be dialable: other nodes reach this one |
+| `discv5_contactable`, `discv5_inbound_per_s`, `discv5_sessions` | `consensus peers` | Advertise a public address / be findable: discv5's own view, shared by every discv5 node of the process (consensus, execution, L1), so not per network |
+| `headers`, `bodies`, `receipts`, `items`, `bytes`, `peers_served` | `serving execution peers` (span `el{network=op}`, the chain's) | Serve headers, bodies and receipts of the canonical chain; serve the recent chain |
+| `empty` | `serving execution peers` | Serve every block or announce the range: asked for blocks not held, answered empty |
+| `refused` | `serving execution peers` | Accept inbound sessions and serve them, within the per-peer limits; on L1 (span `el{network=l1}`), answer every request with empty results |
+
 ## OP Stack consensus layer (libp2p: discv5, gossipsub, req/resp)
 
 Spec: [Rollup node P2P](https://specs.optimism.io/protocol/rollup-node-p2p.html) (sections below

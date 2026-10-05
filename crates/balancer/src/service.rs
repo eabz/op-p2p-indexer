@@ -23,7 +23,7 @@ use tracing::{debug, info, warn};
 
 use crate::proto::balancer_server;
 use crate::proto::{Heartbeat, LocateRequest, LocateResponse, Registered};
-use crate::register::{HEARTBEAT_INTERVAL, PeerReport, SlotReport, is_valid_address};
+use crate::register::{HEARTBEAT_INTERVAL, PeerReport, ServedReport, SlotReport, is_valid_address};
 use crate::table::{Server, Slot, Table};
 
 /// A server is down once no heartbeat came for this long: three missed (6.3).
@@ -198,6 +198,11 @@ fn checked(chain: &ChainSpec, heartbeat: Heartbeat) -> Result<(String, Server), 
         flights_in_use,
         max_subscriptions,
         subscriptions_in_use,
+        blocks_forwarded,
+        payloads_served,
+        execution_requests_served,
+        execution_items_served,
+        execution_peers_served,
     } = heartbeat;
     if chain_id != chain.chain_id {
         return Err(Status::failed_precondition(other_chain(chain, chain_id)));
@@ -231,6 +236,13 @@ fn checked(chain: &ChainSpec, heartbeat: Heartbeat) -> Result<(String, Server), 
             flights_in_use,
             max_subscriptions,
             subscriptions_in_use,
+        },
+        served: ServedReport {
+            blocks_forwarded,
+            payloads_served,
+            execution_requests_served,
+            execution_items_served,
+            execution_peers_served,
         },
         peerless_since: None,
     };

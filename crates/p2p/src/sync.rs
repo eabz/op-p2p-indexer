@@ -175,6 +175,11 @@ fn quota((per_second, burst): (u32, u32)) -> Quota {
 /// A rate limiter per peer.
 type PeerLimiter = RateLimiter<PeerId, HashMapStateStore<PeerId>, DefaultClock>;
 
+/// Whether `response` carries a block.
+pub(crate) fn is_success(response: &[u8]) -> bool {
+    response.first() == Some(&SUCCESS)
+}
+
 /// The answer to a request that could not wait for the rate limits.
 pub(crate) fn throttled() -> Vec<u8> {
     vec![UNKNOWN]

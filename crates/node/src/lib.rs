@@ -45,8 +45,8 @@ use tracing::{debug, info, warn};
 
 pub use crate::config::Config;
 use crate::config::{ElSettings, L1Settings, NODE_DIR};
-pub use crate::peers::PeerCounts;
 use crate::peers::PeerSources;
+pub use crate::peers::{NodeServed, PeerCounts};
 use crate::provider::{NodeProvider, RangeEnd};
 
 /// Unsafe blocks waiting for the pipeline. Blocks arrive every 2 s on OP Mainnet and every
@@ -141,6 +141,13 @@ impl NodeView {
     #[must_use]
     pub fn peers(&self) -> PeerCounts {
         self.peers.counts()
+    }
+
+    /// What the node served each network in the last minute, as each network's last status
+    /// line counted it. Cheap, as [`Self::peers`].
+    #[must_use]
+    pub fn served(&self) -> NodeServed {
+        self.peers.served()
     }
 
     /// The highest block N such that the node holds every block from `archive`'s first

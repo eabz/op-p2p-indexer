@@ -15,7 +15,7 @@ use std::time::Instant;
 use alloy_primitives::BlockNumber;
 use op_indexer_stream::ticket::Cap;
 
-use crate::register::{PeerReport, SlotReport};
+use crate::register::{PeerReport, ServedReport, SlotReport};
 
 /// Picks so far, so ties between equally loaded servers go round-robin across requests.
 static TURN: AtomicUsize = AtomicUsize::new(0);
@@ -36,6 +36,8 @@ pub(crate) struct Server {
     pub(crate) bytes_per_second: u64,
     pub(crate) peers: PeerReport,
     pub(crate) slots: SlotReport,
+    /// What it served the networks in the last minute.
+    pub(crate) served: ServedReport,
     /// Since when it has reported no consensus peer or no execution session, by the
     /// heartbeats; `None` while it has both. Kept by the [`Table`].
     pub(crate) peerless_since: Option<Instant>,

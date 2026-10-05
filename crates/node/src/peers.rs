@@ -1,13 +1,14 @@
-//! How many peers the node's networks have now, for the binary's tasks (the server's heartbeat
-//! to its balancer).
+//! How many peers the node's networks have now, and what it served them in the last minute,
+//! for the binary's tasks (the server's heartbeat to its balancer).
 //!
 //! Read from what each network already publishes as it runs (the consensus swarm's count of
-//! gossip peers, the execution networks' open sessions, the beacon swarm's count of peers):
-//! nothing is polled, and a read is a few loads.
+//! gossip peers and its last status line's tally, the execution networks' open sessions and
+//! their last serving line, the beacon swarm's count of peers): nothing is polled, and a read
+//! is a few loads.
 
-use op_indexer_el::{BlockProvider, ExecutionNetwork, Peers, SessionCounts};
+use op_indexer_el::{BlockProvider, ExecutionNetwork, ExecutionServed, Peers, SessionCounts};
 use op_indexer_l1::{L1Network, LightClient};
-use op_indexer_p2p::Network;
+use op_indexer_p2p::{GossipServed, Network};
 use tokio::sync::watch;
 
 /// The peers of each network, as of one read ([`NodeView::peers`](crate::NodeView::peers)).
@@ -23,6 +24,16 @@ pub struct PeerCounts {
     pub beacon: Option<usize>,
 }
 
+/// What the node served each network in the last minute, as of one read
+/// ([`NodeView::served`](crate::NodeView::served)).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NodeServed {
+    /// The consensus network: blocks relayed and served by number.
+    pub consensus: GossipServed,
+    /// The chain's execution network; `None` without it.
+    pub execution: Option<ExecutionServed>,
+}
+
 /// Where the counts are read from: one handle per network that runs.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PeerSources {
@@ -30,6 +41,8 @@ pub(crate) struct PeerSources {
     execution: Option<Peers>,
     l1: Option<Peers>,
     beacon: Option<watch::Receiver<usize>>,
+    consensus_served: Option<watch::Receiver<GossipServed>>,
+    execution_served: Option<watch::Receiver<ExecutionServed>>,
 }
 
 impl PeerSources {
@@ -44,6 +57,8 @@ impl PeerSources {
             execution: execution.map(ExecutionNetwork::peers),
             l1: l1.map(|(network, _)| network.peers()),
             beacon: l1.map(|(_, light_client)| light_client.peer_count()),
+            consensus_served: Some(consensus.served()),
+            execution_served: execution.map(ExecutionNetwork::serving),
         }
     }
 
@@ -54,6 +69,21 @@ impl PeerSources {
             execution: self.execution.as_ref().map(Peers::session_counts),
             l1_execution: self.l1.as_ref().map(|l1| l1.session_counts().total),
             beacon: self.beacon.as_ref().map(|beacon| *beacon.borrow()),
+        }
+    }
+
+    /// What was served in the last minute.
+    pub(crate) fn served(&self) -> NodeServed {
+        NodeServed {
+            consensus: self
+                .consensus_served
+                .as_ref()
+                .map(|served| *served.borrow())
+                .unwrap_or_default(),
+            execution: self
+                .execution_served
+                .as_ref()
+                .map(|served| *served.borrow()),
         }
     }
 }

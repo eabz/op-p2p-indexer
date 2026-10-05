@@ -211,7 +211,8 @@ impl Balancer {
 
 /// Logs every [`STATUS_INTERVAL`] one line per registered server: its heads, how far it
 /// holds every block, how far that is behind the newest head any server has, its load (bytes
-/// per second, Flight streams and subscriptions taken of its limits), and its peers.
+/// per second, Flight streams and subscriptions taken of its limits), its peers, and what it
+/// served the networks in the last minute.
 /// A server unhealthy, more than [`BEHIND_WARN`] blocks behind, or with no consensus peer or
 /// no execution session for more than [`NO_PEERS_WARN`] is logged as a warning.
 async fn report_servers(table: Table, cancel: CancellationToken) {
@@ -239,6 +240,7 @@ async fn report_servers(table: Table, cancel: CancellationToken) {
             let lagging = behind.is_none_or(|behind| behind > BEHIND_WARN);
             let peers = server.peers;
             let slots = server.slots;
+            let served = server.served;
             let stalled = server
                 .peerless_since
                 .is_some_and(|since| since.elapsed() > NO_PEERS_WARN);
@@ -262,6 +264,11 @@ async fn report_servers(table: Table, cancel: CancellationToken) {
                         execution_inbound = ?peers.execution_inbound,
                         l1_sessions = ?peers.l1_sessions,
                         beacon_peers = ?peers.beacon_peers,
+                        blocks_forwarded = ?served.blocks_forwarded,
+                        payloads_served = ?served.payloads_served,
+                        execution_requests_served = ?served.execution_requests_served,
+                        execution_items_served = ?served.execution_items_served,
+                        execution_peers_served = ?served.execution_peers_served,
                         "server status"
                     )
                 };

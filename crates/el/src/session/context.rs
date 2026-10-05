@@ -16,7 +16,7 @@ use tracing::warn;
 
 use crate::horizon::Horizon;
 use crate::network::NetworkSpec;
-use crate::serve::{Serving, SessionServing};
+use crate::serve::{ServeCounters, Serving, SessionServing};
 use crate::warn_limit::WarnLimit;
 
 /// Shortest time between two "this build looks behind" warnings.
@@ -101,6 +101,11 @@ impl SessionContext {
     ) -> (SessionServing, mpsc::Receiver<Bytes>) {
         self.serving
             .session(self.tip.clone(), self.lowest_for(indexer), version)
+    }
+
+    /// What this node served on this network.
+    pub(crate) const fn serve_counters(&self) -> &ServeCounters {
+        self.serving.counters()
     }
 
     /// Whether this node serves blocks on this network: eth/68 is offered only then, for

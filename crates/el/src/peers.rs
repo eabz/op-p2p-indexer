@@ -61,6 +61,7 @@ use self::schedule::{
 use crate::ElError;
 use crate::discovery::Candidate;
 use crate::network::PeerConfig;
+use crate::serve::ExecutionServed;
 use crate::session::{
     self, Accepted, Direction, EndReason, SessionContext, SessionDriver, SessionEnd, SessionError,
     SessionHandle, host, unix_now,
@@ -334,6 +335,7 @@ impl PeerSet {
                 _ = dial_tick.tick() => {}
                 _ = status_tick.tick() => {
                     self.log_status(&mut last_status);
+                    self.log_serving();
                     self.ctx.horizon().log(false);
                     self.release_idle();
                 }
@@ -363,6 +365,25 @@ impl PeerSet {
             timed_out = tally.timed_out,
             failed = tally.other,
             "execution peers"
+        );
+    }
+
+    /// Logs what this node served on the network since the last line, if anything was asked.
+    fn log_serving(&self) {
+        let served = self.ctx.serve_counters().take();
+        if served == ExecutionServed::default() {
+            return;
+        }
+        info!(
+            headers = served.headers,
+            bodies = served.bodies,
+            receipts = served.receipts,
+            items = served.items,
+            bytes = served.bytes,
+            empty = served.empty,
+            refused = served.refused,
+            peers_served = served.peers,
+            "serving execution peers"
         );
     }
 

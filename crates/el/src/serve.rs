@@ -31,7 +31,7 @@ mod provider;
 mod session;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use alloy_primitives::{BlockNumber, Bytes};
@@ -81,6 +81,124 @@ const RANGE_REFRESH: Duration = Duration::from_secs(10);
 const MAX_FAILURES: u32 = 8;
 /// Shortest time between two warnings about the same kind of failed read.
 const FAILURE_WARN_INTERVAL: Duration = Duration::from_mins(1);
+
+/// What this node served on one execution network between two status lines of its peer set
+/// (one a minute): requests answered with blocks, by kind, and those that got none.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExecutionServed {
+    /// `GetBlockHeaders` answered with at least one header.
+    pub headers: u32,
+    /// `GetBlockBodies` answered with at least one body.
+    pub bodies: u32,
+    /// `GetReceipts` answered with the receipts of at least one block.
+    pub receipts: u32,
+    /// Headers, bodies and blocks of receipts sent, in all.
+    pub items: u32,
+    /// Bytes of the answers with items.
+    pub bytes: u64,
+    /// Requests answered empty after a read: nothing asked for is held, the request did not
+    /// decode, or the store could not be read.
+    pub empty: u32,
+    /// Requests answered empty without a read: over a per-peer or server limit, too large,
+    /// for transactions (this node has no pool), or on a network the node does not serve.
+    pub refused: u32,
+    /// Peers with at least one request taken for reading.
+    pub peers: u32,
+}
+
+impl ExecutionServed {
+    /// Requests answered with blocks, of every kind.
+    #[must_use]
+    pub const fn requests(&self) -> u32 {
+        self.headers
+            .saturating_add(self.bodies)
+            .saturating_add(self.receipts)
+    }
+}
+
+/// The counts behind [`ExecutionServed`], kept as they happen: atomics, no lock. Shared by the
+/// sessions, the server and the peer set, which takes them once a minute.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ServeCounters(Arc<Counters>);
+
+#[derive(Debug, Default)]
+struct Counters {
+    /// Requests answered with items, by kind.
+    headers: AtomicU32,
+    bodies: AtomicU32,
+    receipts: AtomicU32,
+    items: AtomicU32,
+    bytes: AtomicU64,
+    empty: AtomicU32,
+    refused: AtomicU32,
+    peers: AtomicU32,
+    /// Advances at each [`ServeCounters::take`]: a session counts itself in [`Self::peers`]
+    /// once per value.
+    minute: AtomicU64,
+    /// The last minute taken.
+    last: watch::Sender<ExecutionServed>,
+}
+
+impl ServeCounters {
+    /// A request answered after a read: with `items` and `bytes`, or empty.
+    fn answered(&self, kind: ServeKind, items: usize, bytes: usize) {
+        let counters = &self.0;
+        if items == 0 {
+            counters.empty.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let answered = match kind {
+            ServeKind::Headers => &counters.headers,
+            ServeKind::Bodies => &counters.bodies,
+            ServeKind::Receipts => &counters.receipts,
+        };
+        answered.fetch_add(1, Ordering::Relaxed);
+        let items = u32::try_from(items).unwrap_or(u32::MAX);
+        counters.items.fetch_add(items, Ordering::Relaxed);
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        counters.bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// A request answered empty without a read.
+    pub(crate) fn refused(&self) {
+        self.0.refused.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A request taken for reading from a session, which last counted itself as a peer
+    /// served in the minute `counted`: counts it once per minute.
+    fn taken(&self, counted: &mut Option<u64>) {
+        let minute = self.0.minute.load(Ordering::Relaxed);
+        if *counted != Some(minute) {
+            *counted = Some(minute);
+            self.0.peers.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The counts since the last call, which start again from zero; also published to
+    /// [`Self::subscribe`].
+    pub(crate) fn take(&self) -> ExecutionServed {
+        let counters = &self.0;
+        counters.minute.fetch_add(1, Ordering::Relaxed);
+        let take = |count: &AtomicU32| count.swap(0, Ordering::Relaxed);
+        let served = ExecutionServed {
+            headers: take(&counters.headers),
+            bodies: take(&counters.bodies),
+            receipts: take(&counters.receipts),
+            items: take(&counters.items),
+            bytes: counters.bytes.swap(0, Ordering::Relaxed),
+            empty: take(&counters.empty),
+            refused: take(&counters.refused),
+            peers: take(&counters.peers),
+        };
+        counters.last.send_replace(served);
+        served
+    }
+
+    /// The last minute taken, kept current.
+    pub(crate) fn subscribe(&self) -> watch::Receiver<ExecutionServed> {
+        self.0.last.subscribe()
+    }
+}
 
 /// How the provider has been doing, shared by the server and the reads it spawns.
 #[derive(Debug, Default)]
@@ -154,6 +272,7 @@ pub(crate) struct Server<P> {
     /// Whether what is advertised has been logged once.
     logged: bool,
     health: Arc<Health>,
+    counters: ServeCounters,
 }
 
 /// Builds the server over `provider` and what sessions use to reach it. The held range is
@@ -164,6 +283,7 @@ pub(crate) fn new<P: BlockProvider>(
 ) -> (Server<P>, Serving) {
     let (requests_tx, requests_rx) = mpsc::channel(MAX_QUEUED);
     let (range_tx, range_rx) = watch::channel(None);
+    let counters = ServeCounters::default();
     let server = Server {
         provider: Arc::new(provider),
         head,
@@ -171,11 +291,13 @@ pub(crate) fn new<P: BlockProvider>(
         range: range_tx,
         logged: false,
         health: Arc::default(),
+        counters: counters.clone(),
     };
     let serving = Serving {
         requests: requests_tx,
         range: range_rx,
         enabled: true,
+        counters,
     };
     (server, serving)
 }
@@ -191,6 +313,7 @@ pub(crate) fn disabled() -> Serving {
         requests,
         range,
         enabled: false,
+        counters: ServeCounters::default(),
     }
 }
 
@@ -230,7 +353,8 @@ impl<P: BlockProvider> Server<P> {
                     // Closed: every session and the context are gone.
                     let Some(request) = request else { return Ok(()) };
                     let (provider, health) = (Arc::clone(&self.provider), Arc::clone(&self.health));
-                    answering.spawn(answer(provider, health, request).in_current_span());
+                    let counters = self.counters.clone();
+                    answering.spawn(answer(provider, health, counters, request).in_current_span());
                 }
             }
         }
@@ -310,7 +434,12 @@ const fn response_id(kind: ServeKind) -> u8 {
 
 /// Answers one request from `provider` and hands the answer to its session.
 /// While the provider is failing, answers empty without reading.
-async fn answer<P: BlockProvider>(provider: Arc<P>, health: Arc<Health>, request: Request) {
+async fn answer<P: BlockProvider>(
+    provider: Arc<P>,
+    health: Arc<Health>,
+    counters: ServeCounters,
+    request: Request,
+) {
     let Request {
         kind,
         lowest,
@@ -335,8 +464,10 @@ async fn answer<P: BlockProvider>(provider: Arc<P>, health: Arc<Health>, request
             Vec::new()
         }
     };
+    let response = response(response_id(kind), id, &items);
+    counters.answered(kind, items.len(), response.len());
     // If the session has ended, the answer is dropped with its channel.
-    drop(answer.send(response(response_id(kind), id, &items)));
+    drop(answer.send(response));
 }
 
 /// Reads the items answering the request in `body`: one call of the provider, which applies

@@ -46,7 +46,7 @@ pub use error::ElError;
 pub use network::{ETH_RECORD_KEY, NetworkSpec, OPEL_RECORD_KEY, PeerConfig, PeerNetwork};
 pub use peers::{Peers, Report, SessionCounts};
 pub use reth_network_peers::PeerId;
-pub use serve::BlockProvider;
+pub use serve::{BlockProvider, ExecutionServed};
 pub use session::{BlockRange, RequestError, SessionHandle};
 pub use sync::{RangeSync, RoundEnd, SyncPlan};
 
@@ -132,6 +132,13 @@ impl<P: BlockProvider> ExecutionNetwork<P> {
     ) -> Self {
         self.fills = Some((requests, filled));
         self
+    }
+
+    /// What this node served its peers in the last minute ([`ExecutionServed`]), kept
+    /// current while the network runs.
+    #[must_use]
+    pub fn serving(&self) -> watch::Receiver<ExecutionServed> {
+        self.network.serving()
     }
 
     /// The open sessions, as requesters see them: for what peers advertise.

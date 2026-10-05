@@ -27,8 +27,8 @@ use tokio::time::{MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use self::state::State;
 pub(crate) use self::state::unix_now_secs;
+use self::state::{Published, State};
 use crate::block::BlockValidator;
 use crate::discovery::{Discovery, DiscoveryError};
 use crate::gossip::{self, GossipError};
@@ -92,8 +92,24 @@ pub struct Network {
     blocks: mpsc::Sender<UnsafeBlock>,
     safe_head: watch::Receiver<BlockNumber>,
     payloads: Arc<dyn PayloadSource>,
-    /// Connected peers subscribed to the block topics, published by the swarm task.
-    peer_count: watch::Sender<usize>,
+    /// What the swarm task publishes: the peer count and what was served.
+    published: Published,
+}
+
+/// What this node gave the consensus network between two `consensus peers` lines (one a
+/// minute): blocks relayed through gossip and blocks served by number.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GossipServed {
+    /// New valid blocks accepted from gossip.
+    pub blocks_accepted: u32,
+    /// Of those, the ones gossipsub still held when accepted, which it forwards to its mesh
+    /// peers: the node relays the chain.
+    pub blocks_forwarded: u32,
+    /// `payload_by_number` requests answered with a block.
+    pub payloads_served: u32,
+    /// `payload_by_number` requests answered without one: throttled, not held, outside the
+    /// range served, or the peer left first.
+    pub payloads_refused: u32,
 }
 
 /// The swarm's protocols: connection limits enforced for every connection, gossipsub, ping
@@ -203,7 +219,10 @@ impl Network {
             blocks,
             safe_head,
             payloads,
-            peer_count: watch::Sender::new(0),
+            published: Published {
+                peer_count: watch::Sender::new(0),
+                served: watch::Sender::default(),
+            },
         }
     }
 
@@ -211,7 +230,14 @@ impl Network {
     /// node runs: what the node gossips with.
     #[must_use]
     pub fn peer_count(&self) -> watch::Receiver<usize> {
-        self.peer_count.subscribe()
+        self.published.peer_count.subscribe()
+    }
+
+    /// What the node served on the consensus network in the last minute ([`GossipServed`]),
+    /// kept current while it runs.
+    #[must_use]
+    pub fn served(&self) -> watch::Receiver<GossipServed> {
+        self.published.served.subscribe()
     }
 
     /// Runs the node until `cancel` fires or the block consumer drops its receiver.
@@ -228,7 +254,7 @@ impl Network {
             blocks,
             safe_head,
             payloads,
-            peer_count,
+            published,
         } = self;
         let chain = config.chain;
 
@@ -247,14 +273,14 @@ impl Network {
         discovery_task.spawn(discovery.run(
             config.bootnodes,
             discovered_tx,
-            peer_count.subscribe(),
+            published.peer_count.subscribe(),
             cancel.child_token(),
         ));
 
         let validator = BlockValidator::new(chain);
         let server = crate::sync::Server::new(chain, payloads);
         let mut state = State::new(
-            topics, validator, blocks, store, peer_count, safe_head, server,
+            topics, validator, blocks, store, published, safe_head, server,
         );
 
         state.dial_known_peers(&mut swarm).await;
@@ -276,13 +302,7 @@ impl Network {
                 },
                 event = swarm.select_next_some() => state.on_swarm_event(&mut swarm, event),
                 Some(ready) = state.server.next_answer() => match ready {
-                    Ok(ready) => {
-                        if answer(&mut swarm, ready.channel, ready.response)
-                            && let Some(permit) = ready.permit
-                        {
-                            state.server.writing(ready.request_id, permit);
-                        }
-                    }
+                    Ok(ready) => state.on_answer(&mut swarm, ready),
                     Err(err) => warn!(%err, "payload_by_number task failed"),
                 },
                 Some(addr) = discovered_rx.recv() => {

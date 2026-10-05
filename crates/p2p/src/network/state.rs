@@ -20,10 +20,10 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tracing::{debug, info, trace, warn};
 
-use super::{Behaviour, BehaviourEvent, answer};
+use super::{Behaviour, BehaviourEvent, GossipServed, answer};
 use crate::block::{BlockError, BlockValidator, SeenBlocks};
 use crate::peers::ConnectedPeers;
-use crate::sync::Server;
+use crate::sync::{Answer, Server};
 use crate::{NodeStore, StoreError};
 
 /// Minimum time between dials to the same peer, so unreachable peers aren't re-dialed every lookup.
@@ -92,8 +92,8 @@ pub(super) struct State {
     /// Known peers dialed from the store this run and not connected yet, with their address.
     known_dials: HashMap<PeerId, Multiaddr>,
     pub(super) persists: JoinSet<Result<(), StoreError>>,
-    /// Connected peers subscribed to our block topics, read by discovery to pace itself.
-    peer_count: watch::Sender<usize>,
+    /// What the swarm task publishes: the peer count, and what was served.
+    published: Published,
     /// Highest accepted block number in this run; the first block sets it, so a restart is not
     /// seen as a gap.
     highest: Option<BlockNumber>,
@@ -108,6 +108,15 @@ pub(super) struct State {
     tally: PeerTally,
 }
 
+/// What the swarm task publishes for the rest of the node.
+#[derive(Debug)]
+pub(super) struct Published {
+    /// Connected peers subscribed to our block topics, read by discovery to pace itself.
+    pub(super) peer_count: watch::Sender<usize>,
+    /// What the last status line counted as served, for the binary's heartbeat.
+    pub(super) served: watch::Sender<GossipServed>,
+}
+
 /// What happened to peers since the last status line, to show where they are lost.
 #[derive(Debug, Default)]
 struct PeerTally {
@@ -119,8 +128,12 @@ struct PeerTally {
     failed: u32,
     /// Connections established, either direction.
     connected: u32,
+    /// Of those, the ones peers dialed: other nodes reach this one.
+    inbound: u32,
     /// Peers disconnected for not subscribing to a block topic.
     evicted: u32,
+    /// What was served: blocks relayed and `payload_by_number` answers.
+    served: GossipServed,
 }
 
 /// Result of validating one message on a blocking thread.
@@ -136,7 +149,7 @@ impl State {
         validator: BlockValidator,
         blocks: mpsc::Sender<UnsafeBlock>,
         store: Arc<NodeStore>,
-        peer_count: watch::Sender<usize>,
+        published: Published,
         safe_head: watch::Receiver<BlockNumber>,
         server: Server,
     ) -> Self {
@@ -160,7 +173,7 @@ impl State {
             saved: HashSet::new(),
             known_dials: HashMap::new(),
             persists: JoinSet::new(),
-            peer_count,
+            published,
             highest: None,
             safe_head,
             server,
@@ -222,6 +235,9 @@ impl State {
                 debug!(peer = %peer_id, addr = %endpoint.get_remote_address(), "peer connected");
                 self.peers.connected(peer_id, Instant::now());
                 self.tally.connected = self.tally.connected.saturating_add(1);
+                if !endpoint.is_dialer() {
+                    self.tally.inbound = self.tally.inbound.saturating_add(1);
+                }
                 self.known_dials.remove(&peer_id);
                 if endpoint.is_dialer()
                     && let Ok(addr) = endpoint.get_remote_address().clone().with_p2p(peer_id)
@@ -260,6 +276,7 @@ impl State {
             })) => {
                 if let Some(channel) = self.server.on_request(peer, request_id, request, channel) {
                     answer(swarm, channel, crate::sync::throttled());
+                    self.payload_answered(false);
                 }
             }
             SwarmEvent::Behaviour(BehaviourEvent::Payloads(
@@ -287,7 +304,13 @@ impl State {
                 debug!(peer = %source, "ignored duplicate block");
             }
             Ok(Some(block)) => {
-                report(swarm, &id, &source, MessageAcceptance::Accept);
+                // Still in gossipsub's cache: it forwards the block to its mesh peers.
+                let forwarded = report(swarm, &id, &source, MessageAcceptance::Accept);
+                let served = &mut self.tally.served;
+                served.blocks_accepted = served.blocks_accepted.saturating_add(1);
+                if forwarded {
+                    served.blocks_forwarded = served.blocks_forwarded.saturating_add(1);
+                }
                 debug!(number = block.number(), hash = %block.hash, version = ?block.version, "received unsafe block");
                 self.check_gap(block.number());
                 self.remember(source, block.timestamp_secs());
@@ -444,7 +467,7 @@ impl State {
     /// Publishes the number of connected peers subscribed to our block topics.
     fn update_peer_count(&self, swarm: &Swarm<Behaviour>) {
         let subscribed = self.subscribed_peers(swarm).count();
-        self.peer_count.send_replace(subscribed);
+        self.published.peer_count.send_replace(subscribed);
     }
 
     /// Connected peers subscribed to at least one of our block topics.
@@ -549,18 +572,54 @@ impl State {
         let tally = std::mem::take(&mut self.tally);
         let gossipsub = &swarm.behaviour().gossipsub;
         let mesh = gossipsub.all_mesh_peers().count();
+        let connected = swarm.connected_peers().count();
+        let served = tally.served;
+        // Process-wide: every discv5 node of this process (consensus, execution, L1) shares them.
+        let discovery = discv5::Discv5::metrics();
         info!(
-            connected = swarm.connected_peers().count(),
+            connected,
             subscribed = self.subscribed_peers(swarm).count(),
             mesh,
             outbound = self.outbound.len(),
+            inbound = connected.saturating_sub(self.outbound.len()),
             discovered = tally.discovered,
             dialed = tally.dialed,
             dial_failed = tally.failed,
             new_connections = tally.connected,
+            new_inbound = tally.inbound,
             evicted_unsubscribed = tally.evicted,
+            blocks_accepted = served.blocks_accepted,
+            blocks_forwarded = served.blocks_forwarded,
+            payloads_served = served.payloads_served,
+            payloads_refused = served.payloads_refused,
+            discv5_contactable = discovery.ipv4_contactable,
+            discv5_inbound_per_s = discovery.unsolicited_requests_per_second,
+            discv5_sessions = discovery.active_sessions,
             "consensus peers"
         );
+        self.published.served.send_replace(served);
+    }
+
+    /// Sends a prepared `payload_by_number` answer, keeping its place among those being written
+    /// until it is, and counts it.
+    pub(super) fn on_answer(&mut self, swarm: &mut Swarm<Behaviour>, ready: Answer) {
+        let has_block = crate::sync::is_success(&ready.response);
+        let sent = answer(swarm, ready.channel, ready.response);
+        self.payload_answered(sent && has_block);
+        if sent && let Some(permit) = ready.permit {
+            self.server.writing(ready.request_id, permit);
+        }
+    }
+
+    /// Counts a `payload_by_number` answer: `delivered` if a block went out, refused otherwise
+    /// (throttled, not held, out of range, or the peer left).
+    fn payload_answered(&mut self, delivered: bool) {
+        let tally = &mut self.tally.served;
+        if delivered {
+            tally.payloads_served = tally.payloads_served.saturating_add(1);
+        } else {
+            tally.payloads_refused = tally.payloads_refused.saturating_add(1);
+        }
     }
 
     /// Saves every good outbound peer as known good, so a restart dials them at once: connected,
@@ -649,16 +708,18 @@ impl State {
     }
 }
 
+/// Reports a validation result; `true` if gossipsub still held the message (an accepted one is
+/// then forwarded to its mesh peers).
 fn report(
     swarm: &mut Swarm<Behaviour>,
     id: &MessageId,
     source: &PeerId,
     acceptance: MessageAcceptance,
-) {
+) -> bool {
     swarm
         .behaviour_mut()
         .gossipsub
-        .report_message_validation_result(id, source, acceptance);
+        .report_message_validation_result(id, source, acceptance)
 }
 
 /// Current Unix time in seconds; protocol timestamps are wall-clock.

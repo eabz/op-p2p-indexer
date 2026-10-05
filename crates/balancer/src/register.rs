@@ -97,6 +97,25 @@ pub struct Report {
     pub peers: PeerReport,
     /// Its stream limits: `Heartbeat.max_flights` and the fields after it in the proto.
     pub slots: SlotReport,
+    /// What it served the networks in the last minute: `Heartbeat.blocks_forwarded` and the
+    /// fields after it in the proto.
+    pub served: ServedReport,
+}
+
+/// What a server reports it gave the networks in the last minute; `None` when it does not say
+/// (or, for the execution counts, does not run that network).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ServedReport {
+    /// Blocks relayed on the consensus gossip.
+    pub blocks_forwarded: Option<u32>,
+    /// `payload_by_number` requests answered with a block.
+    pub payloads_served: Option<u32>,
+    /// Execution requests answered with blocks.
+    pub execution_requests_served: Option<u32>,
+    /// Headers, bodies and blocks of receipts sent to execution peers.
+    pub execution_items_served: Option<u32>,
+    /// Execution peers served.
+    pub execution_peers_served: Option<u32>,
 }
 
 /// The stream limits a server reports, and how many places of each are taken; `None` when it
@@ -301,6 +320,14 @@ fn heartbeat(template: Heartbeat, report: Report) -> Heartbeat {
                 max_subscriptions,
                 subscriptions_in_use,
             },
+        served:
+            ServedReport {
+                blocks_forwarded,
+                payloads_served,
+                execution_requests_served,
+                execution_items_served,
+                execution_peers_served,
+            },
     } = report;
     Heartbeat {
         healthy,
@@ -320,6 +347,11 @@ fn heartbeat(template: Heartbeat, report: Report) -> Heartbeat {
         flights_in_use,
         max_subscriptions,
         subscriptions_in_use,
+        blocks_forwarded,
+        payloads_served,
+        execution_requests_served,
+        execution_items_served,
+        execution_peers_served,
         ..template
     }
 }
