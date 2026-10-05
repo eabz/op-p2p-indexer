@@ -14,6 +14,7 @@
 //! binary's edge.
 
 mod config;
+pub mod env_file;
 mod provider;
 
 use std::future::Future;
@@ -927,8 +928,8 @@ async fn prepare_storage<A: Archive>(
     })
 }
 
-/// Resolves with the signal's name on Ctrl-C (SIGINT) or, on Unix, SIGTERM, which `docker stop`
-/// sends before killing the process.
+/// Resolves with the signal's name on Ctrl-C (SIGINT) or, on Unix, SIGTERM, which a service
+/// manager (systemd, a container runtime) sends on stop.
 async fn shutdown_signal() -> eyre::Result<&'static str> {
     #[cfg(unix)]
     {

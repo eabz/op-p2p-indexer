@@ -17,6 +17,7 @@ op-indexer-storage.workspace = true
 op-indexer-stream.workspace = true
 
 alloy-primitives.workspace = true
+dotenvy.workspace = true
 eyre.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync"] }
 tokio-util.workspace = true

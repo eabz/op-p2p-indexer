@@ -11,7 +11,8 @@ op-indexer-node.workspace = true
 op-indexer-storage.workspace = true
 
 eyre.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [lints]

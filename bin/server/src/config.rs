@@ -6,6 +6,7 @@ use std::env;
 use eyre::eyre;
 use op_indexer_chainspec::ChainSpec;
 use op_indexer_chunks::{R2Config, ReadOptions};
+use op_indexer_node::env_file;
 /// The exporter's name in the manifest when none is configured.
 const DEFAULT_EXPORTER_ID: &str = "server";
 
@@ -15,15 +16,17 @@ pub(crate) struct ServerConfig {
     /// The bucket. Only the exporter's key may write.
     pub(crate) r2: R2Config,
     pub(crate) read: ReadOptions,
-    /// With `--export`: the exporter's name in the manifest.
+    /// With `--export` or `OP_INDEXER_EXPORT=true`: the exporter's name in the manifest.
     pub(crate) export: Option<String>,
 }
 
 impl ServerConfig {
     /// Reads the configuration:
     ///
-    /// - `--export` (command line): also run the exporter. Exactly one server per deployment,
-    ///   the one with the bucket's write key.
+    /// - `--env-file <path>` (command line): read by the env-file loader before this.
+    /// - `OP_INDEXER_EXPORT`: `true` to also run the exporter (default `false`); `--export` on
+    ///   the command line does the same. Exactly one server per deployment, the one with the
+    ///   bucket's write key.
     /// - `OP_INDEXER_R2_ACCOUNT_ID`, `OP_INDEXER_R2_ACCESS_KEY_ID`,
     ///   `OP_INDEXER_R2_SECRET_ACCESS_KEY` (required): the R2 account and the key to the
     ///   bucket, read-only except on the exporter. The secret is never logged.
@@ -33,20 +36,37 @@ impl ServerConfig {
     ///   `archive`).
     /// - `OP_INDEXER_R2_ENDPOINT`: the S3 endpoint (default
     ///   `https://<account id>.r2.cloudflarestorage.com`).
-    /// - `OP_INDEXER_EXPORTER_ID`: the exporter's name in the manifest (default `server`).
+    /// - `OP_INDEXER_EXPORT_ID`: the exporter's name in the manifest (default `server`).
     ///
-    /// The API keys of the gRPC and Flight services are the node's `OP_INDEXER_API_KEYS`.
+    /// The API keys of the gRPC and Flight services are the node's `OP_INDEXER_STREAM_API_KEYS`.
     ///
     /// # Errors
     ///
     /// Returns an error if a required variable is missing or one is invalid, or an argument
     /// is unknown.
     pub(crate) fn from_env_and_args(chain: &ChainSpec) -> eyre::Result<Self> {
-        let mut export = false;
-        for arg in env::args().skip(1) {
+        let mut export = var("OP_INDEXER_EXPORT")
+            .map(|value| value.parse())
+            .transpose()
+            .map_err(|_err| eyre!("OP_INDEXER_EXPORT must be true or false"))?
+            .unwrap_or(false);
+        let mut args = env::args().skip(1);
+        while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--export" => export = true,
-                other => return Err(eyre!("unknown argument {other}; the only one is --export")),
+                // Read before anything else, by the env-file loader.
+                flag if flag == env_file::FLAG => {
+                    args.next();
+                }
+                other
+                    if other
+                        .strip_prefix(env_file::FLAG)
+                        .is_some_and(|rest| rest.starts_with('=')) => {}
+                other => {
+                    return Err(eyre!(
+                        "unknown argument {other}; the arguments are --export and --env-file"
+                    ));
+                }
             }
         }
         let r2 = R2Config {
@@ -62,7 +82,7 @@ impl ServerConfig {
             r2,
             read: ReadOptions::default(),
             export: export.then(|| {
-                var("OP_INDEXER_EXPORTER_ID").unwrap_or_else(|| DEFAULT_EXPORTER_ID.to_owned())
+                var("OP_INDEXER_EXPORT_ID").unwrap_or_else(|| DEFAULT_EXPORTER_ID.to_owned())
             }),
         })
     }

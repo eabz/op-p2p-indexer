@@ -152,6 +152,9 @@ object_store = { version = "0.14", default-features = false, features = ["aws", 
 # The importer's allocator: `verify` builds rows and receipts on every core at once, and is
 # about 9% faster with it at eight threads than with the system allocator.
 mimalloc = { version = "0.1", default-features = false }
+# Reads the `.env` file each binary loads at startup (`NAME=value` lines, the process
+# environment winning); maintained fork of `dotenv`, no dependencies.
+dotenvy = { version = "0.15", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -27,7 +27,7 @@ to fill.
 **D0. No Redis.** The unsafe chain (gossiped blocks not yet committed, with fork choice) lives
 in memory in the node process, `indexer` and `server` alike, and every change to it is
 journaled to a local fjall keyspace, so a restart replays it without the network. Nothing
-needs a separate service: no Redis in the binaries, in docker compose or in the docs. (This
+needs a separate service: no Redis in the binaries or in the docs. (This
 replaced the Redis unsafe store of the `storage` crate: `MemoryStore`, `docs/storage.md`
 section 3.)
 
@@ -406,9 +406,9 @@ Unchanged code over `R2Archive`:
     minute; without one the peer gets the empty answer.
   - `Exporter` (section 4): adds a block to the chunk being written once it is finalized and
     has its receipts, and publishes the chunk when the writer ends it.
-- `bin/server`: `--export`; `OP_INDEXER_R2_ACCOUNT_ID`, `_BUCKET`, `_ACCESS_KEY_ID`,
-  `_SECRET_ACCESS_KEY`, `_ENDPOINT`, `OP_INDEXER_EXPORTER_ID`; the node's variables otherwise.
-- API keys (D18): `OP_INDEXER_API_KEYS` on `indexer` and `server` alike, an interceptor on
+- `bin/server`: `--export` or `OP_INDEXER_EXPORT=true`; `OP_INDEXER_R2_ACCOUNT_ID`, `_BUCKET`, `_ACCESS_KEY_ID`,
+  `_SECRET_ACCESS_KEY`, `_ENDPOINT`, `OP_INDEXER_EXPORT_ID`; the node's variables otherwise.
+- API keys (D18): `OP_INDEXER_STREAM_API_KEYS` on `indexer` and `server` alike, an interceptor on
   the gRPC and Flight services (`crates/stream/src/auth.rs`); empty means no check.
 - Not built: retry-once-then-`UNAVAILABLE` on a failed chunk read (5.2) is left to the
   caller's own retry; the hash lookup is the chunk store's (no index cache on the server side).

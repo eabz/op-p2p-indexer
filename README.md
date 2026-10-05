@@ -44,13 +44,16 @@ Requirements: a recent stable Rust, and for a public node open ports 9222 (gossi
 
 ```bash
 cargo build --release
-OP_INDEXER_EL_ENABLED=true ./target/release/indexer
+cp .env.example .env     # then edit it: at least OP_INDEXER_EL_ENABLED=true
+./target/release/indexer
 ```
 
-The node keeps its state in `data-op/` (`data-unichain/`, `data-base/` for the others): its identity, known
-peers, the block archive and the unsafe chain's journal. Every setting is an `OP_INDEXER_*`
-environment variable, all of them documented on `Config::from_env` in
-[`crates/node/src/config.rs`](crates/node/src/config.rs).
+Every setting is an `OP_INDEXER_*` environment variable. Each binary loads `.env` from the
+current directory at startup (or the file given with `--env-file <path>`); a variable already
+set in the shell wins over the file. One file serves every binary:
+[`.env.example`](.env.example) lists the variables of `indexer`, `server` and the importer with
+their defaults. The node's are also documented on `Config::from_env` in
+[`crates/node/src/config.rs`](crates/node/src/config.rs), the importer's in `import --help`.
 Some useful ones:
 
 | Variable | Default | |
@@ -59,12 +62,15 @@ Some useful ones:
 | `OP_INDEXER_EL_ENABLED` | `false` | Fetch receipts and serve the execution network |
 | `OP_INDEXER_EL_SYNC` | `false` | Fill gaps in the archive from execution peers |
 | `OP_INDEXER_L1_ENABLED` | `false` | Safe and finalized heads from L1; needs `OP_INDEXER_L1_CHECKPOINT` and range sync |
-| `OP_INDEXER_STREAM_LISTEN_ADDR` | `127.0.0.1:50051` | The stream has no authentication: keep it local or behind a proxy |
-| `OP_INDEXER_ADVERTISED_ADDR`, `OP_INDEXER_EL_ADVERTISED_ADDR` | unset | Your public `ip:port`, when behind NAT |
+| `OP_INDEXER_STREAM_LISTEN_ADDR` | `127.0.0.1:50051` | Keep it local, behind a proxy, or set `OP_INDEXER_STREAM_API_KEYS` |
+| `OP_INDEXER_P2P_ADVERTISED_ADDR`, `OP_INDEXER_EL_ADVERTISED_ADDR` | unset | Your public `ip:port`, when behind NAT |
 
-With Docker, `docker compose up -d` runs the node; `unichain.env.example` shows a second
-instance for Unichain next to the first. See [storage.md](docs/storage.md), "Several instances on
-one host".
+The node keeps its state in `data-op/` (`data-unichain/`, `data-base/` for the others): its
+identity, known peers, the block archive and the unsafe chain's journal. Several nodes can run
+on one host (another chain, or another build): each with its own data directory, its own ports
+and its own `.env`, run from its own directory or given with `--env-file`. The end of
+`.env.example` shows the settings for Unichain and Base next to an OP Mainnet node; see
+also [storage.md](docs/storage.md), "Several instances on one host".
 
 ## Consuming the data
 

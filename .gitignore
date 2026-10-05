@@ -3,3 +3,7 @@
 .claude/settings.local.json
 /graphify-out
 .DS_Store
+
+# Env files hold keys; `.env.example` is tracked.
+.env
+*.env

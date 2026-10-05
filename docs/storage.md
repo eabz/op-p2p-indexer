@@ -339,38 +339,28 @@ fast if either is another chain's. The pipeline then writes the blocks.
 
 ### Several instances on one host
 
-Several indexers can run on one server: several chains (OP Mainnet and Unichain), or several
+Several indexers can run on one server: several chains (OP Mainnet, Unichain, Base), or several
 builds of one chain. Each needs:
 
 - **Its own data directory** (`OP_INDEXER_DATA_DIR`). By default it is named after the chain,
-  `data-op` or `data-unichain` (`ChainSpec::default_data_dir`), so two chains on one host
+  `data-op`, `data-unichain` or `data-base` (`ChainSpec::default_data_dir`), so two chains on one host
   never share a directory unless told to. Two builds of the same chain need an explicit one each. The archive, the
   unsafe chain's journal and the node store all live in it, record their chain and refuse
   another's: nothing else is shared, so two instances of one chain need nothing more.
-- **Its own ports**: `OP_INDEXER_LISTEN_ADDR`, `OP_INDEXER_EL_LISTEN_ADDR`,
+- **Its own ports**: `OP_INDEXER_P2P_LISTEN_ADDR`, `OP_INDEXER_EL_LISTEN_ADDR`,
   `OP_INDEXER_L1_LISTEN_ADDR`, `OP_INDEXER_L1_BEACON_LISTEN_ADDR` and
   `OP_INDEXER_STREAM_LISTEN_ADDR`, plus the advertised addresses on a public host.
 - **Its own L1 side**, if L1 is enabled: each instance runs its own beacon light client and
   its own L1 execution peers. Two instances do not share them; nothing on L1 is
   per-chain except the dispute game factory.
-
-With docker compose, every host port comes from a variable with today's value as its default
-(`OP_INDEXER_P2P_PORT`, `OP_INDEXER_EL_PORT`, `OP_INDEXER_L1_PORT`, `OP_INDEXER_L1_BEACON_PORT`,
-`OP_INDEXER_STREAM_PORT`, and `OP_INDEXER_STREAM_HOST_BIND`). The listen addresses follow the
-same variables, so a port is the same inside the container and on the host and the node
-records advertise it. The data directory is a host directory, `./data-op` by default and
-`./data-unichain` in `unichain.env.example` (`OP_INDEXER_HOST_DATA_DIR`): the same names as
-outside Docker, so `scripts/archive-sync.sh` works on it directly. The
-container runs as uid 10001, so create it once with `chown 10001:10001`. A project name gives
-a second instance its own container:
+- **Its own `.env`**: the settings above, in a file per instance. Run each instance from its own
+  directory, where it reads `.env`, or point it at its file with `--env-file <path>`. The end of
+  `.env.example` shows a Unichain and a Base instance next to an OP Mainnet one (their ports
+  shifted by 100 and by 200):
 
 ```bash
-docker compose up -d
-docker compose -p unichain --env-file unichain.env.example up -d
+./target/release/indexer --env-file unichain.env
 ```
-
-`unichain.env.example` shifts every port by 100 and names the data directory. A second
-instance of the same chain needs the same: its own ports and data directory.
 
 Storage has no metrics (removed 2026-10-04, to be re-added later where needed): retries,
 reorgs, evictions and failed operations are logged.

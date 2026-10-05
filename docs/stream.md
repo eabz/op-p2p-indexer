@@ -10,8 +10,7 @@ changes as their own messages. It only reads: the archive, the unsafe store, and
 store's event stream. It depends on `primitives` and `storage` only.
 
 **There is no authentication and no TLS.** Anyone who can reach the port can subscribe. The
-binary listens on `127.0.0.1` by default, and docker compose publishes the port on the host's
-loopback unless told otherwise (section 5).
+binary listens on `127.0.0.1` by default (section 5).
 
 ## 1. Service
 
@@ -149,13 +148,11 @@ execution network disabled no receipts come, and `Heads.receipts` says so.
 
 | Variable | Default | What |
 |---|---|---|
-| `OP_INDEXER_STREAM_LISTEN_ADDR` | `127.0.0.1:50051` | gRPC listen address: local only, since there is no authentication. The image sets `0.0.0.0:50051` inside the container. |
+| `OP_INDEXER_STREAM_LISTEN_ADDR` | `127.0.0.1:50051` | gRPC listen address: local only, since there is no authentication. |
 | `OP_INDEXER_STREAM_MAX_SUBSCRIPTIONS` | `64` | Concurrent subscriptions (at most `Semaphore::MAX_PERMITS`; more is lowered to it). |
 | `OP_INDEXER_STREAM_MAX_FLIGHTS` | `8` | Concurrent Arrow Flight `DoGet` streams (section 6), with the same ceiling. |
 
-docker compose: `OP_INDEXER_STREAM_PORT` (default `50051`) is the port inside and outside the
-container; `OP_INDEXER_STREAM_HOST_BIND` (default `127.0.0.1`) is the host address it is
-published on. Set it to `0.0.0.0` to expose the stream, knowingly: there is no authentication.
+Set it to `0.0.0.0:50051` to expose the stream, knowingly: there is no authentication.
 
 ## 6. Arrow Flight: bulk history
 

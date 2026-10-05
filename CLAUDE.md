@@ -14,7 +14,10 @@ before proposing a design, and record new decisions there.
 
 | Path | Package | Role | Internal deps |
 |---|---|---|---|
-| `bin/op-indexer` | `op-indexer` | Thin binary: config, tracing, wiring, shutdown | chainspec, p2p, el, l1, storage, pipeline, stream, primitives |
+| `bin/indexer` | `indexer` | The full node for a single user: thin binary over `crates/node` with the fjall archive | node, storage |
+| `bin/server` | `server` | The full node for serving at scale: thin binary over `crates/node` with history read from R2 (`crates/server`); `--export` (or `OP_INDEXER_EXPORT=true`) makes it the deployment's single exporter | node, server, chunks, storage, chainspec |
+| `crates/node` | `op-indexer-node` | Shared node wiring for `indexer` and `server`: config (`Config::from_env`), `.env` loading, tracing, startup, shutdown | chainspec, p2p, el, l1, storage, pipeline, stream, primitives |
+| `crates/server` | `op-indexer-server` | The server's committed store: R2-backed `ArchiveStore` (sealed chunks through `crates/chunks` plus a local fjall tail) and the exporter | chainspec, chunks, primitives, storage |
 | `bin/op-indexer-import` | `op-indexer-import` (binary `import`) | Command-line importer, a separate process: downloads a block range from an external archive (Envio HyperSync), verifies it, and exports it as sealed chunks to R2 | chainspec, primitives, chunks |
 | `crates/chunks` | `op-indexer-chunks` | Sealed block chunks in object storage (Cloudflare R2 through `object_store`'s S3 API): chunk format (zstd segments, index, footer), the hash-chained manifest, the global hash index, and the client; written by `import export` and the server's exporter, read by `server` | primitives, chainspec |
 | `crates/primitives` | `op-indexer-primitives` | Shared domain types (alloy and op-alloy only) | none |
@@ -44,7 +47,7 @@ before proposing a design, and record new decisions there.
   history: there is no retention window), in its consensus encoding, with its transaction senders
   and the committed L1 heads. It is what the node serves to peers and streams to consumers. Embedded; needs no service.
 
-There is no Redis and no ClickHouse: the binary needs no other service. `docker compose up --build` runs the indexer image. At startup it opens the archive and the unsafe chain's journal (replaying it), and exits if either belongs to another chain. Every `OP_INDEXER_*` variable it reads is documented on `Config::from_env` in `crates/node/src/config.rs`.
+There is no Redis and no ClickHouse: the binary needs no other service. At startup it opens the archive and the unsafe chain's journal (replaying it), and exits if either belongs to another chain. Settings are `OP_INDEXER_*` environment variables, which every binary also reads from `.env` in the current directory (or `--env-file <path>`); the process environment wins. `.env.example` lists every variable of every binary, and the node's are documented on `Config::from_env` in `crates/node/src/config.rs`. There is no Docker setup for now.
 
 ## Project skills
 

@@ -278,11 +278,12 @@ The importer is a self-contained command-line tool, meant to be built here and r
 machine: `cargo build --release -p op-indexer-import` produces one file to copy.
 
 - Subcommands: `download`, `verify`, `export`, and `run` for all three in order.
-- `--api-token <TOKEN>` carries the HyperSync token; `ENVIO_API_TOKEN` in the environment is
-  the fallback. A flag is visible in the process list and the shell history, the variable is
+- `--api-token <TOKEN>` carries the HyperSync token; `OP_INDEXER_IMPORT_API_TOKEN` in the
+  environment is the fallback (`ENVIO_API_TOKEN`, its former name, still works, with a
+  warning). A flag is visible in the process list and the shell history, the variable is
   not. The token is never logged and never written to the state directory.
 - Every other setting is a flag with an environment fallback and a default: the state
-  directory (`OP_INDEXER_IMPORT_STATE_DIR`), the chain (`OP_INDEXER_IMPORT_CHAIN`), the
+  directory (`OP_INDEXER_IMPORT_STATE_DIR`), the chain (`OP_INDEXER_CHAIN_ID`), the
   endpoints (`OP_INDEXER_IMPORT_ENDPOINT`, `OP_INDEXER_IMPORT_L1_ENDPOINT`), the range
   (`OP_INDEXER_IMPORT_FIRST_BLOCK`, `_LAST_BLOCK`, `_ANCHOR_HASH`, `_LEGACY_ONLY`), the chunk
   size (`OP_INDEXER_IMPORT_CHUNK_BLOCKS`), requests in flight (`OP_INDEXER_IMPORT_REQUESTS`),

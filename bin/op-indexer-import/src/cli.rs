@@ -1,14 +1,20 @@
 //! The command line: subcommands, flags with their environment fallbacks, and defaults.
 //!
 //! The range is decided by the flags of [`DownloadArgs`]; chain parameters come from the
-//! chainspec. Does not read files or connect anywhere.
+//! chainspec. Does not read files or connect anywhere; reads the environment only through clap,
+//! and for the API token's former name.
 
-use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::{env, fmt};
 
 use alloy_primitives::B256;
 use clap::{Args, Parser, Subcommand};
+use eyre::eyre;
+use tracing::warn;
+
+/// The former name of `OP_INDEXER_IMPORT_API_TOKEN`, still read.
+const DEPRECATED_API_TOKEN_VAR: &str = "ENVIO_API_TOKEN";
 
 /// Downloads a chain's blocks from an external archive, verifies every block, and exports
 /// them as sealed chunks to object storage (Cloudflare R2), where servers read history from.
@@ -22,7 +28,7 @@ use clap::{Args, Parser, Subcommand};
 /// the last block known to be committed to L1: the block of the newest dispute game. Blocks
 /// come from Envio `HyperSync`.
 #[derive(Debug, Parser)]
-#[command(name = "import", version)]
+#[command(name = "import", version, arg = crate::env_file::arg())]
 pub(crate) struct Cli {
     /// Directory for the plan and the downloaded and verified chunks. Use the same one for
     /// every step.
@@ -98,12 +104,14 @@ pub(crate) struct ExportArgs {
 /// recorded; on later runs a flag that disagrees with the recorded plan is refused.
 #[derive(Debug, Clone, Args)]
 pub(crate) struct DownloadArgs {
-    /// API token of the archive service. A flag is visible in the process list and the shell
-    /// history; the environment variable is not. It is never logged or written to disk.
-    #[arg(long, env = "ENVIO_API_TOKEN", hide_env_values = true)]
-    pub(crate) api_token: Secret,
+    /// API token of the archive service, required by `download`. A flag is visible in the
+    /// process list and the shell history; the environment variable is not. It is never logged
+    /// or written to disk. `ENVIO_API_TOKEN`, its former variable, is still read, with a
+    /// warning.
+    #[arg(long, env = "OP_INDEXER_IMPORT_API_TOKEN", hide_env_values = true)]
+    pub(crate) api_token: Option<Secret>,
     /// Chain id of the chain to import [default: 10, OP Mainnet].
-    #[arg(long, env = "OP_INDEXER_IMPORT_CHAIN")]
+    #[arg(long, env = "OP_INDEXER_CHAIN_ID")]
     pub(crate) chain: Option<u64>,
     /// First block of the range [default: 0].
     #[arg(long, env = "OP_INDEXER_IMPORT_FIRST_BLOCK")]
@@ -162,6 +170,27 @@ pub(crate) struct DownloadArgs {
         value_parser = clap::value_parser!(u64).range(1..=4096)
     )]
     pub(crate) requests: u64,
+}
+
+impl DownloadArgs {
+    /// The API token: `--api-token` or `OP_INDEXER_IMPORT_API_TOKEN`, else the former
+    /// `ENVIO_API_TOKEN`, with a deprecation warning.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if none is set, or `ENVIO_API_TOKEN` is blank.
+    pub(crate) fn api_token(&self) -> eyre::Result<Secret> {
+        if let Some(token) = &self.api_token {
+            return Ok(token.clone());
+        }
+        let token = env::var(DEPRECATED_API_TOKEN_VAR).map_err(|_unset| {
+            eyre!("the API token is required: set OP_INDEXER_IMPORT_API_TOKEN, or --api-token")
+        })?;
+        warn!("{DEPRECATED_API_TOKEN_VAR} is deprecated: rename it OP_INDEXER_IMPORT_API_TOKEN");
+        token
+            .parse()
+            .map_err(|err| eyre!("{DEPRECATED_API_TOKEN_VAR}: {err}"))
+    }
 }
 
 /// Settings of `verify`.

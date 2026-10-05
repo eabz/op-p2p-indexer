@@ -108,13 +108,13 @@ impl Config {
     ///
     /// - `OP_INDEXER_CHAIN_ID`: L2 chain id, one of [`ChainSpec::ALL`] (default 10, OP
     ///   Mainnet).
-    /// - `OP_INDEXER_LISTEN_ADDR`: p2p listen socket, TCP and UDP (default `0.0.0.0:9222`).
-    /// - `OP_INDEXER_BOOTNODES`: comma-separated `enr:` records or `enode://` URLs (default: the
+    /// - `OP_INDEXER_P2P_LISTEN_ADDR`: p2p listen socket, TCP and UDP (default `0.0.0.0:9222`).
+    /// - `OP_INDEXER_P2P_BOOTNODES`: comma-separated `enr:` records or `enode://` URLs (default: the
     ///   chain's bootnodes).
-    /// - `OP_INDEXER_ADVERTISED_ADDR`: public socket (IP and port, the same for TCP and UDP)
+    /// - `OP_INDEXER_P2P_ADVERTISED_ADDR`: public socket (IP and port, the same for TCP and UDP)
     ///   the consensus-layer node record advertises (default: unset, the address
     ///   peers observe). Set it behind NAT or in a container, with the port forwarded.
-    /// - `OP_INDEXER_MAX_PEERS`: maximum connections, inbound and outbound (default 30).
+    /// - `OP_INDEXER_P2P_MAX_PEERS`: maximum connections, inbound and outbound (default 30).
     /// - `OP_INDEXER_DATA_DIR`: node state directory (default `data-<chain>`: `data-op` or
     ///   `data-unichain`, so two chains on one host never share one by default). Without it,
     ///   the node refuses to start while `data`, an earlier build's default, holds an archive
@@ -173,7 +173,7 @@ impl Config {
     /// - `OP_INDEXER_STREAM_MAX_SUBSCRIPTIONS`: stream subscriptions at once (default 64).
     /// - `OP_INDEXER_STREAM_MAX_FLIGHTS`: Arrow Flight `DoGet` streams at once, on the same
     ///   listener (default 8).
-    /// - `OP_INDEXER_API_KEYS`: comma-separated API keys; with any set, a gRPC or Flight
+    /// - `OP_INDEXER_STREAM_API_KEYS`: comma-separated API keys; with any set, a gRPC or Flight
     ///   request is served only with one of them as `authorization: Bearer <key>` (default:
     ///   none, no check). Never logged.
     ///
@@ -184,7 +184,7 @@ impl Config {
         let chain_id = parse_var("OP_INDEXER_CHAIN_ID")?.unwrap_or(DEFAULT_CHAIN_ID);
         let chain = ChainSpec::by_chain_id(chain_id)
             .ok_or_else(|| eyre!("unsupported chain id {chain_id}"))?;
-        let bootnodes = match var("OP_INDEXER_BOOTNODES") {
+        let bootnodes = match var("OP_INDEXER_P2P_BOOTNODES") {
             Some(list) => list
                 .split(',')
                 .map(|node| parse_bootnode(node.trim()))
@@ -225,7 +225,7 @@ impl Config {
             block_time: Duration::from_secs(chain.block_time_secs),
             receipts: el.is_some(),
             sync,
-            api_keys: var("OP_INDEXER_API_KEYS")
+            api_keys: var("OP_INDEXER_STREAM_API_KEYS")
                 .map(|keys| keys.split(',').map(|key| key.trim().to_owned()).collect())
                 .unwrap_or_default(),
         };
@@ -236,10 +236,11 @@ impl Config {
             sync,
             network: NetworkConfig {
                 chain,
-                listen_addr: parse_var("OP_INDEXER_LISTEN_ADDR")?.unwrap_or(DEFAULT_LISTEN_ADDR),
+                listen_addr: parse_var("OP_INDEXER_P2P_LISTEN_ADDR")?
+                    .unwrap_or(DEFAULT_LISTEN_ADDR),
                 bootnodes,
-                advertised_addr: parse_var("OP_INDEXER_ADVERTISED_ADDR")?,
-                max_peers: parse_var("OP_INDEXER_MAX_PEERS")?.unwrap_or(DEFAULT_MAX_PEERS),
+                advertised_addr: parse_var("OP_INDEXER_P2P_ADVERTISED_ADDR")?,
+                max_peers: parse_var("OP_INDEXER_P2P_MAX_PEERS")?.unwrap_or(DEFAULT_MAX_PEERS),
             },
             storage: StorageConfig {
                 unsafe_chain: UnsafeConfig {

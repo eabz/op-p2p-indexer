@@ -2335,6 +2335,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "dotenvy"
+version = "0.15.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
+
+[[package]]
 name = "dtoa"
 version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3670,6 +3676,7 @@ dependencies = [
  "op-indexer-node",
  "op-indexer-storage",
  "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 
@@ -5240,6 +5247,7 @@ dependencies = [
  "alloy-rlp",
  "bytes",
  "clap",
+ "dotenvy",
  "eyre",
  "fastrand",
  "flate2",
@@ -5298,6 +5306,7 @@ name = "op-indexer-node"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "dotenvy",
  "eyre",
  "op-indexer-chainspec",
  "op-indexer-el",
@@ -7382,6 +7391,7 @@ dependencies = [
  "op-indexer-server",
  "op-indexer-storage",
  "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 
