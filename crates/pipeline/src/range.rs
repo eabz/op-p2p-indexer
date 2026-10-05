@@ -16,6 +16,7 @@
 use op_indexer_primitives::{ArchivedBlock, EncodedBlock};
 use op_indexer_storage::{ArchiveStore, RetryError, StorageError, Store};
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -47,6 +48,7 @@ pub(crate) async fn run<A: ArchiveStore>(
         };
         // A closed channel is the fetch ending.
         let Some(batch) = batch else { return Ok(()) };
+        let started = Instant::now();
         let mut blocks = match recover_encoded(batch.clone()).await {
             Ok(blocks) => blocks,
             Err(RecoverError::Task(err)) => return Err(PipelineError::Task(err)),
@@ -66,12 +68,19 @@ pub(crate) async fn run<A: ArchiveStore>(
             })
             .collect();
         let count = archived.len();
+        let recovered = started.elapsed();
         let append = retry(&cancel, Store::Archive, APPEND, || {
             archive.append_batch(archived.clone())
         });
         match append.await {
             Ok(()) => {
-                debug!(blocks = count, last, "stored a batch of the range sync");
+                debug!(
+                    blocks = count,
+                    last,
+                    recover_ms = recovered.as_millis(),
+                    store_ms = started.elapsed().saturating_sub(recovered).as_millis(),
+                    "stored a batch of the range sync"
+                );
             }
             Err(RetryError::Cancelled) => return Ok(()),
             Err(RetryError::Storage(StorageError::NotContiguous { expected, got })) => {

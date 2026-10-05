@@ -15,9 +15,11 @@ use super::{HeldRange, MAX_ITEMS, Request, ServeCounters, ServeKind, response, r
 use crate::wire;
 
 /// Requests answered from the provider per peer per [`RATE_WINDOW`]; further ones get an empty
-/// answer. Two a second, each up to 2 MiB, is more than a syncing node asks
-/// of one peer, and bounds what one peer can make this node read.
-const MAX_REQUESTS_PER_WINDOW: u32 = 120;
+/// answer. Twenty a second: a syncing op-p2p-indexer asks one peer for a segment's headers,
+/// bodies and receipts several times a second (up to 15 requests a second), and an empty
+/// answer makes it leave the peer for a minute. [`MAX_IN_FLIGHT_PER_PEER`] and the 2 MiB
+/// answer bound what one peer can make this node read at once.
+const MAX_REQUESTS_PER_WINDOW: u32 = 1200;
 
 /// The window of the per-peer request limit.
 const RATE_WINDOW: Duration = Duration::from_mins(1);

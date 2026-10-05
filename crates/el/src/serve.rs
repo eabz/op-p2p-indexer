@@ -66,9 +66,11 @@ const SOFT_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 /// seconds of work at most, so no peer waits into its own request timeout.
 const MAX_QUEUED: usize = 64;
 
-/// Requests read from the provider at once. Each read runs on a blocking thread in the
-/// provider; this keeps serving to a few of them whatever the number of peers.
-const MAX_CONCURRENT: usize = 4;
+/// Requests read from the provider at once, of all peers. A read runs on a blocking thread
+/// (the local archive) or waits on object storage (a server's sealed history, 100 to 200 ms a
+/// GET); a syncing peer keeps four open, so four in all would serve one peer and queue the
+/// rest into their timeouts.
+const MAX_CONCURRENT: usize = 16;
 
 /// Shortest time between two reads of the held range when the head moves: a block or two.
 const HEAD_REFRESH: Duration = Duration::from_secs(2);

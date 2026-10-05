@@ -137,7 +137,7 @@ network it joins (the OP Stack chain's and, with the L1 side, Ethereum's):
 | A full peer | a dial refused with "too many peers" (or a dropped handshake): again after 60 to 90 s, doubling with each refusal in a row, up to 8 to 12 minutes; a session the peer ended with "too many peers": again after 60 to 90 s | `FULL_PEER_RETRY` |
 | Other failed dials | 5 to 7.5 minutes, doubling, up to 40 to 60 minutes; another fork or no shared protocol: 1 hour; bad data: banned 6 hours | `peers/schedule.rs` |
 | Requests we send | per session, one at a time for each requester (receipts of new blocks, range sync), 200 ms apart; a peer that leaves three requests in a row unanswered is dropped as unresponsive | `pacing.rs` |
-| Requests we answer | 120 a minute and 4 at once per peer, 1,024 items or about 2 MiB per answer, 4 answered at once in all; a request beyond these is answered empty, never left unanswered | `serve.rs`, `serve/session.rs` |
+| Requests we answer | 1,200 a minute and 4 at once per peer, 1,024 items or about 2 MiB per answer, 16 answered at once in all; a request beyond these is answered empty, never left unanswered | `serve.rs`, `serve/session.rs` |
 | What we advertise | the blocks we hold and serve, or the tip alone; never blocks we would refuse (section 13) | `serve/session.rs` |
 
 ## 7. Not done
@@ -259,10 +259,10 @@ The node answers peers from its own stores, so that another node can sync from i
   |---|---|---|
   | Items per response | 1024 | the response ends |
   | Bytes per response (soft) | 2 MiB | the response ends after the item that crosses it |
-  | Requests per peer per minute | 120 | empty answer |
+  | Requests per peer per minute | 1,200 (a syncing op-p2p-indexer asks up to ~15 a second, and leaves a peer for a minute after an empty answer) | empty answer |
   | Requests of one peer being answered | 4 | empty answer |
   | Requests of all peers waiting | 64 | empty answer |
-  | Requests read from the provider at once | 4 | the others wait in the queue |
+  | Requests read from the provider at once | 16 (a server's reads wait on R2) | the others wait in the queue |
 
 - **What is advertised** (status and `BlockRangeUpdate`, at most once every two minutes per
   eth/69 session, as devp2p `caps/eth.md` recommends; the range is read again whenever the
@@ -317,13 +317,26 @@ history can get it from one that has it.
   the rules of the block's era: plain legacy receipts before Bedrock, the deposit nonce left
   out of the hash before Canyon, the consensus encoding after.
 - Each session takes up to 4 requests of the sync at once (one start per 200 ms), the fastest
-  peers (verified blocks per second, smoothed) first; up to 32 segments of 256 blocks are
-  fetched or waiting at once, within 256 MiB of verified blocks waiting to be handed on. While a
+  peers (verified blocks per second, smoothed) first; up to 32 segments are fetched or waiting
+  at once, within 256 MiB of verified blocks waiting to be handed on. A segment spans whole
+  checkpoints (every 256th block) up to about 2 MiB of blocks of the size seen so far, from
+  256 to 1,024 blocks: a request then carries as many light blocks as a peer answers at once
+  (1,024 items), so the 200 ms between requests, not the size of an answer, bounds the sync of
+  light blocks. Measured on Unichain blocks 0 to 400,000 from a laptop (2026-10-05): 3,400
+  blocks/s from one peer with 1,024-block segments, against ~785/s on 3 sessions with 256;
+  storing a batch of 1,024 took about 10 ms, so the pipeline never held the fetch up. The
+  progress line shows the segment size, the jobs in flight, the segments waiting and the time
+  spent waiting on the store.
+- An empty receipts list for a block with transactions is "not held" (a node that pruned its
+  receipts answers so), never bad data: until 2026-10-05 it was hashed and failed the
+  receipts root, and banned honest reth peers (seen on Unichain at block 385). While a
   round runs the peer set dials for twice `OP_INDEXER_EL_MAX_SESSIONS` outbound sessions and
   releases none for being unused.
 - Items in an answer are matched by what verifies: leading items that belong to their blocks
   are kept and the rest asked for again; an item of a later block means "not held from here";
-  an item of no block asked for is bad data and bans the peer.
+  an item of no block asked for is bad data and bans the peer. The rejection is logged with what
+  did not match for the first block asked (which root, computed and the header's, or the
+  receipt count).
 - Verified blocks go to the pipeline in ascending order, in batches, as the exact bytes
   received (`EncodedBlock`). The pipeline decodes them on blocking threads for the committed
   store, recovers senders in parallel, and appends the bytes to the archive

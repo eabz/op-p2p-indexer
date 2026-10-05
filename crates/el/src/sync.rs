@@ -68,9 +68,19 @@ use crate::ElError;
 use crate::peers::{Peers, Report, closed};
 use crate::session::{RequestError, SessionHandle};
 
-/// Blocks between two checkpoints: what one session fetches as a unit and the size of a batch
-/// handed to the pipeline. A segment is held in memory until it is handed on.
+/// Blocks between two checkpoints, and the fewest blocks one session fetches as a unit (a
+/// segment, handed to the pipeline as one batch). A segment is held in memory until it is
+/// handed on.
 const SEGMENT_BLOCKS: u64 = 256;
+/// The most blocks of one segment: what peers answer in one request (1,024 headers, bodies or
+/// blocks of receipts). Segments of light blocks span several checkpoints, so a request
+/// carries as many blocks as a peer answers at once: the 200 ms between two requests to a
+/// peer, not the size of an answer, is what bounds a sync of light blocks.
+const MAX_SEGMENT_BLOCKS: u64 = 1024;
+/// The bytes a segment aims at, from the blocks' size so far: one answer of bodies or
+/// receipts (peers stop an answer past 2 MiB). Heavier blocks keep segments of
+/// [`SEGMENT_BLOCKS`], whose answers come in several pages.
+const SEGMENT_TARGET_BYTES: u64 = 2 << 20;
 /// Segments fetched or waiting to be handed on at once: enough for every session to keep a
 /// few requests in flight. Bounds how far the fetch runs ahead of a pipeline that stores
 /// slowly; [`MAX_READY_BYTES`] bounds the memory.
@@ -216,6 +226,8 @@ struct Syncer {
     gaps_busy: HashSet<BlockNumber>,
     /// Bytes of the segments in `ready`.
     ready_bytes: usize,
+    /// Bytes per block of the segments fetched so far, smoothed; 0 before the first.
+    block_bytes: u64,
     /// First block not yet assigned to a segment.
     next_assign: BlockNumber,
     /// First block not yet handed on.
@@ -226,6 +238,9 @@ struct Syncer {
     ready: BTreeMap<BlockNumber, (Segment, Vec<EncodedBlock>)>,
     /// Segments assigned and not yet handed on. At most [`MAX_SEGMENTS_AHEAD`].
     outstanding: usize,
+    /// Time spent waiting for the pipeline to take a batch since progress was last logged:
+    /// time the fetch was held up by storing.
+    store_wait: Duration,
     jobs: JoinSet<Done>,
     /// When it was last said that no peer serves what is needed.
     starved_warned: Option<Instant>,
@@ -374,11 +389,13 @@ impl Syncer {
             gaps: BTreeMap::new(),
             gaps_busy: HashSet::new(),
             ready_bytes: 0,
+            block_bytes: 0,
             next_assign: first,
             next_emit: first,
             waiting: BTreeMap::new(),
             ready: BTreeMap::new(),
             outstanding: 0,
+            store_wait: Duration::ZERO,
             jobs: JoinSet::new(),
             starved_warned: None,
             anchor_served: false,
@@ -658,7 +675,14 @@ impl Syncer {
         if self.outstanding >= MAX_SEGMENTS_AHEAD || self.ready_bytes >= MAX_READY_BYTES {
             return None;
         }
-        let (number, hash) = self.checkpoints.range(self.next_assign..).next()?;
+        // The furthest checkpoint within the segment's span, and at least the next one.
+        let end = self.next_assign.saturating_add(self.segment_span());
+        let mut tops = self.checkpoints.range(self.next_assign..);
+        let next = tops.next()?;
+        let (number, hash) = tops
+            .take_while(|(number, _)| **number < end)
+            .last()
+            .unwrap_or(next);
         let segment = Segment {
             first: self.next_assign,
             top: BlockRef {
@@ -672,6 +696,16 @@ impl Syncer {
         self.next_assign = segment.top.number.saturating_add(1);
         self.outstanding = self.outstanding.saturating_add(1);
         Some(Job::Segment(segment))
+    }
+
+    /// Blocks a new segment spans: [`SEGMENT_TARGET_BYTES`] of blocks of the size seen so far,
+    /// in whole checkpoints, from [`SEGMENT_BLOCKS`] to [`MAX_SEGMENT_BLOCKS`].
+    fn segment_span(&self) -> u64 {
+        if self.block_bytes == 0 {
+            return SEGMENT_BLOCKS;
+        }
+        let blocks = SEGMENT_TARGET_BYTES / self.block_bytes;
+        (blocks / SEGMENT_BLOCKS * SEGMENT_BLOCKS).clamp(SEGMENT_BLOCKS, MAX_SEGMENT_BLOCKS)
     }
 
     /// Says, at most once per [`STARVED_INTERVAL`], that sessions are open and free but none
@@ -739,7 +773,9 @@ impl Syncer {
                         return Ok(true);
                     }
                 }
-                self.ready_bytes = self.ready_bytes.saturating_add(batch_bytes(&blocks));
+                let bytes = batch_bytes(&blocks);
+                self.measured_size(bytes, blocks.len());
+                self.ready_bytes = self.ready_bytes.saturating_add(bytes);
                 self.ready.insert(segment.first, (segment, blocks));
                 return Ok(self.hand_on(cancel).await);
             }
@@ -802,6 +838,25 @@ impl Syncer {
         self.schedule.measured(peer, blocks, took);
         // A success is never reported to the peer set.
         let _report = self.schedule.finished(peer, None);
+    }
+
+    /// Records the size of `blocks` verified blocks of `bytes` bytes, for [`Self::segment_span`].
+    fn measured_size(&mut self, bytes: usize, blocks: usize) {
+        let (Ok(bytes), Ok(blocks)) = (u64::try_from(bytes), u64::try_from(blocks)) else {
+            return;
+        };
+        let Some(size) = bytes.checked_div(blocks) else {
+            return;
+        };
+        // Smoothed as peers' rates are: a quarter of the new segment.
+        self.block_bytes = if self.block_bytes == 0 {
+            size.max(1)
+        } else {
+            self.block_bytes
+                .saturating_mul(3)
+                .saturating_add(size)
+                .div_ceil(4)
+        };
     }
 
     /// The first block of the gap below `top`: a page of the walk, not below the first block.
@@ -883,7 +938,10 @@ impl Syncer {
     async fn hand_on(&mut self, cancel: &CancellationToken) -> bool {
         while let Some((segment, blocks)) = self.ready.remove(&self.next_emit) {
             self.ready_bytes = self.ready_bytes.saturating_sub(batch_bytes(&blocks));
-            if !send(&self.blocks, blocks, "blocks", cancel).await {
+            let started = Instant::now();
+            let sent = send(&self.blocks, blocks, "blocks", cancel).await;
+            self.store_wait = self.store_wait.saturating_add(started.elapsed());
+            if !sent {
                 return false;
             }
             self.next_emit = segment.top.number.saturating_add(1);
@@ -893,7 +951,7 @@ impl Syncer {
         true
     }
 
-    fn log_progress(&self) {
+    fn log_progress(&mut self) {
         if let Some(lowest) = self.walk_from() {
             // Sessions whose peer says it holds the next page of the walk.
             let page_first = self.gap_first(lowest.number);
@@ -934,10 +992,15 @@ impl Syncer {
                 "{waiting}"
             );
         } else {
+            let store_wait = std::mem::take(&mut self.store_wait);
             info!(
                 next = self.next_emit,
                 anchor = self.anchor.number,
                 in_progress = self.outstanding,
+                fetching = self.jobs.len(),
+                segment_blocks = self.segment_span(),
+                ready = self.ready.len(),
+                store_wait_ms = store_wait.as_millis(),
                 sessions = self.schedule.len(),
                 "range sync: fetching blocks"
             );

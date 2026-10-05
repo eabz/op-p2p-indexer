@@ -43,8 +43,11 @@ struct Wanted {
 enum Check<T> {
     /// It is; here in the form it is kept in.
     Belongs(T),
-    /// It is another block's, or nothing valid.
-    Other,
+    /// It is another block's, or nothing valid: what does not match, for the log.
+    Other(String),
+    /// It says the peer does not hold what was asked: an empty receipts list for a block with
+    /// transactions (a node that pruned them answers so).
+    NotHeld,
     /// It cannot be read at all.
     Undecodable(String),
 }
@@ -202,12 +205,17 @@ fn accept<T>(
             Check::Undecodable(reason) if accepted.is_empty() => {
                 return Err(Failure::Undecodable(reason));
             }
-            Check::Other | Check::Undecodable(_) => break,
+            Check::NotHeld if accepted.is_empty() => return Err(Failure::NotHeld),
+            Check::Other(_) | Check::Undecodable(_) | Check::NotHeld => break,
         }
     }
     if !accepted.is_empty() {
         return Ok(accepted);
     }
+    let mismatch = expected.first().map(|block| match belongs(block, first) {
+        Check::Other(mismatch) => format!("block {}: {mismatch}", block.header.header.number),
+        Check::Belongs(_) | Check::Undecodable(_) | Check::NotHeld => String::new(),
+    });
     let later = expected
         .iter()
         .skip(1)
@@ -216,8 +224,9 @@ fn accept<T>(
         Failure::NotHeld
     } else {
         Failure::Invalid(format!(
-            "an answer that belongs to none of the {} blocks asked for",
-            expected.len()
+            "an answer that belongs to none of the {} blocks asked for ({})",
+            expected.len(),
+            mismatch.unwrap_or_default()
         ))
     })
 }
@@ -229,16 +238,36 @@ fn accept<T>(
 /// storage root, not the list's.)
 fn body_of(block: &Wanted, body: &Bytes) -> Check<(Bytes, usize)> {
     let header = &block.header.header;
-    match split_body(body) {
-        Some(parts)
-            if transactions_root(&parts.transactions) == header.transactions_root
-                && keccak256(parts.ommers) == header.ommers_hash
-                && parts.withdrawals == header.withdrawals_root.is_some() =>
-        {
-            Check::Belongs((body.clone(), parts.transactions.len()))
-        }
-        Some(_) | None => Check::Other,
+    let Some(parts) = split_body(body) else {
+        return Check::Other("the body is not a block body".to_owned());
+    };
+    let root = transactions_root(&parts.transactions);
+    if root != header.transactions_root {
+        return Check::Other(format!(
+            "transactions root {root} of {} transactions, the header's {}",
+            parts.transactions.len(),
+            header.transactions_root
+        ));
     }
+    if keccak256(parts.ommers) != header.ommers_hash {
+        return Check::Other("ommers hash differs".to_owned());
+    }
+    if parts.withdrawals != header.withdrawals_root.is_some() {
+        return Check::Other(format!(
+            "withdrawals list {}, header withdrawals root {}",
+            if parts.withdrawals {
+                "present"
+            } else {
+                "absent"
+            },
+            if header.withdrawals_root.is_some() {
+                "present"
+            } else {
+                "absent"
+            },
+        ));
+    }
+    Check::Belongs((body.clone(), parts.transactions.len()))
 }
 
 /// Checks that `item` holds the receipts of `block`: one per transaction, hashing to its
@@ -246,12 +275,23 @@ fn body_of(block: &Wanted, body: &Bytes) -> Check<(Bytes, usize)> {
 fn receipts_of(block: &Wanted, item: &Bytes, canyon_time: u64) -> Check<Bytes> {
     let header = &block.header.header;
     match decode_receipts(item, block.transactions) {
-        Ok(receipts)
-            if receipts_root(&receipts, header.timestamp, canyon_time) == header.receipts_root =>
-        {
-            Check::Belongs(encode_receipts(&receipts))
+        // Asked only for blocks with transactions: an empty list is "not from me".
+        Ok(receipts) if receipts.is_empty() => Check::NotHeld,
+        Ok(receipts) => {
+            let root = receipts_root(&receipts, header.timestamp, canyon_time);
+            if root == header.receipts_root {
+                Check::Belongs(encode_receipts(&receipts))
+            } else {
+                Check::Other(format!(
+                    "receipts root {root} of {} receipts (time {}, Canyon {canyon_time}), the \
+                     header's {}",
+                    receipts.len(),
+                    header.timestamp,
+                    header.receipts_root
+                ))
+            }
         }
-        Ok(_) | Err(ReceiptsError::Count { .. }) => Check::Other,
+        Err(err @ ReceiptsError::Count { .. }) => Check::Other(err.to_string()),
         Err(ReceiptsError::Rlp(err)) => Check::Undecodable(err.to_string()),
     }
 }

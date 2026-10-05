@@ -11,10 +11,15 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-/// R2 reads for peers in progress at once.
-const MAX_PEER_READS: usize = 4;
-/// Bytes read from R2 for peers per minute: about 8 MB/s, a fraction of a droplet's link.
-const PEER_BYTES_PER_MINUTE: u64 = 512 * 1024 * 1024;
+/// R2 reads for peers in progress at once: as many as `el` answers at once. A read waits on
+/// R2 (100 to 200 ms a GET), not on this host, and a syncing peer keeps four requests open:
+/// four places would let one syncing peer starve every other.
+const MAX_PEER_READS: usize = 16;
+/// Bytes read from R2 for peers per minute: about 70 MB/s, a part of a droplet's link. A
+/// syncing peer's segment of OP Mainnet costs about 60 MB (its headers, bodies and receipts
+/// each read the segment's blocks), so this serves about 300 such blocks a second; R2 egress
+/// is free, the droplet's link is what it spends.
+const PEER_BYTES_PER_MINUTE: u64 = 4 * 1024 * 1024 * 1024;
 const WINDOW: Duration = Duration::from_mins(1);
 
 /// The budget, shared by every clone.
