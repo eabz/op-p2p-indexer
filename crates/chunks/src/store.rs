@@ -138,7 +138,11 @@ impl ChunkStore {
             .endpoint
             .clone()
             .unwrap_or_else(|| format!("https://{}.r2.cloudflarestorage.com", config.account_id));
+        // HTTP/1.1: over HTTP/2 every request in flight is multiplexed on one connection,
+        // which caps a whole export or server near one connection's throughput (~150 MB/s
+        // measured to R2); separate pooled connections scale with the requests in flight.
         let client = ClientOptions::new()
+            .with_http1_only()
             .with_pool_max_idle_per_host(POOL_PER_HOST)
             .with_pool_idle_timeout(POOL_IDLE)
             .with_timeout(REQUEST_TIMEOUT)
