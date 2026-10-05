@@ -1,0 +1,76 @@
+site_name: op/p2p-indexer
+site_description: Run a node, configure your infrastructure, and build with OP Stack data.
+site_url: https://eabz.github.io/op-p2p-indexer/docs/
+repo_url: https://github.com/eabz/op-p2p-indexer
+repo_name: eabz/op-p2p-indexer
+docs_dir: .docs
+site_dir: .site/docs
+theme:
+  name: material
+  custom_dir: docs-theme
+  font: false
+  logo: logo.svg
+  favicon: logo.svg
+  palette:
+    scheme: slate
+    primary: custom
+    accent: custom
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - search.highlight
+    - search.suggest
+    - content.code.copy
+plugins:
+  - search
+markdown_extensions:
+  - admonition
+  - attr_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight
+  - pymdownx.inlinehilite
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+extra_css:
+  - brand.css
+nav:
+  - Get started:
+      - Overview: index.md
+      - Install and run: guides/start.md
+      - Your first query: guides/query.md
+      - Readiness and limits: guides/readiness.md
+  - Build applications:
+      - Live updates and recovery: guides/live.md
+      - Trust and finality: guides/trust.md
+      - API reference: stream.md
+  - Operate your deployment:
+      - Operations and recovery: guides/operate.md
+      - Configuration: configuration.md
+      - Import history: import.md
+      - Fleet and object storage: serving.md
+  - Open project:
+      - Contributing and governance: guides/community.md
+      - Roadmap: roadmap.md
+  - Engineering reference:
+      - Architecture: architecture.md
+      - Storage: storage.md
+      - Base: base.md
+      - Peer duties: citizenship.md
+      - Pipeline: pipeline.md
+      - Benchmarks: bench.md
+      - Execution peers: el.md
+      - L1 verification: l1.md
+  - Historical research:
+      - Execution viability: el-viability.md
+      - L1 viability: l1-viability.md
+      - Design decisions: decisions.md
+extra:
+  homepage: ../
+  release_docs: ./
+  development_docs: development/

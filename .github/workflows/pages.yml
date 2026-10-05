@@ -6,6 +6,8 @@ on:
     paths:
       - 'website/**'
       - 'scripts/install.sh'
+      - 'docs/**'
+      - 'README.md'
       - '.github/workflows/pages.yml'
   workflow_dispatch:
 
@@ -27,17 +29,26 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Check website JavaScript
         run: node --check website/dist/app.js
-      - name: Stage the canonical installer
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: website/requirements.txt
+      - name: Build website and documentation
         run: |
+          python -m pip install -r website/requirements.txt
           bash -n scripts/install.sh
-          cp scripts/install.sh website/dist/install.sh
-          cmp scripts/install.sh website/dist/install.sh
+          python website/build.py
+          python website/check_links.py
+          git show "$(python -c 'import json; print(json.load(open("website/release.json"))["version"])'):scripts/install.sh" | cmp - website/.site/install.sh
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: website/dist
+          path: website/.site
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4

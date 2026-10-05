@@ -10,3 +10,10 @@
 
 # Per-chain TOML configuration contains secrets.
 config.toml
+
+# Website build and documentation tooling.
+/website/.venv/
+/website/.docs/
+/website/.site/
+/website/__pycache__/
+website/.docs-development/

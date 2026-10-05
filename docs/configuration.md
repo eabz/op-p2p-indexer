@@ -173,28 +173,6 @@ See [`config.toml.example`](../config.toml.example) for an editable example.
 | `bench.max_message_bytes` | integer |
 | `bench.json` | path |
 
-### bench
-
-| Field | Type |
-|---|---|
-| `bench.api_key` | string |
-| `bench.balancer_url` | string |
-| `bench.table` | string |
-| `bench.heavy` | boolean |
-| `bench.from` | integer |
-| `bench.to` | integer |
-| `bench.cap` | string |
-| `bench.concurrency` | integer |
-| `bench.per_server` | integer |
-| `bench.compression` | string |
-| `bench.plan_timeout` | integer |
-| `bench.rpc_timeout` | integer |
-| `bench.retry_for` | integer |
-| `bench.progress` | integer |
-| `bench.repeat` | integer |
-| `bench.max_message_bytes` | integer |
-| `bench.json` | path |
-
 ### r2
 
 | Field | Type |

@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block extrahead %}
+  {{ super() }}
+  {% if page %}<link rel="alternate" type="text/markdown" href="{{ ('markdown/' ~ page.file.src_uri) | url }}" title="Markdown source">{% endif %}
+{% endblock %}
+{% block content %}
+  <p class="release-note">{{ config.extra.version_label }} · <a href="{{ config.extra.release_docs | url }}">Release docs</a> · <a href="{{ config.extra.development_docs | url }}">Development</a></p>
+  <div class="doc-links"><a href="{{ config.extra.homepage | url }}">← Website</a><a href="{{ ('markdown/' ~ page.file.src_uri) | url }}">View Markdown</a><a href="{{ 'llms.txt' | url }}">Agent index</a></div>
+  {{ super() }}
+{% endblock %}

@@ -1,37 +1,80 @@
-# op-p2p-indexer landing page
+# Website and documentation
 
-Static branding and product landing page. The source of truth lives in this repository under `website/dist/`; there is no build step or package installation.
+The landing page lives in `dist/`. The documentation uses Material for MkDocs and builds
+from Markdown. Public guides live in `docs/index.md` and `docs/guides/`; the technical reference and installer
+come from the Git tag selected in `release.json`. `/docs/development/` separately renders
+the working tree's engineering docs and README. Edit sources, not generated files.
 
-## Preview
+## Build and preview
 
 From the repository root:
 
 ```sh
-python3 -m http.server 4173 --directory website/dist
+git fetch --tags
+python3 -m venv website/.venv
+website/.venv/bin/pip install -r website/requirements.txt
+website/.venv/bin/python website/build.py
+python3 -m http.server 4173 --directory website/.site
 ```
 
-Open http://localhost:4173. The hero is a labeled simulation, not a connection to a running indexer.
+Open http://localhost:4173 for the website or http://localhost:4173/docs/ for the docs.
+Rebuild after editing. Generated `.docs/` and `.site/` directories are ignored by Git.
 
-## Edit
+## Editing
 
-- `dist/index.html`: product copy, architecture, links and setup commands.
-- `dist/style.css`: brand colors, typography, responsive layout and motion preferences.
-- `dist/app.js`: chain and pipeline selection, simulation controls, protocol examples and clipboard action.
+- `dist/index.html`: landing page content; keep install and documentation as the main actions.
+- `dist/style.css`: the charcoal/coral brand, responsive layout and reduced-motion support.
+- `dist/app.js`: data-flow controls, API examples and clipboard feedback.
+- `mkdocs.yml`: documentation navigation, search, code copying and Mermaid diagrams.
+- `docs-theme/`: matching colors and links to each page's Markdown source.
+- `build.py`: stage the existing Markdown, compile the site and export agent-readable docs.
 
-The displayed command uses the short Pages endpoint:
+The installer comes from the selected release's `scripts/install.sh` and is staged automatically.
+The landing command pins that same release. To adopt a release, update `release.json`, the
+landing command/version label and guide baseline together; verify the config paths and
+service names against that tag. This prevents development setup changes from being paired
+with older binaries. Historical technical references are retained as release records.
+The data-flow diagram describes architecture;
+it does not display live network measurements.
 
-```sh
-sudo bash -c "$(curl -fsSL https://eabz.github.io/op-p2p-indexer/install.sh)"
-```
+## Documentation for readers and agents
 
-The installer takes no options; it asks which programs to install in a menu. The copy
-button reads the displayed command automatically. Keep it consistent with the root README;
-no Rust build is required.
+- `/docs/`: searchable HTML, grouped navigation, section permalinks and code-copy buttons.
+- `/docs/markdown/<name>.md`: plain Markdown for each page, linked from its HTML header.
+- `/llms.txt` and `/docs/llms.txt`: an index of the Markdown URLs.
+- `/llms-full.txt` and `/docs/llms-full.txt`: the complete documentation text.
+
+These are all generated from the same source files. Benchmark evidence is preserved as
+static downloads. `llms.txt` aids discovery; agents can also read the rendered HTML or fetch
+individual Markdown pages without JavaScript.
+
+Both the release and development docs have their own Markdown exports and agent indexes.
+The root agent index selects the release documentation. Do not mix development guidance
+with installed releases. Downloadable examples and the released protobuf schema are under
+`/docs/examples/`.
 
 ## Publish
 
-GitHub Pages serves `website/dist/` at https://eabz.github.io/op-p2p-indexer/.
+The existing `.github/workflows/pages.yml` builds and publishes both the landing page and
+docs to GitHub Pages when `website/`, `docs/`, `README.md`, or `scripts/install.sh` changes on
+`main`. It can also be run manually. Repository Settings → Pages must use GitHub Actions.
+There is no separate documentation hosting account or service.
 
-The workflow in `.github/workflows/pages.yml` deploys automatically when website files or `scripts/install.sh` change on `main`. It copies the canonical `scripts/install.sh` into the Pages artifact as `install.sh`; do not maintain a second tracked installer under `website/dist/`. The endpoint therefore follows main, while downloaded binaries always come from checksum-verified releases. It can also be run manually from GitHub Actions. Repository Settings → Pages must use **GitHub Actions** as the publishing source. Only the static files are uploaded; no build step, hosting credentials or external hosting service is required.
+Before publishing:
 
-Before publishing, run `node --check website/dist/app.js` from the repository root and check chain selection, pipeline stages, pause/play, protocol tabs, copy commands and the mobile layout.
+```sh
+node --check website/dist/app.js
+website/.venv/bin/python website/build.py
+website/.venv/bin/python website/check_links.py
+website/.venv/bin/pip install -r website/requirements-check.txt
+website/.venv/bin/python website/check_examples.py
+```
+
+Check desktop and mobile layouts, install copy feedback, data-flow controls, documentation
+navigation, search, Mermaid rendering and Markdown links in the browser. The MkDocs build
+runs in strict mode so documentation build warnings fail CI.
+
+The PR check compiles the released protocol and exercises the actual downloadable query
+against a local Flight fixture, including gap/truncation diagnostics. This checks client
+behavior, not real-chain correctness. Fresh-host installation, exporter continuity,
+reorganization recovery and sustained production operation require external run evidence.
