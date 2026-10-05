@@ -13,7 +13,7 @@
 //! - `service`: the gRPC service, `Register` (server key) and `Locate` (user key).
 //! - `flight`: Arrow Flight's `GetFlightInfo` and `ListFlights` (user key): a range cut into
 //!   one endpoint per sealed chunk, each naming servers by load, and the part above the last
-//!   sealed chunk naming the servers whose head covers it.
+//!   sealed chunk naming the servers whose head covers it with no hole below it.
 //! - [`register`]: the server's side, the client that keeps a server registered.
 //!
 //! [`Balancer`] is the component.

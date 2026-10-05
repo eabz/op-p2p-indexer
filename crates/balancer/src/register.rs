@@ -87,6 +87,8 @@ pub struct Report {
     pub finalized_head: Option<BlockNumber>,
     /// The last block of the sealed chunks it has read from the manifest.
     pub last_sealed: Option<BlockNumber>,
+    /// How far it holds every block: `Heartbeat.contiguous_through` in the proto.
+    pub contiguous_through: Option<BlockNumber>,
     /// Requests in flight: subscriptions, Flight streams, lookups.
     pub requests_in_flight: u32,
     /// Bytes it sends to clients per second.
@@ -248,6 +250,7 @@ fn heartbeat(template: Heartbeat, report: Report) -> Heartbeat {
         safe_head,
         finalized_head,
         last_sealed,
+        contiguous_through,
         requests_in_flight,
         bytes_per_second,
     } = report;
@@ -257,6 +260,7 @@ fn heartbeat(template: Heartbeat, report: Report) -> Heartbeat {
         safe_head,
         finalized_head,
         last_sealed,
+        contiguous_through,
         requests_in_flight,
         bytes_per_second,
         ..template

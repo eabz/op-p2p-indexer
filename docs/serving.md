@@ -447,6 +447,18 @@ heartbeat:
 - id, chain, and the `host:port` of its gRPC and Flight listener;
 - health: an unhealthy server gets no work;
 - heads: unsafe, safe, finalized, and the last sealed block it has read from the manifest;
+- contiguity (`contiguous_through`): the highest block N such that it holds every block from
+  the chain's first through N, each with its receipts. A server holds the sealed chunks (R2),
+  its own tail (committed blocks above them; filled by range sync, `OP_INDEXER_EL_SYNC=true`)
+  and its own unsafe chain (gossip since it started). Without range sync there is a gap
+  between the last sealed block and the first block it gossiped: its head is above the gap
+  but it cannot serve it (seen on the bench, 2026-10-04: one server answered `NOT_FOUND` for
+  a block the other served). The server computes it at each heartbeat, cheaply, as the range
+  it advertises to execution peers (`NodeView::contiguous_through`, `NodeProvider::range`):
+  its committed store's blocks (contiguous by construction: every append links to the one
+  before) up to the first still waiting for receipts, extended through its unsafe chain's
+  canonical blocks that link to them and have theirs, each search continuing from the last;
+  never below the last sealed block;
 - load: requests in flight (subscriptions, Flight streams, lookups) and bytes sent per second.
 
 The table holds no chunk ranges (corrected by the user, 2026-10-04): every server is stateless
@@ -456,14 +468,16 @@ manifest itself, once per refresh (every 30 s), only for the chunk boundaries.
 ### 6.2 Registration
 
 A server opens a `Register` stream to the balancer and sends a heartbeat every 5 s with its
-health, heads and load. Three missed heartbeats (15 s) mark it down and remove it.
+health, heads, contiguity and load. Three missed heartbeats (15 s) mark it down and remove it.
 
 ### 6.3 Health and failover
 
 - A server is down after 3 missed heartbeats, and out of the table as soon as its `Register`
   call ends.
-- Work at the tip goes only to a server whose head covers it (6.4, 6.5): a server that falls
-  behind gets none until it catches up, but still serves sealed chunks.
+- Work above the sealed chunks goes only to a server that holds every block through it: its
+  head covers the work and so does its `contiguous_through` (6.4, 6.5). A server that falls
+  behind, or has a gap above the sealed chunks, gets none there, but still serves sealed
+  chunks. A server that reports no `contiguous_through` gets no work above them.
 - Failover is on the client side: every answer names more than one server when there are.
 
 ### 6.4 Flight: per-chunk jobs
@@ -472,8 +486,8 @@ health, heads and load. Three missed heartbeats (15 s) mark it down and remove i
 into per-chunk jobs, so one big range runs in parallel over the servers:
 - One `FlightEndpoint` per chunk the range touches, its ticket clipped to the chunk
   (`table:first:last:cap`, the stream's existing ticket); every healthy server can take it.
-- The part above the last sealed chunk becomes jobs only a server whose head (under the
-  ticket's cap) reaches the job's last block can take.
+- The part above the last sealed chunk becomes jobs only a server can take whose head (under
+  the ticket's cap) and `contiguous_through` both reach the job's last block.
 - Every job is also cut to the servers' `DoGet` limit (100,000 blocks).
 - Each job goes to the least loaded server that can take it, and its `location` lists up to
   three, least loaded first. The load counts the jobs already given out for the same range, so
@@ -486,7 +500,8 @@ into per-chunk jobs, so one big range runs in parallel over the servers:
 ### 6.5 Locate
 
 **D17.** `Locate(chain, from_block) → [server endpoints]` for gRPC subscriptions: the healthy
-servers whose head reaches the block before `from_block`, least loaded first. The client
+servers whose `contiguous_through` reaches the block before `from_block` (they hold every
+block up to it), least loaded first. The client
 subscribes to the first and, on failure, resubscribes from its last block at the next.
 Subscriptions already resume by number.
 
@@ -531,11 +546,14 @@ environment and are never logged. TLS is not part of this design.
   and registers again after a backoff of 1 s doubling to 30 s with jitter; it never stops the
   server. A server's address must be exactly `host:port` (`register::is_valid_address`).
 - **Picking** (6.4, 6.5): by requests in flight plus the jobs given out for the same request,
-  then bytes per second, ties round-robin. The heads are the heartbeats'; no separate
-  `GetHeads` probe.
+  then bytes per second, ties round-robin. Above the sealed chunks a server serves up to its
+  reach, min(head under the cap, `contiguous_through`) (`table::Server::reach`): Flight jobs
+  by the ticket's cap, `Locate` by the unsafe head. The heads and `contiguous_through` are the
+  heartbeats'; no separate `GetHeads` probe.
 - **Flight** (D16): the other Flight calls are `UNIMPLEMENTED` (no `GetSchema`: the schema is
-  in each `FlightInfo`). A range is clipped by the best head of its cap among the servers, and
-  may not start below the first sealed chunk (`OUT_OF_RANGE`). `ordered` is set.
+  in each `FlightInfo`). A range is clipped by the best reach among the servers (the head of
+  its cap, but no further than the server's `contiguous_through`), and may not start below the
+  first sealed chunk (`OUT_OF_RANGE`). `ordered` is set.
 - **Keys** (D18): `Locate` and Flight take a user key from `OP_INDEXER_STREAM_API_KEYS`, the
   servers' own list; `Register` takes a server key from `OP_INDEXER_BALANCER_SERVER_KEYS`,
   which is required. Checked per call (`op_indexer_stream::ApiKeys::verify`), never logged.

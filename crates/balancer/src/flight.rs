@@ -4,7 +4,9 @@
 //! - one per sealed chunk the range touches, its ticket clipped to the chunk; every healthy
 //!   server serves it;
 //! - the part above the last sealed chunk; only a server whose head (under the ticket's cap)
-//!   reaches the job's last block serves it.
+//!   reaches the job's last block, and that holds every block through it
+//!   (`contiguous_through`: a server without range sync has a gap above the sealed chunks),
+//!   serves it.
 //!
 //! Every job is also cut to the servers' own limit, [`ticket::MAX_FLIGHT_BLOCKS`] blocks.
 //!
@@ -13,7 +15,8 @@
 //! range, so a large range spreads over every server); the client moves to the next if one
 //! fails. Tickets and descriptors are the servers'
 //! own ([`ticket`]): a ticket from here works on any server. The range is clipped by the best
-//! head the servers report; each server clips again by its own when it serves.
+//! reach the servers report (head and contiguity); each server clips again by its own when it
+//! serves.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -30,7 +33,7 @@ use tokio::sync::watch;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::table::{Server, Table};
+use crate::table::Table;
 
 /// Servers named by each job: the client moves to the next if one fails.
 const LOCATIONS: usize = 3;
@@ -79,15 +82,12 @@ impl Flight {
                 first.first
             )));
         }
-        let reach = picker
+        let best = picker
             .servers()
             .iter()
-            .filter_map(|server| head(server, query.cap))
+            .filter_map(|server| server.reach(query.cap))
             .max();
-        let Some(to) = reach
-            .map(|reach| reach.min(query.to))
-            .filter(|to| *to >= from)
-        else {
+        let Some(to) = best.map(|best| best.min(query.to)).filter(|to| *to >= from) else {
             return Err(Status::out_of_range(format!(
                 "no server holds block {from} under the cap {}",
                 query.cap.name()
@@ -113,11 +113,11 @@ impl Flight {
             }
             next = chunk.last.saturating_add(1);
         }
-        // Above the sealed chunks: only a server whose head covers the piece. The best head
-        // reaches `to`, so every piece has one.
+        // Above the sealed chunks: only a server that holds every block through the piece
+        // under the cap. The best reaches `to`, so every piece has one.
         for (piece_from, piece_to) in pieces(next, to) {
             let locations = picker.pick(LOCATIONS, |server| {
-                head(server, query.cap).is_some_and(|head| head >= piece_to)
+                server.reach(query.cap).is_some_and(|last| last >= piece_to)
             });
             jobs.push(Job {
                 from: piece_from,
@@ -174,15 +174,6 @@ fn pieces(from: BlockNumber, to: BlockNumber) -> impl Iterator<Item = (BlockNumb
         next = (end < to).then(|| end.saturating_add(1));
         Some((start, end))
     })
-}
-
-/// `server`'s head under `cap`.
-const fn head(server: &Server, cap: Cap) -> Option<BlockNumber> {
-    match cap {
-        Cap::Finalized => server.finalized_head,
-        Cap::Safe => server.safe_head,
-        Cap::Any => server.unsafe_head,
-    }
 }
 
 fn unimplemented<T>() -> Result<T, Status> {

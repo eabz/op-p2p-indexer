@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use alloy_primitives::BlockNumber;
+use op_indexer_stream::ticket::Cap;
 
 /// Picks so far, so ties between equally loaded servers go round-robin across requests.
 static TURN: AtomicUsize = AtomicUsize::new(0);
@@ -26,8 +27,24 @@ pub(crate) struct Server {
     pub(crate) unsafe_head: Option<BlockNumber>,
     pub(crate) safe_head: Option<BlockNumber>,
     pub(crate) finalized_head: Option<BlockNumber>,
+    /// How far it holds every block: `Heartbeat.contiguous_through` in the proto.
+    pub(crate) contiguous_through: Option<BlockNumber>,
     pub(crate) requests_in_flight: u32,
     pub(crate) bytes_per_second: u64,
+}
+
+impl Server {
+    /// The last block it serves under `cap`: its head under the cap, but no further than it
+    /// holds every block (a server without range sync has a gap above the sealed chunks).
+    pub(crate) fn reach(&self, cap: Cap) -> Option<BlockNumber> {
+        let head = match cap {
+            Cap::Finalized => self.finalized_head,
+            Cap::Safe => self.safe_head,
+            Cap::Any => self.unsafe_head,
+        };
+        head.zip(self.contiguous_through)
+            .map(|(head, through)| head.min(through))
+    }
 }
 
 /// The table, cheap to clone: clones share it.

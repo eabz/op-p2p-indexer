@@ -26,7 +26,7 @@ use std::time::Duration;
 use alloy_primitives::BlockNumber;
 use eyre::WrapErr;
 use op_indexer_chainspec::ChainSpec;
-use op_indexer_el::{ExecutionNetwork, Peers, RangeSync, RoundEnd, SyncPlan};
+use op_indexer_el::{BlockProvider as _, ExecutionNetwork, Peers, RangeSync, RoundEnd, SyncPlan};
 use op_indexer_l1::{BeaconConfig, L1Config, L1Network, LightClient};
 use op_indexer_p2p::{Network, NodeStore, PayloadSource, StoreError};
 use op_indexer_pipeline::{Pipeline, ReceiptsChannels};
@@ -34,7 +34,7 @@ use op_indexer_primitives::{
     BeaconCheckpoint, BlockRef, EncodedBlock, ExecutionPeer, L1Games, L1Heads, SyncRange,
 };
 use op_indexer_storage::unsafe_store::MemoryStore;
-use op_indexer_storage::{ArchiveStore, StorageConfig, UnsafeStore};
+use op_indexer_storage::{ArchiveStore, StorageConfig, StorageError, UnsafeStore};
 use op_indexer_stream::{Load, StreamServer};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
@@ -43,7 +43,7 @@ use tracing::{debug, info, warn};
 
 pub use crate::config::Config;
 use crate::config::{ElSettings, L1Settings, NODE_DIR};
-use crate::provider::NodeProvider;
+use crate::provider::{NodeProvider, RangeEnd};
 
 /// Unsafe blocks waiting for the pipeline. Blocks arrive every 2 s on OP Mainnet and every
 /// second on Unichain; this absorbs a store that is unreachable for about 8 or 4 minutes
@@ -108,6 +108,44 @@ pub struct NodeView {
     pub head: watch::Receiver<Option<BlockRef>>,
     /// How busy the stream server is.
     pub load: Load,
+    /// The unsafe chain, for [`Self::contiguous_through`].
+    unsafe_store: MemoryStore,
+    /// Where [`Self::contiguous_through`]'s last search ended.
+    range_end: RangeEnd,
+}
+
+impl NodeView {
+    fn new(head: watch::Receiver<Option<BlockRef>>, load: Load, unsafe_store: MemoryStore) -> Self {
+        Self {
+            head,
+            load,
+            unsafe_store,
+            range_end: RangeEnd::default(),
+        }
+    }
+
+    /// The highest block N such that the node holds every block from `archive`'s first
+    /// through N, each with its receipts: the range it advertises to execution peers,
+    /// `archive`'s blocks up to the first still waiting for its receipts, extended through the
+    /// unsafe chain's canonical blocks that link to them and have theirs. `None` while there
+    /// is no such block.
+    ///
+    /// Cheap: each call continues the search from where the last one ended.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if `archive` cannot be read.
+    pub async fn contiguous_through<A: Archive>(
+        &self,
+        archive: &A,
+    ) -> Result<Option<BlockNumber>, StorageError> {
+        let provider = NodeProvider::sharing_range(
+            archive.clone(),
+            self.unsafe_store.clone(),
+            Arc::clone(&self.range_end),
+        );
+        Ok(provider.range().await?.map(|(_, end)| end.number))
+    }
 }
 
 /// What every committed store the node runs on must be.
@@ -197,10 +235,7 @@ pub async fn run<A: Archive>(
         stores.unsafe_store.clone(),
         stores.archive.clone(),
     );
-    let view = NodeView {
-        head: view_head,
-        load: stream.load(),
-    };
+    let view = NodeView::new(view_head, stream.load(), stores.unsafe_store.clone());
     let pipeline = Pipeline::new(
         stores.unsafe_store,
         stores.archive,
