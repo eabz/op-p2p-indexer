@@ -15,31 +15,31 @@ before proposing a design, and record new decisions there.
 
 | Path | Package | Role | Internal deps |
 |---|---|---|---|
-| `bin/indexer` | `indexer` | The full node for a single user: thin binary over `crates/node` with the fjall archive | node, storage |
-| `bin/server` | `server` | The full node for serving at scale: thin binary over `crates/node` with history read from R2 (`crates/server`); `--export` (or `OP_INDEXER_EXPORT=true`) makes it the deployment's single exporter | node, server, chunks, storage, chainspec |
-| `crates/node` | `op-indexer-node` | Shared node wiring for `indexer` and `server`: config (`Config::from_env`), `.env` loading, tracing, startup, shutdown | chainspec, p2p, el, l1, storage, pipeline, stream, primitives |
-| `crates/server` | `op-indexer-server` | The server's committed store: R2-backed `ArchiveStore` (sealed chunks through `crates/chunks` plus a local fjall tail) and the exporter | chainspec, chunks, primitives, storage |
-| `bin/balancer` | `balancer` | The directory for a fleet of servers: thin binary over `crates/balancer` | balancer, chainspec, chunks, runtime |
-| `crates/balancer` | `op-indexer-balancer` | Servers register and heartbeat (health, heads, load); Arrow Flight `GetFlightInfo` splits a range into per-chunk jobs on the least-loaded servers; `Locate` for subscriptions; the registration client the server uses. No block data passes through it | api, chainspec, chunks |
-| `bin/op-indexer-import` | `op-indexer-import` (binary `import`) | Command-line importer, a separate process: downloads a block range from an external archive (Envio HyperSync), then `verify` checks every block (hashes, roots, senders), seals it into chunks and uploads them to R2, deleting each downloaded chunk once uploaded; the chunks are listed in the manifest only when the range matches its anchor | chainspec, primitives, chunks |
-| `crates/chunks` | `op-indexer-chunks` | Sealed block chunks in object storage (Cloudflare R2 through `object_store`'s S3 API): chunk format (zstd segments, index, footer), the hash-chained manifest, the global hash index, and the client; written by `import verify` and the server's exporter, read by `server` | primitives, chainspec |
-| `crates/runtime` | `op-indexer-runtime` | Shared environment loading, tracing and shutdown signals, without node dependencies | none |
-| `crates/api` | `op-indexer-api` | Shared API keys and Flight tickets, without storage dependencies | none |
-| `crates/primitives` | `op-indexer-primitives` | Shared domain types (alloy and op-alloy only) | none |
+| `bin/indexer` | `indexer` | The full node for one user: thin binary over `crates/node` with the local fjall archive | node, runtime, storage |
+| `bin/server` | `server` | The full node for serving at scale: thin binary over `crates/node` with sealed history read from R2 (`crates/server`), registered with a balancer; `--export` (or `OP_INDEXER_EXPORT=true`) makes it the deployment's single exporter | balancer, chainspec, chunks, node, runtime, server, storage |
+| `bin/balancer` | `balancer` | The directory of a fleet of servers: thin binary over `crates/balancer` | balancer, chainspec, chunks, runtime |
+| `bin/op-indexer-import` | `op-indexer-import` (binary `import`) | Command-line importer, a separate process: `download` fetches a block range from an external archive (Envio HyperSync), `verify` checks every block (hashes, roots, senders), seals the blocks into chunks and uploads them to R2 (listed in the manifest only once the range matches its anchor); `fetch` downloads sealed chunks straight from R2 through a balancer's presigned URLs | chainspec, chunks, primitives, runtime |
+| `crates/node` | `op-indexer-node` | Shared node wiring for `indexer` and `server`: configuration (`Config::from_env`) and machine-sized defaults, startup, the peer reports, supervision and shutdown | chainspec, el, l1, p2p, pipeline, primitives, runtime, storage, stream |
+| `crates/server` | `op-indexer-server` | The server's committed store: an R2-backed `ArchiveStore` (sealed chunks through `crates/chunks`, a local fjall tail above them), its read-ahead and peer read budgets, and the exporter | chainspec, chunks, primitives, storage |
+| `crates/balancer` | `op-indexer-balancer` | Servers register and heartbeat (health, heads, load, peers, what they served); Arrow Flight `GetFlightInfo` splits a range into per-chunk jobs on the least-loaded servers, or a `raw` plan of presigned chunk URLs; `Locate` for subscriptions; the registration client a server runs. No block data passes through it | api, chainspec, chunks |
+| `crates/chunks` | `op-indexer-chunks` | Sealed block chunks in object storage (Cloudflare R2 through `object_store`'s S3 API, an optional public cached domain, or a local directory): the chunk format (zstd segments, index, footer), the hash-chained manifest, the global hash index, the client and its presigned URLs; written by `import verify` and the server's exporter, read by `server` and `import fetch` | chainspec, primitives |
+| `crates/stream` | `op-indexer-stream` | gRPC (tonic, prost) and Arrow Flight server: subscriptions to history from the archive then the live chain from the unsafe store, decoded or raw, with block status and reorgs; heads and block lookups; Flight `DoGet` of a table over a block range | api, primitives, storage |
+| `crates/pipeline` | `op-indexer-pipeline` | Gossiped blocks → unsafe store; promotion of safe/finalized blocks → archive; the receipts, missed-block (fill) and range-sync storing tasks | primitives, storage |
+| `crates/storage` | `op-indexer-storage` | The unsafe store (in memory, fork choice, journaled to fjall) and the block archive (fjall), the committed store: committed blocks with their senders and the committed L1 heads; their traits; the retry policy | primitives |
+| `crates/p2p` | `op-indexer-p2p` | Consensus p2p (libp2p): discv5 discovery, gossipsub block gossip (scoring, connection limits), unsafe-block validation, `payload_by_number` serving, and the fjall node state (identity, saved peers, sync progress, for `el` and `l1` too) | chainspec, primitives |
+| `crates/el` | `op-indexer-el` | Execution p2p (devp2p): discovery, sessions, receipts of new blocks, missed-block fetch, range sync, and serving the archive to peers; blocks before Bedrock shared only with other op-p2p-indexers | chainspec, primitives |
+| `crates/l1` | `op-indexer-l1` | L1 commitment without an RPC: a beacon light client and L1's execution network; from the L1 block hashes the light client vouches for, finds and verifies the chain's dispute games, giving the L2 blocks claimed on L1 | chainspec, el, primitives |
 | `crates/chainspec` | `op-indexer-chainspec` | Every per-chain value, for each supported chain (OP Mainnet, Unichain, Base): chain id, sequencer signer, consensus and execution bootnodes, execution discovery identity, genesis, fork blocks and the per-chain list of time forks, block time, dispute game factory and its game types. The one exception is the importer's HyperSync endpoint, which stays in the importer | none |
-| `crates/p2p` | `op-indexer-p2p` | discv5 discovery, gossipsub block gossip (scoring, connection limits), unsafe-block validation, fjall node state (identity, saved peers and sync progress, for `el` and `l1` too) | primitives, chainspec |
-| `crates/storage` | `op-indexer-storage` | Unsafe store (in memory, fork choice, journaled to fjall) and the block archive (fjall), which is the committed store: committed blocks with their senders and the committed L1 heads; their traits; the retry policy | primitives |
-| `crates/pipeline` | `op-indexer-pipeline` | Unsafe blocks → unsafe store; promote safe/finalized → archive | primitives, storage |
-| `crates/el` | `op-indexer-el` | Execution p2p (devp2p): discovery, sessions, receipts of new blocks, serving the archive to peers, range sync; pre-Bedrock blocks shared only with other op-p2p-indexers | primitives, chainspec |
-| `crates/l1` | `op-indexer-l1` | L1 commitment without an RPC: from L1 block hashes a beacon light client vouches for, finds and verifies the dispute games created for the chain, giving the L2 blocks claimed on L1 | el, chainspec, primitives |
-| `crates/stream` | `op-indexer-stream` | gRPC server (tonic, prost): subscriptions to history from the archive then the live chain from the unsafe store, decoded or raw, with block status and reorgs; heads and block lookups | primitives, storage |
+| `crates/api` | `op-indexer-api` | Shared API keys and Flight tickets, without storage dependencies | none |
+| `crates/runtime` | `op-indexer-runtime` | Shared process setup without node dependencies: `.env` loading, tracing, shutdown signals, service commands (start/stop/status/logs), the machine's cores and memory | none |
+| `crates/primitives` | `op-indexer-primitives` | Shared domain types (alloy and op-alloy only) | none |
 
 - Keep these edges: `p2p` and `storage` never depend on each other, and `pipeline` doesn't depend
   on `p2p`. `el` depends on none of `p2p`, `storage` and `pipeline`, and `l1` on none of `storage`,
   `pipeline` and the importer; `stream` on none of `p2p`, `el`, `l1` and `pipeline`. Nothing about an external API
   (HyperSync or any other) may appear outside `bin/op-indexer-import`, with one exception: object
-  storage (Cloudflare R2, through the S3 API) in `crates/chunks`, which the importer's export and
-  the `server` binary use. `p2p` depends on `chainspec` (it is chain-specific); the binary parses overrides (e.g.
+  storage (Cloudflare R2, through the S3 API) in `crates/chunks`, which the importer, the
+  `server` and the `balancer` use. `p2p` depends on `chainspec` (it is chain-specific); the binary parses overrides (e.g.
   bootnodes) at the edge. The binary wires them together with channels.
 - Safe/finalized status comes from the `l1` crate (off by default), not from reth or an RPC (see `docs/l1.md`).
 - New crates go in `crates/<name>` as package `op-indexer-<name>`, inherit `[workspace.package]`,
@@ -47,12 +47,12 @@ before proposing a design, and record new decisions there.
 
 ## Storage
 
-- **Unsafe chain** (in memory, journal `unsafe/` in the data dir): blocks received over gossip and not yet committed to L1, with fork choice; replayed from the journal on start, capped by `OP_INDEXER_UNSAFE_MAX_BYTES`.
-- **fjall** (`archive/` in the data dir): the committed store. Every committed block (the whole
-  history: there is no retention window), in its consensus encoding, with its transaction senders
-  and the committed L1 heads. It is what the node serves to peers and streams to consumers. Embedded; needs no service.
+- **Unsafe chain** (in memory, journal `unsafe/` in the data directory): blocks received over gossip and not yet committed to L1, with fork choice; replayed from the journal on start, capped by `OP_INDEXER_UNSAFE_MAX_BYTES` (sized from the machine by default).
+- **Archive** (fjall, `archive/` in the data directory, `indexer`): the committed store. Every committed block (the whole history: there is no retention window), in its consensus encoding, with its transaction senders and the committed L1 heads. It is what the node serves to peers and streams to consumers. Embedded; needs no service.
+- **Sealed chunks** (`server`): the committed history in object storage (R2), read through `crates/chunks`, with a local fjall tail of the committed blocks above the last sealed chunk ([`docs/serving.md`](docs/serving.md)).
+- **Node state** (fjall, `node/` in the data directory): identity keys, saved peers and range sync progress.
 
-There is no Redis and no ClickHouse: the binary needs no other service. At startup it opens the archive and the unsafe chain's journal (replaying it), and exits if either belongs to another chain. Optional `OP_INDEXER_PROFILE=live|archive|fleet` selects capability defaults; explicit environment values override them, and unset preserves legacy defaults. Settings are `OP_INDEXER_*` environment variables, which every binary also reads from `.env` in the current directory (or `--env-file <path>`); the process environment wins. `.env.example` lists every variable of every binary, and the node's are documented on `Config::from_env` in `crates/node/src/config.rs`. There is no Docker setup for now.
+There is no Redis and no ClickHouse: the binaries need no other service. At startup a node opens its committed store and the unsafe chain's journal (replaying it), and exits if either belongs to another chain. Settings are `OP_INDEXER_*` environment variables, which every binary also reads from `.env` in the current directory (or `--env-file <path>`); the process environment wins. `.env` holds only what differs between machines: what to run, secrets, and where things are. `.env.example` lists exactly those, with a required block per binary first. Tuning knobs are sized from the machine's cores and memory (`crates/node/src/sizing.rs`) and logged at startup; the importer's options are flags. Every other variable, the sizing formulas and the deprecated names are in [`docs/configuration.md`](docs/configuration.md) ("Advanced settings"). Keep a new variable out of `.env.example` unless it is machine-specific, and keep a removed or renamed one working for one release through `op_indexer_runtime::deprecated`. Optional `OP_INDEXER_PROFILE=live|archive|fleet` selects capability defaults. L1 turns on range sync, which turns on the execution network; explicit values override both. Run in the background with `<binary> start|stop|restart|status|logs` or `install-service` (systemd). There is no Docker setup for now.
 
 ## Project skills
 

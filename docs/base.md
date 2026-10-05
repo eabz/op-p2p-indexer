@@ -1,9 +1,9 @@
 # Base (chain 8453)
 
-Status: **built, not run.** The chain spec (`op_indexer_chainspec::BASE`), its fork list and
-its L1 game format are in; the execution discovery identity (`el`), the fork horizon and the
-importer are being built alongside (roadmap, 2026-10-04 Base row). Nothing has run against Base
-yet.
+What the code does for Base (chain 8453), and the investigation it rests on. Status
+2026-10-05: the chain spec, fork list, execution discovery identity, game format and fork
+horizon are built; Base's import is downloaded and being completed (2.57 TB of downloaded
+chunks; [roadmap](roadmap.md) #1). No Base node has run yet.
 
 ## Spec
 
@@ -35,14 +35,26 @@ every source.
   live game `0x12d7…895f` (L1 block 26,122,197): block 52,181,760, claim `0x24e371…bbb9`,
   equal to the output root rebuilt from that block's header. A type a chain does not list is
   `UnknownGameType` and is not promoted.
-- **Not served by Base**: `payload_by_number` (Base's consensus client does not implement it),
-  so gaps fill through execution range sync only.
-- **Forks this build does not know**: the node stops (roadmap row), never stores a block it
-  cannot verify. EIP-8130 transactions (`0x79`, Everest) are refused that way until supported.
+- **Gaps**: Base's consensus client does not serve `payload_by_number`; this node never asks
+  for it on any chain (it only serves it), and fills gaps from execution peers (fill and range
+  sync, [el.md](el.md)).
+- **Forks this build does not know**:
+  - **Execution**: when 3 distinct hosts announce the same unknown `next` fork time, it is the
+    horizon, and the node warns the operator to upgrade before it. Information only: nothing is
+    refused ([el §5](el.md#5-fork-activations)).
+  - **Gossip**: 3 distinct sequencer-signed blocks this build cannot read within 600 s stop
+    the node (`p2p/src/network/state.rs`, `NetworkError::ProtocolChanged`). It never stores a
+    block it cannot verify. EIP-8130 transactions (`0x79`, Everest) count as unreadable until
+    supported.
+- **Not checked**: an `AggregateVerifier` game's intermediate roots (only the last, the root
+  claim, is compared).
+- **Import**: HyperSync's Base rows lack header fields, deposit source hashes and mints in
+  stretches; they are rebuilt from L1 ([import §10](import.md#10-unichain-and-base)).
 
 # Investigation record (2026-10-04)
 
-Every value below was read on 2026-10-04 (Base L2 head
+The source record behind the spec above, as read on 2026-10-04; what was built from it is
+recorded in [decisions.md](decisions.md) (2026-10-04, Base). Every value below was read on 2026-10-04 (Base L2 head
 52,183,374; Ethereum head 26,122,243). "L1 read" means a read-only `eth_call` / `eth_getLogs`
 against `https://ethereum-rpc.publicnode.com`; "L2 read" means a read against Base's public
 RPCs (`base.drpc.org`, `base-rpc.publicnode.com`). No HyperSync call was made.
@@ -96,23 +108,10 @@ Working model: a fork is an activation time in `ChainSpec`, with per-layer rules
 | Everest (announced) | EIP-8130 transactions, type `0x79` | transaction and receipt decoding, senders | **structural**: outside `op-alloy` |
 | Denim | not published | unknown | unknown |
 
-So no layer has been replaced wholesale. Consensus gossip, payload, header, receipts and the output root are still OP's; every Base fork so far touches only the EVM, the RPC or the L1 contracts. The structural items, and how I would model each:
-
-- **Execution discovery identity** → per-chain data in `ChainSpec`: a discv5 protocol id (`basev0`, default `discv5`) and separate consensus and execution bootnode lists. `el` builds its discv5 config from them (`discv5` 0.12 `ConfigBuilder::protocol_identity`). No fork.
-- **L1 commitment** → a per-chain table, game type → claim format, extending today's `claim_format(game_type)` in `chainspec/game.rs`. Base accepts 621 → `AggregateProposal`: `createWithInitData` (`0x1011f377`), extraData packed as block number ‖ parent ‖ 32·n roots, root claim = output root. Keyed by game type, not by time: L1 says which game a proposal is.
-- **EIP-8130 (`0x79`)** → until it is scheduled: a chain-specific "last known fork" (below). When it is: either a Base transaction envelope (Base's types are in `base-common-consensus`, not on crates.io as of 2026-10-04, so a git dependency or our own type), or refusing blocks from Everest on. Its sender is not an ECDSA recovery, so the archive's sender column needs a rule too.
-- **Dynamic fork times** → static times as now, plus the guard below. Reading the contract would need its address and an L1 state read we do not have.
-
-**An unknown fork today (e.g. Denim).** Nothing stops the node:
-1. **Execution, first and loudest.** Base nodes announce the coming fork as `next` in their fork id, in the eth Status and the ENR. `el` logs a rate-limited warn ("execution peers are on a hardfork this build does not know", `session/context.rs` `warn_build_behind`) and goes on. After activation Base peers refuse our fork id: receipts and range sync stop, with warnings, but the node runs.
-2. **Gossip.** If the fork changes nothing in the payload, header or transaction format (true of Azul, Beryl and Cobalt), we keep accepting correctly signed blocks and store them correctly, since we do not execute. If it changes the format, the rebuilt block hash or the transaction decode fails, and the message is rejected at `debug` (`network/state.rs`, "block message failed validation"). The unsafe head freezes quietly. Nothing unverifiable is stored, but nothing stops either.
-3. **L1.** A new game type is `UnknownGameType` and is not promoted.
-
-To stop cleanly, I would add a **known-forks horizon**:
-- When an execution peer's fork id announces a `next` time this build does not know, that time becomes a horizon.
-- Gossip, sync and promotion refuse blocks with a timestamp at or after it.
-- The node exits with an error naming it once its unsafe head reaches it.
-- Also: a block whose sequencer signature is valid but whose payload does not decode or hash is treated as a protocol change and stops the node. The sequencer does not sign invalid blocks.
+So no layer has been replaced wholesale. Consensus gossip, payload, header, receipts and the
+output root are still OP's; every Base fork so far touches only the EVM, the RPC or the L1
+contracts. The structural items became per-chain data in `ChainSpec` (discovery identity and
+bootnodes, the game-type table, the fork list) and the unknown-fork handling of the spec above.
 
 ## 1. Chain parameters
 
@@ -208,7 +207,8 @@ Base still uses the DisputeGameFactory, with a new game ([proof contracts](https
 
 **Created by a plain call to the factory, `createWithInitData(uint32,bytes32,bytes,bytes)`.**
 - L1 read: selector `0x1011f377`, `to` = the factory, sent by `0xc136…1cf5`.
-- Our code accepts only `create(uint32,bytes32,bytes)` (`0x82ecf2f6`).
+- Before Base, our code accepted only `create(uint32,bytes32,bytes)` (`0x82ecf2f6`); both are
+  read now.
 - The `DisputeGameCreated` event is unchanged.
 
 **`extraData` = `l2BlockNumber (32) ‖ parentGame (20) ‖ intermediateRoots (32 × n)`**, packed.
@@ -225,14 +225,15 @@ Base still uses the DisputeGameFactory, with a new game ([proof contracts](https
 ## 5. Importer
 
 Envio HyperSync serves Base at `https://base.hypersync.xyz` (or `8453.hypersync.xyz`)
-([supported networks](https://docs.envio.dev/docs/HyperSync/hypersync-supported-networks)). The
-row contents are the OP formats (sections 1–3): no legacy blocks, the same transaction types,
-deposit receipts and Isthmus header fields. One difference: Base never had OP's pre-Bedrock or
-pre-Regolith history, so nothing in that path is needed.
+([supported networks](https://docs.envio.dev/docs/HyperSync/hypersync-supported-networks)), in
+the OP formats (sections 1–3), with no legacy blocks. What its rows turned out to lack, and how
+the importer completes them: [import §10](import.md#10-unichain-and-base).
 
 ## 6. Size
 
 52,183,374 blocks (L2 read).
+
+Downloaded since (2026-10-05): 2.57 TB of HyperSync answers for blocks 0 to 52,166,660.
 
 Archive estimate: **about 2–3.5 TB**, roughly 2–4 times OP Mainnet's 914 GB for 157.7 M blocks.
 - Method: 12 blocks sampled evenly across each chain's history (`base.drpc.org`, `optimism.drpc.org`). Block `size` plus receipts in their consensus encoding, rebuilt from `eth_getBlockReceipts`.
@@ -251,33 +252,11 @@ Archive estimate: **about 2–3.5 TB**, roughly 2–4 times OP Mainnet's 914 GB 
 - **Proofs**: AggregateVerifier replaced fault proofs, and its contracts changed in each of Azul, Beryl and Cobalt.
 - **Specs**: Base's p2p spec and its `payload_by_number` versions still match OP's. Nothing published says they will stay so.
 
-## Works unchanged
+## Open
 
-- Consensus gossip: topics, payload format, signature and validation rules (only Base's values are needed).
-- `payload_by_number` serving (harmless; Base's own clients never ask, and do not answer, section A).
-- eth/69 sessions; the receipt and header formats; the output-root formula (`primitives/game.rs`).
-- Envio HyperSync coverage.
-
-## Needs a change (what, where)
-
-- **`chainspec`**: a `BASE` entry with the values in section 1.
-  - The per-chain time forks become a list: Base has Azul, Beryl and Cobalt and no Karst. Today `fork_times()` returns a fixed `[u64; 8]` ending in `karst_time`. Only the forks the EL fork id needs are listed.
-  - Separate consensus and execution bootnodes: the `bootnodes` doc says the two layers share one discv5 network, which is false for Base.
-- **`el` discovery**: discv5 `ProtocolIdentity` per chain, `basev0` for Base (`discv5` 0.12 has `ConfigBuilder::protocol_identity`), with Base's execution enodes as bootnodes. The fork id then comes out right from the chainspec times.
-- **`chainspec/game.rs` + `l1`**: claim format for game type 621.
-  - Accept the `createWithInitData` selector.
-  - extraData: the block number from the first 32 bytes, the rest checked to be 20 + 32·n bytes.
-  - The root claim is the output root of that block.
-  - Intermediate roots could also be checked.
-
-- **Gap filling**: Base peers do not answer `payload_by_number`, so gaps in the unsafe chain
-  fill only through execution range sync.
-- **Unknown forks**: the known-forks horizon (section B), so the node stops instead of freezing.
-
-## Unknown
-
-- Whether discovery under `basev0` finds peers that serve history (`eth/69` block range). Not run.
-- Whether Base execution peers accept our `Status`. Our fork id matches theirs on paper; no Base peer was dialed.
+- Whether discovery under `basev0` finds peers that serve history (`eth/69` block range), and
+  whether Base execution peers accept our `Status` (our fork id matches theirs on paper): no
+  Base node has run.
 - Whether the L1 "dynamic node upgrades" will ever move a fork time away from the release value on mainnet. They are metrics-only today.
 - When Denim and Everest are scheduled, and what Denim changes.
 - The 2–3.5 TB size range (12 samples per chain).

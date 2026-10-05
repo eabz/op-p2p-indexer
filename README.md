@@ -20,9 +20,9 @@ many users means running several servers behind one balancer.
 | Binary | Role | Storage | Status |
 |---|---|---|---|
 | **`indexer`** | The full node for a single user: every service in one process. Takes part in the p2p networks, follows L1, keeps history and serves it over gRPC and Arrow Flight | Its own local block archive (fjall) | built |
-| **`server`** | A full node for serving at scale: the same p2p participation and live data, but stateless for history: it keeps no archive and reads sealed, immutable block chunks from Cloudflare R2 on demand, with no cache. One server per deployment runs with `--export` (or `OP_INDEXER_EXPORT=true`) and is the single exporter, which seals finalized blocks into new chunks | R2 (sealed chunks), a small local tail of unsealed blocks | built; not yet run against R2 |
-| **`importer`** | Fills history once from an external archive (Envio HyperSync): `download`, then `verify`, which checks every block and uploads it as sealed chunks to R2, deleting each downloaded chunk once uploaded | Its state directory | built (`import`) |
-| **`balancer`** | The single entry point for users: tracks server health, contiguous coverage and load, and directs clients to servers sharing the same sealed history. No data passes through it | In-memory registrations and the shared manifest | built; checked locally |
+| **`server`** | A full node for serving at scale: the same p2p participation and live data, but stateless for history: it keeps no archive and reads sealed, immutable block chunks from Cloudflare R2 on demand (no block cache; only the indexes of recently opened chunks are kept). One server per deployment runs with `--export` (or `OP_INDEXER_EXPORT=true`) and is the single exporter, which seals finalized blocks into new chunks | R2 (sealed chunks), a small local tail of unsealed blocks | built; run against R2 in a three-server bench ([serving.md](docs/serving.md)) |
+| **`import`** (package `op-indexer-import`) | Fills history once from an external archive (Envio HyperSync), with an optional RPC for fields the archive leaves out: `download`, then `verify`, which checks every block and uploads it as sealed chunks to R2, deleting each downloaded chunk once uploaded (`run` does both); `fetch` downloads sealed chunks straight from R2 through URLs a balancer signs | Its state directory | built |
+| **`balancer`** | The single entry point for users: tracks server health, contiguous coverage and load, directs clients to servers sharing the same sealed history, and signs R2 URLs for raw chunk downloads. No block data passes through it | In-memory registrations and the shared manifest | built; run in the bench |
 
 R2 holds the sealed history the servers read. Live data always comes from the p2p networks,
 and chunks are sealed only once all their blocks are finalized on L1, so they never change.
@@ -34,7 +34,9 @@ and chunks are sealed only once all their blocks are finalized on L1, so they ne
 | Consensus p2p (`crates/p2p`) | Joins the OP Stack gossip network, validates sequencer-signed blocks, serves `payload_by_number` to older op-nodes |
 | Execution p2p (`crates/el`) | Joins the execution network (devp2p, eth/68 and eth/69): fetches each block's receipts and verifies them against the header, serves headers, bodies and receipts, and syncs missing ranges |
 | L1 (`crates/l1`, optional) | A beacon light client plus L1 execution peers: finds the chain's dispute games on Ethereum and marks blocks safe and finalized |
+| Pipeline (`crates/pipeline`) | Gossiped blocks into the unsafe store, missed blocks and receipts attached, committed blocks promoted into the archive |
 | Storage (`crates/storage`) | The unsafe tip in memory with a local journal, a fjall block archive for committed history |
+| Serving at scale (`crates/server`, `crates/chunks`, `crates/balancer`) | Sealed chunks in R2 read by the servers, the exporter that seals new ones, and the balancer that directs clients |
 | Stream (`crates/stream`) | gRPC subscriptions (history, then the live chain, with reorgs) and Arrow Flight tables (`blocks`, `transactions`, `receipts`, `logs`) |
 
 ## Quick start
@@ -44,28 +46,31 @@ Requirements: a recent stable Rust, and for a public node open ports 9222 (gossi
 
 ```bash
 cargo build --release
-cp .env.example .env     # then edit it: select OP_INDEXER_PROFILE=live
+cp .env.example .env     # then edit it: e.g. OP_INDEXER_EL_ENABLED=true for receipts
 ./target/release/indexer
 ```
 
 Every setting is an `OP_INDEXER_*` environment variable. Each binary loads `.env` from the
 current directory at startup (or the file given with `--env-file <path>`); a variable already
-set in the shell wins over the file. One file serves every binary:
-[`.env.example`](.env.example) lists the variables of `indexer`, `server` and the importer with
-their defaults. The node's are also documented on `Config::from_env` in
-[`crates/node/src/config.rs`](crates/node/src/config.rs), the importer's in `import --help`.
-Some useful ones:
+set in the shell wins over the file. One file serves every binary.
+[`.env.example`](.env.example) holds only what differs between machines: what to run,
+secrets, and where things are, with a short required block per binary at the top. The tuning
+knobs (Flight streams, memory, execution sessions) are sized from the machine's cores and
+memory and logged at startup; the importer's options are flags (`import <step> --help`).
+[docs/configuration.md](docs/configuration.md) has a minimal `.env` for each binary and, under
+"Advanced settings", every other variable, the sizing formulas and the deprecated names. The
+role switches:
 
 | Variable | Default | |
 |---|---|---|
 | `OP_INDEXER_CHAIN_ID` | `10` | `130` for Unichain, `8453` for Base |
 | `OP_INDEXER_EL_ENABLED` | `false` | Fetch receipts and serve the execution network |
-| `OP_INDEXER_EL_SYNC` | `false` | Fill gaps in the archive from execution peers |
-| `OP_INDEXER_L1_ENABLED` | `false` | Safe and finalized heads from L1; needs `OP_INDEXER_L1_CHECKPOINT` and range sync |
+| `OP_INDEXER_EL_SYNC` | `false` | Fill gaps in the archive from execution peers; turns the execution network on |
+| `OP_INDEXER_L1_ENABLED` | `false` | Safe and finalized heads from L1; needs `OP_INDEXER_L1_CHECKPOINT`, turns range sync on |
 | `OP_INDEXER_STREAM_LISTEN_ADDR` | `127.0.0.1:50051` | Keep it local, behind a proxy, or set `OP_INDEXER_STREAM_API_KEYS` |
-| `OP_INDEXER_P2P_ADVERTISED_ADDR`, `OP_INDEXER_EL_ADVERTISED_ADDR` | unset | Your public `ip:port`, when behind NAT |
 
-Choose an operating profile with `OP_INDEXER_PROFILE`:
+`OP_INDEXER_PROFILE` (`live`, `archive` or `fleet`) sets the defaults of the three switches in
+one line instead:
 
 | Profile | Default capabilities | Requirements |
 |---|---|---|
@@ -73,11 +78,11 @@ Choose an operating profile with `OP_INDEXER_PROFILE`:
 | `archive` | Live ingestion, range sync and L1 tracking | Trusted `OP_INDEXER_L1_CHECKPOINT` |
 | `fleet` | Archive capabilities in the `server` binary | Checkpoint and R2 configuration (or a local chunk directory) |
 
-Profiles are opt-in. With no profile, existing defaults remain unchanged. Explicit
-`OP_INDEXER_EL_ENABLED`, `OP_INDEXER_EL_SYNC` and `OP_INDEXER_L1_ENABLED` settings override
-profile defaults; invalid combinations fail at startup. The node logs the selected profile
-and effective capabilities. Exporting is still explicit (`server --export`), and only one
-server per deployment should export.
+With no profile, the defaults above apply. Explicit `OP_INDEXER_EL_ENABLED`,
+`OP_INDEXER_EL_SYNC` and `OP_INDEXER_L1_ENABLED` settings override profile defaults; an
+explicit `false` that a switch needs fails at startup. The node logs the selected profile and
+effective capabilities. Exporting is still explicit (`server --export`), and only one server
+per deployment should export.
 
 For initial fleet history, use `import run` to download and verify/upload in one invocation.
 `import download` and `import verify` remain available for recovery and separate operation;
@@ -86,9 +91,9 @@ run `import run --help` for source and destination options.
 The node keeps its state in `data-op/` (`data-unichain/`, `data-base/` for the others): its
 identity, known peers, the block archive and the unsafe chain's journal. Several nodes can run
 on one host (another chain, or another build): each with its own data directory, its own ports
-and its own `.env`, run from its own directory or given with `--env-file`. The end of
-`.env.example` shows the settings for Unichain and Base next to an OP Mainnet node; see
-also [storage.md](docs/storage.md), "Several instances on one host".
+and its own `.env`, run from its own directory or given with `--env-file`. See
+[configuration.md](docs/configuration.md), "A second instance on the same host", and
+[storage.md](docs/storage.md), "Several instances on one host".
 
 ## Install on a server
 
@@ -152,20 +157,23 @@ foreground as before (in tmux, say).
 ## Consuming the data
 
 - **gRPC** (`opindexer.v1.Stream`, [stream.proto](crates/stream/proto/opindexer/v1/stream.proto)):
-  `Subscribe` from a block number, with history from the archive and then live blocks, each
+  `Subscribe` from a block number or the head, with history from the archive and then live blocks, each
   marked unsafe, safe or finalized, plus reorg and late-receipts events. Each subscription picks
   decoded records or the raw consensus encoding. `GetHeads` and `GetBlock` cover lookups.
-- **Arrow Flight**, on the same port: `DoGet` with a ticket such as
-  `logs:120000000:120010000:finalized` returns record batches for DuckDB, Polars, Spark and the
-  like.
+- **Arrow Flight**, on the same port (`127.0.0.1:50051` by default): `DoGet` with a ticket
+  such as `logs:120000000:120010000:finalized` (at most 100,000 blocks) returns record batches
+  for DuckDB, Polars, Spark and the like. Against a fleet, ask the balancer's `GetFlightInfo`
+  for per-chunk tickets and their servers.
 
 Details, schemas and limits: [stream.md](docs/stream.md).
 
 ## Status
 
-All four programs are implemented. The [roadmap](docs/roadmap.md) separates finished work,
-remaining implementation and end-to-end validation. The complete R2 fleet, L1-to-promotion
-path and Base deployment are not yet production verified.
+All four programs are implemented and have run live: nodes on OP Mainnet and Unichain (on
+Unichain, range sync from block 0, and L1 end to end: games matched, heads raised, blocks
+promoted), and `server`s with a balancer on R2 in a three-server bench. Base has not been
+deployed. The [roadmap](docs/roadmap.md) separates finished work, remaining implementation
+and validation.
 
 ## Documentation
 
@@ -174,7 +182,7 @@ for historical decisions. Each part has its
 own spec: [storage](docs/storage.md), [pipeline](docs/pipeline.md), [execution p2p](docs/el.md),
 [L1](docs/l1.md), [importer](docs/import.md), [stream](docs/stream.md),
 [serving at scale](docs/serving.md), [Base](docs/base.md),
-[good-peer duties](docs/citizenship.md).
+[good-peer duties](docs/citizenship.md), [configuration](docs/configuration.md).
 
 ## License
 

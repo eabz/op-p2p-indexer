@@ -1,5 +1,8 @@
 # L1 viability test
 
+**Historical:** measurements of 2026-10-04, before the crate ran end to end; not maintained.
+The current spec, and what has run since (end to end on Unichain), are in [l1.md](l1.md).
+
 What a set of probes, and then the `l1` crate itself, measured on 2026-10-04 about following
 Ethereum mainnet without an RPC: a beacon light client over libp2p for trusted L1 block
 hashes, and L1 execution peers over devp2p for the blocks behind them. It is the evidence
@@ -233,5 +236,5 @@ Every citation below was read on the consensus-specs `master` branch.
 - **A beacon or blob-parameter fork during a run**: the network half subscribes with the
   digest computed at start.
 - **The whole chain end to end**: light client → L1 execution fetch from crate code →
-  verified game → safe and finalized heads in the pipeline. The L1 execution half has only
-  run in the probe; the step from a trusted hash to a game has never run from crate code.
+  verified game → safe and finalized heads in the pipeline. (Since run on Unichain in a `server`
+  node; [l1.md](l1.md) §4.)

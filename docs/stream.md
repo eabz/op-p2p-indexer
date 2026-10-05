@@ -1,8 +1,11 @@
 # Stream spec (`crates/stream`)
 
-Status: **implemented**, including Arrow Flight and optional API-key authentication.
-See [roadmap.md](roadmap.md) for current validation status. The original design decision is
-in [decisions.md](decisions.md), 2026-10-04, "The node is a source of data, streamed out".
+What this covers: how consumers read the chain from a node: gRPC subscriptions (history then
+the live chain, with reorgs and status changes), heads and block lookups, and Arrow Flight for
+bulk ranges. Status: **built and run**: subscriptions and Flight on `indexer` and `server`
+nodes, Flight benchmarked on a fleet ([serving.md](serving.md)); API keys optional, no TLS.
+Open work is in [roadmap.md](roadmap.md); the design decision is in
+[decisions.md](decisions.md), 2026-10-04, "The node is a source of data, streamed out".
 
 The `stream` crate serves the chain to consumers over gRPC: history from the block archive,
 then the live chain from the unsafe store, each block with its status, and reorgs and status
@@ -24,7 +27,7 @@ generated code trips, and only those.
 
 | RPC | What |
 |---|---|
-| `Subscribe(SubscribeRequest) returns (stream Event)` | From a block number, or from the head; the payload, `DECODED` or `RAW`, chosen per subscription. A number the stores do not hold and never will is refused with `OUT_OF_RANGE`: below the archive's first block (the archive keeps all it has), or, with range sync off, between the archive's tip and the unsafe store's lowest block (the unsafe store expires blocks nothing promoted after `UNSAFE_TTL`, 24 h). A subscription whose next height becomes such ends with `OUT_OF_RANGE` too. With range sync on (`OP_INDEXER_EL_SYNC`) that gap is being filled: a subscription in it waits. |
+| `Subscribe(SubscribeRequest) returns (stream Event)` | From a block number, or from the head; the payload, `DECODED` or `RAW`, chosen per subscription. A number the stores do not hold and never will is refused with `OUT_OF_RANGE`: below the archive's first block (the archive keeps all it has), or, with range sync off, between the archive's tip and the unsafe store's lowest block (the unsafe store drops heights more than 24 h older than its newest block, `RETENTION_SECS`, and its lowest heights past `OP_INDEXER_UNSAFE_MAX_BYTES`). A subscription whose next height becomes such ends with `OUT_OF_RANGE` too. With range sync on (`OP_INDEXER_EL_SYNC`) that gap is being filled: a subscription in it waits. |
 | `GetHeads(GetHeadsRequest) returns (Heads)` | Unsafe, safe and finalized heads, and whether receipts are fetched. |
 | `GetBlock(GetBlockRequest) returns (Block)` | One canonical block, by number or hash, in either payload. `NOT_FOUND` if not held, or a side block. |
 
@@ -147,15 +150,11 @@ execution network disabled no receipts come, and `Heads.receipts` says so.
 
 ## 5. Configuration
 
-| Variable | Default | What |
-|---|---|---|
-| `OP_INDEXER_STREAM_LISTEN_ADDR` | `127.0.0.1:50051` | Shared gRPC/Flight listen address; local by default. |
-| `OP_INDEXER_STREAM_MAX_SUBSCRIPTIONS` | `64` | Concurrent subscriptions (at most `Semaphore::MAX_PERMITS`; more is lowered to it). |
-| `OP_INDEXER_STREAM_MAX_FLIGHTS` | `8` | Concurrent Arrow Flight `DoGet` streams (section 6), with the same ceiling. |
-| `OP_INDEXER_STREAM_FLIGHT_QUEUE_MS` | `2000` | How long a `DoGet` waits for a free stream before `RESOURCE_EXHAUSTED` (section 6); `0` refuses at once. |
-| `OP_INDEXER_STREAM_API_KEYS` | unset | Comma-separated bearer keys; unset disables authentication. |
-
-Use API keys or a suitable proxy when exposing the listener beyond localhost.
+The stream's variables (`OP_INDEXER_STREAM_*`: the listen address, local by default; the
+subscriptions, Flight streams and Flight builds at once; the Flight queue; the API keys) and
+their defaults, some sized from the machine, are in [configuration.md](configuration.md). What
+each limit does is in sections 4 and 6. Use API keys or a suitable proxy when exposing the
+listener beyond localhost.
 
 ## 6. Arrow Flight: bulk history
 
@@ -168,7 +167,7 @@ TLS termination remains external.
 **Crates.** `arrow-flight` 60 (Apache, Apache-2.0), with no default features: no Flight SQL,
 no TLS, no CLI. It uses tonic 0.14 and prost 0.14, the stream's, so the binary holds one tonic.
 It also needs `arrow-array`, `arrow-schema` and `arrow-ipc` (also direct dependencies, to build
-the batches and the schemas) and `arrow-cast`. A separate crate would move that compile weight,
+the batches and the schemas); `arrow-cast` comes in through `arrow-flight`. A separate crate would move that compile weight,
 not remove it, and would duplicate the server's wiring.
 
 **Requests.**
@@ -199,15 +198,19 @@ not remove it, and would duplicate the server's wiring.
   `PollFlightInfo`) is `UNIMPLEMENTED`. Flight SQL is not served.
 
 **Reads.** A `DoGet` reads the range as the subscription's history does: archive batches of at
-most 64 blocks or 16 MiB, senders from the archive. `blocks` reads the headers alone; the other
-tables decode each block once. A task reads the stores in order and hands each read to a
+most 64 blocks or 16 MiB, senders from the archive. Each table reads only what its columns
+need: `blocks` and `transactions` read no receipts, `receipts` and `logs` read them without
+rebuilding their blooms; `transactions`, `receipts` and `logs` decode each block once. A task reads the stores in order and hands each read to a
 blocking thread, which converts it to one record batch and encodes it as Flight messages:
 arrow-flight's encoder, which cuts it into pieces of about 2 MiB for gRPC. Up to
-`PARALLEL_BUILDS` reads are built at once, so one stream uses that many cores, and their
-messages are sent in order, `MESSAGES_AHEAD` of them queued ahead of the consumer
+`PARALLEL_BUILDS` (2) reads of one stream are built at once, so one stream uses that many
+cores, and at most `OP_INDEXER_STREAM_MAX_BUILDS` across all streams (two per core by default,
+within memory; [configuration.md](configuration.md)): a stream that finds none free sends what
+it has built first, then waits, so streams never wait on each other's places. Messages are
+sent in order, `MESSAGES_AHEAD` (4) of them queued ahead of the consumer
 (`crates/stream/src/flight.rs`). A large range is never held whole: a build runs to its end
-even while the consumer is slow, so a stream holds up to that many reads with their batches
-and encoded messages (about 100 MiB at most); HTTP/2 flow control does the rest. A consumer
+even while the consumer is slow and holds its read, batch and encoded messages (about 100 MiB)
+until they are sent; HTTP/2 flow control does the rest. A consumer
 that does not read for 30 s is ended with `RESOURCE_EXHAUSTED`; one slot of the queue is held
 back for that error. On shutdown a `DoGet` ends with `UNAVAILABLE` at once, not after its
 next batch.
@@ -226,11 +229,12 @@ pyarrow:
 A range ends early with an error in two cases:
 
 - `UNAVAILABLE`: a block is not held: a gap in the unsafe chain, or a block above the archive
-  that the unsafe store expired (`UNSAFE_TTL`) before the read reached it.
+  that the unsafe store dropped (retention, section 1) before the read reached it.
 - `ABORTED`: a block does not build on the one before it (a reorg during the read; only with
   `any`).
 
-At most `OP_INDEXER_STREAM_MAX_FLIGHTS` `DoGet`s run at once (default 8). One more waits for
+At most `OP_INDEXER_STREAM_MAX_FLIGHTS` `DoGet`s run at once (default sized from the
+machine, at least 8). One more waits for
 a place up to `OP_INDEXER_STREAM_FLIGHT_QUEUE_MS` (default 2000; 0 refuses at once), among at
 most as many waiters as there are places, before it reads anything; past that, or with the
 waiters full, it is refused with `RESOURCE_EXHAUSTED`, and a client backs off and asks again
@@ -317,5 +321,6 @@ fleet validation remains in [roadmap.md](roadmap.md).
 
 ## 7. Not built
 
-Log filters by address and topic, built-in TLS, compression, and for Flight:
+Log filters by address and topic, built-in TLS, gRPC message compression (Flight's IPC buffer
+compression is built, section 6), and for Flight:
 `DoPut`, `DoExchange`, Flight SQL, and total row counts in `FlightInfo`.

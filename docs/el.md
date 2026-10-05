@@ -1,45 +1,45 @@
 # Execution p2p spec (`crates/el`)
 
-Status: **built**, off by default (`OP_INDEXER_EL_ENABLED`). Receipts at the tip have run
-live; serving (section 11) and range sync (section 12) have not. Peer access is the open
-risk (section 1).
+What this covers: the execution-layer p2p stack (devp2p): discovery, sessions, receipts of new
+blocks, missed blocks, range sync, serving our blocks to peers, and the policy that keeps it a
+polite peer. Status: **built and run live**: receipts at the tip, range sync from block 0 with
+the skeleton walk (Unichain), the fill of missed spans, and serving history to execution
+peers from `server`s (section 1). On by default only with a profile, range sync or the L1 side
+([configuration.md](configuration.md)).
 
-The `el` crate connects to the configured chain's execution peers (OP Mainnet or Unichain,
-`op-indexer-chainspec`) over devp2p and fetches what gossip does not carry: receipts for every block, and headers and bodies for blocks missed on gossip. All of
+The `el` crate connects to the configured chain's execution peers (OP Mainnet, Unichain or
+Base, `op-indexer-chainspec`) over devp2p and fetches what gossip does not carry: receipts for
+every block, and headers and bodies for blocks missed on gossip. All of
 it is verified against data we already trust before it is handed on. It is a second p2p stack
 next to `p2p` (libp2p); the two never depend on each other.
 
 It fetches receipts at the tip (sections 2 to 10), serves its own blocks to peers (section 11)
 and syncs a range of blocks from peers (section 12).
 
-## 1. What the viability test established
+## 1. What has been measured
 
-From a viability probe (a program outside the repo), 2026-10-04; the full account, with
-numbers and sources, is [el-viability.md](el-viability.md).
+Before the crate existed, a probe (2026-10-04, a program outside the repo) established that
+the protocol and the verification work against op-reth and reth peers, that peers are scarce
+and full ("too many peers"), that sessions with a node that only asks last (46 minutes and
+more), that receipt depth is not advertised, and that no public peer serves blocks before
+Bedrock. That account is kept as a historical record in [el-viability.md](el-viability.md).
 
-- **The protocol works.** Handshake over eth/69, then headers, bodies and receipts from
-  op-reth and reth peers at the tip, a few hundred milliseconds each. 1,024 headers per
-  request in 0.4 to 1.1 s, parent links intact.
-- **Verification works.** Transactions roots matched for every body. Receipts roots matched
-  for every receipt answer at the tip (167 of 167) and for samples back to Bedrock (legacy,
-  EIP-1559, EIP-7702 and deposit receipts).
-- **Peers are scarce and full.** About 25 nodes with OP Mainnet's current fork id in an hour,
-  arriving about one every two minutes. Most dials end in the encrypted handshake with no
-  reason given; every reason that was given was "too many peers".
-- **Sessions last.** Two sessions with a node that only asks were still open after 46 and 42
-  minutes; beyond an hour nothing is known.
-- **Receipt depth is not advertised.** A peer's advertised range covers headers and bodies;
-  many peers keep receipts for hours, a few for up to a year.
-- **No peer serves blocks before Bedrock.**
-- **Anchoring old headers** by hash chain from a gossip-verified block costs minutes for a
-  week and hours for a year, per peer.
+Since then, with the crate (live unless said otherwise):
+
+- Receipts at the tip on OP Mainnet and Unichain, verified against the gossiped headers.
+- Range sync: the skeleton walk at 6–7k headers/s on 3 sessions (OP Mainnet, from a laptop);
+  blocks 0 to 400,000 of Unichain at 3,400 blocks/s from one peer (section 12).
+- The fill of missed spans of the unsafe chain ([pipeline.md](pipeline.md), "Missed blocks").
+- Serving: `server`s answered history requests of execution peers; fixed 2026-10-05 to read in
+  runs and only the parts a request needs (section 11, [serving.md](serving.md)).
+- Fork ids observed from peers: OP Mainnet and Unichain (section 5).
 
 Rules observed:
 
 - *Fork id* (EIP-2124): block forks 3,950,000 and 105,235,063; time forks Canyon 1704992401,
   Ecotone 1710374401, Fjord 1720627201, Granite 1726070401, Holocene 1736445601, Isthmus
-  1746806401, Jovian 1764691201, and one more at 1783526401 (2026-07-08) that the published
-  `alloy-op-hardforks` 0.5.0 lacks. With the stale fork id the node only peers with nodes that
+  1746806401, Jovian 1764691201, and Karst at 1783526401 (2026-07-08), first learned from
+  peers (the published `alloy-op-hardforks` 0.5.0 lacked it). With the stale fork id the node only peers with nodes that
   have not upgraded, which are days behind the tip.
 - *Receipts root*: from Canyon on, each receipt is hashed in its EIP-2718 consensus encoding.
   Before Canyon the deposit nonce is on the wire but not in the hashed receipt.
@@ -55,13 +55,15 @@ Rules observed:
 |---|---|---|---|
 | in | a block that needs receipts | `ReceiptsRequest { block: BlockRef, receipts_root, timestamp_secs, transaction_count }` on an `mpsc` channel | the pipeline, as each block is ingested, and at startup for stored blocks without receipts |
 | out | verified receipts for a block | `VerifiedReceipts { block: BlockRef, receipts: Vec<OpReceiptEnvelope> }` on an `mpsc` channel | the pipeline, which attaches them in the stores |
+| in / out | a missed span of the unsafe chain, and its blocks | `FillRequest` in, `Vec<EncodedBlock>` out, on `mpsc` channels | the pipeline's fill task ([pipeline.md](pipeline.md), "Missed blocks"); fetched by `sync/fill.rs` in 64-block segments |
+| out | range-sync batches and checkpoints | `Vec<EncodedBlock>`, `Vec<BlockRef>` | the pipeline's range task and the node store (section 12) |
 
 `el` depends on `primitives` and `chainspec` only: like `p2p`, it talks to the binary through
 channels, and never depends on `p2p`, `storage` or `pipeline`.
 
 A request that cannot be served (no peer, or no peer has the receipts) stays queued and is
-tried again; the queue is bounded and drops its oldest entries first, counted. Headers and
-bodies of a range come from the same stack: range sync, section 12.
+tried again; the queue is bounded and drops its oldest entries first. Headers and bodies of a
+missed span or a range come from the same stack: the fill and range sync, section 12.
 
 ## 3. Parts
 
@@ -99,7 +101,7 @@ this project keeps current (in `chainspec`), not something taken from a crate al
 |---|---|---|
 | OP Mainnet (10) | `c29239af` | observed from peers (2026-10-04) |
 | Base (8453) | `68647e86` | computed from the chain spec (genesis `0xf712…73dd`; Canyon through Jovian, Azul, Beryl, Cobalt); equal to what Base reports through `eth_config` (`docs/base.md` §3); not yet confirmed by a peer |
-| Unichain (130) | `1faa456e` | computed (2026-10-04: genesis `0x3425…befe`; Holocene, Isthmus, Jovian, Karst); not yet confirmed by a peer: a 4-minute run found no Unichain peer, execution or gossip, while the same setup found OP Mainnet peers in 50 s |
+| Unichain (130) | `1faa456e` | computed (genesis `0x3425…befe`; Holocene, Isthmus, Jovian, Karst); observed from peers (Unichain range sync, 2026-10-05) |
 
 **The known-forks horizon** (`horizon.rs`), information only. A peer whose fork id announces a
 `next` time this build does not know is on a fork that is coming and that the node cannot
@@ -128,7 +130,7 @@ network it joins (the OP Stack chain's and, with the L1 side, Ethereum's):
 
 | | Policy | Where |
 |---|---|---|
-| Sessions | 4 dialed and 4 accepted by an `indexer`, 32 by a `server`, which exists to serve (`OP_INDEXER_EL_MAX_SESSIONS`; the L1 side uses 4); on the OP Stack network one more dialed, not counted against these, for an op-p2p-indexer with blocks before Bedrock (section 13) | `PeerConfig::max_sessions`, `bin/server` `EL_MAX_SESSIONS` |
+| Sessions | 4 dialed and 4 accepted by an `indexer`, two per core (8 to 64) by a `server`, which exists to serve (`OP_INDEXER_EL_MAX_SESSIONS`; the L1 side uses 4); on the OP Stack network one more dialed, not counted against these, for an op-p2p-indexer with blocks before Bedrock (section 13) | `PeerConfig::max_sessions`, `sizing::server_el_sessions` (`crates/node`) |
 | Peers that want history | up to 4 more accepted for a peer that wants history most peers prune: an op-p2p-indexer (by its node record, or its `op-indexer/` client name) or a node whose head is over 10,000 blocks behind ours (syncing). When those are full too, the inbound peer that has asked us for nothing the longest (2 minutes at least, and not one that wants history) is disconnected ("too many peers") to make room, so a full node's slots cannot lock them out | `peers.rs` `HISTORY_SLOTS`, `SYNCING_BEHIND`, `UNASKED_EVICTION` |
 | Our own deployment | peers listed in `OP_INDEXER_EL_TRUSTED_PEERS` (the other servers): dialed first, always accepted, never released for being unused, and counted against no limit, so they neither take the slots kept for others nor are refused | `PeerConfig::trusted_peers` |
 | Inbound connections | at most 8 handshakes at once, 2 from one host (an IPv4 address or an IPv6 /64), with 5 s each for the encrypted handshake, the hello and the status; further connections are closed and warned about once a minute, with a count; one established inbound session per host | `session/listener.rs`, `peers.rs` |
@@ -136,8 +138,9 @@ network it joins (the OP Stack chain's and, with the L1 side, Ethereum's):
 | Dials | at most 8 at once, 30 a minute, no peer more often than once a minute | `peers.rs`, `peers/schedule.rs` |
 | A full peer | a dial refused with "too many peers" (or a dropped handshake): again after 60 to 90 s, doubling with each refusal in a row, up to 8 to 12 minutes; a session the peer ended with "too many peers": again after 60 to 90 s | `FULL_PEER_RETRY` |
 | Other failed dials | 5 to 7.5 minutes, doubling, up to 40 to 60 minutes; another fork or no shared protocol: 1 hour; bad data: banned 6 hours | `peers/schedule.rs` |
-| Requests we send | per session, one at a time for each requester (receipts of new blocks, range sync), 200 ms apart; a peer that leaves three requests in a row unanswered is dropped as unresponsive | `pacing.rs` |
+| Requests we send | per session and requester: the receipts of new blocks one at a time, range sync and the fill up to 4 at once; a requester starts a request on a session at most every 200 ms; a peer that leaves three requests in a row unanswered is dropped as unresponsive | `pacing.rs`, `sync/schedule.rs` |
 | Requests we answer | 1,200 a minute and 4 at once per peer, 1,024 items or about 2 MiB per answer, 16 answered at once in all; a request beyond these is answered empty, never left unanswered | `serve.rs`, `serve/session.rs` |
+| A server's R2 reads for peers | 16 at once and 4 GiB a minute over all peers; beyond them, an empty answer | `crates/server/src/budget.rs` |
 | What we advertise | the blocks we hold and serve, or the tip alone; never blocks we would refuse (section 13) | `serve/session.rs` |
 
 ## 7. Not done
@@ -169,7 +172,9 @@ not delay ingest; a small storage call (parent hash plus has-receipts) would rem
 |---|---|
 | `lib.rs`, `config.rs`, `error.rs` | `ExecutionNetwork::new(...)` / `run(cancel)`, plain-data config, the crate's error |
 | `network.rs` | `NetworkSpec` (network id, genesis, fork schedule, bootnodes, record keys) and `PeerNetwork`: discovery, sessions and the peer set for one devp2p network, reused by `l1` for Ethereum L1 |
-| `discovery.rs` | discv5 in the global DHT, filtered by the current fork id (`opel` and `eth` keys) |
+| `discovery.rs` | discv5 on the chain's discovery network (`execution_discovery_id`), filtered by the current fork id (`opel` and `eth` keys); the advertised address, and the public IP learned |
+| `horizon.rs` | The known-forks horizon (section 5) |
+| `warn_limit.rs` | Warnings at most once per interval |
 | `session.rs`, `session/{context,driver,handshake,listener}.rs` | One RLPx session, dialed or accepted: ECIES, hello, eth/69 or eth/68 status (the highest both speak; an eth/68 peer is served, never asked), ping/pong, disconnect reasons; requests as async calls; peers' requests passed to the server |
 | `wire.rs` | The message types used and OP's eth/69 receipt decoding, including the bloom rebuilt from the logs |
 | `peers.rs`, `peers/schedule.rs` | The peer set: who to dial and when, polite retry and backoff, how many sessions to keep in each direction, banning peers that fail verification |
@@ -177,24 +182,23 @@ not delay ingest; a small storage call (parent hash plus has-receipts) would rem
 | `fetch.rs` | The receipt request queue: newest blocks first, one peer per request, timeout, another peer on failure |
 | `verify.rs` | The receipt count and the receipts root against the header, with the per-fork rules |
 | `serve.rs`, `serve/{provider,session}.rs` | Serving: the `BlockProvider` trait, the server task, per-session answering and limits (section 11) |
-| `sync.rs`, `sync/{headers,schedule,segment}.rs` | Range sync: the header walk, the per-segment fetch, scheduling across sessions (section 12) |
+| `sync.rs`, `sync/{fill,headers,schedule,segment}.rs` | Range sync: the header walk, the per-segment fetch, scheduling across sessions (section 12); the fill of missed spans |
 
 Elsewhere: `chainspec` holds the genesis hash, the fork activations and the fork id;
-`primitives` the channel types; the pipeline has a receipts task and sends requests; the
-binary has the configuration, the provider over the archive and the unsafe store, and the
-wiring.
+`primitives` the channel types; the pipeline has the receipts, fill and range tasks; `crates/node`
+has the configuration, the provider over the archive and the unsafe store, the range sync
+planner and the wiring; a `server`'s provider reads sealed history from R2 (`crates/server`).
 
 ## 10. Configuration and identity
 
-- `OP_INDEXER_EL_ENABLED` (default `false` while peer access is unproven),
-  `OP_INDEXER_EL_LISTEN_ADDR` (default `0.0.0.0:30303`, TCP and UDP),
-  `OP_INDEXER_EL_BOOTNODES`, `OP_INDEXER_EL_MAX_SESSIONS` (default 4 in each direction; see
-  section 6).
-  `OP_INDEXER_EL_ADVERTISED_ADDR` (optional `ip:port`): the public address the node record
-  carries for TCP and UDP, for a server or a forwarded port. Unset, discovery fills in the
-  address it learns from other nodes, and withdraws it again if nothing reaches the node
-  within five minutes, so a node behind NAT without a port forward advertises no address.
-  With `el` disabled the pipeline has no receipts task and the binary behaves as before.
+- The variables (`OP_INDEXER_EL_*`: enabled, listen address, bootnodes, sessions, advertised
+  address, trusted peers, range sync) and their defaults are in
+  [configuration.md](configuration.md). Behaviour: with an advertised address set, the node
+  record carries it for TCP and UDP (a server or a forwarded port). Unset, discovery fills in
+  the address it learns from other nodes, and withdraws it again if nothing reaches the node
+  within five minutes, so a node behind NAT without a port forward advertises no address; the
+  last IP learned is kept for the server's own address. With `el` disabled the pipeline has no
+  receipts, fill or range task.
 - The execution network has its own secp256k1 key, kept in the node store next to the
   libp2p identity and supplied by the binary. It is not the same key: both networks run a
   discv5 node, and one node id announcing two different records would look like a node
@@ -205,9 +209,10 @@ wiring.
   its status: peers end a session at once with a node whose status says genesis.
 - Shutdown: both networks stop first, then the pipeline.
 
-## 11. Serving (not run live)
+## 11. Serving
 
-The node answers peers from its own stores, so that another node can sync from it.
+The node answers peers from its own stores, so that another node can sync from it. Run live
+from `server`s; an `indexer` serves the same way from its archive.
 
 - `el` does not depend on `storage`. It defines the `BlockProvider` trait (`read` a run of
   headers, bodies or receipts within `ReadLimits`, and the held `range`), and the binary
@@ -295,7 +300,13 @@ The node answers peers from its own stores, so that another node can sync from i
   requests are answered empty without reading and the advertised range stays where it was,
   until a read of the held range succeeds again. A failed request read does not count: one
   corrupt stored block that peers keep asking for fails their requests only.
-- Serving itself has not run live.
+- A `server`'s provider reads sealed history from R2 in runs (a downward header request read
+  upwards as one stream, bodies and receipts by hash continuing from the block before, a
+  skeleton page at most 64 headers), and only the parts of each block it sends, within its R2
+  budget for peers ([serving.md](serving.md), section 5). Until 2026-10-05 it read a block at a
+  time, so peers timed out on it ("it stopped answering").
+- What was served is counted and logged once a minute ("serving execution peers"), and a
+  `server` sends the totals in its heartbeat ([citizenship.md](citizenship.md)).
 
 ## 12. Range sync
 
@@ -344,22 +355,26 @@ history can get it from one that has it.
 - Progress: the archive's last block is where the fetch resumes, and the anchor of an
   unfinished sync with its walk's checkpoints is saved in the node store, so a restart
   continues the walk instead of starting it again.
-- One sync request per session, next to the tip fetcher's own; neither waits for the other.
+- Range sync's requests run next to the tip fetcher's on the same sessions; neither waits for
+  the other.
 - It needs an archive that keeps every block and whose range the sync continues; otherwise
   the binary refuses to start it. A store that refuses a batch stops the process.
-- Off by default; `OP_INDEXER_EL_SYNC=true` runs it in rounds, for as long as the node runs.
+- On with `OP_INDEXER_EL_SYNC`, a profile that turns it on, or the L1 side
+  ([configuration.md](configuration.md)); it then runs in rounds, for as long as the node runs.
   It only closes the gaps gossip cannot; otherwise promotion extends the archive from the
   unsafe store, and no block is fetched twice. Each round goes from the block after the
   archive's last one (block 0 on an empty archive) to an anchor whose hash is trusted; the
   saved anchor of an unfinished round is resumed first.
   - **With the L1 side**, a round is planned while the archive's last block is 1,024 blocks
     or more (`CAUGHT_UP_BLOCKS`, the unsafe store's read limit) below the safe head, or below
-    the committed safe block, and it is anchored on the safe head only (its batch is on L1:
-    no reorg replaces it). Everything the sync writes is then committed on L1.
+    the committed safe block, and it is anchored on the safe head only (a bonded claim on L1
+    matched it, [l1.md](l1.md#3-trust); heads never move back). Everything the sync writes is
+    then at or below a block L1 commits to.
   - **Without it**, a round is planned while the archive is that far below the gossiped head,
-    anchored on the gossiped block 64 below the unsafe head (`ANCHOR_DEPTH`), whose hash the
-    sequencer signed, looked up in the unsafe store (right after a start the sync waits until
-    gossip has delivered that many blocks). An unsafe reorg deeper than 64 blocks would leave
+    anchored on the gossiped block 64 below the unsafe head (`ANCHOR_DEPTH`), or lower, at the
+    newest block peers advertise, whose hash the sequencer signed, looked up in the unsafe
+    store (right after a start the sync waits until gossip has delivered that many blocks, and
+    until a peer advertises a height). An unsafe reorg deeper than 64 blocks would leave
     the archive on a dead branch: such an archive has to be rebuilt.
 - **The chain must reach the archive.** The plan carries the archive's last block, and the
   parent the first fetched block names is checked against it as soon as the header walk
@@ -371,37 +386,24 @@ history can get it from one that has it.
   range, a segment from it). After a round is given up, for any reason, the next waits a
   minute, doubling for each round given up in a row, up to 30 minutes; the next anchor
   chosen replaces the saved one.
-- **Promotion extends the archive.** Promotion reads the range above the archive's last block
-  when that block is above the committed safe head and below the new safe head, so a first
-  safe head above the archive's last block promotes everything from it on, not the safe block
-  alone, and blocks the archive holds are not read again (no hole is reported for them). The
-  binary holds an L1 head back from promotion while the archive is more than 1,024 blocks
-  below its safe block, or below the committed safe block; the finalized head is held with it
-  (promotion takes the two together). The hold is looked at again every 2 s against the
-  growing archive, so a head is released as soon as a round has stored enough, often with the
-  round still storing: promotion and the range task then both append, and each leaves out
-  what the other already wrote. A failing read of the archive or of the node store is
-  retried, warned about once a minute; the head forwarder treats an unreadable archive as no
-  reason to hold a head.
-- **The range task and promotion share the archive.** For each batch the pipeline leaves out
-  the blocks the archive already holds and requires the first block left to name the
-  archive's last one as its parent, before it writes anything. If promotion appends between
-  that check and the archive append, the append is checked once more against the new tip. A
-  batch that does not extend the archive is left out with a warning and nothing written; the
-  round then never reaches its anchor, and the planner gives it up two minutes after it was
-  fetched (`ROUND_STORE_TIMEOUT`). The pipeline does not stop for it. A node filled by the importer therefore continues
-  from the import's last block, with no range to configure. On an empty archive the range
-  begins before Bedrock, which no public peer serves: the header walk reaches as far down as
-  peers hold and then waits, warning once a minute.
+- **The archive is shared.** Promotion extends the archive from the unsafe store above its
+  last block, and the binary holds an L1 head back from promotion while the archive is more
+  than 1,024 blocks below it; the range task and promotion each leave out what the other
+  already wrote ([pipeline.md](pipeline.md), sections 4 and 4b). A batch that does not extend
+  the archive is left out with a warning; the round then never reaches its anchor, and the
+  planner gives it up two minutes after it was fetched (`ROUND_STORE_TIMEOUT`). A node filled
+  by the importer continues from the import's last block, with no range to configure. On an
+  empty OP Mainnet archive the range begins before Bedrock, which only op-p2p-indexers serve
+  (section 13): the header walk reaches as far down as peers hold and then waits, warning once
+  a minute.
 - Logs: every line of the execution network carries `el{network=op}` or `el{network=l1}`;
   the range sync's progress line says how many peers hold the next headers, and waits "for a
   peer that holds the anchor" when none does.
 
-**State: never run.** Nothing has executed it, because it needs execution sessions with a
-peer that serves the range. Known inefficiencies: bodies and
-receipts of a segment are fetched one after the other, and headers are downloaded twice (once
-by the walk, once per segment). Before Bedrock no public peer serves blocks, so a sync from
-genesis only works against another instance of this node.
+**State: run live** (Unichain from block 0, 2026-10-05; the numbers above). Known
+inefficiencies: bodies and receipts of a segment are fetched one after the other, and headers
+are downloaded twice (once by the walk, once per segment). Before Bedrock no public peer serves
+blocks, so a sync of OP Mainnet from genesis only works against another op-p2p-indexer.
 
 ## 13. op-p2p-indexer peers
 
@@ -423,19 +425,20 @@ find each other without a protocol of their own.
   later) for anyone else. Range sync asks for blocks below Bedrock only of indexer peers, and
   waits for one; other peers are not asked for them. On a chain without a legacy chain
   (Unichain) the Bedrock block is 0 and none of this changes anything.
-- **Finding each other.** Indexers are few: one outbound and one inbound slot beyond
+- **Finding each other.** Indexers are few: one outbound slot beyond
   `OP_INDEXER_EL_MAX_SESSIONS` is kept for an indexer that says it holds blocks before
   Bedrock (its advertised `earliest` is below Bedrock), and its session is not counted
-  against the ordinary slots. Only an indexer discovery saw in this run is dialed for it.
+  against the ordinary slots; inbound, indexers share the four history slots (section 6). Only an indexer discovery saw in this run is dialed for it.
   The session in the outbound slot is exempt from the release of unused sessions, and is
   left out of the "every kept session busy" check. Beyond the slot indexers compete for the
   ordinary slots like any peer. An indexer that answers "not held" three times in a row for
   blocks before Bedrock is dropped (`not_holding`) and not dialed for a long while, so
   another can take the slot; one that answers nothing useful otherwise is dropped like any
-  useless peer. On a chain with nothing before Bedrock (Unichain) there is no slot.
+  useless peer. On a chain with nothing before Bedrock (Unichain) there is no outbound slot.
 - **Spoofing is accepted.** The flag is self-declared: any node can carry `opidx`, take the
   indexer slot and be served blocks before Bedrock. That costs bandwidth only: those blocks
-  are public history, and the slot is one each way.
-- **Not done:** an indexer we only meet inbound and whose record discovery has not seen is
-  treated as an ordinary peer until discovery finds its record. Nothing of this has run
-  against another indexer.
+  are public history, and the slots are few.
+- **Not done:** an indexer we only meet inbound and whose record discovery has not seen is not
+  served blocks before Bedrock until discovery finds its record (its `op-indexer/` client
+  name already gets it a history slot). Sharing blocks before Bedrock between two indexers
+  has not run.

@@ -1,5 +1,9 @@
 # Execution-peer viability test
 
+**Historical:** the 2026-10-04 probe, before the `el` crate existed; not maintained. The
+current spec and what the crate has measured since are in [el.md](el.md) (section 1); questions
+listed below as unknown that have been answered since are noted there.
+
 What a throwaway probe measured on 2026-10-04 about fetching receipts, headers and bodies from
 OP Mainnet execution peers over devp2p. It is the evidence behind [el.md](el.md) and the
 roadmap's decision to take receipts from execution peers. The probe is not in the repository.
@@ -151,7 +155,7 @@ legacy block), with 105,235,063 and 105,235,064 as controls.
 | Rule | Detail | Source |
 |---|---|---|
 | Fork id | Genesis hash, block forks 3,950,000 and 105,235,063, time forks Canyon 1704992401, Ecotone 1710374401, Fjord 1720627201, Granite 1726070401, Holocene 1736445601, Isthmus 1746806401, Jovian 1764691201, and 1783526401 (2026-07-08). Result: hash `c29239af`, next 0. | [EIP-2124](https://eips.ethereum.org/EIPS/eip-2124); activations from `alloy-op-hardforks` 0.5.0 except the last |
-| The last activation | Not in any published crate. Learned from node records of nodes that had not upgraded, which announce it as their next fork; adding it yields exactly the hash upgraded nodes report. Its name was not sourced. | observed |
+| The last activation | Not in any published crate. Learned from node records of nodes that had not upgraded, which announce it as their next fork; adding it yields exactly the hash upgraded nodes report. Its name was not sourced (since named Karst, in `chainspec`). | observed |
 | Stale fork id | With the list one fork short (`d53e568f`) the probe reached only nodes that had not upgraded, days behind the tip, and its own check refused every up-to-date peer. | observed, runs A and B |
 | Protocol version | eth/69 on every current-fork peer. Its status carries the earliest and latest block. Up-to-date op-geth offered only eth/69 and snap/1. | [EIP-7642](https://eips.ethereum.org/EIPS/eip-7642) |
 | eth/69 receipts | No bloom on the wire; each receipt is `[tx-type, status, cumulative-gas, logs]`, and a deposit receipt carries the deposit nonce and the deposit receipt version after the logs when it has them. op-alloy's `OpReceipt` decodes exactly this; the bloom is rebuilt from the logs. | EIP-7642; op-alloy-consensus 2.0 |
@@ -180,7 +184,7 @@ legacy block), with 105,235,063 and 105,235,064 as controls.
   candidate), and everything about legacy bodies and receipts.
 - **erigon on eth/68**: on the stale fork, one erigon peer returned receipts whose root did not
   match for three of five blocks, while its headers and bodies were fine. Not diagnosed. The
-  crate speaks eth/69 only, so it does not meet this case.
+  crate asks only eth/69 peers for blocks, so it does not meet this case.
 - **Peer supply at saturation**: discovery was still finding new peers when each run ended.
 - **Time of day and vantage**: one evening, one residential connection.
 - **Anchoring of old headers**: measured as practical in speed, never actually done.

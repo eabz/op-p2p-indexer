@@ -1,21 +1,20 @@
 # Storage specification
 
-Scope: the `storage` crate only, plus the shared types it needs in `primitives`. See
-[roadmap.md](roadmap.md) for why storage is built first and what feeds it later.
+The `storage` crate (the unsafe chain and the fjall archive, their traits and errors) and the
+shared types it needs in `primitives`. Status 2026-10-05: built and run live on OP Mainnet and
+Unichain; one known gap, a safe head that contradicts the unsafe chain (section 3.2,
+[roadmap](roadmap.md) #3). A `server` keeps only a tail of the archive and reads the rest
+from R2 ([serving §5.1](serving.md#51-state)).
 
 | Store | Holds | Why |
 |---|---|---|
 | **Unsafe chain** (in memory, journaled to fjall) | Unsafe blocks: live, not yet committed to L1, with fork choice. | Small, changes shape on reorgs; in the node process, so no service. |
 | **fjall** (archive, the committed store) | Every committed block in its consensus encoding, with each transaction's sender, and the committed L1 heads. | Embedded, needs no service; serves peers and the stream by number or hash (section 9). |
 
-There was a third store, ClickHouse, for committed blocks as rows; it was removed on 2026-10-04
-when the node became a data source streamed over gRPC (see the roadmap). Sections 4 and 5.1
-say so; the numbering is kept.
-
-**Input.** Storage takes a block that is already decoded, with or without its receipts. (The
-type is named `DecodedBlock` from an earlier plan; receipts are now expected to come from
-execution-network peers, see the roadmap. "Executed" below means "has receipts".) It does not
-decode gossip payloads, execute transactions or know about L1. Whoever calls it supplies:
+**Input.** Storage takes a block that is already decoded (`DecodedBlock`), with or without its
+receipts, which come from execution peers ([pipeline §4b](pipeline.md#4b-the-receipts-task-and-the-range-task)).
+"Executed" below means "has receipts". It does not decode gossip payloads, execute
+transactions or know about L1. Whoever calls it supplies:
 
 - the block (header and transactions), and its receipts if they are known;
 - the L1 safe and finalized heads, when known.
@@ -63,24 +62,28 @@ pub trait UnsafeStore {
     /// The canonical block at height `number`, or None if none is stored there.
     async fn canonical(&self, number: BlockNumber) -> Result<Option<DecodedBlock>, StorageError>;
     async fn set_l1_heads(&self, heads: L1Heads) -> Result<(), StorageError>;
+    // Also: `lowest`, the serving reads `canonical_number`, `canonical_headers`,
+    // `canonical_items` and `canonical_run` (below), and `last_event_id` and `events`
+    // for live readers (section 3.3).
 }
 
 ```
 
 The committed store is the archive's trait, `ArchiveStore` (section 9.2).
 
-- `MemoryStore` and `FjallArchive` are the implementations. Both are cheap to clone.
+- `MemoryStore` and `FjallArchive` are the implementations, and the server's `R2Archive`
+  (`crates/server`) implements `ArchiveStore` too. All are cheap to clone.
 - `StorageError` is one `thiserror` enum with `severity(&self) -> Severity`:
-  - **Transient** (retry can help): a local disk I/O failure of the archive or the journal.
+  - **Transient** (retry can help): a local disk I/O failure of the archive or the journal,
+    and a connection error or timeout reading R2 (`Remote`).
   - **Expected** (the caller handles it, nothing is wrong with the store): `MissingAncestor`,
     `AncestryTooLong`, and the archive's `NotContiguous`.
   - **Fatal** (needs an operator): everything else, including a schema or chain mismatch,
     undecodable stored data, and a block that does not fit the schema.
   Variants carry what failed: the operation for engine errors, the block for decode errors.
-  The stores do not retry. The crate exports `retry(cancel, store, operation, budget, call)`
-  and `RetryError`, which repeat a call while its error is transient, with exponential backoff
-  and jitter, until `cancel` fires or the optional `budget` of time is spent; the pipeline and
-  the importer use it.
+  The stores do not retry. The crate exports `retry(cancel, store, operation, call)` and
+  `RetryError`, which repeat a call while its error is transient, with exponential backoff
+  and jitter, until `cancel` fires (no time limit); the pipeline and the stream use it.
 - **Retries.** Every write is idempotent. An insert whose journal write failed was applied in
   memory: a retry returns `stored = false` and no events (the readers got them the first
   time). A caller that needs them re-reads `head()`.
@@ -93,8 +96,7 @@ The committed store is the archive's trait, `ArchiveStore` (section 9.2).
 
 ## 3. The unsafe chain (unsafe store)
 
-Decision D0 (`docs/serving.md`, 2026-10-04): no Redis. The unsafe chain lives in memory in the
-node process, and every change to it is journaled to a small local fjall database, so a
+The unsafe chain lives in memory in the node process, and every change to it is journaled to a small local fjall database, so a
 restart replays it without the network.
 
 ### 3.1 In memory, and the journal
@@ -120,7 +122,7 @@ header over exactly those bytes; a mismatch is `InvalidBlock` (`TransactionsRoot
 **Bounds.** Blocks leave when the caller prunes; when their height's blocks are more than a
 day (`RETENTION_SECS`) older than the newest block, a few lowest heights per insert, the
 backstop for when nothing prunes (no L1); and when the blocks take more than
-`UnsafeConfig::max_bytes` (`OP_INDEXER_UNSAFE_MAX_BYTES`, default 2 GiB), lowest heights first,
+`UnsafeConfig::max_bytes` (`OP_INDEXER_UNSAFE_MAX_BYTES`, default an eighth of the memory, 256 MiB to 2 GiB, or 2 GiB when the memory is unknown), lowest heights first,
 never the head's. Evictions are logged. Readers must not expect blocks older than that.
 
 **Measured** (2026-10-04, synthetic, release build, Apple M-series): 3,600 linked blocks of 20
@@ -152,8 +154,7 @@ are small (8 MiB each): the chain is in memory, the journal is only read on open
 
 Blocks reaching the unsafe store are assumed valid (signature and hash checked upstream). The
 unsafe store decides which are canonical. The whole decision for one block runs under the
-chain's lock, so readers never see a half-applied reorg. The rules are the ones the Redis
-store's Lua scripts had, ported step for step (`unsafe_store::chain`).
+chain's lock, so readers never see a half-applied reorg (`unsafe_store::chain`).
 
 The rule follows what an op-node follower does with gossiped unsafe payloads (verified against
 optimism `develop` @ c8e4ba855d79, `op-node/rollup/engine/payloads_queue.go` and
@@ -218,7 +219,7 @@ Limits and consequences:
   block at the safe height (the safe head moved and prune has not run yet) the safe hash is
   not accepted as an ancestor there. In both cases the block above stays a side block and its
   height a gap.
-- **Setting the safe head does not reconcile the store. Known gap, to close with the L1 work.**
+- **Setting the safe head does not reconcile the store. Known gap ([roadmap](roadmap.md) #3).**
   `set_l1_heads` only records the heads. If the safe head lands on a block other than the one
   `canonical` holds at that height (L1 derived a different chain), the store keeps its old
   branch until the caller prunes, and the `head` key keeps pointing at that branch until a block
@@ -227,12 +228,12 @@ Limits and consequences:
   the safe height that nothing fills later. An op-node follower resets its unsafe head in this
   situation. The fix is for `set_l1_heads` to become a write that, when the safe block
   contradicts `canonical`, removes the contradicted entries, moves the head to the safe block
-  and emits a `reorg`. This is reachable when the L1 side publishes a safe head on a branch the
+  and emits a `Reorg`. This is reachable when the L1 side publishes a safe head on a branch the
   unsafe store does not follow; the fix is not done, the gap is open.
 - **When the unsafe head is below the safe head**, a block directly above the safe height
-  becomes the head only if its parent is the safe head; `gap` is then `0`, because the heights
+  becomes the head only if its parent is the safe head; `gap` is then `false`, because the heights
   in between are committed, not missing.
-- **A reorg can be long.** One `reorg` event lists up to `MAX_REORG_DEPTH` replaced hashes.
+- **A reorg can be long.** One `Reorg` event lists up to `MAX_REORG_DEPTH` replaced hashes.
 - **Every height a fill writes emits `Filled`**, whether the height was empty or held another
   branch's block, so a reader learns the new canonical hash at each height it changed.
 - **The head can outlive its block.** Prune, retention or the cap may remove the block the head
@@ -297,10 +298,7 @@ same write. Readers are in the node process (the stream); a restart restarts the
 
 ## 4. Committed store
 
-The archive (section 9) is the committed store. The ClickHouse committed store that was here
-(tables `blocks`, `transactions`, `receipts`, `logs`, `chain_state`, `imported_ranges`) was
-removed with its client, migrations and configuration. A database an earlier build wrote is
-not read; drop it when convenient.
+The archive (section 9) is the committed store.
 
 ## 5. Migrations
 
@@ -315,7 +313,7 @@ again in a new directory.
 
 The journal's `meta` holds its layout version. On open: absent means write the current
 version; equal means continue; different means **empty the journal and start empty**. Unsafe
-blocks are disposable. A Redis store an earlier build wrote is not read; stop the service.
+blocks are disposable.
 
 ## 6. Connectors and configuration
 
@@ -332,38 +330,19 @@ disabled and keeps every block (section 9.3). The binary fills it from the envir
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OP_INDEXER_UNSAFE_MAX_BYTES` | 2 GiB | Memory the unsafe chain's blocks may take (section 3.1). |
+| `OP_INDEXER_UNSAFE_MAX_BYTES` | memory / 8, 256 MiB to 2 GiB | Memory the unsafe chain's blocks may take (section 3.1). |
 
 The binary opens the archive, then opens the unsafe chain and replays its journal, and fails
 fast if either is another chain's. The pipeline then writes the blocks.
 
 ### Several instances on one host
 
-Several indexers can run on one server: several chains (OP Mainnet, Unichain, Base), or several
-builds of one chain. Each needs:
+Each instance needs its own data directory (`OP_INDEXER_DATA_DIR`, by default named after the
+chain: `data-op`, `data-unichain`, `data-base`), its own ports and its own `.env`. The archive,
+the unsafe chain's journal and the node store all live in the data directory, record their
+chain and refuse another's. See [configuration.md](configuration.md#a-second-instance-on-the-same-host).
 
-- **Its own data directory** (`OP_INDEXER_DATA_DIR`). By default it is named after the chain,
-  `data-op`, `data-unichain` or `data-base` (`ChainSpec::default_data_dir`), so two chains on one host
-  never share a directory unless told to. Two builds of the same chain need an explicit one each. The archive, the
-  unsafe chain's journal and the node store all live in it, record their chain and refuse
-  another's: nothing else is shared, so two instances of one chain need nothing more.
-- **Its own ports**: `OP_INDEXER_P2P_LISTEN_ADDR`, `OP_INDEXER_EL_LISTEN_ADDR`,
-  `OP_INDEXER_L1_LISTEN_ADDR`, `OP_INDEXER_L1_BEACON_LISTEN_ADDR` and
-  `OP_INDEXER_STREAM_LISTEN_ADDR`, plus the advertised addresses on a public host.
-- **Its own L1 side**, if L1 is enabled: each instance runs its own beacon light client and
-  its own L1 execution peers. Two instances do not share them; nothing on L1 is
-  per-chain except the dispute game factory.
-- **Its own `.env`**: the settings above, in a file per instance. Run each instance from its own
-  directory, where it reads `.env`, or point it at its file with `--env-file <path>`. The end of
-  `.env.example` shows a Unichain and a Base instance next to an OP Mainnet one (their ports
-  shifted by 100 and by 200):
-
-```bash
-./target/release/indexer --env-file unichain.env
-```
-
-Storage has no metrics (removed 2026-10-04, to be re-added later where needed): retries,
-reorgs, evictions and failed operations are logged.
+Storage has no metrics: retries, reorgs, evictions and failed operations are logged.
 
 ## 7. Open points
 
@@ -372,8 +351,7 @@ reorgs, evictions and failed operations are logged.
 - **Encoding runs on the calling task.** A block's encoding and root check before it is stored
   run on the calling task; blocks are small. The write and the journal run on a blocking thread.
 - **Tests.** `CLAUDE.md` says no tests for now. Fork choice (3.2) is a state machine that live
-  runs will rarely exercise. It is a port of the Lua scripts step for step; until the rule
-  changes, verify it by driving `MemoryStore` with hand-made block sequences in a scratch
+  runs will rarely exercise; verify it by driving `MemoryStore` with hand-made block sequences in a scratch
   program, and report the sequences and results.
 
 ## 8. Constants
@@ -385,7 +363,7 @@ reorgs, evictions and failed operations are logged.
 | `MAX_REORG_DEPTH` | 256 | jump and fill walks |
 | `MAX_ANCESTRY_BLOCKS` | 1024 | one `ancestry` call |
 | `EVENTS_KEPT` | 10000 | events kept for readers |
-| `OP_INDEXER_UNSAFE_MAX_BYTES` | 2 GiB | the unsafe chain's memory cap |
+| `OP_INDEXER_UNSAFE_MAX_BYTES` | memory / 8, 256 MiB to 2 GiB | the unsafe chain's memory cap |
 | Journal cache / journal cap / memtable | 8 MiB / 64 MiB / 8 MiB | the unsafe chain's journal |
 | Archive cache / journal cap / memtable | 64 MiB / 128 MiB / 16 MiB per keyspace | fjall archive |
 | Archive background threads | 2 | fjall archive |
@@ -393,41 +371,16 @@ reorgs, evictions and failed operations are logged.
 ## 9. Local block archive (fjall)
 
 **Why.** The archive is the committed store: every block committed to L1, kept in the encoding peers ask for, with each transaction's sender, and the committed
-L1 heads. Promotion (pipeline) appends to it and records the heads, the importer and range
-sync fill it, serving (`el`) and the stream (`stream`) read it. Serving also reads the
+L1 heads. Promotion (pipeline) appends to it and records the heads, range sync fills it,
+serving (`el`) and the stream (`stream`) read it. Serving also reads the
 canonical unsafe blocks above the archive's tip from the unsafe store (`docs/el.md`
 section 11), with the unsafe store's `canonical_*` reads (section 3.2).
 
 **Engine.** fjall (3.x): a log-structured store, pure Rust, published on crates.io, with no
 native code and nothing our `cargo deny` rejects. It is a directory, `archive/` in the data
 directory. Everything goes through the `ArchiveStore` trait, so the engine can be replaced.
-
-Why not the others, all measured or evaluated for this crate:
-
-- **redb** was built first and benchmarked against fjall with the same workload (360,000
-  blocks, 20 GB, body sizes modelled on real blocks, a 40 KB placeholder for receipts, one
-  durable atomic write per block; macOS, internal SSD):
-
-  | Measure | redb 4.3 | fjall 3.1 |
-  |---|---|---|
-  | Disk for 20.2 GB of data | 34.4 GB (1.7x) | 20.6 GB (1.02x) |
-  | Durable appends: empty / 10 GB / 20 GB | 171 / 143 / 133 per second | 212 / 207 / 192 per second |
-  | Appends with relaxed durability | 3,200 to 3,700 per second | 6,300 to 6,600 per second |
-  | Trim the oldest third | 36 s | 1.6 s |
-  | Disk for a constant 240,000-block window (13.5 GB) | 21.8 GB after two offline compactions (611 s, 208 s) | 14.3 GB, by itself |
-  | Read by number, first touch: p50 / p99 | 0.81 ms / 9.0 ms | 0.47 ms / 2.8 ms |
-  | Read by number, warm: p50 / p99 | 23 us / 48 us | 76 us / 486 us |
-  | Clean open | 5 to 10 ms | 54 to 157 ms |
-  | Reopen after `kill -9` | not measured | 158 ms, range contiguous |
-
-  redb is fine for a small window and wrong for a history of hundreds of GB. Limits of the
-  comparison: 20 GB only, one fjall configuration, incompressible filler, memory use not
-  recorded. fjall frees space lazily: a trim with no writes after it reclaimed nothing in 25
-  seconds; with appends following, the size settles and stays flat.
-- **NippyJar** (reth's static files): an unpublished internal crate needing a git dependency
-  and two `cargo deny` exceptions; rows cannot be completed later, so receipts could only be
-  written in strict block order.
-- **RocksDB, MDBX**: not Rust.
+Why fjall and not redb, NippyJar, RocksDB or MDBX (measured): [decisions.md](decisions.md),
+2026-10-03.
 
 **Invariant.** The archive holds one contiguous range of blocks, each the parent of the next.
 That is what makes the range announceable.
@@ -444,7 +397,7 @@ so key order is block order. Values are RLP, snappy-compressed (`snap`).
 | `receipts` | number | RLP list of the receipts in network encoding, with bloom (one `Receipts` entry up to eth/68; a caller serving eth/69 re-encodes without the bloom); absent until set |
 | `numbers` | block hash (32 bytes) | number |
 | `senders` | number | the sender of each transaction, 20 bytes each, in block order, uncompressed |
-| `pending_receipts` | number | block hash, for each archived block without receipts: written in the same batch as the block, removed in the same batch as its receipts (`set_receipts`). Added after version 2 without a new version: a version-2 archive gains it empty on open, which is right for an import (every imported block has receipts) |
+| `pending_receipts` | number | block hash, for each archived block without receipts: written in the same batch as the block, removed in the same batch as its receipts (`set_receipts`). A version-2 archive without it gains it empty on open |
 | `meta` | name | `schema_version` (2); `chain`, the chain the archive holds: its id (8 bytes, big-endian), then its genesis hash (32 bytes); `safe_head` and `finalized_head`, the committed heads: number (8 bytes, big-endian) then hash, absent until promotion records one |
 
 `bodies` and `receipts` use fjall's key-value separation, which keeps large values out of the
@@ -465,6 +418,8 @@ pub trait ArchiveStore {
     /// A run of headers, bodies or receipts, read in one call on one snapshot, up to `limits`.
     async fn read(&self, read: BlockRead, limits: ReadLimits, convert: Option<ItemConvert>) -> Result<Vec<Bytes>, StorageError>;
     /// Whole blocks (header, body, receipts if set, senders) from `from` upwards, on one snapshot.
+    /// `read_range(from, limits, parts)` streams the same in batches, reading only `parts`
+    /// (whole, without blooms, without receipts) where the store can.
     async fn blocks(&self, from: BlockNumber, limits: ReadLimits) -> Result<Vec<ArchivedBlock>, StorageError>;
     /// The committed L1 heads; `set_heads` records them, a `None` head leaving the recorded one.
     async fn heads(&self) -> Result<L1Heads, StorageError>;
@@ -486,11 +441,10 @@ pub trait ArchiveStore {
 - `append_batch` is the write path of the trait: `ArchivedBlock { encoded: EncodedBlock { hash,
   header, body, receipts }, senders }` (primitives). **The bytes are stored unchanged**, never encoded
   again from a decoded value, so what is served later is what was verified: a legacy
-  transaction with an all-zero signature does not survive a decode and re-encode. Import and
-  range sync hand over the bytes they verified; promotion encodes its gossip blocks once
+  transaction with an all-zero signature does not survive a decode and re-encode. Range sync
+  hands over the bytes it verified; promotion encodes its gossip blocks once
   (`ArchivedBlock::from(&DecodedBlock)`), which gives their original bytes because their
-  transactions are signed. Promotion and range sync pass the senders the pipeline recovered;
-  the importer passes those of its verified chunks.
+  transactions are signed. Promotion and range sync pass the senders the pipeline recovered.
 - The archive checks keccak(header) = `hash`, so it never holds a block whose bytes do not
   match its hash, reads the number and parent hash from that header, and checks that each
   block is the child of the one before and that the list extends the tip (or the archive is
@@ -499,7 +453,7 @@ pub trait ArchiveStore {
   caller has verified the transactions root and receipts root over these bytes, and recovered
   the senders. Receipts are in the form
   `op_indexer_primitives::encode_receipts` gives.
-- Blocks already held are skipped, so a resumed import or sync can resend any amount: the
+- Blocks already held are skipped, so a resumed sync can resend any amount: the
   leading blocks when the tip is among the list, and the whole list when it ends at or below
   the tip. "Held" is checked on one block, the one at the tip's height or the list's last:
   it must be stored under its hash at its number; the archive is one chain, so the blocks
@@ -545,7 +499,7 @@ pub trait ArchiveStore {
   files that are dropped only once wholly stale. A small archive therefore looks many times
   its live data (measured: 250 to 400 MB for 37 MB live); at 20 GB it was 1.02x.
 - fjall is synchronous: the implementation (`FjallArchive`, cheap to clone) runs each call on
-  a blocking thread, so the trait is async like the other two.
+  a blocking thread, so the trait is async like the unsafe store's.
 - On open: a directory holding an archive of another `schema_version` (or blocks and no
   version) is refused with `StorageError::ArchiveSchema`, naming the directory and both
   versions and telling the operator to start a new one. Nothing is deleted: an archive can hold
@@ -562,13 +516,15 @@ pub trait ArchiveStore {
   `StoreError::UnreadableChain`); for it, holding data means an identity, saved peers or sync
   progress. The binary opens the archive before the node store, so a refused archive leaves
   the node store without a record.
-- **Nothing removes blocks.** The archive only grows (section 9.3); a block is replaced only
-  by an import or append of the same block.
+- **The indexer's archive never removes blocks** (section 9.3); a block is replaced only by
+  an append of the same block. A server's tail drops blocks once sealed chunks cover them
+  (`prune_below`; [serving §5.1](serving.md#51-state)).
 
 ### 9.3 Retention and configuration
 
-The archive keeps every block: it is the history the node serves and streams. There is no
-window and no setting; the archive cannot be disabled.
+The indexer's archive keeps every block: it is the history the node serves and streams. There
+is no window and no setting; the archive cannot be disabled. A server's archive is a tail
+(`tail/` in its data directory) that drops blocks once sealed chunks in R2 cover them.
 
 With the range sync on (`OP_INDEXER_EL_SYNC`) and no L1 side, the sync anchors on a block 64
 below the gossiped head, so the archive holds blocks L1 has not committed (the stream marks
@@ -578,12 +534,8 @@ rebuilding the archive repairs. With the L1 side every archived block is committ
 The archive lives at `{OP_INDEXER_DATA_DIR}/archive/`. The binary opens it at startup;
 promotion and range sync write to it.
 
-**Sizing.** Real blocks (264 consecutive OP Mainnet blocks from live gossip, 2026-10-03
-22:32-22:42 UTC, a Saturday): compressed header plus body averages 17.8 KB per block (median
-6.7 KB, p95 76.9 KB, max 83.7 KB), bimodal, about one block in six carrying roughly 94 KB of
-poorly compressible data. That is about 23 GB of values for 30 days, **without
-receipts** (gossip carries none, so they are unmeasured) and before the engine's overhead. The
-whole history is plausibly 300 to 500 GB today and grows by roughly 200 GB a year; a full OP
-Mainnet node, state included, is about 700 GB. One short weekend sample: repeat at a weekday
-peak before relying on it. The archive holds only what the node has seen; older history comes
-from the importer or the range sync.
+**Sizing.** The full OP Mainnet archive (blocks 0 to 157,745,023, with senders) measured about
+914 GB in fjall (2026-10-04); live OP Mainnet blocks average 17.8 KB compressed without
+receipts (264 gossip blocks, 2026-10-03), about 23 GB a month before receipts. The archive
+holds only what the node has seen and what range sync fetched below it; bootstrapping it from
+chunks is not built ([serving §5.6](serving.md#56-the-indexers-history-from-chunks-design-not-built)).
