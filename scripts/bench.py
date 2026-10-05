@@ -1,28 +1,28 @@
 #!/usr/bin/env python3
-"""Arrow Flight bench: reads a block range of one table through the balancer, in parallel.
+"""Arrow Flight bench with bounded per-server concurrency and strict range coverage.
 
-Asks the balancer (`GetFlightInfo`) to plan the range into jobs, each naming up to three
-servers, then runs the jobs across `--processes` processes with `--threads` threads each, so one
-Python process (its GIL, its gRPC client) is not what limits the read. A job reads its ticket
-from its first location. On UNAVAILABLE (a server down) it moves to the next at once; on
-RESOURCE_EXHAUSTED (a server full) it tries the next too, and once it has tried them all it
-backs off before the next round, 200 ms doubling to 5 s with jitter. It keeps going round
-until `--retry-for` seconds have passed since the job began. Other errors fail the job.
+Plans through the balancer, then reads directly from its servers. --per-server bounds
+active RPCs across all processes/threads of THIS run; separate benchmark clients have
+independent limits. Full/down servers are tried through fallback locations with backoff.
+--retry-for bounds a started job including local slot waits; --rpc-timeout bounds each read
+RPC and --plan-timeout bounds planning.
+Queued jobs have not started their budget yet. A worker process failure aborts the run.
 
-Prints progress every few seconds, then: jobs done and failed, MB/s and rows/s, retries and the
-time spent backing off, time to first batch (median and p95), and per server its jobs and
-MB/s. MB are the Arrow bytes
-received, decoded (compressed IPC is counted after decompression).
+Progress counts decoded Arrow bytes as batches arrive, including unsuccessful attempts.
+Final useful throughput counts successful jobs only; incomplete runs are marked explicitly.
+MB means decimal 1,000,000 bytes, NOT network bytes (compression is decoded before counting).
+TTFB and job latency include queueing and retries; planning is reported separately and in
+the end-to-end rate. Latency is observed in the parent and includes IPC delivery. Empty
+streams have no first-batch sample.
 
-    KEY=<api key> scripts/bench.py --balancer grpc://balancer:50060 \\
-        --table logs --from 120000000 --to 120100000 --processes 4 --threads 8
+    KEY=<api key> scripts/bench.py --balancer grpc://balancer:50060 \
+        --table logs --from 120000000 --to 120100000 --processes 4 --threads 8 --per-server 8
 
-Run it from two machines at once to tell a client limit from a server limit: if the sum of
-the two runs' MB/s is about twice one run's, the client was the limit. See docs/serving.md
-section 7. Needs pyarrow (`pip install pyarrow`).
+Needs pyarrow. Use matching ranges and report cold/warm runs separately.
 """
 
 import argparse
+import math
 import multiprocessing
 import os
 import queue
@@ -46,86 +46,129 @@ ROUND_PAUSE = 0.2
 
 
 def failure(err):
-    """"exhausted" (the server is at its limit), "unavailable" (down or shutting down), or
-    None (not retried)."""
+    """Classifies retryable capacity, availability and deadline failures; others are fatal."""
     text = str(err).lower()
     if any(word in text for word in EXHAUSTED):
         return "exhausted"
+    if isinstance(err, flight.FlightTimedOutError) or "deadline exceeded" in text or "deadline_exceeded" in text:
+        return "timeout"
     if isinstance(err, flight.FlightUnavailableError) or "unavailable" in text:
         return "unavailable"
-    return None
+    return "other"
 
 
-def options(key, compression):
+def options(key, compression, timeout):
     headers = [(b"authorization", b"Bearer " + key.encode())]
     if compression != "none":
         headers.append((b"op-indexer-compression", compression.encode()))
-    return flight.FlightCallOptions(headers=headers)
+    return flight.FlightCallOptions(headers=headers, timeout=timeout)
 
 
-def record(index, server, retries, rows=0, nbytes=0, ttfb=None, seconds=0.0, error=None,
-           waited=0.0):
-    """One job's result; `waited` is the time it spent backing off."""
-    return {
-        "index": index,
-        "server": server,
-        "rows": rows,
-        "bytes": nbytes,
-        "ttfb": ttfb,
-        "seconds": seconds,
-        "retries": retries,
-        "error": error,
-        "waited": waited,
-    }
+def record(index, error=None, **values):
+    """One job's useful output and cumulative work, including failed attempts."""
+    result = dict(index=index, server="-", rows=0, bytes=0, received=0, failed_bytes=0,
+                  ttfb=None, seconds=0.0, latency=0.0, queued=0.0, retries=0,
+                  failures=0, exhausted=0, unavailable=0, timeout=0, other=0,
+                  last_failure=None, cleanup_failures=0, waited=0.0, error=error)
+    result.update(values)
+    return result
 
 
-def read_job(clients, job, call, retry_for):
-    """Reads one job, retrying it until `retry_for` seconds have passed; returns its record.
-
-    Each round tries the job's locations in turn; after a round in which one was full it
-    backs off before the next, after one in which all were down it pauses briefly."""
+def read_job(clients, job, args, permits, results):
+    """Reads under a shared server limit and a finite budget, trying fallback locations."""
     index, ticket, locations = job
-    deadline = time.monotonic() + retry_for
-    failovers = 0
-    waited = 0.0
+    began = time.monotonic()
+    deadline = began + args.retry_for
+    result = record(index)
+    first_batch = False
+    attempts = 0
     backoff = BACKOFF_FIRST
-    while True:
+    last_progress = 0.0
+
+    def progress(force=False):
+        nonlocal last_progress
+        now = time.monotonic()
+        if force or now - last_progress >= 0.2:
+            results.put(("progress", dict(result)))
+            last_progress = now
+
+    def finish(error=None):
+        if error and error.startswith("job budget expired") and result["last_failure"]:
+            error += "; last failure: " + result["last_failure"]
+        result["error"] = error
+        progress(True)
+        return result
+
+    while time.monotonic() < deadline:
         exhausted = False
+        attempted = False
         for location in locations:
+            if time.monotonic() >= deadline:
+                break
+            # Never wait on one location while a fallback has room. Slots cover the entire
+            # RPC, including failure cleanup, across every process and thread in this run.
+            if not permits[location].acquire(False):
+                continue
+            attempted = True
             started = time.monotonic()
+            rows = nbytes = 0
+            reader = None
+            complete = False
             try:
+                attempts += 1
+                result["retries"] = attempts - 1
+                result["server"] = location
                 client = clients.get(location)
                 if client is None:
                     client = flight.connect(location)
                     clients[location] = client
-                rows = 0
-                nbytes = 0
-                ttfb = None
-                for chunk in client.do_get(flight.Ticket(ticket), call):
-                    if ttfb is None:
-                        ttfb = time.monotonic() - started
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return finish("job budget expired before RPC")
+                call = options(args.key, args.compression, min(args.rpc_timeout, remaining))
+                reader = client.do_get(flight.Ticket(ticket), call)
+                for chunk in reader:
+                    if chunk.data is None:
+                        continue
+                    if not first_batch:
+                        first_batch = True
+                        results.put(("first_batch", index))
                     rows += chunk.data.num_rows
                     nbytes += chunk.data.nbytes
-                seconds = time.monotonic() - started
-                return record(index, location, failovers, rows, nbytes,
-                              ttfb if ttfb is not None else seconds, seconds, waited=waited)
-            except Exception as err:  # noqa: BLE001: a job's failure is reported, not raised
+                    result["received"] += chunk.data.nbytes
+                    progress()
+                complete = True
+                result.update(rows=rows, bytes=nbytes, seconds=time.monotonic() - started)
+                return finish()
+            except Exception as err:  # a job failure is reported to the parent
+                result["failed_bytes"] += nbytes
+                result["failures"] += 1
                 kind = failure(err)
-                if kind is None:
-                    return record(index, location, failovers, error=describe(err), waited=waited)
-                if time.monotonic() >= deadline:
-                    return record(index, location, failovers, waited=waited,
-                                  error="gave up after {:.0f} s: {}".format(retry_for, describe(err)))
-                failovers += 1
+                result[kind] += 1
+                result["last_failure"] = describe(err)
+                progress(True)
+                if kind == "other":
+                    return finish(result["last_failure"])
                 exhausted = exhausted or kind == "exhausted"
+            finally:
+                try:
+                    if reader is not None and not complete:
+                        reader.cancel()
+                except Exception:
+                    # Keep the original failure and received-byte accounting. The RPC's
+                    # deadline still bounds the read if its explicit cancellation fails.
+                    result["cleanup_failures"] += 1
+                finally:
+                    permits[location].release()
         left = max(0.0, deadline - time.monotonic())
         if exhausted:
             pause = min(left, backoff * random.uniform(0.5, 1.0))
             backoff = min(BACKOFF_MOST, backoff * 2)
         else:
-            pause = min(left, ROUND_PAUSE)
+            pause = min(left, ROUND_PAUSE if attempted else 0.02)
         time.sleep(pause)
-        waited += pause
+        result["waited"] += pause
+    return finish("job budget expired after {:.1f} s (including slot waits)".format(args.retry_for))
 
 
 def describe(err):
@@ -134,45 +177,64 @@ def describe(err):
     return "{}: {}".format(type(err).__name__, lines[0] if lines else repr(err))
 
 
-def worker(jobs, results, threads, key, compression, retry_for):
-    """One process: `threads` threads taking jobs until each gets a stop marker.
-
-    Each job is announced ("started", index, pid) before it is read and reported ("done",
-    record) after, whatever happens in it, so the parent knows which jobs a process that dies
-    took with it."""
-    call = options(key, compression)
-    pid = os.getpid()
-
+def worker(jobs, results, args, permits):
+    """One process with persistent clients per thread. Worker death aborts the whole run."""
     def run():
         clients = {}
-        while True:
-            job = jobs.get()
-            if job is None:
-                return
-            index = job[0]
-            results.put(("started", index, pid))
-            try:
-                result = read_job(clients, job, call, retry_for)
-            except BaseException as err:  # noqa: BLE001: reported as the job's failure
-                result = record(index, "-", 0, error=describe(err))
-            results.put(("done", result))
+        try:
+            while True:
+                job = jobs.get()
+                if job is None:
+                    return
+                results.put(("started", job[0], os.getpid()))
+                try:
+                    result = read_job(clients, job, args, permits, results)
+                except BaseException as err:
+                    result = record(job[0], error=describe(err))
+                results.put(("done", result))
+        finally:
+            for client in clients.values():
+                client.close()
 
-    pool = [threading.Thread(target=run, daemon=True) for _ in range(threads)]
+    pool = [threading.Thread(target=run, daemon=True) for _ in range(args.threads)]
     for thread in pool:
         thread.start()
     for thread in pool:
         thread.join()
 
 
-def plan(balancer, key, table, start, end, cap):
-    """The balancer's jobs for the range: (index, ticket bytes, locations)."""
-    client = flight.connect(balancer)
-    command = "{}:{}:{}:{}".format(table, start, end, cap).encode()
-    info = client.get_flight_info(flight.FlightDescriptor.for_command(command), options(key, "none"))
-    return [
-        (index, endpoint.ticket.ticket, [location.uri.decode() for location in endpoint.locations])
-        for index, endpoint in enumerate(info.endpoints)
-    ]
+def plan(args):
+    """Requires tickets to cover exactly the requested range, without overlaps or gaps."""
+    client = flight.connect(args.balancer)
+    command = "{}:{}:{}:{}".format(args.table, args.start, args.end, args.cap).encode()
+    try:
+        info = client.get_flight_info(flight.FlightDescriptor.for_command(command),
+                                     options(args.key, "none", args.plan_timeout))
+    finally:
+        client.close()
+    jobs = []
+    ranges = []
+    for index, endpoint in enumerate(info.endpoints):
+        ticket = endpoint.ticket.ticket
+        parts = ticket.decode("utf-8").split(":")
+        if len(parts) != 4 or parts[0] != args.table or parts[3] != args.cap:
+            raise ValueError("plan contains an unexpected table, cap or ticket format")
+        first, last = int(parts[1]), int(parts[2])
+        if first < args.start or last > args.end or first > last:
+            raise ValueError("plan contains a ticket outside the requested range")
+        locations = list(dict.fromkeys(location.uri.decode() for location in endpoint.locations))
+        if not locations:
+            raise ValueError("plan contains a ticket without a server")
+        ranges.append((first, last))
+        jobs.append((index, ticket, locations))
+    expected = args.start
+    for first, last in sorted(ranges):
+        if first != expected:
+            raise ValueError("plan has a gap or overlap at block {}".format(expected))
+        expected = last + 1
+    if expected != args.end + 1:
+        raise ValueError("plan ends at {}; requested through {}".format(expected - 1, args.end))
+    return jobs
 
 
 def percentile(values, share):
@@ -213,19 +275,34 @@ def main():
     parser.add_argument("--cap", default="finalized", choices=["finalized", "safe", "any"])
     parser.add_argument("--processes", type=int, default=4)
     parser.add_argument("--threads", type=int, default=4, help="threads per process")
+    parser.add_argument("--per-server", type=int, default=8,
+                        help="maximum concurrent reads per server across this run (default 8)")
+    parser.add_argument("--plan-timeout", type=float, default=30.0,
+                        help="deadline in seconds for planning (default 30)")
+    parser.add_argument("--rpc-timeout", type=float, default=120.0,
+                        help="deadline in seconds for each read RPC (default 120)")
     parser.add_argument("--compression", default="none", choices=["none", "lz4", "zstd"])
     parser.add_argument("--retry-for", type=float, default=120.0,
                         help="seconds a job is retried for, from its start")
     parser.add_argument("--progress", type=float, default=5.0, help="seconds between lines")
     args = parser.parse_args()
 
-    key = os.environ.get("KEY")
-    if not key:
+    for name in ("processes", "threads", "per_server", "rpc_timeout", "plan_timeout", "retry_for", "progress"):
+        value = getattr(args, name)
+        if value <= 0 or (isinstance(value, float) and not math.isfinite(value)):
+            parser.error("--{} must be positive and finite".format(name.replace("_", "-")))
+    if not 0 <= args.start <= args.end <= 2**64 - 1:
+        parser.error("require 0 <= --from <= --to <= 2^64-1")
+    args.key = os.environ.get("KEY")
+    if not args.key:
         sys.exit("set KEY to an API key the servers accept")
 
-    jobs = plan(args.balancer, key, args.table, args.start, args.end, args.cap)
-    if not jobs:
-        sys.exit("the balancer planned no jobs for this range")
+    overall_started = time.monotonic()
+    try:
+        jobs = plan(args)
+    except Exception as err:
+        sys.exit("planning failed: " + describe(err))
+    planning_seconds = time.monotonic() - overall_started
     print(
         "{} jobs for {} {}..{} ({}), {} processes x {} threads, compression {}".format(
             len(jobs), args.table, args.start, args.end, args.cap,
@@ -234,10 +311,16 @@ def main():
         flush=True,
     )
 
+    print("local cap  {} concurrent reads per server (not discovered capacity)".format(args.per_server),
+          flush=True)
+
     # gRPC does not survive fork: every process starts fresh.
     context = multiprocessing.get_context("spawn")
+    locations = {location for _, _, servers in jobs for location in servers}
+    permits = {location: context.BoundedSemaphore(args.per_server) for location in locations}
     job_queue = context.Queue()
     results = context.Queue()
+    enqueued = time.monotonic()
     for job in jobs:
         job_queue.put(job)
     for _ in range(args.processes * args.threads):
@@ -246,7 +329,7 @@ def main():
     processes = [
         context.Process(
             target=worker,
-            args=(job_queue, results, args.threads, key, args.compression, args.retry_for),
+            args=(job_queue, results, args, permits),
             daemon=True,
         )
         for _ in range(args.processes)
@@ -255,73 +338,118 @@ def main():
         process.start()
 
     by_index = {}
-    in_flight = {}  # job index -> pid of the process reading it
-    reported = set()  # pids whose end was reported
+    progress_by_index = {}
+    queued = {}
+    first_batches = {}
+    # All cross-process latency is measured on receipt in the parent. Older Python/macOS
+    # monotonic clocks have different process origins; IPC delivery is included in latency.
     last_line = started
-    while len(by_index) < len(jobs):
-        try:
-            message = results.get(timeout=1.0)
-        except queue.Empty:
-            # Nothing for a second: whatever a dead process sent has been read, so the jobs it
-            # still held are lost with it.
-            for process in processes:
-                if process.is_alive() or process.pid in reported:
-                    continue
-                reported.add(process.pid)
-                lost = [index for index, pid in in_flight.items() if pid == process.pid]
-                if process.exitcode != 0 or lost:
-                    print("worker process {} ended ({}), {} jobs lost with it".format(
-                        process.pid, ended(process.exitcode), len(lost)), file=sys.stderr)
-                for index in lost:
-                    del in_flight[index]
-                    by_index[index] = record(
-                        index, "-", 0,
-                        error="its worker process ended ({}) during the job".format(
-                            ended(process.exitcode)))
-            if not any(process.is_alive() for process in processes):
+    aborted = None
+    # Also bound native client/process failures that cannot deliver a Python exception.
+    watchdog = started + args.retry_for * len(jobs) + args.rpc_timeout + 30
+    try:
+        while len(by_index) < len(jobs):
+            dead = [p for p in processes if p.exitcode not in (None, 0)]
+            if dead:
+                aborted = "worker {} ended ({})".format(dead[0].pid, ended(dead[0].exitcode))
                 break
-        else:
-            if message[0] == "started":
-                in_flight[message[1]] = message[2]
+            if time.monotonic() >= watchdog:
+                aborted = "run watchdog expired"
+                break
+            try:
+                message = results.get(timeout=0.2)
+            except queue.Empty:
+                if not any(p.is_alive() for p in processes):
+                    aborted = "workers ended before all jobs were reported"
+                    break
             else:
-                result = message[1]
-                in_flight.pop(result["index"], None)
-                by_index[result["index"]] = result
-        now = time.monotonic()
-        if now - last_line >= args.progress:
-            last_line = now
-            elapsed = now - started
-            nbytes, rows, retries = totals(by_index.values())
-            print(
-                "{:7.1f}s  {}/{} jobs  {:8.1f} MB/s  {:10.0f} rows/s  {} retries".format(
-                    elapsed, len(by_index), len(jobs), mb(nbytes) / elapsed, rows / elapsed,
-                    retries,
-                ),
-                flush=True,
-            )
-    # Every planned job has a result: a job no process reported is a failure too.
+                observed = time.monotonic() - enqueued
+                if message[0] == "started":
+                    queued[message[1]] = observed
+                elif message[0] == "first_batch":
+                    first_batches[message[1]] = observed
+                else:
+                    result = message[1]
+                    index = result["index"]
+                    result["queued"] = queued.get(index, 0.0)
+                    result["ttfb"] = first_batches.get(index)
+                    progress_by_index[index] = result
+                    if message[0] == "done":
+                        result["latency"] = observed
+                        by_index[index] = result
+            now = time.monotonic()
+            if now - last_line >= args.progress:
+                last_line = now
+                elapsed = now - started
+                received = sum(r["received"] for r in progress_by_index.values())
+                failed = sum(r["failed_bytes"] for r in progress_by_index.values())
+                print("{:7.1f}s  {}/{} jobs  {:.1f} MB received ({:.1f} failed-attempt MB), "
+                      "{:.1f} decoded MB/s".format(elapsed, len(by_index), len(jobs),
+                                                  mb(received), mb(failed), mb(received) / elapsed),
+                      flush=True)
+    except KeyboardInterrupt:
+        aborted = "interrupted"
+    finally:
+        if aborted:
+            print("aborted: " + aborted, file=sys.stderr)
+        for process in processes:
+            if aborted and process.is_alive():
+                process.terminate()
+        for process in processes:
+            process.join(timeout=5)
+            if process.is_alive():
+                process.kill()
+                process.join()
+        # Do not wait for the feeder to flush jobs after workers have been terminated.
+        job_queue.cancel_join_thread()
+        job_queue.close()
+        results.close()
     for index, _ticket, _locations in jobs:
         if index not in by_index:
-            by_index[index] = record(index, "-", 0, error="not run: every worker process ended")
+            result = dict(progress_by_index.get(index, record(index)))
+            result["error"] = aborted or "worker did not report completion"
+            # No completed result proves these partial bytes useful; account for all of them.
+            result["failed_bytes"] = result["received"]
+            result["bytes"] = result["rows"] = 0
+            by_index[index] = result
     done = [by_index[index] for index, _ticket, _locations in jobs]
     elapsed = time.monotonic() - started
-    for process in processes:
-        process.join(timeout=5)
+    overall_elapsed = time.monotonic() - overall_started
 
     ok = [result for result in done if result["error"] is None]
     errors = [result for result in done if result["error"] is not None]
     nbytes, rows, _ = totals(ok)
     retries = totals(done)[2]
     waited = sum(result["waited"] for result in done)
-    ttfbs = [result["ttfb"] for result in ok if result["ttfb"] is not None]
+    ttfbs = [result["ttfb"] for result in done if result["ttfb"] is not None]
     print()
-    print("jobs       {} planned: {} done, {} failed, {} retries, {:.1f} s backing off".format(
+    print("jobs       {} planned: {} done, {} failed, {} retries, {:.1f} s slot/backoff waiting".format(
         len(jobs), len(ok), len(errors), retries, waited))
-    print("time       {:.1f} s".format(elapsed))
+    print("time       {:.1f} s reading, {:.3f} s planning, {:.1f} s end-to-end".format(
+        elapsed, planning_seconds, overall_elapsed))
+    print("received   {:.1f} decoded MB, {:.1f} failed/incomplete MB (not wire bytes)".format(
+        mb(sum(r["received"] for r in done)), mb(sum(r["failed_bytes"] for r in done))))
+    if aborted:
+        print("received counts are a lower bound: a terminated worker may not have reported its last batches")
+    cleanup_failures = sum(r["cleanup_failures"] for r in done)
+    if cleanup_failures:
+        print("warning: {} stream cancellation failures; RPC deadlines remained active".format(cleanup_failures))
     print("read       {:.1f} MB, {} rows".format(mb(nbytes), rows))
     print("rate       {:.1f} MB/s, {:.0f} rows/s".format(mb(nbytes) / elapsed, rows / elapsed))
-    print("ttfb       median {:.3f} s, p95 {:.3f} s".format(
+    print("end-to-end {:.1f} useful MB/s".format(mb(nbytes) / overall_elapsed))
+    print("ttfb incl queue/retries  median {:.3f} s, p95 {:.3f} s".format(
         percentile(ttfbs, 0.5), percentile(ttfbs, 0.95)))
+    latencies = [r["latency"] for r in done if r["latency"] > 0]
+    queues = [r["queued"] for r in done]
+    print("job latency incl queue/retries  median {:.3f} s, p95 {:.3f} s".format(
+        percentile(latencies, 0.5), percentile(latencies, 0.95)))
+    print("queue      median {:.3f} s, p95 {:.3f} s; failures {}".format(
+        percentile(queues, 0.5), percentile(queues, 0.95), sum(r["failures"] for r in done)))
+    print("attempt failures  " + ", ".join(
+        "{} {}".format(kind, sum(r[kind] for r in done))
+        for kind in ("exhausted", "unavailable", "timeout", "other")))
+    if errors:
+        print("INCOMPLETE RUN: successful-subset throughput is not a full-range benchmark")
     per_server = defaultdict(lambda: [0, 0, 0.0])
     for result in ok:
         entry = per_server[result["server"]]
@@ -338,7 +466,7 @@ def main():
         print("failed job {} at {}: {}".format(result["index"], result["server"], result["error"]))
     if len(errors) > 10:
         print("... and {} more failures".format(len(errors) - 10))
-    sys.exit(1 if errors else 0)
+    sys.exit(1 if errors or aborted else 0)
 
 
 if __name__ == "__main__":

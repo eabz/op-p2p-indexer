@@ -34,6 +34,12 @@ What runs today is in [architecture.md](architecture.md), and how it got here is
 
 ## Decisions pending measurement
 
+- **Serving throughput after v0.1.8:** the CPU/read-path changes and machine-sized limits are
+  implemented. The v0.1.9 benchmark adds shared per-server admission, read deadlines, exact
+  plan coverage and incremental decoded-byte accounting. Local Flight checks validate the
+  benchmark; repeat the Unichain fleet runs to establish its sustainable rate. Larger batches,
+  work-weighted jobs and R2 tuning remain proposals until profiling supports them
+  ([serving §7](serving.md#7-the-bench-3-to-4-small-droplets-one-r2-bucket)).
 - **Separate history servers from ingestion?** Only if the duplicated networking costs more
   than it gives; servers stay full nodes until then.
 - **Keep the custom balancer?** Only while per-chunk parallel Flight jobs beat ordinary load
