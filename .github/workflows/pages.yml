@@ -44,7 +44,7 @@ jobs:
           bash -n scripts/install.sh
           python website/build.py
           python website/check_links.py
-          git show "$(python -c 'import json; print(json.load(open("website/release.json"))["version"])'):scripts/install.sh" | cmp - website/.site/install.sh
+          cmp scripts/install.sh website/.site/install.sh
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:

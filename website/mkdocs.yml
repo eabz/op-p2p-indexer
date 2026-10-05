@@ -44,7 +44,7 @@ nav:
       - Overview: index.md
       - Install and run: guides/start.md
       - Your first query: guides/query.md
-      - Readiness and limits: guides/readiness.md
+      - Supported chains and limits: guides/readiness.md
   - Build applications:
       - Live updates and recovery: guides/live.md
       - Trust and finality: guides/trust.md
@@ -54,8 +54,8 @@ nav:
       - Configuration: configuration.md
       - Import history: import.md
       - Fleet and object storage: serving.md
-  - Open project:
-      - Contributing and governance: guides/community.md
+  - Project:
+      - Contribute: guides/community.md
       - Roadmap: roadmap.md
   - Engineering reference:
       - Architecture: architecture.md

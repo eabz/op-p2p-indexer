@@ -1,8 +1,8 @@
 # Website and documentation
 
 The landing page lives in `dist/`. The documentation uses Material for MkDocs and builds
-from Markdown. Public guides live in `docs/index.md` and `docs/guides/`; the technical reference and installer
-come from the Git tag selected in `release.json`. `/docs/development/` separately renders
+from Markdown. Public guides live in `docs/index.md` and `docs/guides/`; the technical reference
+comes from the Git tag selected in `release.json`. `/docs/development/` separately renders
 the working tree's engineering docs and README. Edit sources, not generated files.
 
 ## Build and preview
@@ -29,13 +29,9 @@ Rebuild after editing. Generated `.docs/` and `.site/` directories are ignored b
 - `docs-theme/`: matching colors and links to each page's Markdown source.
 - `build.py`: stage the existing Markdown, compile the site and export agent-readable docs.
 
-The installer comes from the selected release's `scripts/install.sh` and is staged automatically.
-The landing command pins that same release. To adopt a release, update `release.json`, the
-landing command/version label and guide baseline together; verify the config paths and
-service names against that tag. This prevents development setup changes from being paired
-with older binaries. Historical technical references are retained as release records.
-The data-flow diagram describes architecture;
-it does not display live network measurements.
+The installer is `scripts/install.sh` from this checkout, published as `/install.sh`. It takes
+no options and installs the latest release itself, so the landing command pins no version.
+The data-flow diagram describes the architecture; it does not show live measurements.
 
 ## Documentation for readers and agents
 
@@ -74,7 +70,5 @@ Check desktop and mobile layouts, install copy feedback, data-flow controls, doc
 navigation, search, Mermaid rendering and Markdown links in the browser. The MkDocs build
 runs in strict mode so documentation build warnings fail CI.
 
-The PR check compiles the released protocol and exercises the actual downloadable query
-against a local Flight fixture, including gap/truncation diagnostics. This checks client
-behavior, not real-chain correctness. Fresh-host installation, exporter continuity,
-reorganization recovery and sustained production operation require external run evidence.
+The PR check compiles the released protocol and runs the downloadable query against a local
+Flight fixture, including its gap and truncation diagnostics.

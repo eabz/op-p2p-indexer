@@ -1,6 +1,6 @@
 # Follow live updates
 
-The gRPC service delivers history followed by live chain events. It is useful when your database must stay current after a backfill. This is the v0.1.12 protocol; [download its schema](../examples/stream.proto) for client generation.
+The gRPC service delivers history followed by live chain events. It is useful when your database must stay current after a backfill. [Download its schema](../examples/stream.proto) to generate a client.
 
 With `grpcurl` installed, query the local node's heads using the supplied schema. Server reflection is not required:
 
@@ -30,6 +30,6 @@ Store `(chain_id, block_number, block_hash)` with every block. Keep your persist
 | Reorg | Invalidate the removed canonical blocks from the supplied height and undo derived records; replacement blocks follow. |
 | Heads | Update the interpretation of previously received blocks at or below the heads. |
 
-After a reconnect, reconcile your stored hashes with the node before treating the resumed range as canonical. A server change can have different coverage; retrying against another server alone does not establish continuity. Failover under interruption remains a release-readiness gate.
+After a reconnect, reconcile your stored hashes with the node before treating the resumed range as canonical. A server change can have different coverage; retrying against another server alone does not establish continuity. Failover during a read is not yet proven; see [known limits](readiness.md).
 
 Raise your client's receive limit to 64 MiB, bound work queues and surface stalled progress. Late receipts and reorganizations must be part of the application model, including for data initially read through Flight. See [stream semantics](../stream.md) and [trust boundaries](trust.md).

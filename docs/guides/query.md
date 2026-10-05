@@ -1,6 +1,6 @@
 # Read your first dataset
 
-Use Python 3.10+ with `pyarrow` on the node's host. The API example below targets the v0.1.12 protocol and reads a small inclusive range from a direct node, not a balancer.
+Use Python 3.10+ with `pyarrow` on the node's host. The example below reads a small inclusive range from a direct node, not a balancer.
 
 ```bash
 python3 -m venv .venv

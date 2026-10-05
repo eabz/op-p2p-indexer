@@ -1,26 +1,34 @@
 # Own your chain data
 
-Bring OP Stack blocks, transactions, receipts and logs into your application, then keep your dataset current with live updates. Run the data source yourself and choose where your application stores and processes its output.
+op-p2p-indexer brings OP Stack blocks, transactions, receipts and logs into your application,
+straight from the chain's peer-to-peer network, and keeps them current. You run it on your
+own infrastructure.
 
-This guide targets **v0.1.12**. Start with a small local read before committing to a historical import or a serving fleet.
-
-## Your first workflow
+## Get started
 
 1. [Install and start a node](guides/start.md) on a Linux server.
 2. [Read ten blocks](guides/query.md) with Python and Arrow Flight.
 3. [Follow live updates](guides/live.md), including receipts and reorganizations.
-4. [Operate the service](guides/operate.md) with explicit recovery and access controls.
+4. [Operate it](guides/operate.md): health, access, backups and upgrades.
 
-## Where it fits
+## What it does
 
-Use this project as the data input to an indexer, an analytics pipeline or your own chain dataset. Arrow Flight supplies columnar ranges; gRPC supplies ordered history and live events. You bring the database, transformations and application.
+- **Collects from peers.** Joins the chain's gossip and execution networks; it needs no L1
+  or L2 RPC at runtime.
+- **Verifies.** Checks sequencer signatures, block hashes and the transaction and receipt
+  roots. With L1 tracking on, it also follows the safe and finalized heads.
+- **Serves.** Arrow Flight for block ranges as columnar tables, gRPC for history followed by
+  live blocks, receipts and reorgs.
+- **Scales out.** One node with a local archive, or a fleet of servers reading history from
+  object storage behind a balancer.
 
-The running node connects to consensus and execution peers without L1 or L2 RPC. Historical bootstrapping is a separate task: the importer can use HyperSync and RPC to complete archived records. Fleet serving uses object storage.
+It is a data source, not an execution node: no balances, `eth_call`, traces or EVM state.
+You bring the database and the transformations.
 
-It is not an execution node: balances, `eth_call`, traces, EVM state and batch derivation are outside its scope. Flight does not implement SQL or address/topic filters.
+Supported chains: OP Mainnet, Base and Unichain. See [supported chains and limits](guides/readiness.md).
 
-## Choose with evidence
+## For agents
 
-OP Mainnet and Unichain have live-run evidence. Base is implemented, but its complete import and live operation remain validation work. See [readiness and limits](guides/readiness.md) before choosing a deployment, and [trust and finality](guides/trust.md) before deciding what your application treats as settled.
-
-This is an early open-source project under the MIT license. Production reliability is not yet established for all recovery and failover paths. [Contribution and governance](guides/community.md) explains how to participate and how decisions are made today.
+Every page is available as Markdown (the **View Markdown** link on each page), and the whole
+documentation is indexed in [`llms.txt`](https://eabz.github.io/op-p2p-indexer/llms.txt) and concatenated in
+[`llms-full.txt`](https://eabz.github.io/op-p2p-indexer/llms-full.txt).

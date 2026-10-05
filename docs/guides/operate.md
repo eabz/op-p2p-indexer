@@ -1,6 +1,6 @@
 # Operate and recover
 
-Start with one chain and one role. Use v0.1.12 configuration and record the config path, service owner, ports, binary version and data directories for each process. Do not share a writable data directory between processes.
+Start with one chain and one program. Record the config path, service owner, ports, binary version and data directories for each process. Do not share a writable data directory between processes.
 
 ## Health and capacity
 
@@ -16,14 +16,14 @@ Keep the API on loopback for your first setup. Optional bearer keys provide acce
 
 1. Record the current release and pause consumers if they cannot tolerate restart.
 2. Stop the process gracefully. Copy its config and complete data directory while stopped, including node state and the unsafe journal. For a fleet, preserve the object-store manifest and its referenced immutable chunks as well.
-3. Install the intended release explicitly, review its configuration changes, and validate with `--check-config` before startup.
+3. Run the installer and choose **Update the programs**. It restarts only the services whose configuration passes `--check-config`; fix and start the others yourself.
 4. Restart one node, check head/receipt continuity, and run a small read. Reconcile consumer checkpoints before resuming larger jobs.
 
 Do not assume that replacing binaries makes data formats backward compatible. Test restore and upgrades on a copy before relying on rollback. A deployment is not backed up until you have demonstrated a restore.
 
 ## Import failures
 
-A PUT timeout can leave later sealed records behind a missing chunk. A subsequent `verify` may report a gap. Read the exact error and the release's [import reference](../import.md); upload/retry behavior can differ from development versions.
+A PUT timeout can leave later sealed records behind a missing chunk. A subsequent `verify` may report a gap. Read the exact error and the [import reference](../import.md).
 
 Stop the importer before changing its state. Preserve a copy of its state records. If the error explicitly instructs removal of sealed records from a given block, first identify their filenames and ranges, then **move the affected records to a recovery directory** so the repair is reversible. Retain raw inputs. Re-run verification and check manifest continuity; never delete remote chunks or manifests as a generic timeout fix.
 
@@ -31,4 +31,4 @@ A missing header field requires a fill/refetch before verification. `download` c
 
 ## Recovery acceptance
 
-Before depending on the service, demonstrate restart from local state, object-store failure/retry, interrupted import, exporter boundary continuity and consumer resume under server loss. Track evidence and unresolved cases in [readiness](readiness.md). Never silently skip a gap to make a process appear healthy.
+Before depending on the service, demonstrate restart from local state, object-store failure/retry, interrupted import, exporter boundary continuity and consumer resume under server loss. See [known limits](readiness.md). Never silently skip a gap to make a process appear healthy.

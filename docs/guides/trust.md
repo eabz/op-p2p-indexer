@@ -12,7 +12,7 @@ Verification helps you detect corrupted or inconsistent data. It does not make t
 
 L1 tracking starts from a trusted recent beacon checkpoint. Choose and refresh that checkpoint through your own trusted process. The live profile can operate without L1 tracking, but it then cannot provide the same safe/finalized coverage.
 
-The project still needs stronger handling of a safe head that contradicts the unsafe chain and of respected dispute-game selection/claim retention. These limits affect settlement-sensitive applications. They are [readiness gates](readiness.md), not guarantees hidden behind a finality label.
+The project still needs stronger handling of a safe head that contradicts the unsafe chain and of respected dispute-game selection/claim retention. These limits matter to settlement-sensitive applications; see [known limits](readiness.md).
 
 Historical imports use external archive data, can fill missing fields through RPC, and are verified against the importer's configured anchors. An anchor is a trust input: record where it came from. A successful transport, checksum or Flight query is not a substitute for this verification.
 

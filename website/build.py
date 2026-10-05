@@ -25,8 +25,6 @@ def main():
     version = json.loads((HERE / 'release.json').read_text())['version']
     if not re.fullmatch(r'v\d+\.\d+\.\d+', version):
         raise ValueError('release.json must select an existing release tag')
-    if f'--version {version}' not in (HERE / 'dist/index.html').read_text():
-        raise ValueError('landing install command must pin the selected release')
     development = HERE / '.docs-development'
     for directory in (STAGED, OUTPUT, development):
         if directory.exists():
@@ -57,7 +55,8 @@ def main():
         for asset in ('brand.css', 'logo.svg'):
             shutil.copy2(HERE / 'docs-theme' / asset, source / asset)
     shutil.copytree(HERE / 'dist', OUTPUT)
-    (OUTPUT / 'install.sh').write_bytes(release_file(version, 'scripts/install.sh'))
+    # The installer installs the latest release itself: it is served from this checkout.
+    shutil.copy2(ROOT / 'scripts/install.sh', OUTPUT / 'install.sh')
     shutil.copy2(HERE / 'release.json', OUTPUT / 'release.json')
     config = load_config(str(HERE / 'mkdocs.yml'), strict=True)
     config['extra']['version_label'] = f'{version} · Release guide'
