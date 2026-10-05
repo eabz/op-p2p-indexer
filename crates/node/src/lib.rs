@@ -41,7 +41,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-pub use crate::config::{Config, Profile};
+pub use crate::config::{Config, Defaults, Profile};
 use crate::config::{ElSettings, L1Settings, NODE_DIR};
 use crate::peers::PeerSources;
 pub use crate::peers::{NodeServed, PeerCounts};

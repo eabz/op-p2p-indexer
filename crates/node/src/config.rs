@@ -53,6 +53,7 @@ pub(crate) struct ElSettings {
     bootnodes: Vec<String>,
     advertised_addr: Option<SocketAddr>,
     max_sessions: usize,
+    trusted_peers: Vec<ExecutionPeer>,
 }
 
 impl ElSettings {
@@ -65,6 +66,22 @@ impl ElSettings {
             saved_peers,
             advertised_addr: self.advertised_addr,
             max_sessions: self.max_sessions,
+            trusted_peers: self.trusted_peers,
+        }
+    }
+}
+
+/// What a binary changes of the configuration's defaults.
+#[derive(Debug, Clone, Copy)]
+pub struct Defaults {
+    /// `OP_INDEXER_EL_MAX_SESSIONS` when unset.
+    pub el_max_sessions: usize,
+}
+
+impl Default for Defaults {
+    fn default() -> Self {
+        Self {
+            el_max_sessions: PeerConfig::DEFAULT_MAX_SESSIONS,
         }
     }
 }
@@ -179,8 +196,13 @@ impl Config {
     ///   UDP) announced in the execution node record, for a node behind NAT or in a container
     ///   (default: unset, the address other peers observe).
     /// - `OP_INDEXER_EL_MAX_SESSIONS`: execution sessions kept in each direction, dialed and
-    ///   accepted; one more is kept for an op-p2p-indexer (default 4). Full nodes ration their
-    ///   slots: keep it low.
+    ///   accepted (default 4; the server's binary sets 32, see [`Defaults`]). Four more are
+    ///   accepted for peers that want history (op-p2p-indexers, nodes syncing far behind), and
+    ///   one more dialed for an op-p2p-indexer. Full nodes ration their slots: an `indexer`
+    ///   keeps it low; a `server` exists to serve and keeps many.
+    /// - `OP_INDEXER_EL_TRUSTED_PEERS`: comma-separated `enode://<id>@<ip>:<port>` of the peers of
+    ///   our own deployment (the other servers): dialed first, always accepted, never released,
+    ///   and counted against no limit (default: none).
     /// - `OP_INDEXER_EL_SYNC`: `true` to fetch from execution peers the blocks between the
     ///   archive's last block and the chain that gossip cannot fill, into the archive
     ///   (default `false`), in rounds from the block after the archive's last
@@ -229,6 +251,15 @@ impl Config {
     ///
     /// Returns an error if a variable is invalid or the settings contradict each other.
     pub fn from_env() -> eyre::Result<Self> {
+        Self::from_env_with(Defaults::default())
+    }
+
+    /// Reads the configuration as [`Self::from_env`] does, with a binary's own `defaults`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::from_env`].
+    pub fn from_env_with(defaults: Defaults) -> eyre::Result<Self> {
         let profile = Profile::from_env()?;
         let history = profile.is_some_and(Profile::history);
         let chain_id = parse_var("OP_INDEXER_CHAIN_ID")?.unwrap_or(DEFAULT_CHAIN_ID);
@@ -250,7 +281,7 @@ impl Config {
             path: data_dir.join(ARCHIVE_DIR),
         };
 
-        let el = el_settings(chain, profile.is_some())?;
+        let el = el_settings(chain, profile.is_some(), defaults.el_max_sessions)?;
         let sync = parse_var(SYNC_VAR)?.unwrap_or(history);
         ensure!(
             !sync || el.is_some(),
@@ -381,6 +412,7 @@ fn default_data_dir(chain: &ChainSpec) -> eyre::Result<PathBuf> {
 fn el_settings(
     chain: &'static ChainSpec,
     enabled_by_default: bool,
+    default_sessions: usize,
 ) -> eyre::Result<Option<ElSettings>> {
     if !parse_var("OP_INDEXER_EL_ENABLED")?.unwrap_or(enabled_by_default) {
         return Ok(None);
@@ -400,14 +432,37 @@ fn el_settings(
             })
             .unwrap_or_default(),
         advertised_addr: parse_var("OP_INDEXER_EL_ADVERTISED_ADDR")?,
-        max_sessions: max_sessions()?,
+        max_sessions: max_sessions(default_sessions)?,
+        trusted_peers: var("OP_INDEXER_EL_TRUSTED_PEERS")
+            .map(|list| {
+                list.split(',')
+                    .map(str::trim)
+                    .filter(|peer| !peer.is_empty())
+                    .map(parse_enode)
+                    .collect::<eyre::Result<Vec<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
     }))
 }
 
-/// `OP_INDEXER_EL_MAX_SESSIONS`, at least 1.
-fn max_sessions() -> eyre::Result<usize> {
+/// An `enode://<id>@<ip>:<port>` URL (a `?discport=` is ignored) as a peer to dial.
+fn parse_enode(url: &str) -> eyre::Result<ExecutionPeer> {
+    let invalid = || eyre!("OP_INDEXER_EL_TRUSTED_PEERS has an invalid enode URL: {url}");
+    let rest = url.strip_prefix("enode://").ok_or_else(invalid)?;
+    let (id, addr) = rest.split_once('@').ok_or_else(invalid)?;
+    let addr = addr.split('?').next().unwrap_or(addr);
+    Ok(ExecutionPeer {
+        id: id.parse().map_err(|_err| invalid())?,
+        addr: addr.parse().map_err(|_err| invalid())?,
+        last_served_secs: 0,
+    })
+}
+
+/// `OP_INDEXER_EL_MAX_SESSIONS`, `default` when unset; at least 1.
+fn max_sessions(default: usize) -> eyre::Result<usize> {
     let sessions = parse_var("OP_INDEXER_EL_MAX_SESSIONS")?;
-    let sessions = sessions.unwrap_or(PeerConfig::DEFAULT_MAX_SESSIONS);
+    let sessions = sessions.unwrap_or(default);
     eyre::ensure!(
         sessions > 0,
         "OP_INDEXER_EL_MAX_SESSIONS must be at least 1"

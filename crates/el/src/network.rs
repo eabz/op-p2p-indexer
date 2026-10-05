@@ -18,7 +18,7 @@ use secp256k1::SecretKey;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, info_span};
+use tracing::{Instrument, info, info_span};
 
 use crate::ElError;
 use crate::discovery::Discovery;
@@ -165,8 +165,13 @@ pub struct PeerConfig {
     /// Peers that served us in an earlier run, most recently served first: dialed first.
     pub saved_peers: Vec<ExecutionPeer>,
     /// Sessions kept in each direction: this many dialed, as many accepted. On a network
-    /// op-p2p-indexers share, one more is dialed for an indexer peer.
+    /// op-p2p-indexers share, one more is dialed for an indexer peer; a few more are accepted
+    /// for peers that want history (see `peers`).
     pub max_sessions: usize,
+    /// Peers of our own deployment (the other servers of one balancer): always accepted,
+    /// dialed first, never released for being unused, and counted against no limit, so they
+    /// cannot take the slots kept for others, nor be refused them.
+    pub trusted_peers: Vec<ExecutionPeer>,
 }
 
 impl PeerConfig {
@@ -263,6 +268,14 @@ impl PeerNetwork {
         } = self;
         let discovery =
             Discovery::new(Arc::clone(&ctx), config.listen_addr, config.advertised_addr)?;
+        // What another node of our deployment lists in `OP_INDEXER_EL_TRUSTED_PEERS`.
+        let id = reth_network_peers::pk2id(&ctx.key().public_key(secp256k1::SECP256K1));
+        let reached_at = config.advertised_addr.unwrap_or(config.listen_addr);
+        info!(
+            network = ctx.spec().label,
+            enode = %format!("enode://{id:x}@{reached_at}"),
+            "execution node identity"
+        );
         let (candidates_tx, candidates_rx) = mpsc::channel(CANDIDATES_CAPACITY);
         let (accepted_tx, accepted_rx) = mpsc::channel(ACCEPTED_CAPACITY);
         let peer_set = PeerSet::new(

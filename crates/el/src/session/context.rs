@@ -71,7 +71,7 @@ impl SessionContext {
         self.tip().is_some()
     }
 
-    pub(super) fn tip(&self) -> Option<BlockRef> {
+    pub(crate) fn tip(&self) -> Option<BlockRef> {
         *self.tip.borrow()
     }
 

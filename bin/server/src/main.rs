@@ -21,7 +21,7 @@ use op_indexer_balancer::register::{
     HEARTBEAT_INTERVAL, PeerReport, Report, ServedReport, SlotReport,
 };
 use op_indexer_chunks::ChunkStore;
-use op_indexer_node::{Config, NodeServed, NodeView, PeerCounts, Task};
+use op_indexer_node::{Config, Defaults, NodeServed, NodeView, PeerCounts, Task};
 use op_indexer_server::{ChunkSource, Exporter, R2Archive, R2Chunks};
 use op_indexer_storage::ArchiveStore;
 use op_indexer_storage::archive_store::FjallArchive;
@@ -29,6 +29,9 @@ use tokio::sync::watch;
 
 use crate::config::{Chunks, ServerConfig};
 
+/// Default `OP_INDEXER_EL_MAX_SESSIONS` of a server: it holds every sealed block and serves
+/// peers that sync from it, so it keeps many sessions in each direction.
+const EL_MAX_SESSIONS: usize = 32;
 /// Directory of the hash-index builder's spill files, inside the data directory.
 const INDEX_DIR: &str = "index-build";
 /// Directory of the tail, inside the data directory. Not the indexer's `archive`: the tail
@@ -48,7 +51,10 @@ fn main() -> eyre::Result<()> {
 async fn run(env_file: Option<PathBuf>) -> eyre::Result<()> {
     op_indexer_runtime::init_tracing(env_file.as_deref());
 
-    let config = Config::from_env()?;
+    // A server exists to serve: it keeps many execution sessions, where an indexer keeps few.
+    let config = Config::from_env_with(Defaults {
+        el_max_sessions: EL_MAX_SESSIONS,
+    })?;
     let chain = config.chain();
     let server = ServerConfig::from_env_and_args(chain)?;
     // Startup-only blocking I/O, before any task runs: the tail before the node store, so a

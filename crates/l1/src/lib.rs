@@ -126,6 +126,7 @@ impl L1Network {
             advertised_addr: config.advertised_addr,
             saved_peers: config.saved_peers,
             max_sessions: PeerConfig::DEFAULT_MAX_SESSIONS,
+            trusted_peers: Vec::new(),
         };
         let (head, head_rx) = watch_channel::channel(None);
         let (network, peers) = PeerNetwork::new(

@@ -105,6 +105,7 @@ impl<P: BlockProvider> ExecutionNetwork<P> {
             advertised_addr: config.advertised_addr,
             saved_peers: config.saved_peers.clone(),
             max_sessions: config.max_sessions,
+            trusted_peers: config.trusted_peers.clone(),
         };
         let (network, peers) =
             PeerNetwork::with_serving(spec, peer_config, node_key, head, served, serving)?;

@@ -78,6 +78,18 @@ const DROP_WARN_INTERVAL: Duration = Duration::from_mins(1);
 /// `max_sessions`: a sync spreads its requests over every session, and gives them back when the
 /// round ends (unused sessions are released again).
 const SYNC_SESSIONS_FACTOR: usize = 2;
+/// Inbound slots beyond `max_sessions` for peers that want history (op-p2p-indexers, nodes
+/// syncing far behind): a full node's ordinary slots cannot lock them out.
+const HISTORY_SLOTS: usize = 4;
+/// A peer whose advertised head is this far below ours is syncing: it wants history most
+/// peers prune. About three hours of a 1 s chain.
+const SYNCING_BEHIND: u64 = 10_000;
+/// An inbound peer that has asked us for nothing this long gives up its slot to a peer that
+/// wants history, when no slot is free.
+const UNASKED_EVICTION: Duration = Duration::from_mins(2);
+/// Client name prefix op-p2p-indexers announce in the hello: such a peer counts as an
+/// indexer for slots even when discovery has not seen its node record.
+const INDEXER_CLIENT: &str = "op-indexer/";
 /// How long an outbound session may go without a request of ours before it is released.
 const IDLE_RELEASE: Duration = Duration::from_mins(10);
 /// A kept session used within this long counts as busy.
@@ -164,6 +176,8 @@ pub(crate) struct PeerSet {
     /// Sessions kept in each direction (`PeerConfig::max_sessions`); one more is dialed for an
     /// op-p2p-indexer on a network they share.
     max_sessions: usize,
+    /// Peers of our own deployment (`PeerConfig::trusted_peers`).
+    trusted: HashSet<PeerId>,
     /// Whether a range sync round runs (`Report::Syncing`).
     syncing: bool,
     /// The dial for the indexer slot, while it is in [`Self::dialing`].
@@ -284,7 +298,14 @@ impl PeerSet {
         reports: mpsc::Receiver<Report>,
         published: watch::Sender<Arc<[SessionHandle]>>,
     ) -> Self {
-        let schedule = Schedule::new(&config.saved_peers);
+        // Our own deployment's peers first, then those that served earlier runs.
+        let known: Vec<ExecutionPeer> = config
+            .trusted_peers
+            .iter()
+            .chain(&config.saved_peers)
+            .copied()
+            .collect();
+        let schedule = Schedule::new(&known);
         Self {
             ctx,
             candidates,
@@ -298,6 +319,7 @@ impl PeerSet {
             tasks: JoinSet::new(),
             next_generation: 0,
             max_sessions: config.max_sessions,
+            trusted: config.trusted_peers.iter().map(|peer| peer.id).collect(),
             syncing: false,
             outbound_target: config.max_sessions,
             busy_ticks: 0,
@@ -505,33 +527,90 @@ impl PeerSet {
     }
 
     /// Keeps an inbound session if there is room for it and the peer is welcome.
+    ///
+    /// A peer of our own deployment is always kept. Others: `max_sessions` ordinary slots, and
+    /// [`HISTORY_SLOTS`] more for a peer that wants history (see [`Self::wants_history`]); when
+    /// those are full too, the inbound peer that has asked us for nothing the longest (at least
+    /// [`UNASKED_EVICTION`]) makes room for it. One session per host.
     fn accept(&mut self, accepted: Accepted, cancel: &CancellationToken) {
         let Accepted { handle, driver } = accepted;
         let peer = handle.status().peer_id;
-        // The indexer slot is extra: its session is not counted against the ordinary slots,
-        // and an indexer with blocks before Bedrock may take it when it is free.
-        let slot_held = self.slot_holder(Direction::Inbound).is_some();
-        let ordinary = self
-            .count(Direction::Inbound)
-            .saturating_sub(usize::from(slot_held));
-        let takes_slot = !slot_held && self.holds_slot(&handle);
-        // One session per address (a /64 for IPv6): one host cannot take every slot.
-        let from = host(handle.status().addr.ip());
-        let same_host = self.sessions.values().any(|live| {
-            let status = live.handle.status();
-            status.direction == Direction::Inbound && host(status.addr.ip()) == from
-        });
-        let full = (ordinary >= self.max_sessions && !takes_slot) || same_host;
         // Without a tip the handshake advertised genesis: the peer would leave.
         if !self.ctx.has_tip()
-            || full
             || self.sessions.contains_key(&peer)
             || self.schedule.is_banned(&peer)
         {
             self.refuse(driver, DisconnectReason::TooManyPeers);
             return;
         }
+        if self.trusted.contains(&peer) {
+            self.keep(handle, driver, cancel);
+            return;
+        }
+        // One session per address (a /64 for IPv6): one host cannot take every slot.
+        let from = host(handle.status().addr.ip());
+        let same_host = self.sessions.values().any(|live| {
+            let status = live.handle.status();
+            status.direction == Direction::Inbound && host(status.addr.ip()) == from
+        });
+        let wants_history = self.wants_history(&handle);
+        let room = self
+            .max_sessions
+            .saturating_add(if wants_history { HISTORY_SLOTS } else { 0 });
+        let inbound = self
+            .sessions
+            .values()
+            .filter(|live| {
+                let status = live.handle.status();
+                status.direction == Direction::Inbound && !self.trusted.contains(&status.peer_id)
+            })
+            .count();
+        let full = inbound >= room && !(wants_history && self.evict_unasked());
+        if same_host || full {
+            self.refuse(driver, DisconnectReason::TooManyPeers);
+            return;
+        }
         self.keep(handle, driver, cancel);
+    }
+
+    /// Whether the peer of `handle` wants history most peers do not keep: an op-p2p-indexer
+    /// (by its node record, or by its client name), or a node far behind our tip, which is
+    /// syncing. Such a peer gets slots an ordinary one does not.
+    fn wants_history(&self, handle: &SessionHandle) -> bool {
+        let status = handle.status();
+        let behind = self
+            .ctx
+            .tip()
+            .is_some_and(|tip| tip.number.saturating_sub(handle.range().latest) > SYNCING_BEHIND);
+        status.indexer || status.client.starts_with(INDEXER_CLIENT) || behind
+    }
+
+    /// Disconnects the inbound peer that has asked us for nothing the longest, at least
+    /// [`UNASKED_EVICTION`], to make room for one that wants history. Never one of our own
+    /// deployment, nor one that wants history itself. Returns whether one was.
+    fn evict_unasked(&mut self) -> bool {
+        let victim = self
+            .sessions
+            .values()
+            .map(|live| &live.handle)
+            .filter(|handle| {
+                handle.status().direction == Direction::Inbound
+                    && !self.trusted.contains(&handle.peer_id())
+                    && !self.wants_history(handle)
+                    && handle.unasked() >= UNASKED_EVICTION
+            })
+            .max_by_key(|handle| handle.unasked())
+            .map(SessionHandle::peer_id);
+        let Some(victim) = victim else {
+            return false;
+        };
+        let Some(live) = self.sessions.remove(&victim) else {
+            return false;
+        };
+        debug!(peer = %victim, "making room for a peer that wants history: dropping an idle one");
+        live.handle.disconnect(DisconnectReason::TooManyPeers);
+        self.publish();
+        true
     }
 
     /// Adds a session to the set and runs its driver.
@@ -703,7 +782,9 @@ impl PeerSet {
         let mut released = false;
         for handle in ours
             .iter()
-            .filter(|handle| Some(handle.peer_id()) != kept_indexer)
+            .filter(|handle| {
+                Some(handle.peer_id()) != kept_indexer && !self.trusted.contains(&handle.peer_id())
+            })
             .skip(KEEP_IDLE)
         {
             if handle.idle() >= IDLE_RELEASE {

@@ -133,6 +133,7 @@ pub(super) fn new(
         latest: peer.latest.unwrap_or_default(),
     });
     let (commands_tx, commands_rx) = mpsc::channel(COMMAND_CAPACITY);
+    let asked = Arc::new(Mutex::new(Instant::now()));
     let driver = SessionDriver {
         peer_id: peer.peer_id,
         stream,
@@ -143,12 +144,14 @@ pub(super) fn new(
         serving,
         answers,
         established: Instant::now(),
+        asked: Arc::clone(&asked),
     };
     let handle = SessionHandle {
         status: Arc::new(peer),
         commands: commands_tx,
         range: range_rx,
         used: Arc::new(Mutex::new(Instant::now())),
+        asked,
     };
     (handle, driver)
 }
@@ -162,6 +165,9 @@ pub struct SessionHandle {
     /// When we last sent the peer a request, or the session opened: a session we have no use
     /// for is released.
     used: Arc<Mutex<Instant>>,
+    /// When the peer last sent us a request, or the session opened: when slots are short, an
+    /// inbound peer that asks for nothing makes room for one that wants history.
+    asked: Arc<Mutex<Instant>>,
 }
 
 impl SessionHandle {
@@ -254,6 +260,14 @@ impl SessionHandle {
             .elapsed()
     }
 
+    /// Time since the peer last sent us a request, or since the session opened.
+    pub(crate) fn unasked(&self) -> Duration {
+        self.asked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .elapsed()
+    }
+
     /// Sends `request` and waits for the body of its answer (the message without its id byte).
     async fn request(&self, request: Request) -> Result<Bytes, RequestError> {
         *self.used.lock().unwrap_or_else(PoisonError::into_inner) = Instant::now();
@@ -311,6 +325,8 @@ pub(crate) struct SessionDriver {
     /// The server's answers to the peer's requests.
     answers: mpsc::Receiver<Bytes>,
     established: Instant,
+    /// When the peer last sent us a request; shared with the handles.
+    asked: Arc<Mutex<Instant>>,
 }
 
 impl SessionDriver {
@@ -481,7 +497,11 @@ impl SessionDriver {
                 }
             }
         } else {
-            match self.serving.request(message_id, body) {
+            let handled = self.serving.request(message_id, body);
+            if !matches!(handled, Handled::NotARequest) {
+                *self.asked.lock().unwrap_or_else(PoisonError::into_inner) = Instant::now();
+            }
+            match handled {
                 Handled::Now(response) => self.write(response).await?,
                 Handled::Later => {}
                 // Transaction and block announcements: this node does not follow them.
