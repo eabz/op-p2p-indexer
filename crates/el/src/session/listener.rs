@@ -113,7 +113,7 @@ pub(crate) async fn listen(
                         Ok((handle, driver)) => {
                             if let Err(refused) = accepted.try_send(Accepted { handle, driver }) {
                                 let Accepted { driver, .. } = refused.into_inner();
-                                driver.reject(DisconnectReason::TooManyPeers).await;
+                                Box::pin(driver.reject(DisconnectReason::TooManyPeers)).await;
                             }
                         }
                         Err(err) => {
