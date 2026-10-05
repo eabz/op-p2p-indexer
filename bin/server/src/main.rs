@@ -86,7 +86,7 @@ async fn run(env_file: Option<PathBuf>) -> eyre::Result<()> {
     let source = R2Chunks::open(store, config.data_dir().join(INDEX_DIR))
         .await
         .wrap_err("failed to read the R2 manifest")?;
-    let archive = R2Archive::open(chain, source, tail)
+    let archive = R2Archive::open(chain, source, tail, server.read_budget)
         .await
         .wrap_err("failed to open the R2 archive")?;
 

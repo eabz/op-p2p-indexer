@@ -293,7 +293,8 @@ impl State {
 
     /// Warns once when accepted block `number` skips unsafe blocks: heights above both the
     /// highest accepted block and the L2 safe head. Blocks at or below the highest (reorgs, late
-    /// delivery) and heights L1 already has are not a gap. Nothing is fetched.
+    /// delivery) and heights L1 already has are not a gap. Nothing is fetched here: with the
+    /// execution network on, the pipeline asks it for the missed blocks.
     fn check_gap(&mut self, number: BlockNumber) {
         let previous = self.highest;
         if previous.is_some_and(|highest| number <= highest) {

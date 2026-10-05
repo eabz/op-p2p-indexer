@@ -6,23 +6,26 @@
 
 use std::ops::ControlFlow;
 
-use op_indexer_primitives::{BlockRef, ReceiptsRequest, UnsafeBlock, UnsafeEvent};
+use op_indexer_primitives::{BlockRef, FillRequest, ReceiptsRequest, UnsafeBlock, UnsafeEvent};
 use op_indexer_storage::{StorageError, Store, UnsafeStore};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::PipelineError;
+use crate::fill::missing_below;
 use crate::receipts;
 use crate::recover::{RecoverError, recover};
 use crate::retry::{RetryError, retry};
 
 /// Name of the one store call ingest makes, for errors and retry logs.
-const INSERT: &str = "unsafe insert";
+pub(crate) const INSERT: &str = "unsafe insert";
 
 /// Stores every block received on `blocks` until the channel closes or `cancel` fires, and
 /// asks for the receipts of each block it stores on `receipts`, when there is a fetcher, and
-/// publishes the unsafe head on `head` whenever it moves, when something follows it.
+/// publishes the unsafe head on `head` whenever it moves, when something follows it. When the
+/// head moves past heights the store does not hold, the span is asked for on `fills`, when
+/// something fetches blocks.
 ///
 /// On cancellation the blocks already in the channel are still stored, without waiting for
 /// more; a store that is failing then is not waited for.
@@ -37,9 +40,15 @@ pub(crate) async fn run<U: UnsafeStore>(
     mut blocks: mpsc::Receiver<UnsafeBlock>,
     receipts: Option<mpsc::Sender<ReceiptsRequest>>,
     head: Option<watch::Sender<Option<BlockRef>>>,
+    fills: Option<mpsc::Sender<FillRequest>>,
     cancel: CancellationToken,
 ) -> Result<(), PipelineError> {
     let (receipts, head) = (receipts.as_ref(), head.as_ref());
+    let outputs = Outputs {
+        receipts,
+        head,
+        fills: fills.as_ref(),
+    };
 
     loop {
         tokio::select! {
@@ -48,7 +57,7 @@ pub(crate) async fn run<U: UnsafeStore>(
             block = blocks.recv() => {
                 // A closed channel is the network shutting down.
                 let Some(block) = block else { return Ok(()) };
-                let ingested = ingest(&store, block, receipts, head, &cancel);
+                let ingested = ingest(&store, block, &outputs, &cancel);
                 if ingested.await?.is_break() {
                     return Ok(());
                 }
@@ -56,7 +65,7 @@ pub(crate) async fn run<U: UnsafeStore>(
         }
     }
     while let Ok(block) = blocks.try_recv() {
-        let ingested = ingest(&store, block, receipts, head, &cancel);
+        let ingested = ingest(&store, block, &outputs, &cancel);
         if ingested.await?.is_break() {
             break;
         }
@@ -68,10 +77,14 @@ pub(crate) async fn run<U: UnsafeStore>(
 async fn ingest<U: UnsafeStore>(
     store: &U,
     block: UnsafeBlock,
-    receipts: Option<&mpsc::Sender<ReceiptsRequest>>,
-    head: Option<&watch::Sender<Option<BlockRef>>>,
+    outputs: &Outputs<'_>,
     cancel: &CancellationToken,
 ) -> Result<ControlFlow<()>, PipelineError> {
+    let Outputs {
+        receipts,
+        head,
+        fills,
+    } = *outputs;
     let (number, hash) = (block.number(), block.hash);
     let block = match recover(block).await {
         Ok(block) => block,
@@ -121,8 +134,22 @@ async fn ingest<U: UnsafeStore>(
         if let (Some(head), Some(moved)) = (head, moved) {
             head.send_replace(Some(moved));
         }
+        if let (UnsafeEvent::NewHead { head, gap: true }, Some(fills)) = (event, fills)
+            && let Some(request) = missing_below(store, *head).await
+        {
+            // Never waited on; a span not asked for stays for range sync.
+            let _sent = fills.try_send(request);
+        }
     }
     Ok(ControlFlow::Continue(()))
+}
+
+/// Where ingest sends what it learns, each when something takes it.
+#[derive(Clone, Copy)]
+struct Outputs<'a> {
+    receipts: Option<&'a mpsc::Sender<ReceiptsRequest>>,
+    head: Option<&'a watch::Sender<Option<BlockRef>>>,
+    fills: Option<&'a mpsc::Sender<FillRequest>>,
 }
 
 /// Logs one thing fork choice did.

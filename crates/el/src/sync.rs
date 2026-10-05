@@ -35,9 +35,12 @@
 //! walk runs from the top and the fetch from the bottom, and holding the walk's headers until
 //! the fetch reaches them would mean keeping the whole chain's.
 
+mod fill;
 mod headers;
 mod schedule;
 mod segment;
+
+pub(crate) use fill::run as run_fills;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;

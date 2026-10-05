@@ -31,7 +31,8 @@ use op_indexer_l1::{BeaconConfig, L1Config, L1Network, LightClient};
 use op_indexer_p2p::{Network, NodeStore, PayloadSource, StoreError};
 use op_indexer_pipeline::{Pipeline, ReceiptsChannels};
 use op_indexer_primitives::{
-    BeaconCheckpoint, BlockRef, EncodedBlock, ExecutionPeer, L1Games, L1Heads, SyncRange,
+    BeaconCheckpoint, BlockRef, EncodedBlock, ExecutionPeer, FillRequest, L1Games, L1Heads,
+    SyncRange,
 };
 use op_indexer_storage::unsafe_store::MemoryStore;
 use op_indexer_storage::{ArchiveStore, StorageConfig, StorageError, UnsafeStore};
@@ -86,6 +87,11 @@ const ANCHOR_DEPTH: u64 = 64;
 /// How often the archive is asked whether a round of the range sync has reached its end, and
 /// whether it holds the safe block of the L1 heads promotion waits for.
 const SYNC_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Missed gossip spans waiting for the execution network: a gap is rare and one at a time is
+/// enough; one that does not fit is left to range sync.
+const FILL_REQUEST_CAPACITY: usize = 8;
+/// Segments of a missed span fetched and waiting for the pipeline (64 blocks each).
+const FILLED_CAPACITY: usize = 4;
 /// Verified checkpoints of a range sync waiting to be saved; the sync waits when it is full.
 const SYNC_CHECKPOINT_CAPACITY: usize = 16;
 
@@ -212,13 +218,13 @@ pub async fn run<A: Archive>(
             execution_network(el, sync, &store, &stores, head_rx, &mut followers)
         })
         .transpose()?;
-    let (execution, receipts, range, mut saves) = execution.map_or_else(
-        || (None, None, None, Vec::new()),
+    let (execution, receipts, inputs, mut saves) = execution.map_or_else(
+        || (None, None, PipelineInputs::default(), Vec::new()),
         |parts| {
             (
                 Some(parts.network),
                 Some(parts.receipts),
-                parts.range,
+                parts.inputs,
                 parts.saves,
             )
         },
@@ -246,10 +252,7 @@ pub async fn run<A: Archive>(
         receipts,
     )
     .with_head(head_tx);
-    let pipeline = match range {
-        Some(range) => pipeline.with_range(range),
-        None => pipeline,
-    };
+    let pipeline = inputs.extend(pipeline);
     let gate = gate_archive.map(|archive| (archive, safe_number_rx.clone()));
     let forward = forward_l1_heads(l1_source_rx, l1_heads_tx, gate);
     follow(&mut followers, "L1 heads forwarder", forward);
@@ -516,10 +519,37 @@ struct Execution<A: Archive> {
     network: ExecutionNetwork<NodeProvider<A>>,
     /// The pipeline's ends of the receipts channels.
     receipts: ReceiptsChannels,
-    /// The batches of the range sync, for the pipeline, when a range is configured.
-    range: Option<mpsc::Receiver<Vec<EncodedBlock>>>,
+    /// What it feeds the pipeline besides receipts.
+    inputs: PipelineInputs,
     /// Tasks that save what the network reports to the node store.
     saves: Vec<JoinHandle<()>>,
+}
+
+/// What the execution network feeds the pipeline besides receipts.
+#[derive(Default)]
+struct PipelineInputs {
+    /// The batches of the range sync, when a range is configured.
+    range: Option<mpsc::Receiver<Vec<EncodedBlock>>>,
+    /// Where missed gossip spans are asked for, and the blocks fetched for them.
+    fills: Option<(mpsc::Sender<FillRequest>, mpsc::Receiver<Vec<EncodedBlock>>)>,
+}
+
+impl PipelineInputs {
+    /// `pipeline` with these inputs.
+    fn extend<U, A>(self, pipeline: Pipeline<U, A>) -> Pipeline<U, A>
+    where
+        U: UnsafeStore + Clone + Send + Sync + 'static,
+        A: ArchiveStore + Clone + Send + Sync + 'static,
+    {
+        let pipeline = match self.range {
+            Some(range) => pipeline.with_range(range),
+            None => pipeline,
+        };
+        match self.fills {
+            Some((requests, filled)) => pipeline.with_fills(requests, filled),
+            None => pipeline,
+        }
+    }
 }
 
 /// Builds the execution network from its settings and what the node store has saved for it.
@@ -581,13 +611,20 @@ fn execution_network<A: Archive>(
         }
         None => (network, None),
     };
+    // Spans gossip missed: the pipeline asks, the network fetches.
+    let (fill_requests_tx, fill_requests_rx) = mpsc::channel(FILL_REQUEST_CAPACITY);
+    let (filled_tx, filled_rx) = mpsc::channel(FILLED_CAPACITY);
+    let network = network.with_fills(fill_requests_rx, filled_tx);
     Ok(Execution {
         network,
         receipts: ReceiptsChannels {
             requests: requests_tx,
             verified: verified_rx,
         },
-        range,
+        inputs: PipelineInputs {
+            range,
+            fills: Some((fill_requests_tx, filled_rx)),
+        },
         saves,
     })
 }

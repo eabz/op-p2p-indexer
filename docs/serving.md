@@ -406,8 +406,14 @@ Unchanged code over `R2Archive`:
     sealed only once finalized, so blocks served from R2 report `FINALIZED` in `GetBlock`,
     subscriptions and Flight caps even with the L1 side off.
   - Read-ahead (5.2): a consumer's `blocks` calls are served by a feed that streams chunk after
-    chunk ahead of it, at most 64 MiB per reader and 512 MiB in all, dropped after a minute
-    unread; no disk, no cache.
+    chunk ahead of it, at most 16 MiB per reader, dropped after 10 s unread; no disk, no cache.
+    The read budget (`OP_INDEXER_SERVER_READ_BUDGET_MB`, default 1024) bounds them all,
+    whatever the number of readers: half for decoded blocks read ahead, half for the chunk
+    streams open at once (about 32 MiB each, with the server's reads of about a segment, two
+    in flight). Measured on a one-chunk local export (2,000 OP Mainnet blocks), peak RSS for
+    1/8/16/32/64 concurrent Flight `DoGet`s of the whole chunk: 100/420/717/790/878 MB at the
+    default, about 300 MB at 64 with a 256 MiB budget; before, 430 MB/2.6/3.4/5.8 GB for
+    1/8/16/32.
   - Peers (5.3): a read that needs R2 takes one of 4 places and counts against 512 MiB a
     minute; without one the peer gets the empty answer.
   - `Exporter` (section 4): adds a block to the chunk being written once it is finalized and

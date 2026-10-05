@@ -220,6 +220,17 @@ pub struct L1Heads {
     pub finalized: Option<BlockRef>,
 }
 
+/// A span of the unsafe chain that gossip missed, sent to whoever fetches blocks from peers:
+/// the blocks from `first` up to `top`, where `top` is the parent of a stored canonical block,
+/// so its hash is trusted and the span is verified by the hash chain down from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FillRequest {
+    /// The highest missing block: number, and the hash its stored child names as parent.
+    pub top: BlockRef,
+    /// The lowest missing block's number.
+    pub first: BlockNumber,
+}
+
 /// A stored block whose receipts are wanted, sent to whoever fetches them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReceiptsRequest {

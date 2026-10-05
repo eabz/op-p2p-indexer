@@ -5,9 +5,15 @@
 //! from the block after the last one it got. The first call starts a *feed*: a task that
 //! streams the sealed chunks one after the other from that block, verified and decompressed,
 //! into a buffer the next calls take from. The feed runs ahead of its reader by at most
-//! [`MAX_FEED_KIB`], and all feeds together by [`MAX_READ_AHEAD_KIB`], so the next chunk's
+//! [`MAX_FEED_KIB`], and all feeds together by half the read budget, so the next chunk's
 //! GET starts while the reader is still in this one. Nothing is written to disk and nothing is
 //! kept once read: this is read-ahead, not a cache.
+//!
+//! **Memory.** The read budget bounds what all feeds hold, whatever the number of readers:
+//! half of it for decoded blocks waiting in feeds, half for the chunk streams open at once
+//! (each holds its ranges in flight and a decoded batch, about [`STREAM_BYTES`] with the
+//! server's read options); a feed past either waits, so its reader waits, instead of the
+//! process growing.
 //!
 //! A feed is found again by the block its reader asks for next. Feeds not read for
 //! [`FEED_IDLE`] are dropped, which drops their GETs; at most [`MAX_FEEDS`] run at once.
@@ -26,15 +32,16 @@ use tokio::task::JoinHandle;
 use crate::archive::{Sealed, remote, size};
 use crate::source::{ChunkRange, ChunkSource};
 
-/// KiB one feed holds ahead of its reader (64 MiB): about a quarter of a chunk, a second or
-/// two of serving, longer than R2's time to the first byte.
-const MAX_FEED_KIB: u32 = 64 * 1024;
-/// KiB all feeds hold ahead of their readers (512 MiB). KiB are the unit of the permits.
-const MAX_READ_AHEAD_KIB: u32 = 512 * 1024;
+/// KiB one feed holds ahead of its reader (16 MiB): a couple of hundred blocks, longer to
+/// serve than R2's time to the first byte. KiB are the unit of the permits.
+const MAX_FEED_KIB: u32 = 16 * 1024;
+/// What one open chunk stream holds, with the server's read options (two ranges of about a
+/// segment in flight, each compressed and decoded, and the decoded batch handed on).
+pub(crate) const STREAM_BYTES: u64 = 32 << 20;
 /// Feeds at once; past it the one read longest ago is dropped.
 const MAX_FEEDS: usize = 64;
-/// A feed not read for this long is dropped.
-const FEED_IDLE: Duration = Duration::from_mins(1);
+/// A feed not read for this long is dropped, with what it read ahead.
+const FEED_IDLE: Duration = Duration::from_secs(10);
 /// Blocks queued in one feed, whatever their size.
 const FEED_BLOCKS: usize = 4096;
 
@@ -44,8 +51,12 @@ type Fed = Result<(ArchivedBlock, [OwnedSemaphorePermit; 2]), StorageError>;
 /// The feeds of every reader.
 #[derive(Debug, Clone)]
 pub(crate) struct Feeds {
-    feeds: Arc<Mutex<HashMap<BlockNumber, Feed>>>,
+    /// The feeds waiting for their reader, by the block it reads next.
+    waiting: Arc<Mutex<HashMap<BlockNumber, Feed>>>,
+    /// KiB of decoded blocks all feeds may hold.
     read_ahead: Arc<Semaphore>,
+    /// Chunk streams open at once.
+    streams: Arc<Semaphore>,
 }
 
 /// One reader's feed.
@@ -64,10 +75,17 @@ impl Drop for Feed {
 }
 
 impl Feeds {
-    pub(crate) fn new() -> Self {
+    /// Feeds within `budget` bytes in all.
+    pub(crate) fn new(budget: u64) -> Self {
+        let half = budget / 2;
+        let kib = usize::try_from(half / 1024).unwrap_or(usize::MAX);
+        let streams = usize::try_from(half / STREAM_BYTES).unwrap_or(usize::MAX);
         Self {
-            feeds: Arc::default(),
-            read_ahead: Arc::new(Semaphore::new(MAX_READ_AHEAD_KIB as usize)),
+            waiting: Arc::default(),
+            read_ahead: Arc::new(Semaphore::new(
+                kib.clamp(MAX_FEED_KIB as usize, Semaphore::MAX_PERMITS),
+            )),
+            streams: Arc::new(Semaphore::new(streams.clamp(1, Semaphore::MAX_PERMITS))),
         }
     }
 
@@ -81,7 +99,7 @@ impl Feeds {
         limits: ReadLimits,
     ) -> Result<Vec<ArchivedBlock>, StorageError> {
         let found = self
-            .feeds
+            .waiting
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&from);
@@ -126,9 +144,14 @@ impl Feeds {
         let (sender, blocks) = mpsc::channel(FEED_BLOCKS);
         let source = source.clone();
         let read_ahead = Arc::clone(&self.read_ahead);
+        let streams = Arc::clone(&self.streams);
         let own = Arc::new(Semaphore::new(MAX_FEED_KIB as usize));
         let task = tokio::spawn(async move {
             for chunk in chunks {
+                // Held while this chunk's stream is open.
+                let Ok(_open) = Arc::clone(&streams).acquire_owned().await else {
+                    return;
+                };
                 let mut stream = source.stream(&chunk, from.max(chunk.first));
                 // Each chunk's stream yields its blocks in order from the one asked for.
                 while let Some(block) = stream.next().await {
@@ -140,7 +163,7 @@ impl Feeds {
                             // Closed only with the feeds, which the store outlives.
                             let (Ok(global), Ok(local)) = (
                                 Arc::clone(&read_ahead)
-                                    .acquire_many_owned(kib.min(MAX_READ_AHEAD_KIB))
+                                    .acquire_many_owned(kib.min(MAX_FEED_KIB))
                                     .await,
                                 Arc::clone(&own)
                                     .acquire_many_owned(kib.min(MAX_FEED_KIB))
@@ -168,7 +191,7 @@ impl Feeds {
 
     /// Keeps `feed` for its reader's next read, at `next`.
     fn keep(&self, next: BlockNumber, feed: Feed) {
-        let mut feeds = self.feeds.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut feeds = self.waiting.lock().unwrap_or_else(PoisonError::into_inner);
         feeds.retain(|_, feed| feed.used.elapsed() < FEED_IDLE);
         if feeds.len() >= MAX_FEEDS
             && let Some(oldest) = feeds
