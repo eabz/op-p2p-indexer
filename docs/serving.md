@@ -402,6 +402,9 @@ Unchanged code over `R2Archive`:
     empty) pruned with
     `FjallArchive::prune_below` as the manifest grows (read every 30 s), and an empty tail
     accepting only the block after the last sealed one.
+  - Its `heads()` raise the finalized (and safe) head to the last sealed block: a chunk is
+    sealed only once finalized, so blocks served from R2 report `FINALIZED` in `GetBlock`,
+    subscriptions and Flight caps even with the L1 side off.
   - Read-ahead (5.2): a consumer's `blocks` calls are served by a feed that streams chunk after
     chunk ahead of it, at most 64 MiB per reader and 512 MiB in all, dropped after a minute
     unread; no disk, no cache.
@@ -409,7 +412,7 @@ Unchanged code over `R2Archive`:
     minute; without one the peer gets the empty answer.
   - `Exporter` (section 4): adds a block to the chunk being written once it is finalized and
     has its receipts, and publishes the chunk when the writer ends it.
-- `bin/server`: `--export` or `OP_INDEXER_EXPORT=true`; `OP_INDEXER_R2_ACCOUNT_ID`, `_BUCKET`, `_ACCESS_KEY_ID`,
+- `bin/server`: `OP_INDEXER_CHUNKS_DIR` reads the chunks from a local directory instead of R2 (local runs, the bench); `--export` or `OP_INDEXER_EXPORT=true`; `OP_INDEXER_R2_ACCOUNT_ID`, `_BUCKET`, `_ACCESS_KEY_ID`,
   `_SECRET_ACCESS_KEY`, `_ENDPOINT`, `OP_INDEXER_EXPORT_ID`; the node's variables otherwise.
 - API keys (D18): `OP_INDEXER_STREAM_API_KEYS` on `indexer` and `server` alike, an interceptor on
   the gRPC and Flight services (`crates/stream/src/auth.rs`); empty means no check.

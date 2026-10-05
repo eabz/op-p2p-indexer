@@ -381,8 +381,16 @@ impl<S: ChunkSource> ArchiveStore for R2Archive<S> {
         self.feeds.read(&self.source, &sealed, from, limits).await
     }
 
+    /// The L1 heads the tail records, raised to the last sealed block: a chunk is sealed only
+    /// once every block in it is finalized, so the sealed range is finalized whatever L1 has
+    /// been seen to say (with the L1 side off, nothing at all).
     async fn heads(&self) -> Result<L1Heads, StorageError> {
-        self.tail.heads().await
+        let heads = self.tail.heads().await?;
+        let finalized = at_least(heads.finalized, self.sealed().last());
+        Ok(L1Heads {
+            safe: at_least(heads.safe, finalized),
+            finalized,
+        })
     }
 
     async fn set_heads(&self, heads: L1Heads) -> Result<(), StorageError> {
@@ -516,6 +524,13 @@ pub(crate) fn size(block: &ArchivedBlock) -> u64 {
 /// says whether trying again can help.
 pub(crate) fn remote(operation: &'static str) -> impl Fn(io::Error) -> StorageError {
     move |source| StorageError::Remote { operation, source }
+}
+
+/// The later of `head` and `floor`.
+fn at_least(head: Option<BlockRef>, floor: Option<BlockRef>) -> Option<BlockRef> {
+    head.into_iter()
+        .chain(floor)
+        .max_by_key(|block| block.number)
 }
 
 /// Checks that each of `chunks` continues the one before it, the first continuing `before`.

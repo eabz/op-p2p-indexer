@@ -147,8 +147,10 @@ impl<U: UnsafeStore, A: ArchiveStore> Source<U, A> {
 
     /// The canonical blocks from `from` upwards, oldest first: from the archive while `from`
     /// is in it, else from the unsafe store, up to its head. Empty when no canonical block is
-    /// held at `from` (above the head, or in a gap). `tip` remembers the archive's last block
-    /// between calls, so a read above it does not ask the archive first.
+    /// held at `from` (above the head, or in a gap). `tip` remembers where the archive was
+    /// found to end between calls, so a read above it does not ask the archive first. A batch
+    /// the archive returns ends at its limits, not at the archive's end, so `tip` is set only
+    /// when the archive holds nothing at `from`.
     pub(crate) async fn blocks_from(
         &self,
         from: BlockNumber,
@@ -156,8 +158,7 @@ impl<U: UnsafeStore, A: ArchiveStore> Source<U, A> {
     ) -> Result<Vec<Prepared>, ReadError> {
         if tip.is_none_or(|tip| from <= tip) {
             let archived = self.archived(from, HISTORY_BATCH).await?;
-            if let Some(last) = archived.last() {
-                *tip = Some(last.at.number);
+            if !archived.is_empty() {
                 return Ok(archived);
             }
             *tip = Some(from.saturating_sub(1));
@@ -170,8 +171,8 @@ impl<U: UnsafeStore, A: ArchiveStore> Source<U, A> {
         }
         // Promoted meanwhile: archived, then pruned from the unsafe store.
         let archived = self.archived(from, HISTORY_BATCH).await?;
-        if let Some(last) = archived.last() {
-            *tip = Some(last.at.number);
+        if !archived.is_empty() {
+            *tip = None;
         }
         Ok(archived)
     }
