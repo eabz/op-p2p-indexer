@@ -234,5 +234,19 @@
     "useful_bytes": 787118,
     "failed_bytes": 3327480
   },
-  "planning_timeout": "nonzero before reading"
+  "planning_timeout": "nonzero before reading",
+  "local_transport_reset": {
+    "endpoint": "localhost only",
+    "complete": false,
+    "exit": "nonzero after bounded retries",
+    "retries": 2,
+    "failures": {
+      "exhausted": 0,
+      "unavailable": 2,
+      "timeout": 1,
+      "other": 0
+    },
+    "received": 0,
+    "failed_bytes": 0
+  }
 }

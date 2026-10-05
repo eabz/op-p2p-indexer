@@ -73,7 +73,9 @@ on total output or decompressed memory. Endpoints are plaintext `grpc://`, `grpc
   nondecreasing. `blocks` additionally requires every requested block exactly once. Other
   tables can legitimately be empty; their row completeness is not independently proven.
 - Resource exhaustion, unavailability and deadline failures retry fallback locations with
-  bounded, jittered backoff. Nonretryable status, schema and data errors fail the job.
+  bounded, jittered backoff. Local TCP resets/broken bodies are classified from typed I/O
+  causes even when Tonic wraps them as `UNKNOWN`; their connections are replaced. Remote
+  `UNKNOWN` errors without a transient transport cause, schema and data errors fail the job.
 - `--rpc-timeout` bounds a complete attempt, including connection and decode; `--retry-for`
   bounds an admitted job including slot waits and retries. Work-queue time precedes that
   budget. Cancellation drains active readers and preserves partial read reports.
@@ -97,7 +99,7 @@ cache measurement, and the benchmark never restarts servers.
 
 ## Live validation, 2026-10-05
 
-A macOS release build completed `--heavy --from 48000000 --to 48100000` with Zstd,
+The initial macOS native build completed `--heavy --from 48000000 --to 48100000` with Zstd,
 24 concurrent jobs and cap 8. All 12 jobs across four tables completed, with no failures or
 retries and 1,289,622,785 decoded bytes in total. [Full report](benchmarks/2026-10-05-native-heavy.json):
 
@@ -114,6 +116,21 @@ short read deadline discarded 5,031,835 decoded bytes, reported zero useful byte
 nonzero. A planning deadline exited before reading. SIGINT during a 130-job run drained
 readers, recorded every planned job, balanced useful/discarded byte accounting and exited
 nonzero. [Verification summary](benchmarks/2026-10-05-native-checks.json).
+
+The final connection pool completed **5,000,001 blocks / 3,290,625,716 decoded bytes** over
+40,000,000–45,000,000: all 130 jobs, no failures or retries, with 24 concurrent jobs and
+cap 4 in 162.887 seconds end-to-end ([report](benchmarks/2026-10-05-native-blocks.json)).
+Connections are pooled per active read because the original shared-connection prototype
+throttled this workload on the observed client path. These are not controlled capacity results.
+
+A subsequent pooled heavy rerun was interrupted when the operator stopped the remote nodes
+and balancer. It stopped after transaction connection resets and preserves its partial
+[failure report](benchmarks/2026-10-05-native-heavy-interrupted.json); it is not a successful
+heavy benchmark. That exposed a transport classification gap, now corrected. A localhost
+Flight server behind a TCP-reset proxy verified two retries, two unavailable failures and
+one final deadline, with no nonretryable failures; the bounded run correctly exited nonzero.
+The final pooled heavy workload with reset recovery still needs a live rerun after the fleet
+is restarted. No further remote requests were made after the operator reported the shutdown.
 
 These are client correctness checks on an uncontrolled live fleet, not evidence of a server
 speedup. Server revision, resource use and cache state were not verified.

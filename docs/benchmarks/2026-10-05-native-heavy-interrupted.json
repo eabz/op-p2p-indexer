@@ -1,0 +1,250 @@
+{
+  "version": "0.1.10",
+  "client": "rust-arrow-flight",
+  "heavy": true,
+  "repetitions": 1,
+  "planned_runs": 4,
+  "rpc_timeout_seconds": 600.0,
+  "retry_for_seconds": 1800.0,
+  "max_message_bytes": 67108864,
+  "runs": [
+    {
+      "complete": true,
+      "table": "blocks",
+      "from": 48000000,
+      "to": 48100000,
+      "cap": "finalized",
+      "compression": "zstd",
+      "concurrency": 24,
+      "per_server": 8,
+      "planning_seconds": 0.243953917,
+      "reading_seconds": 20.597133375,
+      "end_to_end_seconds": 20.841087375,
+      "done": 3,
+      "failed": 0,
+      "rows": 100001,
+      "bytes": 65813160,
+      "received": 65813160,
+      "failed_bytes": 0,
+      "retries": 0,
+      "wait_seconds": 0.0,
+      "mb_per_second": 3.1952582333559802,
+      "end_to_end_mb_per_second": 3.1578563448155976,
+      "ttfb": {
+        "median": 0.8636865,
+        "p95": 0.938769791
+      },
+      "latency": {
+        "median": 3.235813416,
+        "p95": 20.597082166
+      },
+      "queue": {
+        "median": 0.0013315,
+        "p95": 0.001334958
+      },
+      "servers": {
+        "http://157.245.140.110:50051": {
+          "jobs": 1,
+          "bytes": 5334762,
+          "stream_seconds": 2.405654584,
+          "mb_per_second": 0.2590050713792593,
+          "mb_per_stream_second": 2.2175926816266482
+        },
+        "http://204.48.27.189:50051": {
+          "jobs": 2,
+          "bytes": 60478398,
+          "stream_seconds": 23.829810458,
+          "mb_per_second": 2.936253161976721,
+          "mb_per_stream_second": 2.5379302998063316
+        }
+      },
+      "jobs": [
+        {
+          "index": 0,
+          "from": 48000000,
+          "to": 48043466,
+          "server": "http://204.48.27.189:50051",
+          "rows": 43467,
+          "bytes": 28606720,
+          "received": 28606720,
+          "failed_bytes": 0,
+          "retries": 0,
+          "failures": {
+            "exhausted": 0,
+            "unavailable": 0,
+            "timeout": 0,
+            "other": 0
+          },
+          "queue_seconds": 0.001324083,
+          "wait_seconds": 0.0,
+          "ttfb_seconds": 0.8636865,
+          "latency_seconds": 3.235813416,
+          "read_seconds": 3.23428875,
+          "error": null
+        },
+        {
+          "index": 1,
+          "from": 48043467,
+          "to": 48091894,
+          "server": "http://204.48.27.189:50051",
+          "rows": 48428,
+          "bytes": 31871678,
+          "received": 31871678,
+          "failed_bytes": 0,
+          "retries": 0,
+          "failures": {
+            "exhausted": 0,
+            "unavailable": 0,
+            "timeout": 0,
+            "other": 0
+          },
+          "queue_seconds": 0.0013315,
+          "wait_seconds": 0.0,
+          "ttfb_seconds": 0.938769791,
+          "latency_seconds": 20.597082166,
+          "read_seconds": 20.595521708,
+          "error": null
+        },
+        {
+          "index": 2,
+          "from": 48091895,
+          "to": 48100000,
+          "server": "http://157.245.140.110:50051",
+          "rows": 8106,
+          "bytes": 5334762,
+          "received": 5334762,
+          "failed_bytes": 0,
+          "retries": 0,
+          "failures": {
+            "exhausted": 0,
+            "unavailable": 0,
+            "timeout": 0,
+            "other": 0
+          },
+          "queue_seconds": 0.001334958,
+          "wait_seconds": 0.0,
+          "ttfb_seconds": 0.74605325,
+          "latency_seconds": 2.4071379999999998,
+          "read_seconds": 2.405654584,
+          "error": null
+        }
+      ]
+    },
+    {
+      "complete": false,
+      "table": "transactions",
+      "from": 48000000,
+      "to": 48100000,
+      "cap": "finalized",
+      "compression": "zstd",
+      "concurrency": 24,
+      "per_server": 8,
+      "planning_seconds": 0.210113334,
+      "reading_seconds": 29.730436959,
+      "end_to_end_seconds": 29.940550417,
+      "done": 1,
+      "failed": 2,
+      "rows": 68565,
+      "bytes": 60054987,
+      "received": 294878243,
+      "failed_bytes": 234823256,
+      "retries": 0,
+      "wait_seconds": 0.0,
+      "mb_per_second": 2.0199833282914517,
+      "end_to_end_mb_per_second": 2.005807714406655,
+      "ttfb": {
+        "median": 1.0560595,
+        "p95": 1.105043959
+      },
+      "latency": {
+        "median": 26.363128459,
+        "p95": 29.730320792
+      },
+      "queue": {
+        "median": 0.001308125,
+        "p95": 0.0013195
+      },
+      "servers": {
+        "http://147.182.143.85:50051": {
+          "jobs": 1,
+          "bytes": 60054987,
+          "stream_seconds": 25.525868958,
+          "mb_per_second": 2.0199833282914517,
+          "mb_per_stream_second": 2.3527107774005205
+        }
+      },
+      "jobs": [
+        {
+          "index": 0,
+          "from": 48000000,
+          "to": 48043466,
+          "server": "http://157.245.140.110:50051",
+          "rows": 0,
+          "bytes": 0,
+          "received": 144331983,
+          "failed_bytes": 144331983,
+          "retries": 0,
+          "failures": {
+            "exhausted": 0,
+            "unavailable": 0,
+            "timeout": 0,
+            "other": 1
+          },
+          "queue_seconds": 0.001282792,
+          "wait_seconds": 0.0,
+          "ttfb_seconds": 0.944088167,
+          "latency_seconds": 29.730320792,
+          "read_seconds": 0.0,
+          "error": "flight read failed: Tonic error: code: 'Unknown error', message: \"h2 protocol error: error reading a body from connection\", source: hyper::Error(Body, Error { kind: Io(Kind(ConnectionReset)) })"
+        },
+        {
+          "index": 1,
+          "from": 48043467,
+          "to": 48091894,
+          "server": "http://147.182.143.85:50051",
+          "rows": 0,
+          "bytes": 0,
+          "received": 90491273,
+          "failed_bytes": 90491273,
+          "retries": 0,
+          "failures": {
+            "exhausted": 0,
+            "unavailable": 0,
+            "timeout": 0,
+            "other": 1
+          },
+          "queue_seconds": 0.001308125,
+          "wait_seconds": 0.0,
+          "ttfb_seconds": 1.105043959,
+          "latency_seconds": 26.363128459,
+          "read_seconds": 0.0,
+          "error": "flight read failed: Tonic error: code: 'Unknown error', message: \"h2 protocol error: error reading a body from connection\", source: hyper::Error(Body, Error { kind: Io(Kind(ConnectionReset)) })"
+        },
+        {
+          "index": 2,
+          "from": 48091895,
+          "to": 48100000,
+          "server": "http://147.182.143.85:50051",
+          "rows": 68565,
+          "bytes": 60054987,
+          "received": 60054987,
+          "failed_bytes": 0,
+          "retries": 0,
+          "failures": {
+            "exhausted": 0,
+            "unavailable": 0,
+            "timeout": 0,
+            "other": 0
+          },
+          "queue_seconds": 0.0013195,
+          "wait_seconds": 0.0,
+          "ttfb_seconds": 1.0560595,
+          "latency_seconds": 25.527392125,
+          "read_seconds": 25.525868958,
+          "error": null
+        }
+      ]
+    }
+  ],
+  "validation_context": "Pooled native client, 2026-10-05. User reported stopping remote nodes and balancer during this rerun. Stopped after transaction connection resets; incomplete, not a throughput benchmark. This run preceded typed transport-reset retry handling."
+}
