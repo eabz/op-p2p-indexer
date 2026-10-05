@@ -81,6 +81,11 @@ pub(crate) struct RpcHeader {
     pub(crate) gas_used: Option<U64>,
     #[serde(default, skip_serializing)]
     pub(crate) extra_data: Option<Bytes>,
+    /// What a block that does not hash is compared with (`fill`); not kept in the fill.
+    #[serde(default, skip_serializing)]
+    pub(crate) transactions_root: Option<B256>,
+    #[serde(default, skip_serializing)]
+    pub(crate) receipts_root: Option<B256>,
 }
 
 impl RpcHeader {
@@ -99,6 +104,8 @@ impl RpcHeader {
             gas_limit: None,
             gas_used: None,
             extra_data: None,
+            transactions_root: None,
+            receipts_root: None,
         }
     }
 }
@@ -109,6 +116,9 @@ pub(crate) struct FilledBlock {
     pub(crate) number: u64,
     pub(crate) transactions: Vec<RpcTransaction>,
     pub(crate) receipts: Vec<RpcReceipt>,
+    /// The block's header fields, from the same answer; kept in the fill as a header.
+    #[serde(skip)]
+    pub(crate) header: Option<RpcHeader>,
 }
 
 /// A transaction as the RPC gives it.
@@ -410,7 +420,10 @@ impl Rpc {
             let (Some(found), Some(receipts)) = (answers.next(), answers.next()) else {
                 return Err(RpcError::Malformed("fewer answers than calls".to_owned()));
             };
-            let block: Block<RpcTransaction> = block(found?, hole.number, hole.hash)?;
+            let found = found?;
+            let header = Option::<RpcHeader>::deserialize(&found)
+                .map_err(|err| RpcError::Malformed(err.to_string()))?;
+            let block: Block<RpcTransaction> = block(found, hole.number, hole.hash)?;
             let receipts = match receipts {
                 Ok(receipts) => parse::<Option<Vec<RpcReceipt>>>(receipts)?
                     .ok_or(RpcError::NoBlock(hole.number))?,
@@ -431,6 +444,7 @@ impl Rpc {
                 number: hole.number,
                 transactions: block.transactions,
                 receipts,
+                header,
             });
         }
         Ok(filled)

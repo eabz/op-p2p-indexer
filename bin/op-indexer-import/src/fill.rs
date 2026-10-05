@@ -12,9 +12,9 @@
 //! - Header fields: Base's rows lack `mix_hash` and `base_fee_per_gas` in large stretches before
 //!   block 13.5 M (and may lack a later fork's fields there too). For a block whose header row
 //!   lacks any field its forks have, the fields are rebuilt from L1 and the parent block
-//!   (`derive`, `--headers-from l1`, the default), and what cannot be rebuilt or does not hash
-//!   is fetched (`eth_getBlockByNumber` without transactions); `--headers-from rpc` fetches
-//!   them all.
+//!   (`derive`, `--fill-from l1`, the default), with deposits' source hashes and mints; what
+//!   cannot be rebuilt is fetched, and a block that does not hash is fetched whole, replacing
+//!   its rows (one may be wrong); `--fill-from rpc` fetches them all.
 //!
 //! After the chunks are downloaded, every chunk not sealed yet is read, several at once
 //! within `verify`'s memory bound ([`IN_FLIGHT_BYTES`]), and checked for every field its rows
@@ -55,7 +55,10 @@ use crate::rows::{self, LogRow, Rows, TransactionRow};
 use crate::rpc::{FilledBlock, Rpc, RpcHeader, Wanted};
 use crate::source::HyperSync;
 use crate::state::{Chunk, Plan, State, covered, read_json, write_json};
-use crate::verify::{Forks, IN_FLIGHT_BYTES, Missing, encode_access_list, holes, missing};
+use crate::verify::{
+    Forks, IN_FLIGHT_BYTES, Missing, Roots, Unhashed, encode_access_list, holes, missing,
+    unhashed_blocks,
+};
 
 /// What a chunk's rows lack, fetched from the chain's RPC.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -93,26 +96,50 @@ impl Fill {
         }
     }
 
-    /// Adds what `other` holds of header fields and source hashes, replacing what it held for
-    /// the same blocks and deposits.
+    /// Adds what `other` holds of header fields and source hashes, field by field: a field
+    /// it has replaces the one held for the same block or deposit, one it lacks keeps it (a
+    /// rebuild fills only what the rows and the fill still lack).
     fn add(&mut self, other: Self) {
         self.put_headers(other.headers);
-        self.sources.retain(|kept| {
-            other.sources.iter().all(|new| {
-                (new.block_number, new.transaction_index)
-                    != (kept.block_number, kept.transaction_index)
-            })
-        });
-        self.sources.extend(other.sources);
+        for new in other.sources {
+            let key = (new.block_number, new.transaction_index);
+            match self
+                .sources
+                .iter_mut()
+                .find(|kept| (kept.block_number, kept.transaction_index) == key)
+            {
+                Some(kept) => {
+                    kept.source_hash = new.source_hash.or(kept.source_hash);
+                    kept.mint = new.mint.or(kept.mint);
+                }
+                None => self.sources.push(new),
+            }
+        }
     }
 
-    /// Adds `headers`, replacing what it held for the same blocks: a header fetched again (one
-    /// the endpoint gave without a field asked for) replaces the one kept, so the fill does not
+    /// Adds `headers` field by field, as [`Self::add`]: a header fetched again (one the
+    /// endpoint gave without a field asked for) goes into the one kept, so the fill does not
     /// grow run after run.
     fn put_headers(&mut self, headers: Vec<RpcHeader>) {
-        self.headers
-            .retain(|kept| headers.iter().all(|new| new.number != kept.number));
-        self.headers.extend(headers);
+        for new in headers {
+            match self
+                .headers
+                .iter_mut()
+                .find(|kept| kept.number == new.number)
+            {
+                Some(kept) => {
+                    kept.mix_hash = new.mix_hash.or(kept.mix_hash);
+                    kept.base_fee_per_gas = new.base_fee_per_gas.or(kept.base_fee_per_gas);
+                    kept.withdrawals_root = new.withdrawals_root.or(kept.withdrawals_root);
+                    kept.blob_gas_used = new.blob_gas_used.or(kept.blob_gas_used);
+                    kept.excess_blob_gas = new.excess_blob_gas.or(kept.excess_blob_gas);
+                    kept.parent_beacon_block_root = new
+                        .parent_beacon_block_root
+                        .or(kept.parent_beacon_block_root);
+                }
+                None => self.headers.push(new),
+            }
+        }
     }
 }
 
@@ -151,9 +178,22 @@ pub(crate) fn apply(rows: &mut Rows, fill: Fill) -> u64 {
     }
     let mut filled = 0_u64;
     let mut added = false;
+    // A block fetched whole replaces what the service sent of it: nothing for a hole, rows
+    // that do not hash for another.
+    let mut replaced: Vec<u64> = fill
+        .blocks
+        .iter()
+        .map(|block| block.number)
+        .filter(|&number| rows.block(number).is_some())
+        .collect();
+    replaced.sort_unstable();
+    if !replaced.is_empty() {
+        let kept = |number: &u64| replaced.binary_search(number).is_err();
+        rows.transactions.retain(|tx| kept(&tx.block_number));
+        rows.logs.retain(|log| kept(&log.block_number));
+    }
     for block in fill.blocks {
-        // Only into a hole: rows the service sent are not doubled.
-        if rows.block(block.number).is_none() || rows.has_transactions(block.number) {
+        if replaced.binary_search(&block.number).is_err() {
             continue;
         }
         let (transactions, logs) = hole_rows(block);
@@ -277,6 +317,9 @@ struct Fetch {
     /// The blocks with deposits whose source hash to fetch; their header fields come with
     /// them.
     sources: Vec<Wanted>,
+    /// Of the blocks fetched whole, those that did not hash with their rows, with the
+    /// transactions and receipts roots the rows give: compared with the RPC's, to say which.
+    unhashed: Vec<(u64, Roots)>,
 }
 
 impl Fetch {
@@ -416,24 +459,76 @@ pub(crate) async fn run(
     work.finish(rpc, plan, cancel)
 }
 
-/// A running check of what was rebuilt of a chunk: the chunk, its downloaded bytes (in
-/// flight while it runs), the rebuilt fill, what to fetch instead if it does not hash, and why
-/// it does not, if so.
-type Check = (Chunk, u64, Fill, Fetch, Option<String>);
+/// What was rebuilt of a chunk, to check before it is written.
+#[derive(Debug)]
+struct Rebuild {
+    fill: Fill,
+    /// What to fetch instead if the chunk cannot be read whole.
+    instead: Fetch,
+    /// The rebuilt source hashes and mints with what they are from, for the error.
+    sources: Vec<derive::Source>,
+    /// Every block of the chunk.
+    blocks: Vec<BlockNumHash>,
+}
 
-/// Takes a finished check: writes the rebuilt fill if every block hashes, else has the chunk's
-/// fields fetched. Returns the chunk's downloaded bytes, no longer in flight.
+/// A finished check of a [`Rebuild`]: the chunk, its downloaded bytes (in flight while it
+/// ran), the rebuild, and the blocks that do not hash with it, in block order, or why the
+/// chunk could not be read.
+type Check = (Chunk, u64, Rebuild, Result<Vec<Unhashed>, String>);
+
+/// Takes a finished check: writes the rebuilt fill of the blocks that hash, and has those that
+/// do not fetched whole, with their header fields (a row the service sent wrong is replaced);
+/// without an endpoint, a block that does not hash ends the run and nothing is written.
+/// Returns the chunk's downloaded bytes, no longer in flight.
 fn take_check(state: &State, work: &mut Work, check: Check) -> eyre::Result<u64> {
-    let (chunk, bytes, rebuilt, instead, why) = check;
-    match why {
-        // Every block hashes: only now are the fields written.
-        None => {
-            let path = state.fill_path(chunk);
-            work.rebuilt(&rebuilt);
-            tokio::task::block_in_place(|| add_rebuilt(&path, rebuilt))
-                .wrap_err_with(|| format!("failed to write {}", path.display()))?;
+    let (chunk, bytes, mut rebuild, checked) = check;
+    let unhashed = match checked {
+        Ok(unhashed) => unhashed,
+        Err(why) => {
+            work.unrebuilt(chunk, rebuild.instead, &why);
+            return Ok(bytes);
         }
-        Some(why) => work.unrebuilt(chunk, instead, &why),
+    };
+    if let Some(first) = unhashed.first() {
+        // Before the failing blocks' fields are dropped.
+        let what = derive::describe(first.number, &rebuild.fill.headers, &rebuild.sources);
+        let fails = |number: u64| {
+            unhashed
+                .binary_search_by_key(&number, |block| block.number)
+                .is_ok()
+        };
+        rebuild
+            .fill
+            .headers
+            .retain(|header| !fails(header.number.to()));
+        rebuild
+            .fill
+            .sources
+            .retain(|source| !fails(source.block_number));
+        let fetch = Fetch {
+            holes: rebuild
+                .blocks
+                .iter()
+                .filter(|block| fails(block.number))
+                .copied()
+                .collect(),
+            unhashed: unhashed
+                .iter()
+                .filter_map(|block| Some((block.number, block.roots?)))
+                .collect(),
+            ..Fetch::default()
+        };
+        work.unrebuilt(chunk, fetch, &format!("{}; {what}", first.why));
+        if !work.keep {
+            return Ok(bytes);
+        }
+    }
+    // Every block left hashes: only now are its fields written.
+    if !rebuild.fill.headers.is_empty() || !rebuild.fill.sources.is_empty() {
+        let path = state.fill_path(chunk);
+        work.rebuilt(&rebuild.fill);
+        tokio::task::block_in_place(|| add_rebuilt(&path, rebuild.fill))
+            .wrap_err_with(|| format!("failed to write {}", path.display()))?;
     }
     Ok(bytes)
 }
@@ -459,26 +554,18 @@ impl Ordered<'_, '_> {
         {
             self.order.pop_front();
             if let Some(rebuilding) = self.rebuilding.as_deref_mut()
-                && let Some((rebuilt, instead, sources)) =
-                    rebuilding.chunk(&mut found, work).await?
+                && let Some(rebuild) = rebuilding.chunk(&mut found, work).await?
             {
                 *self.in_flight_bytes = self.in_flight_bytes.saturating_add(bytes);
                 let (raw, fill) = (state.raw_path(chunk), state.fill_path(chunk));
                 self.checks.spawn_blocking(move || {
                     let overlay = Fill {
-                        headers: rebuilt.headers.clone(),
-                        sources: rebuilt.sources.clone(),
+                        headers: rebuild.fill.headers.clone(),
+                        sources: rebuild.fill.sources.clone(),
                         ..Fill::default()
                     };
-                    let why = crate::verify::rebuild_error(&forks, chunk, &raw, &fill, overlay)
-                        .map(|(block, why)| match block {
-                            Some(block) => {
-                                let rebuilt = derive::describe(block, &rebuilt.headers, &sources);
-                                format!("{why}; {rebuilt}")
-                            }
-                            None => why,
-                        });
-                    (chunk, bytes, rebuilt, instead, why)
+                    let checked = unhashed_blocks(&forks, chunk, &raw, &fill, overlay);
+                    (chunk, bytes, rebuild, checked)
                 });
             }
             work.scanned(chunk, found);
@@ -513,15 +600,14 @@ impl<'a> Rebuilding<'a> {
         }
     }
 
-    /// Rebuilds what the rows of `found` lack, and returns it as a fill, to check before it is
-    /// written, with what to fetch instead and the source hashes with what they are from, to
-    /// name if it does not hash; or, when a block cannot be rebuilt (counted in `work`) or the chunk needs the RPC
-    /// for anything else, lists it all in `found`'s fetch.
+    /// Rebuilds what the rows of `found` lack, to check before it is written; or, when a block
+    /// cannot be rebuilt (counted in `work`) or the chunk needs the RPC for anything else,
+    /// lists it all in `found`'s fetch.
     async fn chunk(
         &mut self,
         found: &mut Scanned,
         work: &mut Work,
-    ) -> eyre::Result<Option<(Fill, Fetch, Vec<derive::Source>)>> {
+    ) -> eyre::Result<Option<Rebuild>> {
         let rows = std::mem::take(&mut found.header_rows);
         // The first block lacking its base fee needs its parent's: the chunk before's last
         // block, read earlier in this run (every chunk not sealed is, in block order); else,
@@ -563,11 +649,15 @@ impl<'a> Rebuilding<'a> {
             found.fetch.sources.extend(instead.sources);
             return Ok(None);
         }
-        Ok(Some((
-            Fill::rebuilt(rebuilt.headers, &rebuilt.sources),
+        Ok(Some(Rebuild {
+            fill: Fill::rebuilt(rebuilt.headers, &rebuilt.sources),
             instead,
-            rebuilt.sources,
-        )))
+            sources: rebuilt.sources,
+            blocks: rows
+                .iter()
+                .map(|row| BlockNumHash::new(row.number, row.hash))
+                .collect(),
+        }))
     }
 }
 
@@ -695,7 +785,7 @@ impl Work {
     }
 
     /// Takes what was rebuilt of `chunk` that does not hash (`why`): `instead` is fetched, if
-    /// there is an endpoint; nothing rebuilt was written.
+    /// there is an endpoint; else the run ends, and nothing rebuilt of the chunk is written.
     fn unrebuilt(&mut self, chunk: Chunk, instead: Fetch, why: &str) {
         let blocks = u64::try_from(instead.blocks()).unwrap_or(u64::MAX);
         self.unrebuilt_blocks = self.unrebuilt_blocks.saturating_add(blocks);
@@ -713,7 +803,7 @@ impl Work {
             from = chunk.from,
             to = chunk.to,
             %why,
-            "fields rebuilt from L1 do not hash: fetching them from the RPC"
+            "blocks do not hash with the fields rebuilt from L1: fetching them whole from the RPC"
         );
         self.queued_blocks = self.queued_blocks.saturating_add(blocks);
         self.to_fetch.push_back((chunk, instead));
@@ -948,8 +1038,8 @@ fn scan(forks: &Forks, raw: &Path, fill: &Path, rebuild: bool) -> eyre::Result<S
     scanned.fetch.holes = holes(forks, &rows)
         .map(|block| BlockNumHash::new(block.number, block.hash))
         .collect();
-    // A hole's block is fetched whole, its header fields with it: but those go to the header
-    // row only through `headers`, so a hole lacking them is read for both.
+    // A hole's block is fetched whole, its header fields with it: `fill_chunk` reads a hole's
+    // only that way.
     scanned.fetch.headers = headers
         .into_iter()
         .filter_map(|(number, _)| rows.block(number))
@@ -998,6 +1088,22 @@ fn wanted(rows: &Rows, lacks: impl Fn(&TransactionRow) -> bool) -> Vec<Wanted> {
         .collect()
 }
 
+/// Logs, for block `number` if it did not hash with its rows, which of the roots its rows give
+/// differs from the RPC's `header`: what the service sent wrong, transactions or receipts.
+fn compare_roots(fetch: &Fetch, number: u64, header: &RpcHeader) {
+    let Some((_, roots)) = fetch.unhashed.iter().find(|(block, _)| *block == number) else {
+        return;
+    };
+    let differs = |root: B256, rpc: Option<B256>| rpc.is_some_and(|rpc| rpc != root);
+    warn!(
+        number,
+        transactions_root_differs = differs(roots.transactions, header.transactions_root),
+        receipts_root_differs = differs(roots.receipts, header.receipts_root),
+        "a block that did not hash with its downloaded rows, against the RPC's roots: fetched \
+         whole"
+    );
+}
+
 /// What fetching one chunk's fill added.
 #[derive(Debug, Clone, Copy)]
 struct Fetched {
@@ -1031,12 +1137,25 @@ async fn fill_chunk(rpc: &Rpc, fetch: &Fetch, path: PathBuf) -> eyre::Result<Fet
         );
     }
     let mut blocks = Vec::new();
+    let mut headers = Vec::with_capacity(fetch.headers.len());
     // Two calls a block: the block and its receipts.
     for batch in fetch.holes.chunks(rpc.batch_calls() / 2) {
-        blocks.extend(rpc.whole_blocks(batch).await?);
+        for mut block in rpc.whole_blocks(batch).await? {
+            if let Some(header) = block.header.take() {
+                compare_roots(fetch, block.number, &header);
+                headers.push(header);
+            }
+            blocks.push(block);
+        }
     }
-    let mut headers = Vec::with_capacity(fetch.headers.len());
-    for batch in fetch.headers.chunks(rpc.batch_calls()) {
+    // Those of blocks fetched whole came with them.
+    let alone: Vec<BlockNumHash> = fetch
+        .headers
+        .iter()
+        .filter(|header| !fetch.holes.contains(header))
+        .copied()
+        .collect();
+    for batch in alone.chunks(rpc.batch_calls()) {
         headers.extend(rpc.headers(batch).await?);
     }
     let mut sources = Vec::new();
@@ -1068,9 +1187,15 @@ async fn fill_chunk(rpc: &Rpc, fetch: &Fetch, path: PathBuf) -> eyre::Result<Fet
     tokio::task::spawn_blocking(move || {
         let mut fill = read_json::<Fill>(&path)?.unwrap_or_default();
         fill.transactions.extend(lists);
+        // A block fetched whole again replaces the one kept.
+        fill.blocks
+            .retain(|kept| blocks.iter().all(|new| new.number != kept.number));
         fill.blocks.extend(blocks);
-        fill.put_headers(headers);
-        fill.sources.extend(sources);
+        fill.add(Fill {
+            headers,
+            sources,
+            ..Fill::default()
+        });
         write_json(&path, &fill)
     })
     .await??;

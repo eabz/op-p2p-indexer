@@ -28,19 +28,64 @@ use op_indexer_primitives::{
 use tracing::info;
 
 use super::receipt::BloomHashes;
-use super::{Check, ChunkError, Forks, Stats, receipt, transaction};
+use super::{Check, ChunkError, Forks, Roots, Stats, receipt, transaction};
 use crate::fill::{self, Fill};
 use crate::rows::{self, BlockRow, LogRow, TransactionRow};
 use crate::state::{Chunk, read_json};
 
-/// Verifies the downloaded chunk at `raw`, with what its fill at `fill` holds and then
-/// `overlay`, and returns its blocks as verified, in block order. Blocking, CPU-bound.
+/// Verifies the downloaded chunk at `raw`, with what its fill at `fill` holds, and returns its
+/// blocks as verified, in block order. Blocking, CPU-bound.
+///
+/// # Errors
+///
+/// Returns [`ChunkError`] for a chunk or fill that cannot be read, and for the first block
+/// that does not rebuild to its hash or link to the block before.
 pub(super) fn verify_chunk(
     forks: &Forks,
     chunk: Chunk,
     raw: &Path,
     fill: &Path,
+) -> Result<(Stats, Vec<ArchivedBlock>), ChunkError> {
+    let mut first = None;
+    let verified = walk(forks, chunk, raw, fill, None, |number, check| {
+        first = Some(ChunkError::Block { number, check });
+        false
+    })?;
+    first.map_or(Ok(verified), Err)
+}
+
+/// Checks every block of the downloaded chunk at `raw`, with what its fill at `fill` holds and
+/// then `overlay`, each against its own hash, and returns those that do not rebuild to it, in
+/// block order: `fill`'s check of what it rebuilt, before it writes it. Blocking, CPU-bound.
+///
+/// # Errors
+///
+/// Returns [`ChunkError`] for a chunk or fill that cannot be read.
+pub(super) fn failing_blocks(
+    forks: &Forks,
+    chunk: Chunk,
+    raw: &Path,
+    fill: &Path,
+    overlay: Fill,
+) -> Result<Vec<(u64, Check)>, ChunkError> {
+    let mut failing = Vec::new();
+    walk(forks, chunk, raw, fill, Some(overlay), |number, check| {
+        failing.push((number, check));
+        true
+    })?;
+    Ok(failing)
+}
+
+/// Rebuilds the blocks of a chunk with its fill and then `overlay`, calling `failed` with each
+/// block that does not rebuild to its hash or link to the block before: it goes on to the next
+/// one if `failed` says so (the next is then checked against its own hash only), else stops.
+fn walk(
+    forks: &Forks,
+    chunk: Chunk,
+    raw: &Path,
+    fill: &Path,
     overlay: Option<Fill>,
+    mut failed: impl FnMut(u64, Check) -> bool,
 ) -> Result<(Stats, Vec<ArchivedBlock>), ChunkError> {
     let mut rows = rows::read(raw).map_err(|source| ChunkError::Rows {
         from: chunk.from,
@@ -61,35 +106,47 @@ pub(super) fn verify_chunk(
 
     let mut hashes = BloomHashes::default();
     let mut blocks: Vec<ArchivedBlock> = Vec::new();
+    // The hash of the block before, if it was verified.
+    let mut previous: Option<B256> = None;
     for number in chunk.from..chunk.to {
-        let failed = |check| ChunkError::Block { number, check };
         // Rows of blocks outside the chunk, if the service sent any, are not used.
         while block_rows.next_if(|row| row.number < number).is_some() {}
         let _before = take_while(&mut transactions, |tx| tx.block_number < number);
         let _before = take_while(&mut logs, |log| log.block_number < number);
-        let row = block_rows
-            .next_if(|row| row.number == number)
-            .ok_or_else(|| failed(Check::Missing))?;
-        let block_transactions = take_while(&mut transactions, |tx| tx.block_number == number);
-        let block_logs = take_while(&mut logs, |log| log.block_number == number);
-
-        let block = verify_block(
-            forks,
-            row,
-            block_transactions,
-            block_logs,
-            &mut hashes,
-            &mut stats,
-        )
-        .map_err(failed)?;
-        if let Some(previous) = blocks.last()
-            && previous.encoded.hash != row.parent_hash
-        {
-            return Err(failed(Check::ParentLink {
-                parent: row.parent_hash,
-                previous: previous.encoded.hash,
-            }));
-        }
+        let block = match block_rows.next_if(|row| row.number == number) {
+            None => Err(Check::Missing),
+            Some(row) => {
+                let block_transactions =
+                    take_while(&mut transactions, |tx| tx.block_number == number);
+                let block_logs = take_while(&mut logs, |log| log.block_number == number);
+                verify_block(
+                    forks,
+                    row,
+                    block_transactions,
+                    block_logs,
+                    &mut hashes,
+                    &mut stats,
+                )
+                .and_then(|block| match previous {
+                    Some(previous) if previous != row.parent_hash => Err(Check::ParentLink {
+                        parent: row.parent_hash,
+                        previous,
+                    }),
+                    _ => Ok(block),
+                })
+            }
+        };
+        let block = match block {
+            Ok(block) => block,
+            Err(check) => {
+                previous = None;
+                if failed(number, check) {
+                    continue;
+                }
+                break;
+            }
+        };
+        previous = Some(block.encoded.hash);
         stats.blocks = stats.blocks.saturating_add(1);
         stats.transactions = stats
             .transactions
@@ -189,6 +246,10 @@ fn verify_block(
         return Err(Check::HeaderHash {
             computed,
             reported: row.hash,
+            roots: Box::new(Roots {
+                transactions: transactions_root,
+                receipts: receipts_root,
+            }),
         });
     }
 

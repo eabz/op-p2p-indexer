@@ -491,7 +491,7 @@ struct Ready {
 /// its blocks from `next` on and prepares their records. Blocking, CPU-bound.
 fn prepare(forks: &Forks, chunk: Chunk, raw: &Path, fill: &Path, next: u64) -> eyre::Result<Ready> {
     let (stats, blocks) =
-        block::verify_chunk(forks, chunk, raw, fill, None).map_err(|err| failed(&err, raw))?;
+        block::verify_chunk(forks, chunk, raw, fill).map_err(|err| failed(&err, raw))?;
     let mut ready = Ready {
         records: Vec::with_capacity(blocks.len()),
         stats,

@@ -88,9 +88,15 @@ enum Check {
     Ommers(B256),
     #[error(
         "the rebuilt header hashes to {computed}, the block's hash is {reported}: a header \
-         field, a transaction, a receipt or a log is not what the chain has"
+         field, a transaction, a receipt or a log is not what the chain has (the rows give \
+         {roots})"
     )]
-    HeaderHash { computed: B256, reported: B256 },
+    HeaderHash {
+        computed: B256,
+        reported: B256,
+        /// Boxed: a check is returned on every path.
+        roots: Box<Roots>,
+    },
     #[error("parent hash is {parent}, the block before has hash {previous}")]
     ParentLink { parent: B256, previous: B256 },
     #[error(
@@ -174,23 +180,63 @@ impl Stats {
     }
 }
 
-/// Rebuilds the downloaded chunk at `raw` with its fill at `fill` and then `overlay` as
-/// `verify` does, and says why it does not rebuild to its hashes, if it does not, with the
-/// block that does not, if one: `fill`'s check of the fields it rebuilt, before it writes them.
-/// Blocking, CPU-bound.
-pub(crate) fn rebuild_error(
+/// The transactions and receipts roots a block's rows give.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Roots {
+    pub(crate) transactions: B256,
+    pub(crate) receipts: B256,
+}
+
+impl std::fmt::Display for Roots {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "transactions root {} and receipts root {}",
+            self.transactions, self.receipts
+        )
+    }
+}
+
+/// A block of a chunk that does not rebuild to its hash.
+#[derive(Debug)]
+pub(crate) struct Unhashed {
+    pub(crate) number: u64,
+    pub(crate) why: String,
+    /// The roots its rows give, if its header was rebuilt.
+    pub(crate) roots: Option<Roots>,
+}
+
+/// Rebuilds every block of the downloaded chunk at `raw` with its fill at `fill` and then
+/// `overlay` as `verify` does, each against its own hash, and returns those that do not
+/// rebuild to it: `fill`'s check of what it rebuilt, before it writes it. Blocking, CPU-bound.
+///
+/// # Errors
+///
+/// Returns why, if the chunk or its fill cannot be read.
+pub(crate) fn unhashed_blocks(
     forks: &Forks,
     chunk: Chunk,
     raw: &std::path::Path,
     fill: &std::path::Path,
     overlay: crate::fill::Fill,
-) -> Option<(Option<u64>, String)> {
-    let err = block::verify_chunk(forks, chunk, raw, fill, Some(overlay)).err()?;
-    let block = match &err {
-        ChunkError::Block { number, .. } => Some(*number),
-        ChunkError::Fill(_) | ChunkError::Rows { .. } => None,
-    };
-    Some((block, err.to_string()))
+) -> Result<Vec<Unhashed>, String> {
+    let failing =
+        block::failing_blocks(forks, chunk, raw, fill, overlay).map_err(|err| err.to_string())?;
+    Ok(failing
+        .into_iter()
+        .map(|(number, check)| {
+            let roots = if let Check::HeaderHash { roots, .. } = &check {
+                Some(**roots)
+            } else {
+                None
+            };
+            Unhashed {
+                number,
+                why: ChunkError::Block { number, check }.to_string(),
+                roots,
+            }
+        })
+        .collect())
 }
 
 /// Verifies, seals and uploads the blocks of `plan` the store does not list yet, then, once

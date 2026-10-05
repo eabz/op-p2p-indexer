@@ -235,11 +235,16 @@ download and L1 have (`bin/op-indexer-import/src/fill/derive.rs`):
   it the data availability footprint: RPC).
 - **Checked before written.** The chunks are read in parallel and rebuilt in block order. A
   chunk's rebuilt fields are kept in memory while the chunk is rebuilt whole, as `verify` does,
-  with them on top of its fill (on every core, within the same 256 MiB bound); only if every
-  block hashes are they written to the fill. If a block does not hash, the chunk's headers are
-  fetched from the RPC instead; without an endpoint the run stops naming the chunk and the
-  block. Nothing unchecked is written, so a stopped run leaves nothing behind that would hide
-  a missing field from the next scan. A chunk that needs the RPC for anything else (a block
+  with them on top of its fill (on every core, within the same 256 MiB bound), each block
+  against its own hash; only the fields of blocks that hash are written to the fill, merged
+  field by field into what it holds. A block that does not hash is fetched whole from the RPC
+  (transactions, receipts and header fields), which replaces the rows the service sent of it:
+  the rebuilt values may be right and a transaction, receipt or log row wrong (seen on Base,
+  block 3,109,100 among others). The fetch logs whether the transactions root or
+  the receipts root the rows give differs from the RPC's. Without an endpoint the run stops,
+  naming the block, the roots its rows give and everything rebuilt for it. Nothing unchecked
+  is written, so a stopped run leaves nothing behind that would hide a missing field from the
+  next scan, and a fill an earlier build left short of a field is completed by the next. A chunk that needs the RPC for anything else (a block
   whose field cannot be rebuilt, as above, an L1 origin not found, a list, a hole) has all its
   header fields fetched with it.
 - **One base fee leads to the next**: a stretch without base fees is rebuilt from the block
