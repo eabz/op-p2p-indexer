@@ -518,15 +518,16 @@ pub(super) fn rebuild(
                             number: row.number,
                             index: deposit.index,
                             hash: (!deposit.has_source).then_some(hash),
-                            mint: mint.filter(|_| deposit.mint.is_none()),
+                            // After the L1-attributes deposit, one that is not a user's (an
+                            // upgrade) mints nothing.
+                            mint: (deposit.index > 0 && deposit.mint.is_none())
+                                .then(|| mint.unwrap_or_default()),
                             from,
                         };
                         if source.hash.is_some() || source.mint.is_some() {
                             sources.push(source);
                         }
                     }
-                    // A deposit with neither left lacking a mint is not a user deposit's: it
-                    // mints nothing, which `verify` reads as zero.
                 }
                 Err(field) => {
                     left.get_or_insert(field);
