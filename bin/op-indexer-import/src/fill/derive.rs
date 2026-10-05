@@ -33,6 +33,7 @@
 //! checks a chunk's before writing them.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use alloy_consensus::EMPTY_ROOT_HASH;
 use alloy_eips::BlockNumHash;
@@ -42,8 +43,8 @@ use op_alloy_consensus::{
     L1InfoDepositSource, UpgradeDepositSource, UserDepositSource, decode_holocene_extra_data,
 };
 use op_indexer_chainspec::{ChainSpec, Hardfork};
-use serde::{Deserialize, Serialize};
 
+use crate::rows::BlockRow;
 use crate::rpc::RpcHeader;
 use crate::source::{HyperSync, L1Header, SourceError};
 
@@ -145,7 +146,7 @@ impl HeaderRow {
 }
 
 /// The parent of the next block, as the base fee reads it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub(super) struct Parent {
     number: u64,
     timestamp: u64,
@@ -170,6 +171,18 @@ impl Parent {
             gas_used: header.gas_used?.to(),
             base_fee: header.base_fee_per_gas?.to(),
             extra_data: header.extra_data.clone()?,
+        })
+    }
+
+    /// The parent a downloaded row gives (with its fill), if it has its base fee.
+    pub(super) fn of_row(block: &BlockRow) -> Option<Self> {
+        Some(Self {
+            number: block.number,
+            timestamp: block.timestamp.to(),
+            gas_limit: block.gas_limit.to(),
+            gas_used: block.gas_used.to(),
+            base_fee: block.base_fee_per_gas?.to(),
+            extra_data: block.extra_data.clone(),
         })
     }
 }
@@ -320,6 +333,27 @@ pub(super) struct Rebuilt {
     pub(super) sources: Vec<Source>,
     /// The blocks with a field that cannot be rebuilt, and that field (the first).
     pub(super) left: Vec<(BlockNumHash, &'static str)>,
+    /// The blocks whose user deposits' source hashes were rebuilt, with the L1 log indexes
+    /// they were rebuilt from: what to look at when such a block does not hash.
+    pub(super) from_logs: Vec<FromLogs>,
+}
+
+/// The portal logs a block's user deposits' source hashes were rebuilt from.
+#[derive(Debug)]
+pub(super) struct FromLogs {
+    block: u64,
+    origin: u64,
+    log_indexes: Vec<u64>,
+}
+
+impl fmt::Display for FromLogs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "block {} from the logs of L1 block {} at indexes {:?}",
+            self.block, self.origin, self.log_indexes
+        )
+    }
 }
 
 /// Rebuilds the fields `rows` (one chunk's, in block order) lack, from `l1` and from `parent`,
@@ -376,6 +410,18 @@ pub(super) fn rebuild(
         }
         let mut sources = Vec::new();
         if !row.lacking_sources.is_empty() {
+            if let Some(info) = row.l1_info
+                && info.sequence == 0
+                && row.deposits > 1
+                && let Some(log_indexes) = l1.logs(info)
+                && !log_indexes.is_empty()
+            {
+                rebuilt.from_logs.push(FromLogs {
+                    block: row.number,
+                    origin: info.number,
+                    log_indexes: log_indexes.to_vec(),
+                });
+            }
             match self::sources(chain, row, l1) {
                 Some(hashes) => sources.extend(row.lacking_sources.iter().filter_map(|&index| {
                     let hash = *hashes.get(usize::try_from(index).ok()?)?;
