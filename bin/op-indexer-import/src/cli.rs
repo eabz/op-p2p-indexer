@@ -239,8 +239,38 @@ pub(crate) struct DownloadArgs {
     /// whose rows still lack a field or cannot be read: the service's servers do not all answer
     /// alike, and asking again often gives what an answer left out. A new answer replaces the
     /// chunk, and drops its fill, only if it lacks fewer fields.
+    ///
+    /// The scan takes long on a large range, so the chunks it finds are kept in
+    /// `refetch.json` and a later run asks for those, in block order, without scanning again
+    /// (`--rescan` scans again). When the service limits requests (HTTP 429) for longer than a
+    /// couple of short waits, the run stops and keeps what is left for the next.
     #[arg(long, env = "OP_INDEXER_IMPORT_REFETCH_INCOMPLETE")]
     pub(crate) refetch_incomplete: bool,
+    /// With `--refetch-incomplete`: scan the chunks on disk again, even with a list kept.
+    #[arg(long, requires = "refetch_incomplete")]
+    pub(crate) rescan: bool,
+    /// How the scan reads a chunk: `head`, the first block and its transactions of each
+    /// answer (an answer that lacks a field lacks it on every row), or `full`, every row.
+    #[arg(long, value_enum, default_value_t = ScanMode::Head)]
+    pub(crate) scan: ScanMode,
+    /// Requests in flight while `--refetch-incomplete` asks for chunks again: fewer than
+    /// `--requests`, to stay under the service's rate limit.
+    #[arg(
+        long,
+        env = "OP_INDEXER_IMPORT_REFETCH_REQUESTS",
+        default_value_t = 16,
+        value_parser = clap::value_parser!(u64).range(1..=4096)
+    )]
+    pub(crate) refetch_requests: u64,
+}
+
+/// How `download --refetch-incomplete` reads a chunk on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum ScanMode {
+    /// The first block and its transactions of each answer: no row parsed past them.
+    Head,
+    /// Every row.
+    Full,
 }
 
 impl DownloadArgs {

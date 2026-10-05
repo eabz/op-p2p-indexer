@@ -294,37 +294,7 @@ fn read_batches<B: DeserializeOwned + Into<Batch>>(path: &Path) -> Result<Rows, 
     let mut rows = Rows::default();
     {
         // The text is dropped before the rows are sorted: both are large.
-        let file = File::open(path)?;
-        // Room for the whole text at once: growing the buffer step by step copies it again
-        // and again. The service's JSON compresses about tenfold.
-        let stored = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
-        let mut file = BufReader::new(file);
-        let mut tag = [0_u8];
-        file.read_exact(&mut tag)?;
-        let [tag] = tag;
-        let mut data = match Encoding::from_tag(tag) {
-            Some(Encoding::Identity) => Vec::with_capacity(stored),
-            Some(Encoding::Gzip | Encoding::Zstd) => {
-                Vec::with_capacity(stored.saturating_mul(TEXT_PER_STORED_BYTE))
-            }
-            None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("unknown content encoding {tag}"),
-                )
-                .into());
-            }
-        };
-        match Encoding::from_tag(tag) {
-            Some(Encoding::Gzip) => io::copy(&mut MultiGzDecoder::new(file), &mut data)?,
-            Some(Encoding::Zstd) => {
-                io::copy(&mut zstd::stream::Decoder::with_buffer(file)?, &mut data)?
-            }
-            Some(Encoding::Identity) | None => io::copy(&mut file, &mut data)?,
-        };
-        // Checked as text once, so the parser does not check every string again.
-        let text = String::from_utf8(data)
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.utf8_error()))?;
+        let text = read_text(path)?;
         for response in serde_json::Deserializer::from_str(&text).into_iter::<Response<B>>() {
             for batch in response?.data.into_iter().map(Into::<Batch>::into) {
                 rows.blocks.extend(batch.blocks);
@@ -341,4 +311,124 @@ fn read_batches<B: DeserializeOwned + Into<Batch>>(path: &Path) -> Result<Rows, 
     rows.logs
         .dedup_by_key(|log| (log.block_number, log.transaction_index, log.log_index));
     Ok(rows)
+}
+
+/// Reads the head of each answer of a downloaded chunk: its first block row and that block's
+/// transaction rows, no logs. An answer comes from one of the service's servers, and one that
+/// leaves a field out leaves it out of every row (`download`'s check), so the head of each
+/// answer shows what it lacks; the rest of the text is decompressed but not parsed. Blocking.
+///
+/// # Errors
+///
+/// As [`read`].
+pub(crate) fn read_heads(path: &Path) -> Result<Rows, RowsError> {
+    let text = read_text(path)?;
+    let mut rows = Rows::default();
+    let mut rest = text.as_str();
+    // Each answer ends with its cursor; its rows are its logs, transactions and blocks, each a
+    // key that only a key can spell (a string value holds no unescaped quote).
+    while let Some(end) = rest.find(CURSOR) {
+        let (answer, after) = rest.split_at(end.saturating_add(CURSOR.len()));
+        rest = after;
+        let Some(first) = section(answer, BLOCKS)
+            .map(|blocks| first_rows::<BlockRow>(blocks, 1, |_| true))
+            .transpose()?
+            .and_then(|mut blocks| blocks.pop())
+        else {
+            continue;
+        };
+        if let Some(transactions) = section(answer, TRANSACTIONS) {
+            let number = first.number;
+            let own = first_rows::<TransactionRow>(transactions, HEAD_TRANSACTIONS, |tx| {
+                tx.block_number == number
+            })?;
+            rows.transactions.extend(own);
+        }
+        rows.blocks.push(first);
+    }
+    rows.sort();
+    rows.blocks.dedup_by_key(|block| block.number);
+    rows.transactions
+        .dedup_by_key(|tx| (tx.block_number, tx.transaction_index));
+    Ok(rows)
+}
+
+/// The key that ends an answer: its cursor.
+const CURSOR: &str = "\"next_block\"";
+/// The keys of an answer's block and transaction rows.
+const BLOCKS: &str = "\"blocks\"";
+const TRANSACTIONS: &str = "\"transactions\"";
+/// Transaction rows read at most from the head of an answer: a block's.
+const HEAD_TRANSACTIONS: usize = 4096;
+
+/// The text of `answer` inside the array `key` names: where its rows start. JSON allows
+/// whitespace around the colon and the bracket.
+fn section<'a>(answer: &'a str, key: &str) -> Option<&'a str> {
+    let at = answer.find(key)?;
+    answer
+        .get(at.saturating_add(key.len())..)?
+        .trim_start()
+        .strip_prefix(':')?
+        .trim_start()
+        .strip_prefix('[')
+}
+
+/// The rows of the JSON array whose elements start `text`, from the first, at most `most`,
+/// while `keep` says so.
+fn first_rows<T: DeserializeOwned>(
+    text: &str,
+    most: usize,
+    keep: impl Fn(&T) -> bool,
+) -> Result<Vec<T>, RowsError> {
+    let mut rows = Vec::new();
+    let mut rest = text.trim_start();
+    while rows.len() < most && !rest.starts_with(']') {
+        let mut values = serde_json::Deserializer::from_str(rest).into_iter::<T>();
+        let Some(row) = values.next().transpose()? else {
+            break;
+        };
+        if !keep(&row) {
+            break;
+        }
+        rows.push(row);
+        let read = values.byte_offset();
+        rest = rest.get(read..).unwrap_or_default().trim_start();
+        rest = rest.strip_prefix(',').unwrap_or(rest).trim_start();
+    }
+    Ok(rows)
+}
+
+/// The text of a downloaded chunk, decompressed and checked to be UTF-8 (so the parser does
+/// not check every string again). Blocking.
+fn read_text(path: &Path) -> Result<String, RowsError> {
+    let file = File::open(path)?;
+    // Room for the whole text at once: growing the buffer step by step copies it again and
+    // again. The service's JSON compresses about tenfold.
+    let stored = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
+    let mut file = BufReader::new(file);
+    let mut tag = [0_u8];
+    file.read_exact(&mut tag)?;
+    let [tag] = tag;
+    let mut data = match Encoding::from_tag(tag) {
+        Some(Encoding::Identity) => Vec::with_capacity(stored),
+        Some(Encoding::Gzip | Encoding::Zstd) => {
+            Vec::with_capacity(stored.saturating_mul(TEXT_PER_STORED_BYTE))
+        }
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown content encoding {tag}"),
+            )
+            .into());
+        }
+    };
+    match Encoding::from_tag(tag) {
+        Some(Encoding::Gzip) => io::copy(&mut MultiGzDecoder::new(file), &mut data)?,
+        Some(Encoding::Zstd) => {
+            io::copy(&mut zstd::stream::Decoder::with_buffer(file)?, &mut data)?
+        }
+        Some(Encoding::Identity) | None => io::copy(&mut file, &mut data)?,
+    };
+    Ok(String::from_utf8(data)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.utf8_error()))?)
 }

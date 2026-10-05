@@ -942,15 +942,8 @@ pub(crate) fn lacking(
     raw: &Path,
     fill: Option<&Path>,
 ) -> Result<(u64, u64), rows::RowsError> {
-    let count = |rows: &Rows| {
-        let mut count = 0_u64;
-        missing(forks, rows, |_field, _block| {
-            count = count.saturating_add(1);
-        });
-        count
-    };
     let mut rows = rows::read_without_logs(raw)?;
-    let alone = count(&rows);
+    let alone = count_lacking(forks, &rows);
     if alone == 0 {
         return Ok((0, 0));
     }
@@ -958,7 +951,42 @@ pub(crate) fn lacking(
         return Ok((alone, alone));
     };
     apply(&mut rows, fill);
-    Ok((alone, count(&rows)))
+    Ok((alone, count_lacking(forks, &rows)))
+}
+
+/// How many fields the heads of the answers of the downloaded chunk at `raw` lack with what
+/// the fill at `fill` holds ([`rows::read_heads`]): what [`lacking`] counts, from a few rows
+/// of each answer; every row when no answer's head is found. Blocking, CPU-bound.
+///
+/// # Errors
+///
+/// Returns [`rows::RowsError`] if the chunk or the fill cannot be read.
+pub(crate) fn lacking_at_heads(
+    forks: &Forks,
+    raw: &Path,
+    fill: &Path,
+) -> Result<u64, rows::RowsError> {
+    let mut rows = rows::read_heads(raw)?;
+    // A chunk none of whose answers' heads is found is counted in full: never taken for
+    // complete.
+    if rows.blocks.is_empty() {
+        return lacking(forks, raw, Some(fill)).map(|(_, filled)| filled);
+    }
+    if count_lacking(forks, &rows) > 0
+        && let Some(fill) = read_json::<Fill>(fill)?
+    {
+        apply(&mut rows, fill);
+    }
+    Ok(count_lacking(forks, &rows))
+}
+
+/// One per field each row of `rows` lacks, a hole's transactions once ([`missing`]).
+fn count_lacking(forks: &Forks, rows: &Rows) -> u64 {
+    let mut count = 0_u64;
+    missing(forks, rows, |_field, _block| {
+        count = count.saturating_add(1);
+    });
+    count
 }
 
 /// The chunks downloaded and not sealed yet, with the size of their download. Blocking.

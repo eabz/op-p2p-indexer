@@ -12,9 +12,12 @@
 //! times, and the most complete answer is kept; the fill takes what it still lacks. Nothing
 //! is verified here.
 //!
-//! `--refetch-incomplete` also reads every chunk on disk not sealed yet, with its fill, and
-//! asks again for those whose rows still lack a field or cannot be read: a new answer
-//! replaces the chunk (and its fill, which belonged to the old one) only if it lacks less.
+//! `--refetch-incomplete` also reads every chunk on disk not sealed yet, with its fill
+//! ([`scan`]), and asks again for those whose rows still lack a field or cannot be read: a new
+//! answer replaces the chunk (and its fill, which belonged to the old one) only if it lacks
+//! less, every row counted. The scan's list is kept in `refetch.json` and shortened as chunks
+//! are done, so a run stopped by the service's rate limit (HTTP 429, which a couple of short
+//! waits do not outlast) goes on from where it was without scanning again.
 //!
 //! A chunk that fails for a reason that may pass (the service busy or limiting, a broken
 //! connection) is fetched again from its start a few times, with capped, jittered backoff.
@@ -22,11 +25,12 @@
 //! requests in flight finish and are written, and the step ends with a summary of what is
 //! missing. It never spins.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -38,11 +42,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::backoff::Backoff;
+use crate::cli::ScanMode;
 use crate::fill;
 use crate::progress::{self, Rate};
+use crate::scan;
 use crate::source::{Encoding, HyperSync, Meters, SourceError};
 use crate::state::{
-    Chunk, LOW_SPACE_BYTES, MIN_SPACE_BYTES, Plan, State, covered, remove_if_exists,
+    Chunk, LOW_SPACE_BYTES, Lacking, MIN_SPACE_BYTES, Plan, State, covered, remove_if_exists,
 };
 use crate::verify::Forks;
 
@@ -60,6 +66,9 @@ const COMPLETE_ANSWERS: u32 = 8;
 /// Answers in a row no more complete than the best, after which the best is kept: a field no
 /// server has for the chunk (an upgrade deposit's mint, which it has none of).
 const UNIMPROVED_ANSWERS: u32 = 3;
+/// Attempts at an answer the service refuses for the request rate (HTTP 429), the first
+/// included, before the run stops.
+const RATE_LIMITED_ATTEMPTS: u32 = 3;
 /// Wait before asking again for a chunk whose answer lacked a field.
 const INCOMPLETE_WAIT: Duration = Duration::from_millis(250);
 
@@ -146,9 +155,20 @@ impl DownloadError {
 #[derive(Debug, Clone, Copy)]
 struct Job {
     chunk: Chunk,
-    /// For a chunk on disk asked for again: how many fields its rows lack (`u64::MAX` if they
-    /// cannot be read); an answer replaces it only if it lacks fewer.
-    replaces: Option<u64>,
+    /// Whether it is a chunk on disk asked for again: an answer replaces it only if it lacks
+    /// fewer fields, every row counted.
+    on_disk: bool,
+}
+
+/// What `--refetch-incomplete` asks for.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Refetch {
+    /// Scan the chunks on disk again, even with a list kept from the last scan.
+    pub(crate) rescan: bool,
+    /// How the scan reads a chunk.
+    pub(crate) scan: ScanMode,
+    /// Requests in flight while chunks are asked for again.
+    pub(crate) requests: usize,
 }
 
 /// Counts the fields an answer's rows lack, a few answers at a time: the reading is CPU-bound.
@@ -189,9 +209,10 @@ impl Checker {
 }
 
 /// Downloads the missing chunks of `plan` from `source`, `requests` at a time, until all are
-/// on disk, `cancel` fires, a chunk fails for good, or the disk is nearly full; with
-/// `refetch`, also the chunks on disk whose rows, with their fill, lack a field. Answers are
-/// checked on `threads` threads.
+/// on disk, `cancel` fires, a chunk fails for good, the service keeps limiting requests, or
+/// the disk is nearly full; with `refetch`, also the chunks on disk whose rows, with their
+/// fill, lack a field: those the last scan listed (`refetch.json`), else a new scan's, in
+/// block order, the list kept as they are done. Answers are checked on `threads` threads.
 ///
 /// # Errors
 ///
@@ -201,37 +222,19 @@ pub(crate) async fn run(
     source: &HyperSync,
     state: &State,
     plan: &Plan,
-    requests: usize,
+    mut requests: usize,
     threads: usize,
-    refetch: bool,
+    refetch: Option<Refetch>,
     cancel: &CancellationToken,
 ) -> eyre::Result<()> {
-    let missing = {
-        let (state, plan) = (state.clone(), *plan);
-        tokio::task::spawn_blocking(move || {
-            let mut missing = Vec::new();
-            // A chunk `verify` sealed and uploaded needs no download: its file is gone.
-            let sealed = state.sealed_through()?;
-            for chunk in plan.chunks() {
-                if !state.raw_path(chunk).try_exists()? && !covered(sealed, chunk) {
-                    // A fill belongs to the download it was fetched for: one left from an
-                    // earlier download of the chunk goes before the new one is written.
-                    remove_if_exists(&state.fill_path(chunk))?;
-                    missing.push(Job {
-                        chunk,
-                        replaces: None,
-                    });
-                }
-            }
-            io::Result::Ok(missing)
-        })
-        .await??
-    };
-    let checker = Checker::new(plan, threads);
-    let mut jobs = missing;
-    if refetch {
-        jobs.extend(incomplete(state, plan, &checker, threads, cancel).await?);
+    let (jobs, mut refetching) = jobs(state, plan, refetch, threads, cancel).await?;
+    if let Some(refetch) = refetch {
+        requests = refetch.requests;
     }
+    let checker = Checker::new(plan, threads);
+    let refetch_total = refetching.len();
+    // Whether chunks were done since the list was last written: it is, at the progress line.
+    let mut unkept = false;
     let meters = Arc::new(Meters::default());
     let mut done = Progress::new(&jobs, plan.chain.bedrock_block, Arc::clone(&meters));
     info!(
@@ -247,6 +250,7 @@ pub(crate) async fn run(
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     // Why no new chunk is started any more; the chunks in flight still finish.
     let mut stopped: Option<String> = None;
+    let mut rate_limited = false;
 
     loop {
         while stopped.is_none()
@@ -267,12 +271,22 @@ pub(crate) async fn run(
                 break;
             }
             finished = tasks.join_next() => match finished {
-                Some(Ok((job, Ok(fetched)))) => done.chunk_done(job, fetched),
+                Some(Ok((job, Ok(fetched)))) => {
+                    done.chunk_done(job, fetched);
+                    unkept |= refetching.remove(&job.chunk.from).is_some();
+                }
                 Some(Ok((Job { chunk, .. }, Err(err)))) => {
-                    warn!(from = chunk.from, to = chunk.to, %err, "chunk failed");
-                    stopped.get_or_insert_with(|| {
-                        format!("blocks {}..{}: {err}", chunk.from, chunk.to)
-                    });
+                    if matches!(err, DownloadError::Source(SourceError::RateLimited)) {
+                        rate_limited = true;
+                        stopped.get_or_insert_with(|| {
+                            "HyperSync is rate limiting requests (HTTP 429)".to_owned()
+                        });
+                    } else {
+                        warn!(from = chunk.from, to = chunk.to, %err, "chunk failed");
+                        stopped.get_or_insert_with(|| {
+                            format!("blocks {}..{}: {err}", chunk.from, chunk.to)
+                        });
+                    }
                 }
                 Some(Err(err)) => {
                     stopped.get_or_insert_with(|| format!("download task failed: {err}"));
@@ -280,10 +294,14 @@ pub(crate) async fn run(
                 None => break,
             },
             _ = tick.tick() => {
-                let state = state.clone();
-                let free = tokio::task::spawn_blocking(move || state.free_bytes()).await?;
+                let disk = state.clone();
+                let free = tokio::task::spawn_blocking(move || disk.free_bytes()).await?;
                 let free = free.wrap_err("failed to read the free disk space")?;
                 done.log(tasks.len(), free);
+                if unkept {
+                    keep_refetch(state, plan, &refetching).await?;
+                    unkept = false;
+                }
                 if free.is_some_and(|free| free < MIN_SPACE_BYTES) {
                     stopped.get_or_insert_with(|| {
                         format!(
@@ -299,118 +317,129 @@ pub(crate) async fn run(
     // leaves at most a temporary file.
     tasks.shutdown().await;
 
-    let missing = done.summary();
+    if refetch.is_some() {
+        keep_refetch(state, plan, &refetching).await?;
+    }
+    let missing = done.summary(refetching.len());
+    let left = (missing, done.total_chunks, refetching.len(), refetch_total);
+    ended(stopped, rate_limited, left)
+}
+
+/// How the step ended: `left` is the chunks missing of all, and those still to ask for again
+/// of the refetch's.
+fn ended(
+    stopped: Option<String>,
+    rate_limited: bool,
+    (missing, total, refetch_left, refetch_total): (usize, usize, usize, usize),
+) -> eyre::Result<()> {
     match stopped {
         None => Ok(()),
+        Some(reason) if rate_limited => Err(eyre::eyre!(
+            "{reason}: {refetch_left} of {refetch_total} chunks to ask for again left, and \
+             {missing} of {total} chunks in all; run `download` again later, which goes on from \
+             the list kept in refetch.json"
+        )),
         Some(reason) => Err(eyre::eyre!(
-            "download incomplete, {missing} of {} chunks missing: {reason}; run it again to \
-             continue",
-            done.total_chunks
+            "download incomplete, {missing} of {total} chunks missing: {reason}; run it again to \
+             continue"
         )),
     }
 }
 
-/// The chunks on disk not sealed yet whose rows, with their fill, lack a field or cannot be
-/// read, to ask for again; read on `threads` threads, with a progress line now and then.
-async fn incomplete(
+/// The chunks to download: those not on disk, then with `refetch` those on disk to ask for
+/// again (the list kept, by first block, as the map returned), in block order.
+async fn jobs(
     state: &State,
     plan: &Plan,
-    checker: &Checker,
+    refetch: Option<Refetch>,
     threads: usize,
     cancel: &CancellationToken,
-) -> eyre::Result<Vec<Job>> {
-    let chunks = {
+) -> eyre::Result<(Vec<Job>, BTreeMap<u64, Lacking>)> {
+    let missing = {
         let (state, plan) = (state.clone(), *plan);
-        tokio::task::spawn_blocking(move || -> io::Result<Vec<Chunk>> {
+        tokio::task::spawn_blocking(move || {
+            let mut missing = Vec::new();
+            // A chunk `verify` sealed and uploaded needs no download: its file is gone.
             let sealed = state.sealed_through()?;
-            let mut chunks = Vec::new();
-            for chunk in plan.chunks().filter(|chunk| !covered(sealed, *chunk)) {
-                if state.raw_path(chunk).try_exists()? {
-                    chunks.push(chunk);
+            for chunk in plan.chunks() {
+                if !state.raw_path(chunk).try_exists()? && !covered(sealed, chunk) {
+                    // A fill belongs to the download it was fetched for: one left from an
+                    // earlier download of the chunk goes before the new one is written.
+                    remove_if_exists(&state.fill_path(chunk))?;
+                    missing.push(Job {
+                        chunk,
+                        on_disk: false,
+                    });
                 }
             }
-            Ok(chunks)
+            io::Result::Ok(missing)
         })
         .await??
     };
-    let total = chunks.len();
-    info!(
-        chunks = total,
-        "reading the chunks on disk for fields their rows lack"
-    );
-    let read = Arc::new(AtomicUsize::new(0));
-    let stop = Arc::new(AtomicBool::new(false));
-    let scan = {
-        let (state, forks) = (state.clone(), checker.forks);
-        let (read, stop) = (Arc::clone(&read), Arc::clone(&stop));
-        tokio::task::spawn_blocking(move || {
-            let next = AtomicUsize::new(0);
-            let found = Mutex::new(Vec::new());
-            std::thread::scope(|scope| {
-                for _ in 0..threads {
-                    scope.spawn(|| {
-                        while !stop.load(Ordering::Relaxed)
-                            && let Some(&chunk) = chunks.get(next.fetch_add(1, Ordering::Relaxed))
-                        {
-                            let raw = state.raw_path(chunk);
-                            let fill = state.fill_path(chunk);
-                            let replaces = match fill::lacking(&forks, &raw, Some(&fill)) {
-                                Ok((_, 0)) => None,
-                                // What the download alone lacks, which a new one must beat.
-                                Ok((alone, _)) => Some(alone),
-                                Err(err) => {
-                                    warn!(
-                                        from = chunk.from,
-                                        to = chunk.to,
-                                        %err,
-                                        "a chunk on disk cannot be read: downloading it again"
-                                    );
-                                    Some(u64::MAX)
-                                }
-                            };
-                            if let Some(replaces) = replaces
-                                && let Ok(mut found) = found.lock()
-                            {
-                                found.push(Job {
-                                    chunk,
-                                    replaces: Some(replaces),
-                                });
-                            }
-                            read.fetch_add(1, Ordering::Relaxed);
-                        }
-                    });
-                }
-            });
-            let mut found = found.into_inner().unwrap_or_default();
-            found.sort_unstable_by_key(|job| job.chunk.from);
-            found
-        })
-    };
-    tokio::pin!(scan);
-    let mut tick = interval(progress::INTERVAL);
-    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let found = loop {
-        tokio::select! {
-            biased;
-            () = cancel.cancelled(), if !stop.load(Ordering::Relaxed) => {
-                stop.store(true, Ordering::Relaxed);
-            }
-            found = &mut scan => break found?,
-            _ = tick.tick() => {
-                info!(chunks = read.load(Ordering::Relaxed), of = total, "reading the chunks on disk");
+    let mut jobs = missing;
+    // The chunks on disk still to ask for again, by first block: kept in `refetch.json`.
+    let mut refetching: BTreeMap<u64, Lacking> = BTreeMap::new();
+    if let Some(refetch) = refetch {
+        let listed = refetch_list(state, plan, refetch, threads, cancel).await?;
+        let absent: std::collections::BTreeSet<u64> =
+            jobs.iter().map(|job| job.chunk.from).collect();
+        for lacking in listed {
+            // A chunk whose file is gone is downloaded as missing.
+            if !absent.contains(&lacking.from) {
+                jobs.push(Job {
+                    chunk: lacking.chunk(),
+                    on_disk: true,
+                });
+                refetching.insert(lacking.from, lacking);
             }
         }
-    };
-    eyre::ensure!(
-        !cancel.is_cancelled(),
-        "stopped while reading the chunks on disk: run `download` again"
-    );
-    info!(
-        chunks = total,
-        incomplete = found.len(),
-        "chunks on disk read: those lacking a field are asked for again"
-    );
+    }
+    Ok((jobs, refetching))
+}
+
+/// The chunks to ask for again: the list the last scan kept, unless `refetch` asks for a new
+/// scan or there is none for this plan; then a new scan's, which is kept.
+async fn refetch_list(
+    state: &State,
+    plan: &Plan,
+    refetch: Refetch,
+    threads: usize,
+    cancel: &CancellationToken,
+) -> eyre::Result<Vec<Lacking>> {
+    if !refetch.rescan {
+        let (state, plan) = (state.clone(), *plan);
+        let kept = tokio::task::spawn_blocking(move || state.read_refetch(&plan))
+            .await?
+            .wrap_err("failed to read refetch.json")?;
+        if let Some(listed) = kept {
+            info!(
+                chunks = listed.len(),
+                "asking again for the chunks the last scan listed (refetch.json; --rescan scans \
+                 again)"
+            );
+            return Ok(listed);
+        }
+    }
+    let found = scan::incomplete(state, plan, refetch.scan, threads, cancel).await?;
+    keep(state, plan, found.clone()).await?;
     Ok(found)
+}
+
+/// Writes the chunks still to ask for again to `refetch.json`.
+async fn keep_refetch(
+    state: &State,
+    plan: &Plan,
+    refetching: &BTreeMap<u64, Lacking>,
+) -> eyre::Result<()> {
+    keep(state, plan, refetching.values().copied().collect()).await
+}
+
+/// Writes `chunks` to `refetch.json`.
+async fn keep(state: &State, plan: &Plan, chunks: Vec<Lacking>) -> eyre::Result<()> {
+    let (state, plan) = (state.clone(), *plan);
+    tokio::task::spawn_blocking(move || state.write_refetch(&plan, chunks))
+        .await?
+        .wrap_err("failed to write refetch.json")
 }
 
 /// The blocks of one era of the chain, before the Bedrock block or from it on: they differ
@@ -524,7 +553,7 @@ impl Progress {
         self.incomplete = self
             .incomplete
             .saturating_add(usize::from(kept && fetched.lacking > 0));
-        if job.replaces.is_some() {
+        if job.on_disk {
             if kept {
                 self.replaced = self.replaced.saturating_add(1);
             } else {
@@ -588,8 +617,9 @@ impl Progress {
         }
     }
 
-    /// Logs the summary and returns the number of chunks still missing.
-    fn summary(&self) -> usize {
+    /// Logs the summary, with the chunks on disk still to ask for again (`refetch_left`), and
+    /// returns the number of chunks still missing.
+    fn summary(&self, refetch_left: usize) -> usize {
         let secs = self.started.elapsed().as_secs().max(1);
         let missing = self.total_chunks.saturating_sub(self.chunks);
         info!(
@@ -605,6 +635,7 @@ impl Progress {
             incomplete_chunks = self.incomplete,
             replaced_chunks = self.replaced,
             unreplaced_chunks = self.unreplaced,
+            refetch_left,
             "download ended"
         );
         missing
@@ -636,9 +667,15 @@ async fn fetch_chunk(
     let path = state.raw_path(job.chunk);
     // A killed run's is removed when the directory is opened.
     let answer = path.with_extension("answer.tmp");
+    // A chunk on disk: what its answer lacks, every row counted, which a new one must beat.
+    let lacking = if job.on_disk {
+        checker.lacking(&path).await
+    } else {
+        u64::MAX
+    };
     let mut fetched = Fetched {
         bytes: 0,
-        lacking: job.replaces.unwrap_or(u64::MAX),
+        lacking,
         answers: 0,
     };
     let mut unimproved = 0_u32;
@@ -670,7 +707,7 @@ async fn fetch_chunk(
         }
     }
     // A new chunk with no answer that could be read is not on disk: the run says so.
-    if job.replaces.is_none() && fetched.bytes == 0 {
+    if !job.on_disk && fetched.bytes == 0 {
         return Err(DownloadError::Unreadable {
             from: job.chunk.from,
             to: job.chunk.to,
@@ -681,16 +718,33 @@ async fn fetch_chunk(
 }
 
 /// Fetches one answer for `chunk` into the file at `path`, starting over when an attempt
-/// fails for a reason that may pass. Returns the size of the file written.
+/// fails for a reason that may pass. A refusal for the request rate is tried again
+/// [`RATE_LIMITED_ATTEMPTS`] times only: the service's limit lasts longer than a run should
+/// wait, so the run stops and says so. Returns the size of the file written.
 async fn fetch_answer(
     source: &HyperSync,
     meters: &Meters,
     chunk: Chunk,
     path: &Path,
 ) -> Result<u64, DownloadError> {
-    let mut backoff = Backoff::new();
+    let (mut backoff, mut limited) = (Backoff::new(), Backoff::rate_limited());
     loop {
         match attempt_chunk(source, meters, chunk, path).await {
+            Err(err @ DownloadError::Source(SourceError::RateLimited)) => {
+                let Some(wait) = limited
+                    .next()
+                    .filter(|_| limited.attempt() <= RATE_LIMITED_ATTEMPTS)
+                else {
+                    return Err(err);
+                };
+                warn!(
+                    from = chunk.from,
+                    to = chunk.to,
+                    ?wait,
+                    "the service is limiting requests: waiting"
+                );
+                sleep(wait).await;
+            }
             Err(err) if err.may_pass() => {
                 let attempt = backoff.attempt();
                 let Some(wait) = backoff.next() else {

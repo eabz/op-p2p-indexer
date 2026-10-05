@@ -6,6 +6,7 @@
 //! <state>/raw/<from>-<to>.fill.json     fields the service left out, from the chain's RPC (`fill`)
 //! <state>/sealed/<first>-<last>.json    a sealed chunk `verify` uploaded: its manifest entry
 //! <state>/index-build/                  the hash index being built (`verify`)
+//! <state>/refetch.json                  chunks a scan found lacking a field, still to ask for again
 //! <state>/lock                          held by the one process working on the directory
 //! ```
 //!
@@ -35,6 +36,8 @@ use crate::game::GameAnchor;
 /// Version of the state directory's layout and file formats. A directory written with another
 /// version is refused.
 const LAYOUT_VERSION: u32 = 1;
+/// The list of chunks to ask for again ([`State::read_refetch`]).
+const REFETCH_FILE: &str = "refetch.json";
 
 /// Free space below which a step warns with its progress.
 pub(crate) const LOW_SPACE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
@@ -52,6 +55,51 @@ impl Chunk {
     /// Number of blocks in the chunk.
     pub(crate) const fn blocks(self) -> u64 {
         self.to.saturating_sub(self.from)
+    }
+}
+
+/// A chunk a scan found lacking fields, and how many (one per field of each row it read).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Lacking {
+    pub(crate) from: u64,
+    pub(crate) to: u64,
+    /// `u64::MAX` for a chunk that cannot be read.
+    pub(crate) fields: u64,
+}
+
+impl Lacking {
+    pub(crate) const fn chunk(&self) -> Chunk {
+        Chunk {
+            from: self.from,
+            to: self.to,
+        }
+    }
+}
+
+/// The file of [`State::read_refetch`]: the chunks, and the plan they were cut by.
+#[derive(Debug, Serialize, Deserialize)]
+struct RefetchList {
+    plan: RefetchPlan,
+    chunks: Vec<Lacking>,
+}
+
+/// What of a plan decides its chunks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct RefetchPlan {
+    chain_id: u64,
+    first: u64,
+    last: u64,
+    chunk_blocks: u64,
+}
+
+impl RefetchPlan {
+    const fn of(plan: &Plan) -> Self {
+        Self {
+            chain_id: plan.chain.chain_id,
+            first: plan.first,
+            last: plan.last,
+            chunk_blocks: plan.chunk_blocks,
+        }
     }
 }
 
@@ -274,6 +322,33 @@ impl State {
     /// As [`Self::read_sealed`].
     pub(crate) fn sealed_through(&self) -> io::Result<Option<u64>> {
         Ok(contiguous_through(&self.read_sealed()?))
+    }
+
+    /// The chunks the last scan of `download --refetch-incomplete` found lacking a field and
+    /// not asked for again since, in block order; `None` if there is no list, or one made for
+    /// another plan. Blocking.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidData` if the file is damaged, and the I/O error of reading it.
+    pub(crate) fn read_refetch(&self, plan: &Plan) -> io::Result<Option<Vec<Lacking>>> {
+        let list = read_json::<RefetchList>(&self.root.join(REFETCH_FILE))?;
+        Ok(list
+            .filter(|list| list.plan == RefetchPlan::of(plan))
+            .map(|list| list.chunks))
+    }
+
+    /// Keeps `chunks` as the list [`Self::read_refetch`] reads, for `plan`. Blocking.
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error of writing the file.
+    pub(crate) fn write_refetch(&self, plan: &Plan, chunks: Vec<Lacking>) -> io::Result<()> {
+        let list = RefetchList {
+            plan: RefetchPlan::of(plan),
+            chunks,
+        };
+        write_json(&self.root.join(REFETCH_FILE), &list)
     }
 
     /// Records that the sealed chunk `entry` is uploaded, durably. Blocking.

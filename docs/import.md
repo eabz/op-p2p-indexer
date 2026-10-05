@@ -80,8 +80,24 @@ again; a completed chunk is never redone.
   `incomplete_chunks`.
 - **`--refetch-incomplete`** first reads every chunk on disk not sealed yet, with its fill,
   and asks again for those whose rows still lack a field or cannot be read (a damaged file).
-  A new answer replaces the chunk only if it lacks fewer fields; the chunk's fill, which
-  belonged to the old answer, is dropped with it (`replaced_chunks`, `unreplaced_chunks`).
+  A new answer replaces the chunk only if it lacks fewer fields, every row counted; the
+  chunk's fill, which belonged to the old answer, is dropped with it (`replaced_chunks`,
+  `unreplaced_chunks`).
+  - **The scan reads each answer's head** (`--scan head`, the default): its first block row
+    and that block's transactions. An answer comes from one of the service's servers, and one
+    that leaves a field out leaves it out of every row (seen live: 100 of 100 blocks without
+    `mix_hash`, 111 of 111 deposits without `source_hash`). Logs come first in an answer and
+    blocks last, so the whole text is still decompressed, but nothing past the head is parsed:
+    on 200 OP chunks locally 549 chunks/s against 408 for `--scan full` (10 cores; zstd
+    decompression is most of what is left). An answer whose head is not found is read whole.
+    A chunk the head scan misses is still checked whole by the fill's scan and by `verify`.
+  - **The list is kept** in `refetch.json` once the scan is done, and shortened at each
+    progress line as chunks are done: a later run asks for those, in block order, without
+    scanning again (`--rescan` scans again; a list made for another plan is not used).
+  - **Rate limiting**: an answer refused with HTTP 429 is asked for twice more, about 10 and
+    then 25 seconds later; then no new chunk is started and the run ends with what is left
+    (`refetch_left`), keeping the list for the next run. `--refetch-requests` (default 16,
+    `OP_INDEXER_IMPORT_REFETCH_REQUESTS`) sets the requests in flight while refetching.
 - **Stored as it travels.** The response body is written to the chunk's file exactly as
   received, in the content encoding the service chose (zstd is asked for first, then gzip),
   after one byte naming that encoding. Nothing is decompressed to be compressed again. The

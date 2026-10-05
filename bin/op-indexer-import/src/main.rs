@@ -34,6 +34,7 @@ mod game;
 mod progress;
 mod rows;
 mod rpc;
+mod scan;
 mod source;
 mod state;
 mod verify;
@@ -257,7 +258,16 @@ async fn download(
         &plan,
         requests,
         threads(None),
-        args.refetch_incomplete,
+        args.refetch_incomplete
+            .then(|| -> eyre::Result<download::Refetch> {
+                Ok(download::Refetch {
+                    rescan: args.rescan,
+                    scan: args.scan,
+                    requests: usize::try_from(args.refetch_requests)
+                        .wrap_err("--refetch-requests is too large")?,
+                })
+            })
+            .transpose()?,
         cancel,
     )
     .await?;
