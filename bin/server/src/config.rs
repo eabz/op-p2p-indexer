@@ -49,7 +49,7 @@ pub(crate) enum Chunks {
 impl ServerConfig {
     /// Reads the configuration:
     ///
-    /// - Shared TOML configuration and legacy environment files are loaded before this.
+    /// - Shared TOML configuration is loaded before this.
     /// - `server.export`: `true` to also run the exporter (default `false`); `--export` on
     ///   the command line does the same. Exactly one server per deployment, the one with the
     ///   bucket's write key.
@@ -70,7 +70,7 @@ impl ServerConfig {
     ///   ahead and chunk streams open (default sized from the machine:
     ///   [`sizing::server_read_budget`]). Past it readers wait.
     /// - `server.chunks_dir`: read the chunks from this local directory instead of R2,
-    ///   under `r2.prefix` (for local runs and the bench); the R2 variables are
+    ///   under `r2.prefix` (for local runs and the bench); the R2 settings are
     ///   then not needed.
     /// - `server.id`: this server's name, unique in the deployment, in the balancer
     ///   and, on the exporter, the manifest (default: the host name). `server.export_ID`,
@@ -89,7 +89,7 @@ impl ServerConfig {
     ///
     /// # Errors
     ///
-    /// Returns an error if a required variable is missing or one is invalid, or an argument
+    /// Returns an error if a required setting is missing or one is invalid, or an argument
     /// is unknown.
     pub(crate) fn from_config_and_args(chain: &ChainSpec) -> eyre::Result<Self> {
         let mut export = var("OP_INDEXER_EXPORT")

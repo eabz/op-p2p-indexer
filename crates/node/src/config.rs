@@ -1,4 +1,4 @@
-//! Configuration from `OP_INDEXER_*` environment variables.
+//! Node configuration from the selected TOML role and shared defaults.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -46,7 +46,7 @@ const DEFAULT_STREAM_MAX_SUBSCRIPTIONS: usize = 64;
 /// under a client that asks for more streams than the server has.
 const DEFAULT_STREAM_FLIGHT_QUEUE_MS: u64 = 2000;
 
-/// What the environment says about the execution network. The rest of its configuration,
+/// Configured settings for the execution network. The rest of its configuration,
 /// the peers saved by earlier runs, comes from the node store.
 #[derive(Debug)]
 pub(crate) struct ElSettings {
@@ -89,7 +89,7 @@ impl Default for Defaults {
     }
 }
 
-/// What the environment says about the L1 side.
+/// Configured settings for the L1 side.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct L1Settings {
     /// Listen address of the L1 execution p2p node, UDP and TCP.
@@ -102,7 +102,7 @@ pub(crate) struct L1Settings {
     pub(crate) checkpoint: B256,
 }
 
-/// Defaults for the node's intended role. Explicit capability variables override these.
+/// Defaults for the node's intended role. Explicit capability settings override these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Profile {
@@ -170,7 +170,7 @@ impl Config {
     /// - `indexer.profile`: optional `live` (execution receipts), `archive` (receipts,
     ///   range sync and L1 tracking), or `fleet` (archive defaults, requires the server binary
     ///   and its object storage). Archive and fleet need `indexer.l1.checkpoint` while L1
-    ///   is enabled. Explicit capability variables override profile defaults; dependency
+    ///   is enabled. Explicit capability settings override profile defaults; dependency
     ///   validation still applies. Unset preserves the legacy defaults (all three off).
     /// - `chain`: L2 chain id, one of [`ChainSpec::ALL`] (default 10, OP
     ///   Mainnet).
@@ -192,7 +192,7 @@ impl Config {
     /// - `indexer.el.enabled`: `true` to join the execution p2p network (devp2p) and fetch
     ///   the receipts gossip does not carry (default `false`: blocks stay without receipts;
     ///   `true` with a profile or the range sync, which needs it).
-    ///   The variables below only apply when it is enabled.
+    ///   The settings below only apply when it is enabled.
     /// - `indexer.el.listen_addr`: execution p2p listen socket, TCP and UDP (default
     ///   `0.0.0.0:30303`).
     /// - `indexer.el.bootnodes`: comma-separated `enr:` records or `enode://` URLs
@@ -263,7 +263,7 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// Returns an error if a variable is invalid or the settings contradict each other.
+    /// Returns an error if a setting is invalid or the settings contradict each other.
     pub fn from_config() -> eyre::Result<Self> {
         Self::from_config_with(Defaults::default())
     }
@@ -371,7 +371,7 @@ impl Config {
 }
 
 impl Config {
-    /// Returns the selected profile, or `None` for legacy environment-only defaults.
+    /// Returns the selected profile, or `None` for built-in defaults.
     #[must_use]
     pub const fn profile(&self) -> Option<Profile> {
         self.profile
@@ -395,7 +395,7 @@ impl Config {
             max_flights = self.stream.max_flights,
             max_builds = self.stream.max_builds,
             el_max_sessions = self.el.as_ref().map(|el| el.max_sessions),
-            "settings sized from the machine, or set in the environment"
+            "settings sized from the machine, or set in TOML"
         );
     }
 

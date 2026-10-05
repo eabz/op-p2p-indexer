@@ -67,7 +67,7 @@ async fn run(config_file: Option<PathBuf>) -> eyre::Result<()> {
     }
     tracing::info!(
         read_budget_mib = sizing::mib(server.read_budget),
-        "server read budget, sized from the machine or set in the environment"
+        "server read budget, sized from the machine or set in TOML"
     );
     // Startup-only blocking I/O, before any task runs: the tail before the node store, so a
     // data directory of another chain is refused before anything else is written.

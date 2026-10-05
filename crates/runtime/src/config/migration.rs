@@ -32,7 +32,7 @@ pub(super) fn run(
     }
     for key in values.keys() {
         ensure!(
-            key == "OP_INDEXER_CHAIN_ID" || FIELDS.iter().any(|field| field.env == key),
+            key == "OP_INDEXER_CHAIN_ID" || FIELDS.iter().any(|field| field.key == key),
             "legacy file contains an unsupported variable; migration refused to avoid dropping settings"
         );
     }
@@ -55,12 +55,12 @@ pub(super) fn run(
         .collect();
     for key in values.keys() {
         ensure!(
-            key == "OP_INDEXER_CHAIN_ID" || selected.iter().any(|field| field.env == key),
+            key == "OP_INDEXER_CHAIN_ID" || selected.iter().any(|field| field.key == key),
             "legacy file contains settings for a different role; migrate a role-specific env file to avoid dropping settings"
         );
     }
     for field in selected {
-        if let Some(value) = values.get(field.env) {
+        if let Some(value) = values.get(field.key) {
             insert(&mut table, field.path, migrate_value(field, value, &base)?);
         }
     }

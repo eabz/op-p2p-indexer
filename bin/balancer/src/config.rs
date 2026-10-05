@@ -1,4 +1,4 @@
-//! The balancer's configuration, from the environment (and `.env`, loaded before).
+//! The balancer's configuration from its selected TOML section.
 
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -50,7 +50,7 @@ impl BalancerSettings {
     ///
     /// # Errors
     ///
-    /// Returns an error if a required variable is missing or one is invalid, or an argument
+    /// Returns an error if a required setting is missing or one is invalid, or an argument
     /// is unknown.
     pub(crate) fn from_config_and_args() -> eyre::Result<Self> {
         eyre::ensure!(

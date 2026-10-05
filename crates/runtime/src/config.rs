@@ -93,7 +93,7 @@ pub fn initialize(binary: &str) -> eyre::Result<Option<PathBuf>> {
             .filter_map(|field| {
                 fields
                     .get(field.path)
-                    .map(|value| (field.env.to_owned(), value.clone()))
+                    .map(|value| (field.key.to_owned(), value.clone()))
             })
             .collect();
         let chain = table
@@ -191,7 +191,7 @@ pub fn setting_name(key: &str) -> &str {
     FIELDS
         .iter()
         .find(|field| {
-            field.env == key
+            field.key == key
                 && (role.is_some_and(|role| field.path.starts_with(&format!("{role}.")))
                     || field.path.starts_with("r2.")
                     || field.path == "log_filter")

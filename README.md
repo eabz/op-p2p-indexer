@@ -23,8 +23,10 @@ curl -fsSL https://eabz.github.io/op-p2p-indexer/install.sh | sudo bash
 On a fresh box without curl, first run `sudo apt-get update && sudo apt-get install -y curl ca-certificates`.
 The installer handles its remaining Ubuntu prerequisites.
 
-The wizard selects a chain, roles, owning account, credentials and available ports. It can
-register and start systemd services. Run it again to update binaries or change registrations;
+Use ↑/↓ to move, Space to toggle services, and Enter to confirm. The wizard reuses shared TOML settings and
+shows the selected paths and ports before saving. Downloads display progress and stalled
+transfers time out. It can register and start systemd services. Run it again to update binaries
+or change registrations;
 configuration and data are retained. Downloads use the latest published release and verify
 its checksum before replacing binaries atomically. An update takes effect when a process
 restarts. Shared binaries live in `/usr/local/bin`.

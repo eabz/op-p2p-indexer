@@ -15,6 +15,9 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import select
+import termios
+import tty
 from urllib.parse import urlsplit
 try:
     import tomllib
@@ -35,15 +38,127 @@ def fail(message):
 
 
 def ask(prompt, default="", secret=False):
-    with open("/dev/tty", "r+") as tty:
-        label = prompt + (" [" + default + "]" if default and not secret else "") + ": "
-        if secret:
-            value = getpass.getpass(label, stream=tty)
-        else:
-            tty.write(label)
-            tty.flush()
-            value = tty.readline().strip()
-        return value or default
+    # Separate streams work on non-seekable TTYs; r+ creates a seekable buffered wrapper.
+    try:
+        with open("/dev/tty", "w") as output:
+            label = prompt + (" [" + default + "]" if default and not secret else "") + ": "
+            if secret:
+                value = getpass.getpass(label, stream=output)
+            else:
+                output.write(label)
+                output.flush()
+                with open("/dev/tty", "r") as source:
+                    line = source.readline()
+                if not line:
+                    fail("terminal input ended; setup cancelled without choosing a default")
+                value = line.strip()
+            return value or default
+    except EOFError:
+        fail("terminal input ended; setup cancelled")
+    except OSError:
+        fail("interactive setup needs a terminal; use --non-interactive with explicit options")
+
+
+def choose_numbered(title, options, default, multiple=False):
+    with open("/dev/tty", "w") as output:
+        output.write("\n" + title + "\n")
+        for number, (name, description) in enumerate(options, 1):
+            output.write("  " + str(number) + ") " + name + " — " + description + "\n")
+        output.flush()
+    names = [name for name, _ in options]
+    while True:
+        answer = ask("Numbers separated by commas" if multiple else "Number or name", default)
+        selected = []
+        for item in answer.split(","):
+            item = item.strip()
+            if item.isdecimal() and 1 <= int(item) <= len(names):
+                item = names[int(item) - 1]
+            selected.append(item)
+        if all(item in names for item in selected) and (multiple or len(selected) == 1):
+            return ",".join(dict.fromkeys(selected))
+        print("Choose one of the listed " + ("roles." if multiple else "chains."), flush=True)
+
+
+def choose(title, options, default, multiple=False):
+    if os.environ.get("TERM") == "dumb":
+        return choose_numbered(title, options, default, multiple)
+    names = [name for name, _ in options]
+    selected = set()
+    for item in default.split(","):
+        if item.isdecimal() and 1 <= int(item) <= len(options):
+            selected.add(int(item) - 1)
+        elif item in names:
+            selected.add(names.index(item))
+    cursor = min(selected) if selected else 0
+    fd = os.open("/dev/tty", os.O_RDWR)
+    original = termios.tcgetattr(fd)
+    rows = len(options) + 3
+    drawn = False
+    note = ""
+    def write(text):
+        os.write(fd, text.encode())
+    def read_key():
+        key = os.read(fd, 1)
+        if key == b"\x1b" and select.select([fd], [], [], 0.15)[0]:
+            key += os.read(fd, 1)
+            if key in (b"\x1b[", b"\x1bO") and select.select([fd], [], [], 0.15)[0]:
+                key += os.read(fd, 1)
+        return key
+    try:
+        tty.setcbreak(fd)
+        write("\x1b[?25l")
+        while True:
+            if drawn:
+                write("\x1b[" + str(rows) + "A")
+            lines = [title]
+            for index, (name, description) in enumerate(options):
+                pointer = "> " if index == cursor else "  "
+                marker = ("[x] " if index in selected else "[ ] ") if multiple else ""
+                lines.append(pointer + marker + name + " — " + description)
+            lines.append("↑/↓ move · Space toggles · Enter confirms" if multiple else "↑/↓ move · Enter selects")
+            lines.append(note or "Ctrl-C cancels")
+            for line in lines:
+                write("\r\x1b[2K" + line + "\n")
+            drawn = True
+            key = read_key()
+            if key in (b"\x1b[A", b"\x1bOA", b"k"):
+                cursor = (cursor - 1) % len(options)
+            elif key in (b"\x1b[B", b"\x1bOB", b"j"):
+                cursor = (cursor + 1) % len(options)
+            elif key == b" " and multiple:
+                selected.symmetric_difference_update({cursor})
+                note = ""
+            elif key in (b"\n", b"\r"):
+                if not multiple:
+                    return names[cursor]
+                if selected:
+                    return ",".join(names[index] for index in sorted(selected))
+                note = "Select at least one role with Space."
+            elif not key or key == b"\x04":
+                fail("terminal input ended; setup cancelled")
+            elif key in (b"\x03", b"\x1b"):
+                raise KeyboardInterrupt
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, original)
+        write("\x1b[?25h")
+        os.close(fd)
+
+
+def stage(number, title):
+    print("\n[" + str(number) + "/4] " + title, flush=True)
+
+
+def summary(config, chain, roles, registered=False):
+    print("\nSetup complete", flush=True)
+    print("  Chain:  " + chain)
+    print("  Roles:  " + ", ".join(roles))
+    print("  Config: " + str(config) + " (private; shared settings remain inherited)")
+    if registered:
+        print("  Group:  indexer-chain-" + chain + ".target")
+    else:
+        print("  Services were not registered or started.")
+    if "importer" in roles:
+        print("  Importer is a command-line tool; no background service was created.")
 
 
 def yes(prompt):
@@ -86,7 +201,7 @@ def read_config(path, local=None):
         if parent is not None:
             if not isinstance(parent, str) or not parent:
                 fail("extends must name a configuration file")
-            inherited = current.parent / parent
+            inherited = (current.parent / parent).resolve()
             if not inherited.is_file():
                 fail("inherited configuration file is missing")
             base = load(inherited, None, seen + [canonical])
@@ -219,6 +334,30 @@ def quote(value, argument=False):
     return '"' + (escaped.replace("$", "$$") if argument else escaped) + '"'
 
 
+def working_directory(directory):
+    # Unlike ExecStart arguments, systemd's path directive must not be shell-quoted.
+    value = str(directory)
+    if not Path(value).is_absolute() or value != value.strip() or "\\" in value or any(ord(c) < 32 for c in value):
+        fail("service working directory must be absolute, without control characters, backslashes or trailing whitespace")
+    return value.replace("%", "%%")
+
+
+def saved_directory(text):
+    value = None
+    for line in text.splitlines():
+        if line.startswith("WorkingDirectory="):
+            value = line.partition("=")[2]
+    if value is None:
+        return None
+    # Read our older quoted units so rerunning setup repairs them in place.
+    if value.startswith('"'):
+        words = shlex.split(value)
+        if len(words) != 1:
+            fail("invalid managed service working directory")
+        value = words[0]
+    return Path(value.replace("%%", "%"))
+
+
 def unit_name(role, chain):
     return role + "-" + chain + ".service"
 
@@ -226,7 +365,7 @@ def unit_name(role, chain):
 def service(role, chain, user, directory, prefix):
     return (MARKER + "[Unit]\nDescription=OP indexer " + role + " (" + chain + ")\n"
             "After=network-online.target\nWants=network-online.target\nPartOf=indexer-chain-" + chain + ".target\n"
-            "\n[Service]\nType=simple\nUser=" + user + "\nWorkingDirectory=" + quote(directory) + "\n"
+            "\n[Service]\nType=simple\nUser=" + user + "\nWorkingDirectory=" + working_directory(directory) + "\n"
             "ExecStart=" + quote(prefix / "bin" / role, argument=True) + " --config " + quote(directory / "config.toml", argument=True) + "\n"
             "Restart=on-failure\nRestartSec=5\nTimeoutStopSec=120\nUMask=0077\n"
             "\n[Install]\nWantedBy=multi-user.target\n")
@@ -257,7 +396,11 @@ def managed(path):
 def systemctl(*args):
     if sys.platform != "linux" or os.geteuid() != 0 or not Path("/run/systemd/system").exists():
         fail("systemd registration/control requires root on a Linux systemd host")
-    subprocess.run(["systemctl", *args], check=True)
+    print("Running systemctl " + " ".join(args) + "…", flush=True)
+    try:
+        subprocess.run(["systemctl", *args], check=True, timeout=150)
+    except subprocess.TimeoutExpired:
+        fail("systemctl timed out after 150 seconds; the operation may still continue; inspect selected services with systemctl status")
 
 
 def main():
@@ -275,6 +418,9 @@ def main():
         p.add_argument("--" + flag, action="store_true")
     a = p.parse_args()
     interactive = not a.non_interactive
+    if interactive:
+        print("OP P2P Indexer · Chain setup", flush=True)
+        stage(1, "Choose account, chain and roles")
     username = a.user or os.environ.get("SUDO_USER") or getpass.getuser()
     if interactive:
         username = ask("Account owning data and running services", username)
@@ -285,10 +431,10 @@ def main():
         fail("run as selected account or root")
     root = (a.root or Path(account.pw_dir) / "indexer").expanduser().absolute()
     prefix = a.prefix.absolute()
-    chain = a.chain or (ask("Chain: op, unichain, base", "unichain") if interactive else None)
+    chain = a.chain or (choose("Choose a chain", (("op", "OP Mainnet"), ("unichain", "Unichain"), ("base", "Base")), "2") if interactive else None)
     if chain not in CHAINS:
         fail("--chain is required")
-    raw_roles = a.roles or (ask("Roles, comma-separated: server,indexer,balancer,importer", "server") if interactive else "")
+    raw_roles = a.roles or (choose("Select roles", (("server", "R2-backed full node"), ("indexer", "local archive full node"), ("balancer", "fleet request directory"), ("importer", "one-time history import tools")), "1", multiple=True) if interactive else "")
     roles = list(dict.fromkeys(role.strip() for role in raw_roles.split(",")))
     if any(role not in ROLES for role in roles):
         fail("--roles must name server,indexer,balancer,importer")
@@ -296,6 +442,7 @@ def main():
     config = directory / "config.toml"
     if root.is_symlink() or directory.is_symlink():
         fail("root and chain directories must not be symlinks")
+    working_directory(directory)
     data = read_local(config)
     if not config.exists() and (root / "config.toml").is_file():
         data["extends"] = "../config.toml"
@@ -320,7 +467,7 @@ def main():
         if installed.exists():
             managed(installed)
             text = installed.read_text()
-            if "User=" + username + "\n" not in text or "WorkingDirectory=" + quote(directory) + "\n" not in text:
+            if "User=" + username + "\n" not in text or saved_directory(text) != directory:
                 fail("chain service belongs to another user/root: " + installed.name)
     managed(UNIT_DIR / ("indexer-chain-" + chain + ".target"))
     if a.action in ("restart", "remove", "update"):
@@ -348,6 +495,11 @@ def main():
                 systemctl("restart", *units)
         print("Configuration and data preserved.")
         return
+    if interactive:
+        stage(2, "Configure selected roles")
+        print("Config: " + str(config), flush=True)
+        if data.get("extends"):
+            print("Shared settings: " + str(data["extends"]), flush=True)
     reserved = set()
     other = set()
     saved_configs = set(root.glob("*/config.toml"))
@@ -356,11 +508,9 @@ def main():
     for installed in UNIT_DIR.glob("*.service"):
         if installed.is_symlink() or not installed.read_text().startswith(MARKER):
             continue
-        for line in installed.read_text().splitlines():
-            if line.startswith("WorkingDirectory="):
-                values = shlex.split(line.partition("=")[2])
-                if len(values) == 1:
-                    saved_configs.add(Path(values[0].replace("%%", "%")) / "config.toml")
+        saved = saved_directory(installed.read_text())
+        if saved is not None:
+            saved_configs.add(saved / "config.toml")
     for saved in saved_configs:
         saved_ports = ports(read_config(saved))
         reserved.update(saved_ports)
@@ -471,6 +621,8 @@ def main():
         state_paths.append((directory / state).resolve())
     if len(state_paths) != len(set(state_paths)):
         fail("each node/importer role needs a distinct state directory")
+    if interactive:
+        stage(3, "Validate and save configuration")
     content = toml(data)
     directory.mkdir(parents=True, exist_ok=True)
     if os.geteuid() == 0:
@@ -483,17 +635,39 @@ def main():
         for role in ROLES:
             if role not in effective:
                 continue
+            print("Checking " + role + " configuration (up to 30 seconds)…", flush=True)
             check_capability(prefix, role)
             binary = prefix / "bin" / ("import" if role == "importer" else role)
-            result = subprocess.run([str(binary), "--config", candidate, "--check-config"], capture_output=True, text=True)
+            try:
+                result = subprocess.run([str(binary), "--config", candidate, "--check-config"], capture_output=True, text=True, timeout=30)
+            except subprocess.TimeoutExpired:
+                fail(role + " configuration check timed out after 30 seconds; existing config unchanged")
             if result.returncode:
                 fail(role + " config validation failed; check required settings (values withheld)")
+        if interactive:
+            print("\nReview configuration", flush=True)
+            print("  File: " + str(config))
+            for role in roles:
+                section = effective.get(role, {})
+                key = "state_dir" if role == "importer" else "data_dir"
+                if role != "balancer":
+                    path = (directory / section.get(key, "data/" + role)).resolve()
+                    print("  " + role + " state: " + str(path))
+                listeners = ports({role: section})
+                if listeners:
+                    print("  " + role + " ports: " + ", ".join(str(port) for port in listeners))
+            print("  Secrets are hidden. Shared settings stay in their source files.", flush=True)
+            if not yes("Apply this configuration?"):
+                fail("configuration not applied; existing config unchanged")
         atomic(config, content, 0o600, account)
     finally:
         os.unlink(candidate)
     print("Saved " + str(config) + " (0600). Existing data retained.")
+    if interactive:
+        stage(4, "Choose service registration and startup")
     register = a.register or a.enable or a.start or (interactive and units and yes("Register selected systemd services?"))
     if not register or not units:
+        summary(config, chain, roles)
         return
     systemctl("--version")
     target = UNIT_DIR / ("indexer-chain-" + chain + ".target")
@@ -512,11 +686,14 @@ def main():
         systemctl("enable", *units)
     if a.start or (interactive and yes("Start selected services now?")):
         systemctl("start", *units)
-    print("Registered " + ", ".join(units) + "; group " + target.name)
+    print("Registered " + ", ".join(units))
+    summary(config, chain, roles, registered=True)
 
 
 if __name__ == "__main__":
     try:
         main()
-    except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
+    except KeyboardInterrupt:
+        fail("cancelled by user")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.CalledProcessError) as error:
         fail(type(error).__name__ + ": check paths, permissions and configuration")

@@ -9,6 +9,7 @@ main() (
     local download_dir="" bin_stage="" share_stage=""
     local action="" non_interactive=0 binaries_only=0
     local setup_args=()
+    step() { printf "\n==> %s\n" "$*" >&2; }
     die() { printf 'install: %s\n' "$*" >&2; exit 1; }
     cleanup() {
         if [[ -n "$bin_stage" ]]; then rm -rf -- "$bin_stage"; fi
@@ -63,6 +64,7 @@ main() (
 
     # The installer itself is the bootstrap: fresh Ubuntu needs no Python/pip preparation.
     # Only known distro packages are installed, and only when a required tool is missing.
+    step "Checking this machine and prerequisites"
     local tool package
     local packages=()
     for tool in curl tar sha256sum mktemp install mv rm mkdir chmod grep; do
@@ -86,8 +88,8 @@ except ImportError:
         command -v apt-get >/dev/null 2>&1 || die "missing prerequisites: ${packages[*]}; install them with your package manager"
         (( EUID == 0 )) || die "missing prerequisites: ${packages[*]}; rerun with sudo or install them first"
         printf 'Installing required Ubuntu packages: %s\n' "${packages[*]}"
-        apt-get update || die 'cannot refresh Ubuntu package metadata'
-        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages[@]}" || die 'cannot install prerequisites'
+        apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update || die 'cannot refresh Ubuntu package metadata'
+        DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=60 -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends "${packages[@]}" || die 'cannot install prerequisites'
     fi
     for tool in uname getconf curl tar sha256sum mktemp install mv rm mkdir chmod grep; do
         command -v "$tool" >/dev/null 2>&1 || die "missing required tool: $tool"
@@ -100,10 +102,55 @@ except ImportError:
 except ImportError:
  import tomli' 2>/dev/null || die 'install TOML support: sudo apt-get install python3-tomli'
         if [[ -z "$action" && "$non_interactive" == 0 ]]; then
-            [[ -r /dev/tty ]] || die 'no terminal; use --non-interactive or --binaries-only'
-            printf '%s\n' 'Choose action: install, add-service, update, restart, remove' >/dev/tty
-            printf 'Action [install]: ' >/dev/tty
-            IFS= read -r action </dev/tty || die 'cannot read terminal'
+            local tty_fd
+            { exec {tty_fd}<>/dev/tty; } 2>/dev/null || die 'no terminal; use --non-interactive or --binaries-only'
+            local labels=("Install and configure" "Add a service" "Update binaries" "Restart services" "Remove services (keep data)")
+            local actions=(install add-service update restart remove)
+            local selected=0 index key sequence
+            printf '\nOP Indexer setup\n' >&"$tty_fd"
+            if [[ "${TERM:-dumb}" != dumb && -t "$tty_fd" ]]; then
+                printf 'Use ↑/↓ to move, Enter to select, or q to cancel.\n\n' >&"$tty_fd"
+                while :; do
+                    for index in "${!labels[@]}"; do
+                        if (( index == selected )); then
+                            printf '\r\033[2K  > \033[7m%s\033[0m\n' "${labels[index]}" >&"$tty_fd"
+                        else
+                            printf '\r\033[2K    %s\n' "${labels[index]}" >&"$tty_fd"
+                        fi
+                    done
+                    IFS= read -rsn1 key <&"$tty_fd" || die 'terminal closed; nothing selected'
+                    case "$key" in
+                        "") action="${actions[selected]}"; break ;;
+                        q|Q) die 'cancelled' ;;
+                        1|2|3|4|5) selected=$((key - 1)) ;;
+                        $'\033')
+                            sequence=""
+                            IFS= read -rsn2 -t 0.2 sequence <&"$tty_fd" || true
+                            case "$sequence" in
+                                '[A'|'OA') selected=$(((selected + 4) % 5)) ;;
+                                '[B'|'OB') selected=$(((selected + 1) % 5)) ;;
+                            esac ;;
+                    esac
+                    printf '\033[5A' >&"$tty_fd"
+                done
+            else
+                for index in "${!labels[@]}"; do
+                    printf '  %s) %s\n' "$((index + 1))" "${labels[index]}" >&"$tty_fd"
+                done
+                while :; do
+                    printf '\nChoose an action [1]: ' >&"$tty_fd"
+                    IFS= read -r action <&"$tty_fd" || die 'terminal closed; nothing selected'
+                    case "$action" in
+                        ""|1|install) action=install; break ;;
+                        2|add-service) action=add-service; break ;;
+                        3|update) action=update; break ;;
+                        4|restart) action=restart; break ;;
+                        5|remove) action=remove; break ;;
+                        *) printf 'Enter a number from 1 to 5, or an action name.\n' >&"$tty_fd" ;;
+                    esac
+                done
+            fi
+            exec {tty_fd}>&-
         fi
         action="${action:-install}"
         case "$action" in install|add-service|update|restart|remove) ;; *) die 'invalid action' ;; esac
@@ -116,6 +163,7 @@ except ImportError:
 
     local effective
     if [[ -z "$version" ]]; then
+        step "Finding the latest release on GitHub"
         effective=$(curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 15 --max-time 60 \
             -o /dev/null -w '%{url_effective}' "$repo/releases/latest") || die 'cannot resolve the latest GitHub release'
         [[ "$effective" == "$repo/releases/tag/"* ]] || die "unexpected release redirect: $effective"
@@ -126,11 +174,12 @@ except ImportError:
     archive="$name.tar.gz"
     url="$repo/releases/download/$version"
     download_dir=$(mktemp -d) || die 'cannot create download directory'
-    printf 'Downloading %s...\n' "$version"
-    curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --connect-timeout 15 --max-time 600 \
+    step "Downloading $version (progress below; stalled transfers time out)"
+    curl --proto '=https' --tlsv1.2 -fL --progress-bar --retry 3 --retry-max-time 600 --connect-timeout 15 --max-time 600 --speed-limit 1024 --speed-time 30 \
         -o "$download_dir/$archive" "$url/$archive" || die 'binary download failed'
     curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --connect-timeout 15 --max-time 60 \
         -o "$download_dir/checksum" "$url/$archive.sha256" || die 'checksum download failed'
+    step "Verifying the archive checksum"
     local checksum line="" hash="" listed="" count=0
     # Accept exactly one standard sha256sum record, tied to this release archive.
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -167,6 +216,7 @@ except ImportError:
             members+=("$name/$item")
         fi
     done
+    step "Extracting verified binaries"
     tar -xzf "$download_dir/$archive" -C "$download_dir" --no-same-owner --no-same-permissions \
         -- "${members[@]}" || die 'cannot extract release files'
     for item in "${members[@]}"; do
@@ -177,6 +227,7 @@ except ImportError:
         [[ -s "$download_dir/$name/$binary" ]] || die "archive contains an empty binary: $binary"
     done
 
+    step "Installing binaries to $prefix/bin"
     # Preflight every destination before staging or replacing any installed file.
     for binary in "${binaries[@]}"; do
         [[ ! -d "$prefix/bin/$binary" ]] || die "binary destination is a directory: $prefix/bin/$binary"
@@ -216,6 +267,7 @@ except ImportError:
     printf 'Installed %s to %s/bin\n' "$version" "$prefix"
     printf 'Companion files: %s/share/op-p2p-indexer\n' "$prefix"
     if (( ! binaries_only )); then
+        step "Configuring chains and services"
         python3 "$prefix/share/op-p2p-indexer/setup.py" --prefix "$prefix" --action "$action" "${setup_args[@]}"
     else
         printf 'Configuration and state are unchanged. Restart services explicitly when ready.\n'

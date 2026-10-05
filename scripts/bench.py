@@ -31,6 +31,7 @@ import sys
 import threading
 import time
 from collections import defaultdict
+from pathlib import Path
 
 import pyarrow.flight as flight
 
@@ -266,6 +267,34 @@ def totals(results):
     )
 
 
+def benchmark_settings(path, stack=()):
+    """Read inherited benchmark credentials; child fields override parent fields."""
+    try:
+        import tomllib
+    except ImportError:
+        import tomli as tomllib
+    path = Path(path).resolve(strict=True)
+    if len(stack) >= 8 or path in stack:
+        raise ValueError("configuration inheritance cycle or depth exceeds eight files")
+    with path.open("rb") as source:
+        document = tomllib.load(source)
+    settings = document.get("bench", {})
+    if not isinstance(settings, dict):
+        raise ValueError("bench must be a table")
+    # Validate each layer, including credentials that a child would replace.
+    for key in ("api_key", "balancer_url"):
+        if key in settings and not isinstance(settings[key], str):
+            raise ValueError("benchmark credentials must be strings")
+    parent = document.get("extends")
+    if "extends" in document:
+        if not isinstance(parent, str) or not parent:
+            raise ValueError("extends must be a nonempty file path")
+        inherited = benchmark_settings(path.parent / parent, (*stack, path))
+        inherited.update(settings)
+        return inherited
+    return settings
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--config", default="config.toml", help="TOML file containing [bench] credentials")
@@ -295,12 +324,7 @@ def main():
     if not 0 <= args.start <= args.end <= 2**64 - 1:
         parser.error("require 0 <= --from <= --to <= 2^64-1")
     try:
-        try:
-            import tomllib
-        except ImportError:
-            import tomli as tomllib
-        with open(args.config, "rb") as source:
-            settings = tomllib.load(source).get("bench", {})
+        settings = benchmark_settings(args.config)
         args.key = settings.get("api_key")
         args.balancer = args.balancer or settings.get("balancer_url")
     except ImportError:

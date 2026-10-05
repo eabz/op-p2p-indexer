@@ -27,7 +27,7 @@ use crate::{args, config, say, setting};
 
 /// The flag naming the log file.
 const LOG_FLAG: &str = "--log-file";
-/// The variable naming the log file when the flag is absent.
+/// The setting naming the log file when the flag is absent.
 const LOG_VAR: &str = "OP_INDEXER_LOG_FILE";
 /// The commands.
 const COMMANDS: [&str; 6] = [
