@@ -8,6 +8,7 @@ use eyre::WrapErr;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::time::ChronoUtc;
 
+pub mod config;
 pub mod env_file;
 pub mod machine;
 pub mod service;
@@ -16,9 +17,9 @@ pub mod service;
 #[derive(Debug)]
 #[must_use]
 pub enum Startup {
-    /// Run in the foreground, with the `.env` file loaded from here, if one was.
+    /// Run in the foreground, with the configuration file loaded from here, if one was.
     Run {
-        /// Where the `.env` file was.
+        /// Where the TOML or legacy environment file was.
         env_file: Option<PathBuf>,
     },
     /// The command line asked for something done already (`--version`, a service command):
@@ -27,20 +28,22 @@ pub enum Startup {
 }
 
 /// The start of `indexer`, `server` and `balancer`, before any thread or runtime: answers
-/// `--version` (before the `.env` file, which may not load), loads the `.env` file
-/// ([`env_file::load`]), then runs a service command if the command line names one
+/// `--version` before loading configuration, then resolves TOML or legacy environment
+/// settings ([`config::initialize`]) and runs a service command if the command line names one
 /// ([`service`]).
 ///
 /// # Errors
 ///
-/// Returns an error if the `.env` file cannot be loaded or the service command fails.
+/// Returns an error if configuration cannot be loaded or the service command fails.
 pub fn startup(binary: &str, version: &str) -> eyre::Result<Startup> {
     if version_requested(binary, version) {
         return Ok(Startup::Exit);
     }
-    // Before any thread starts: loading sets environment variables.
-    let env_file = env_file::load(std::env::args_os().skip(1))?;
-    if service::command(binary, env_file.as_deref())? {
+    if config::command(binary)? {
+        return Ok(Startup::Exit);
+    }
+    let env_file = config::initialize(binary)?;
+    if !config::check_requested() && service::command(binary, env_file.as_deref())? {
         return Ok(Startup::Exit);
     }
     Ok(Startup::Run { env_file })
@@ -65,18 +68,19 @@ pub(crate) fn say(line: fmt::Arguments<'_>) {
     drop(writeln!(io::stdout(), "{line}"));
 }
 
-/// Initializes logging and reports the environment file without its contents.
+/// Initializes logging and reports the configuration file without its contents.
 pub fn init_tracing(env_file: Option<&Path>) {
     tracing_subscriber::fmt()
         .with_timer(ChronoUtc::new("%H:%M:%S%.3f".to_owned()))
         // Colours for a terminal only: a log file (`start`, systemd) gets plain text.
         .with_ansi(io::stdout().is_terminal())
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_new(env_var("RUST_LOG").unwrap_or_else(|| "info".to_owned()))
+                .unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
     if let Some(path) = env_file {
-        tracing::info!(path = %path.display(), "loaded env file");
+        tracing::info!(path = %path.display(), "loaded configuration");
     }
 }
 
@@ -90,9 +94,10 @@ pub enum SignalPolicy {
     CtrlCFallback,
 }
 
-/// Reads a nonempty Unicode environment value; absent, empty and non-Unicode values are absent.
+/// Reads the effective value: CLI chain override, nonempty Unicode process environment,
+/// then the selected TOML role. Empty process variables do not hide TOML values.
 pub fn env_var(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|value| !value.is_empty())
+    config::value(name)
 }
 
 /// Reads `name`, which is read for this release only, warning if the environment sets it:
@@ -100,7 +105,7 @@ pub fn env_var(name: &str) -> Option<String> {
 /// automatic). Call it once at startup, after [`init_tracing`]. Never logs the value.
 pub fn deprecated(name: &str, instead: impl fmt::Display) -> Option<String> {
     let value = env_var(name);
-    if value.is_some() {
+    if std::env::var_os(name).is_some() {
         tracing::warn!("{name} is deprecated and read for this release only: {instead}");
     }
     value

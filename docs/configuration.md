@@ -25,7 +25,8 @@ be mode `0600`; generated service files contain paths, not credentials.
 ### Migrate an existing deployment
 
 Keep the old instance stopped while changing service registration. Convert its environment
-file with the binary that owns its state, using an explicit output path:
+file with the binary that owns its state, from its original working directory, using an
+explicit output path:
 
 ```bash
 mkdir -p "$HOME/indexer/unichain"
@@ -33,7 +34,8 @@ server --migrate-env /path/to/old/.env --config "$HOME/indexer/unichain/config.t
 server --config "$HOME/indexer/unichain/config.toml" --check-config
 ```
 
-Migration refuses to overwrite an existing config. Review the generated settings before
+Migration refuses to overwrite an existing config or discard unknown/other-role settings.
+Split a legacy file shared by several roles into role-specific inputs first. Review the generated settings before
 starting; legacy data paths must continue to identify the original state. Add another role
 through the installer so it gets separate paths and ports. Do not run two processes against
 the same database. Environment-file loading remains a deprecated transition path when no

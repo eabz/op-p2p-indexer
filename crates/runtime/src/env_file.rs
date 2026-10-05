@@ -86,7 +86,7 @@ pub fn without_flag(flag: &str, args: impl IntoIterator<Item = OsString>) -> Vec
 /// The arguments the binary itself reads: `args` up to any `--`, without the env file's flag
 /// and its value.
 pub fn other_args(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
-    without_flag(FLAG, args.into_iter().take_while(|arg| arg != "--"))
+    crate::config::other_args(args.into_iter().take_while(|arg| arg != "--"))
 }
 
 /// The value in `arg` if it is `<flag>=<value>`.
