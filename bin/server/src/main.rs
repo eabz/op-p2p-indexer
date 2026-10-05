@@ -61,6 +61,10 @@ async fn run(env_file: Option<PathBuf>) -> eyre::Result<()> {
     })?;
     let chain = config.chain();
     let server = ServerConfig::from_env_and_args(chain)?;
+    if op_indexer_runtime::config::check_requested() {
+        tracing::info!("configuration valid");
+        return Ok(());
+    }
     tracing::info!(
         read_budget_mib = sizing::mib(server.read_budget),
         "server read budget, sized from the machine or set in the environment"

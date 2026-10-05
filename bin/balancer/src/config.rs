@@ -7,7 +7,7 @@ use eyre::{WrapErr, eyre};
 use op_indexer_balancer::BalancerConfig;
 use op_indexer_chainspec::{ChainSpec, OP_MAINNET};
 use op_indexer_chunks::{R2Config, ReadOptions};
-use op_indexer_runtime::env_file;
+use op_indexer_runtime::config;
 use op_indexer_runtime::env_var as var;
 
 /// Clear of the stream's default port (50051).
@@ -53,19 +53,10 @@ impl BalancerSettings {
     /// Returns an error if a required variable is missing or one is invalid, or an argument
     /// is unknown.
     pub(crate) fn from_env_and_args() -> eyre::Result<Self> {
-        let mut args = env::args().skip(1);
-        while let Some(arg) = args.next() {
-            if arg == env_file::FLAG {
-                args.next();
-            } else if !arg
-                .strip_prefix(env_file::FLAG)
-                .is_some_and(|rest| rest.starts_with('='))
-            {
-                return Err(eyre!(
-                    "unknown argument {arg}; the only argument is --env-file"
-                ));
-            }
-        }
+        eyre::ensure!(
+            config::other_args(env::args_os().skip(1)).is_empty(),
+            "unknown balancer argument; use --config, --chain or --check-config"
+        );
         let chain_id = var("OP_INDEXER_CHAIN_ID")
             .map(|id| {
                 id.parse::<u64>()
@@ -86,7 +77,7 @@ impl BalancerSettings {
         if server_keys.is_empty() {
             return Err(eyre!("OP_INDEXER_BALANCER_SERVER_KEYS is required"));
         }
-        let r2 = R2Config::from_env(chain)?;
+        let r2 = R2Config::from_lookup(chain, var)?;
         let presign = match (
             var("OP_INDEXER_R2_PRESIGN_ACCESS_KEY_ID"),
             var("OP_INDEXER_R2_PRESIGN_SECRET_ACCESS_KEY"),

@@ -1,5 +1,58 @@
 # Configuration
 
+## TOML configuration and chain layout
+
+Use [`config.toml.example`](../config.toml.example) as the schema guide. The installer writes
+`~/indexer/<chain>/config.toml` (`op`, `unichain`, or `base`), with separate role state below
+`data/indexer`, `data/server`, and `data/importer`. Relative paths resolve beside the config,
+not against the shell's working directory. Shared R2 credentials live in `[r2]`; role settings
+live in `[indexer]`, `[server]`, `[balancer]` and `[importer]`. Node roles have nested `[stream]`,
+`[p2p]`, `[el]` and `[l1]` tables as shown in the example.
+
+```bash
+indexer --chain unichain
+server --config "$HOME/indexer/unichain/config.toml" --check-config
+import --config "$HOME/indexer/unichain/config.toml" run --help
+```
+
+Command-line flags override process environment, which overrides TOML, which overrides
+machine defaults. TOML is read without copying credentials into the process environment.
+Unknown keys and incorrectly typed values fail startup. `--check-config` validates without
+opening a database or contacting peers/R2; importer operation-specific requirements are
+also checked when its subcommand runs. Configuration files containing credentials should
+be mode `0600`; generated service files contain paths, not credentials.
+
+### Migrate an existing deployment
+
+Keep the old instance stopped while changing service registration. Convert its environment
+file with the binary that owns its state, using an explicit output path:
+
+```bash
+mkdir -p "$HOME/indexer/unichain"
+server --migrate-env /path/to/old/.env --config "$HOME/indexer/unichain/config.toml"
+server --config "$HOME/indexer/unichain/config.toml" --check-config
+```
+
+Migration refuses to overwrite an existing config. Review the generated settings before
+starting; legacy data paths must continue to identify the original state. Add another role
+through the installer so it gets separate paths and ports. Do not run two processes against
+the same database. Environment-file loading remains a deprecated transition path when no
+TOML configuration is selected; explicit `--config` and `--env-file` cannot be combined.
+
+### Several chains on one host
+
+The installer checks saved configurations and occupied TCP/UDP sockets before assigning
+ports. It preserves existing assignments and allows manual choices. Server and indexer
+instances of the same chain also get distinct ports and state. The public advertised Flight
+address must use the selected API port. Service names are `server-unichain.service`,
+`indexer-base.service`, and `balancer-unichain.service`; a chain target groups them for start
+and stop. See the [installer commands](../README.md#install-on-a-server).
+
+## Legacy environment reference
+
+The following examples document the retained environment overrides and transition format.
+New deployments should use TOML and the installer.
+
 Every binary (`indexer`, `server`, `balancer`, `import`) reads `OP_INDEXER_*` environment
 variables, from the process environment or from `.env` in the current directory (`--env-file
 <path>`, or `OP_INDEXER_ENV_FILE`, for another file). The process environment wins over the file.
