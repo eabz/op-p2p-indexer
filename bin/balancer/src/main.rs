@@ -2,7 +2,7 @@
 //! section 6). Servers register with it; clients ask it where to read (Flight
 //! `GetFlightInfo` and `ListFlights`, gRPC `Locate`) and then read from the servers.
 //!
-//! Loads the `.env` file ([`op_indexer_runtime::env_file`]), sets up tracing, reads the
+//! Loads shared configuration ([`op_indexer_runtime::config`]), sets up tracing, reads the
 //! configuration, reads the chain's manifest from R2 (read-only) and runs the
 //! [`Balancer`] until Ctrl-C or SIGTERM.
 
@@ -36,6 +36,10 @@ async fn run(env_file: Option<PathBuf>) -> eyre::Result<()> {
     op_indexer_runtime::init_tracing(env_file.as_deref());
 
     let settings = BalancerSettings::from_env_and_args()?;
+    if op_indexer_runtime::config::check_requested() {
+        info!("configuration valid");
+        return Ok(());
+    }
     let store = ChunkStore::r2(&settings.r2, settings.chain, settings.read)
         .wrap_err("failed to set up the R2 chunk store")?;
     let manifest = Manifest::load(&store)

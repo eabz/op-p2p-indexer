@@ -47,20 +47,18 @@ Requirements: a recent stable Rust, and for a public node open ports 9222 (gossi
 
 ```bash
 cargo build --release
-cp .env.example .env     # then edit it: e.g. OP_INDEXER_EL_ENABLED=true for receipts
-./target/release/indexer
+cp config.toml.example config.toml  # select chain and the roles you run
+./target/release/indexer --config config.toml
 ```
 
-Every setting is an `OP_INDEXER_*` environment variable. Each binary loads `.env` from the
-current directory at startup (or the file given with `--env-file <path>`); a variable already
-set in the shell wins over the file. One file serves every binary.
-[`.env.example`](.env.example) holds only what differs between machines: what to run,
-secrets, and where things are, with a short required block per binary at the top. The tuning
-knobs (Flight streams, memory, execution sessions) are sized from the machine's cores and
-memory and logged at startup; the importer's options are flags (`import <step> --help`).
-[docs/configuration.md](docs/configuration.md) has a minimal `.env` for each binary and, under
-"Advanced settings", every other variable, the sizing formulas and the deprecated names. The
-role switches:
+One `config.toml` serves the roles of a chain. Settings resolve in this order: command-line
+flags, process environment, TOML, machine-sized defaults. Unknown TOML keys are rejected.
+The installer creates `~/indexer/<chain>/config.toml` and separate `data/server`,
+`data/indexer` and `data/importer` directories. Keep configuration private (`chmod 600`).
+Use `--config PATH` explicitly or `--chain unichain` to select the chain's home configuration.
+See [configuration](docs/configuration.md) for migration and the environment override reference.
+
+The equivalent environment switches remain available:
 
 | Variable | Default | |
 |---|---|---|
@@ -89,29 +87,61 @@ For initial fleet history, use `import run` to download and verify/upload in one
 `import download` and `import verify` remain available for recovery and separate operation;
 run `import run --help` for source and destination options.
 
-The node keeps its state in `data-op/` (`data-unichain/`, `data-base/` for the others): its
-identity, known peers, the block archive and the unsafe chain's journal. Several nodes can run
-on one host (another chain, or another build): each with its own data directory, its own ports
-and its own `.env`, run from its own directory or given with `--env-file`. See
-[configuration.md](docs/configuration.md), "A second instance on the same host", and
-[storage.md](docs/storage.md), "Several instances on one host".
+Each role keeps its own identity, peers and state. The installer reserves different ports
+for every role and chain on a host, including stopped instances. Existing legacy data paths
+stay in place during migration; moving a configuration does not move a database.
 
 ## Install on a server
 
 Each release has prebuilt Linux binaries (x86-64, glibc 2.35: Ubuntu 22.04 and newer) of
-`indexer`, `server`, `import` and `balancer`, with `.env.example`, in one archive and its
-SHA-256. To install the latest:
+`indexer`, `server`, `import` and `balancer`. No Rust toolchain or repository clone is needed.
+The guided installer selects the chain, roles, owning account, ports and required credentials,
+then offers systemd registration and startup. From a sudo-enabled account on Ubuntu:
 
 ```bash
-VERSION=$(curl -fsSL https://api.github.com/repos/eabz/op-p2p-indexer/releases/latest | grep -m1 '"tag_name"' | cut -d'"' -f4)
-NAME=op-p2p-indexer-$VERSION-x86_64-linux
-curl -fsSLO "https://github.com/eabz/op-p2p-indexer/releases/download/$VERSION/$NAME.tar.gz"
-curl -fsSLO "https://github.com/eabz/op-p2p-indexer/releases/download/$VERSION/$NAME.tar.gz.sha256"
-sha256sum -c "$NAME.tar.gz.sha256"
-tar -xzf "$NAME.tar.gz" && cd "$NAME"
-cp .env.example .env     # then edit it
-./indexer                # or ./server
+sudo apt-get update && sudo apt-get install -y curl ca-certificates python3 python3-tomli && curl -fsSL https://raw.githubusercontent.com/eabz/op-p2p-indexer/main/scripts/install.sh | sudo bash
 ```
+
+When logged in as root, omit `sudo`. The wizard reads `/dev/tty`, so prompts work when the
+script is piped to Bash. It uses the original sudo account's home unless `--user` or `--root`
+selects another location. Shared binaries go to `/usr/local/bin`.
+
+The installer downloads the latest **published release**, verifies its SHA-256, and replaces
+each binary atomically. Guided setup requires a release containing TOML support; older
+releases can still be installed with `--binaries-only`. It never overwrites data directories.
+Run the same one-liner again to add a role, update binaries, restart selected services or
+remove service registrations while retaining configuration and data.
+
+For automation, download the script and specify the action and chain explicitly:
+
+```bash
+bash install.sh --non-interactive --chain unichain --roles indexer --register --enable --start
+bash install.sh --action update --non-interactive --chain unichain --roles server --restart
+bash install.sh --binaries-only --version v0.1.8 --prefix "$HOME/.local"
+```
+
+For server and balancer automation, supply required settings in the private chain config
+before invoking setup. `--set SECTION.KEY=TOML_VALUE` is available for non-secret overrides.
+Updates preserve configuration and ports; a running process uses its old binary until
+restarted. Binaries are shared, so an update changes the next startup version of all chains.
+The companion benchmark script is installed under `/usr/local/share/op-p2p-indexer/bench.py`;
+its Python/PyArrow environment is separate.
+
+Generated service names include both role and chain:
+
+```bash
+sudo systemctl start server-unichain
+sudo systemctl stop server-unichain
+sudo systemctl restart indexer-base
+sudo journalctl -u server-unichain -f
+sudo systemctl start indexer-chain-unichain.target
+sudo systemctl stop indexer-chain-unichain.target
+```
+
+Chain targets group registered services. Each service runs in the foreground as the selected
+account, logs to journald, and restarts on failure. The importer is an on-demand tool, not a
+restarting daemon. Old units pointing to a checkout must be stopped and disabled before
+starting replacement services against the same state.
 
 To make a release, run `scripts/bump-version.sh patch` (or `minor`, `major`, `X.Y.Z`) on a
 clean tree; it commits the new version and tags it. Pushing the tag
@@ -131,7 +161,7 @@ foreground as before (in tmux, say).
 ./server restart          # stop, then start
 ```
 
-- The files are next to the `.env` loaded (`--env-file`), or in the working directory: the
+- The files are next to the configuration loaded (`--config`, or legacy `--env-file`), or in the working directory: the
   log `<binary>.log` (or `--log-file <path>` / `OP_INDEXER_LOG_FILE`), the pid file
   `<binary>.pid`. The command goes first, before the binary's own arguments
   (`./server start --export`).

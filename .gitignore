@@ -7,3 +7,6 @@
 # Env files hold keys; `.env.example` is tracked.
 .env
 *.env
+
+# Per-chain TOML configuration contains secrets.
+config.toml

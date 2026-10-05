@@ -20,6 +20,36 @@ env:
   RUST_TOOLCHAIN: "1.99.0"
 
 jobs:
+  installer:
+    name: install and update on Ubuntu
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check installer syntax
+        run: bash -n scripts/install.sh
+
+      - name: Install a published release and run the binaries
+        run: |
+          prefix="$RUNNER_TEMP/installed indexer"
+          mkdir -p "$prefix/data"
+          printf 'keep configuration\n' > "$prefix/.env"
+          printf 'keep data\n' > "$prefix/data/sentinel"
+          bash scripts/install.sh --binaries-only --prefix "$prefix"
+          version=$("$prefix/bin/indexer" --version)
+          version="${version#indexer }"
+          for binary in indexer server import balancer; do
+            test "$("$prefix/bin/$binary" --version)" = "$binary $version"
+          done
+          # A pinned reinstall exercises the same replacement path as an update.
+          bash scripts/install.sh --binaries-only --prefix "$prefix" --version "v$version"
+          for binary in indexer server import balancer; do
+            test "$("$prefix/bin/$binary" --version)" = "$binary $version"
+          done
+          test "$(cat "$prefix/.env")" = 'keep configuration'
+          test "$(cat "$prefix/data/sentinel")" = 'keep data'
+
   check:
     name: fmt, clippy, doc
     runs-on: ubuntu-22.04
@@ -46,6 +76,47 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --no-deps --document-private-items --locked
+
+  setup:
+    name: TOML and systemd setup on Ubuntu
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build and setup dependencies
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+          sudo apt-get update
+          sudo apt-get install -y python3-tomli
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the programs being configured
+        run: cargo build --locked --bins
+      - name: Configure two chains and verify systemd units
+        run: |
+          prefix="$RUNNER_TEMP/setup-prefix"
+          root="$RUNNER_TEMP/chains"
+          mkdir -p "$prefix/bin" "$prefix/share/op-p2p-indexer"
+          for binary in indexer server import balancer; do
+            cp "target/debug/$binary" "$prefix/bin/"
+          done
+          (cd "$prefix/bin" && sha256sum indexer server import balancer) > "$prefix/share/op-p2p-indexer/setup-binaries.sha256"
+          for chain in unichain base; do
+            sudo python3 scripts/setup.py --non-interactive --chain "$chain" --roles indexer \
+              --prefix "$prefix" --root "$root" --user "$USER" --register
+            "$prefix/bin/indexer" --config "$root/$chain/config.toml" --check-config
+            test "$(stat -c %a "$root/$chain/config.toml")" = 600
+            sudo systemd-analyze verify "/etc/systemd/system/indexer-$chain.service" \
+              "/etc/systemd/system/indexer-chain-$chain.target"
+          done
+          cp "$root/unichain/config.toml" "$RUNNER_TEMP/before.toml"
+          python3 scripts/setup.py --action update --non-interactive --chain unichain --roles indexer \
+            --prefix "$prefix" --root "$root"
+          cmp "$RUNNER_TEMP/before.toml" "$root/unichain/config.toml"
+          printf '\nunknown_setting = true\n' >> "$root/unichain/config.toml"
+          if "$prefix/bin/indexer" --config "$root/unichain/config.toml" --check-config; then
+            echo 'Unknown configuration key was accepted' >&2
+            exit 1
+          fi
 
   dependencies:
     name: deny, machete

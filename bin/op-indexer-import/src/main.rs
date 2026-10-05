@@ -27,7 +27,7 @@
 mod backoff;
 mod cli;
 mod download;
-use op_indexer_runtime::env_file;
+use op_indexer_runtime::config;
 mod fetch;
 mod fill;
 mod game;
@@ -41,7 +41,6 @@ mod verify;
 
 use std::path::PathBuf;
 
-use clap::Parser;
 use eyre::WrapErr;
 use op_indexer_chainspec::{ChainSpec, OP_MAINNET};
 use tokio_util::sync::CancellationToken;
@@ -64,10 +63,18 @@ fn main() -> eyre::Result<()> {
     if op_indexer_runtime::version_requested(env!("CARGO_BIN_NAME"), env!("CARGO_PKG_VERSION")) {
         return Ok(());
     }
-    // First: loading sets environment variables, which is sound only before the runtime starts
-    // any thread, and the command line falls back to them.
-    let env_file = env_file::load(std::env::args_os().skip(1))?;
-    let cli = Cli::parse();
+    if config::command(env!("CARGO_BIN_NAME"))? {
+        return Ok(());
+    }
+    let env_file = config::initialize(env!("CARGO_BIN_NAME"))?;
+    if config::check_requested() {
+        op_indexer_runtime::init_tracing(env_file.as_deref());
+        tracing::info!(
+            "configuration valid; operation-specific requirements are checked by each import command"
+        );
+        return Ok(());
+    }
+    let cli = Cli::configured();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

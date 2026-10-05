@@ -3,8 +3,8 @@
 //! R2, the balancer); the rest are flags.
 //!
 //! The range is decided by the flags of [`DownloadArgs`]; chain parameters come from the
-//! chainspec. Does not read files or connect anywhere; reads the environment only through clap,
-//! and for the former variables ([`warn_deprecated`], the API token's former name).
+//! chainspec. Uses the shared runtime configuration as clap defaults without connecting
+//! anywhere. Former variables are retained through [`warn_deprecated`].
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use alloy_primitives::B256;
-use clap::{Args, CommandFactory as _, Parser, Subcommand};
+use clap::{Args, CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
 use eyre::eyre;
 
 /// The former name of `OP_INDEXER_IMPORT_API_TOKEN`, still read.
@@ -31,7 +31,12 @@ const DEPRECATED_API_TOKEN_VAR: &str = "ENVIO_API_TOKEN";
 /// the last block known to be committed to L1: the block of the newest dispute game. Blocks
 /// come from Envio `HyperSync`.
 #[derive(Debug, Parser)]
-#[command(name = "import", version, arg = env_file_arg())]
+#[command(
+    name = "import",
+    version,
+    arg = env_file_arg(),
+    after_help = "Shared options: --config PATH, --chain op|unichain|base, --check-config.\nMigrate legacy configuration: --migrate-env PATH --config OUTPUT."
+)]
 pub(crate) struct Cli {
     /// Directory for the plan, the downloaded chunks and the record of the sealed ones. Use
     /// the same one for every step.
@@ -44,6 +49,34 @@ pub(crate) struct Cli {
     pub(crate) state_dir: PathBuf,
     #[command(subcommand)]
     pub(crate) command: Command,
+}
+
+impl Cli {
+    /// Parses flags with the effective configuration as defaults, without putting secrets
+    /// from TOML into the process environment or showing them in generated help.
+    pub(crate) fn configured() -> Self {
+        let args = std::iter::once(std::ffi::OsString::from("import")).chain(
+            op_indexer_runtime::config::other_args(std::env::args_os().skip(1)),
+        );
+        let matches = configured_command(Self::command()).get_matches_from(args);
+        Self::from_arg_matches(&matches).unwrap_or_else(|error| error.exit())
+    }
+}
+
+fn configured_command(command: clap::Command) -> clap::Command {
+    command
+        .mut_args(|arg| {
+            let value = arg
+                .get_env()
+                .and_then(OsStr::to_str)
+                .and_then(op_indexer_runtime::env_var);
+            let arg = arg.env(None::<&str>);
+            match value {
+                Some(value) => arg.default_value(value).hide_default_value(true),
+                None => arg,
+            }
+        })
+        .mut_subcommands(configured_command)
 }
 
 /// The step to run.

@@ -27,11 +27,19 @@ fn main() -> eyre::Result<()> {
 async fn run(env_file: Option<PathBuf>) -> eyre::Result<()> {
     op_indexer_runtime::init_tracing(env_file.as_deref());
 
+    eyre::ensure!(
+        op_indexer_runtime::config::other_args(std::env::args_os().skip(1)).is_empty(),
+        "unknown indexer argument; use --config, --chain or --check-config"
+    );
     let config = Config::from_env()?;
     eyre::ensure!(
         config.profile() != Some(op_indexer_node::Profile::Fleet),
         "the fleet profile requires the server binary"
     );
+    if op_indexer_runtime::config::check_requested() {
+        tracing::info!("configuration valid");
+        return Ok(());
+    }
     // Startup-only blocking I/O, before any task runs: the archive before the node store, so a
     // data directory of another chain is refused before anything else is written.
     std::fs::create_dir_all(config.data_dir()).wrap_err("failed to create data dir")?;

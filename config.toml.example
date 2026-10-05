@@ -1,0 +1,67 @@
+# Copy to ~/indexer/unichain/config.toml and keep private (chmod 600).
+# One file serves all roles for one chain. Values are examples, not production credentials.
+# Paths are relative to this file. CLI overrides process environment, then TOML, then defaults.
+chain = "unichain" # op, unichain, base
+log_filter = "info"
+
+[server]
+data_dir = "data/server"
+# id = "server-1"
+# address = "203.0.113.7:50051"
+# balancer_url = "http://balancer.example:50060"
+# balancer_server_key = "replace-me"
+export = false
+
+[server.stream]
+listen_addr = "127.0.0.1:50051"
+# api_keys = ["replace-me"]
+
+[server.p2p]
+listen_addr = "0.0.0.0:9222"
+
+[server.el]
+enabled = true
+sync = true
+listen_addr = "0.0.0.0:30303"
+
+[server.l1]
+enabled = false
+# checkpoint = "0x..." # Required when enabled: a trusted recent finalized beacon root.
+listen_addr = "0.0.0.0:30304"
+beacon_listen_addr = "0.0.0.0:9001"
+
+[indexer]
+data_dir = "data/indexer"
+[indexer.stream]
+listen_addr = "127.0.0.1:50151"
+[indexer.p2p]
+listen_addr = "0.0.0.0:9322"
+[indexer.el]
+enabled = false
+listen_addr = "0.0.0.0:30403"
+[indexer.l1]
+enabled = false
+listen_addr = "0.0.0.0:30404"
+beacon_listen_addr = "0.0.0.0:9101"
+
+[balancer]
+listen_addr = "0.0.0.0:50060"
+# server_keys = ["replace-me"]
+# api_keys = ["replace-me"]
+
+[importer]
+state_dir = "data/importer"
+# api_token = "replace-me"
+# rpc_endpoint = "https://..."
+# balancer_url = "http://balancer.example:50060"
+# api_key = "replace-me"
+
+[r2]
+# account_id = "replace-me"
+# access_key_id = "replace-me"
+# secret_access_key = "replace-me"
+# bucket = "unichain-snapshot"
+prefix = "archive"
+# public_url = "https://archive.example"
+# presign_access_key_id = "replace-me"
+# presign_secret_access_key = "replace-me"

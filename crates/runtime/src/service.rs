@@ -80,6 +80,11 @@ pub(crate) fn command(binary: &str, env_file: Option<&Path>) -> eyre::Result<boo
         child.remove(at);
     }
     child.retain(|arg| arg != FORCE_FLAG);
+    if let Some(path) = crate::config::path() {
+        child = env_file::without_flag("--config", child);
+        child.push("--config".into());
+        child.push(path.as_os_str().to_owned());
+    }
     match name {
         "start" => node.start(&child)?,
         "stop" => node.stop(force)?,
