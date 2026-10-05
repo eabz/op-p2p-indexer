@@ -1,0 +1,381 @@
+Sequential runs, local macOS client, 2026-10-05 America/Mexico_City.
+All exit codes: 0. API key omitted.
+Command for each cap: python3 -u scripts/bench.py --balancer grpc://146.190.220.254:50060 --table blocks --from 40000000 --to 45000000 --processes 4 --threads 6 --per-server CAP --compression zstd --rpc-timeout 120 --retry-for 300
+
+=== 01-cap8.log ===
+130 jobs for blocks 40000000..45000000 (finalized), 4 processes x 6 threads, compression zstd
+local cap  8 concurrent reads per server (not discovered capacity)
+    5.0s  14/130 jobs  417.2 MB received (0.0 failed-attempt MB), 83.4 decoded MB/s
+   10.0s  29/130 jobs  880.4 MB received (0.0 failed-attempt MB), 87.9 decoded MB/s
+   15.0s  44/130 jobs  1143.9 MB received (0.0 failed-attempt MB), 76.2 decoded MB/s
+   20.0s  55/130 jobs  1354.4 MB received (0.0 failed-attempt MB), 67.7 decoded MB/s
+   25.0s  62/130 jobs  1553.9 MB received (0.0 failed-attempt MB), 62.1 decoded MB/s
+   30.0s  72/130 jobs  1767.0 MB received (0.0 failed-attempt MB), 58.8 decoded MB/s
+   35.0s  78/130 jobs  2010.0 MB received (0.0 failed-attempt MB), 57.4 decoded MB/s
+   40.0s  90/130 jobs  2263.1 MB received (0.0 failed-attempt MB), 56.5 decoded MB/s
+   45.0s  98/130 jobs  2506.6 MB received (0.0 failed-attempt MB), 55.6 decoded MB/s
+   50.1s  98/130 jobs  2742.3 MB received (0.0 failed-attempt MB), 54.8 decoded MB/s
+   55.1s  108/130 jobs  2959.9 MB received (0.0 failed-attempt MB), 53.7 decoded MB/s
+   60.1s  117/130 jobs  3145.5 MB received (0.0 failed-attempt MB), 52.3 decoded MB/s
+   65.1s  122/130 jobs  3237.6 MB received (0.0 failed-attempt MB), 49.7 decoded MB/s
+   70.1s  128/130 jobs  3283.5 MB received (0.0 failed-attempt MB), 46.8 decoded MB/s
+   75.2s  129/130 jobs  3290.0 MB received (0.0 failed-attempt MB), 43.8 decoded MB/s
+
+jobs       130 planned: 130 done, 0 failed, 0 retries, 0.0 s slot/backoff waiting
+time       75.5 s reading, 0.445 s planning, 76.0 s end-to-end
+received   3290.6 decoded MB, 0.0 failed/incomplete MB (not wire bytes)
+read       3290.6 MB, 5000001 rows
+rate       43.6 MB/s, 66201 rows/s
+end-to-end 43.3 useful MB/s
+ttfb incl queue/retries  median 15.073 s, p95 51.760 s
+job latency incl queue/retries  median 28.156 s, p95 65.850 s
+queue      median 14.490 s, p95 51.109 s; failures 0
+attempt failures  exhausted 0, unavailable 0, timeout 0, other 0
+per server (jobs, MB/s over the run, MB/s per stream):
+  grpc+tcp://147.182.143.85:50051             42 jobs      13.3 MB/s      2.0 MB/s
+  grpc+tcp://157.245.140.110:50051            42 jobs      14.5 MB/s      2.2 MB/s
+  grpc+tcp://204.48.27.189:50051              46 jobs      15.8 MB/s      2.4 MB/s
+
+=== 02-cap4.log ===
+130 jobs for blocks 40000000..45000000 (finalized), 4 processes x 6 threads, compression zstd
+local cap  4 concurrent reads per server (not discovered capacity)
+    5.1s  12/130 jobs  257.7 MB received (0.0 failed-attempt MB), 51.0 decoded MB/s
+   10.1s  19/130 jobs  489.9 MB received (0.0 failed-attempt MB), 48.6 decoded MB/s
+   15.1s  25/130 jobs  640.4 MB received (0.0 failed-attempt MB), 42.5 decoded MB/s
+   20.1s  33/130 jobs  803.7 MB received (0.0 failed-attempt MB), 40.0 decoded MB/s
+   25.1s  41/130 jobs  947.2 MB received (0.0 failed-attempt MB), 37.7 decoded MB/s
+   30.1s  47/130 jobs  1099.7 MB received (0.0 failed-attempt MB), 36.5 decoded MB/s
+   35.1s  53/130 jobs  1234.8 MB received (0.0 failed-attempt MB), 35.1 decoded MB/s
+   40.1s  57/130 jobs  1360.9 MB received (0.0 failed-attempt MB), 33.9 decoded MB/s
+   45.2s  63/130 jobs  1477.0 MB received (0.0 failed-attempt MB), 32.7 decoded MB/s
+   50.2s  67/130 jobs  1604.5 MB received (0.0 failed-attempt MB), 32.0 decoded MB/s
+   55.2s  71/130 jobs  1744.2 MB received (0.0 failed-attempt MB), 31.6 decoded MB/s
+   60.2s  79/130 jobs  1885.3 MB received (0.0 failed-attempt MB), 31.3 decoded MB/s
+   65.2s  81/130 jobs  2012.6 MB received (0.0 failed-attempt MB), 30.9 decoded MB/s
+   70.2s  85/130 jobs  2123.7 MB received (0.0 failed-attempt MB), 30.2 decoded MB/s
+   75.3s  88/130 jobs  2239.8 MB received (0.0 failed-attempt MB), 29.8 decoded MB/s
+   80.3s  90/130 jobs  2354.1 MB received (0.0 failed-attempt MB), 29.3 decoded MB/s
+   85.3s  94/130 jobs  2458.2 MB received (0.0 failed-attempt MB), 28.8 decoded MB/s
+   90.3s  100/130 jobs  2603.1 MB received (0.0 failed-attempt MB), 28.8 decoded MB/s
+   95.4s  105/130 jobs  2761.3 MB received (0.0 failed-attempt MB), 28.9 decoded MB/s
+  100.4s  108/130 jobs  2912.6 MB received (0.0 failed-attempt MB), 29.0 decoded MB/s
+  105.4s  121/130 jobs  3184.3 MB received (0.0 failed-attempt MB), 30.2 decoded MB/s
+  110.5s  127/130 jobs  3262.9 MB received (0.0 failed-attempt MB), 29.5 decoded MB/s
+  115.6s  128/130 jobs  3288.6 MB received (0.0 failed-attempt MB), 28.5 decoded MB/s
+
+jobs       130 planned: 130 done, 0 failed, 0 retries, 1014.9 s slot/backoff waiting
+time       116.4 s reading, 0.442 s planning, 116.8 s end-to-end
+received   3290.6 decoded MB, 0.0 failed/incomplete MB (not wire bytes)
+read       3290.6 MB, 5000001 rows
+rate       28.3 MB/s, 42959 rows/s
+end-to-end 28.2 useful MB/s
+ttfb incl queue/retries  median 37.612 s, p95 102.562 s
+job latency incl queue/retries  median 48.951 s, p95 106.310 s
+queue      median 25.323 s, p95 90.260 s; failures 0
+attempt failures  exhausted 0, unavailable 0, timeout 0, other 0
+per server (jobs, MB/s over the run, MB/s per stream):
+  grpc+tcp://147.182.143.85:50051             46 jobs       9.9 MB/s      2.7 MB/s
+  grpc+tcp://157.245.140.110:50051            42 jobs       9.1 MB/s      2.4 MB/s
+  grpc+tcp://204.48.27.189:50051              42 jobs       9.2 MB/s      2.5 MB/s
+
+=== 03-cap4.log ===
+130 jobs for blocks 40000000..45000000 (finalized), 4 processes x 6 threads, compression zstd
+local cap  4 concurrent reads per server (not discovered capacity)
+    5.0s  10/130 jobs  307.6 MB received (0.0 failed-attempt MB), 61.4 decoded MB/s
+   10.0s  23/130 jobs  582.7 MB received (0.0 failed-attempt MB), 58.1 decoded MB/s
+   15.1s  31/130 jobs  782.1 MB received (0.0 failed-attempt MB), 51.9 decoded MB/s
+   20.1s  40/130 jobs  920.0 MB received (0.0 failed-attempt MB), 45.8 decoded MB/s
+   25.1s  44/130 jobs  1059.3 MB received (0.0 failed-attempt MB), 42.2 decoded MB/s
+   30.1s  52/130 jobs  1188.7 MB received (0.0 failed-attempt MB), 39.5 decoded MB/s
+   35.1s  57/130 jobs  1312.8 MB received (0.0 failed-attempt MB), 37.4 decoded MB/s
+   40.1s  65/130 jobs  1489.8 MB received (0.0 failed-attempt MB), 37.1 decoded MB/s
+   45.1s  68/130 jobs  1633.7 MB received (0.0 failed-attempt MB), 36.2 decoded MB/s
+   50.2s  72/130 jobs  1734.5 MB received (0.0 failed-attempt MB), 34.6 decoded MB/s
+   55.2s  76/130 jobs  1837.5 MB received (0.0 failed-attempt MB), 33.3 decoded MB/s
+   60.2s  80/130 jobs  1944.6 MB received (0.0 failed-attempt MB), 32.3 decoded MB/s
+   65.3s  85/130 jobs  2125.8 MB received (0.0 failed-attempt MB), 32.6 decoded MB/s
+   70.3s  92/130 jobs  2281.7 MB received (0.0 failed-attempt MB), 32.5 decoded MB/s
+   75.3s  93/130 jobs  2423.8 MB received (0.0 failed-attempt MB), 32.2 decoded MB/s
+   80.3s  97/130 jobs  2563.4 MB received (0.0 failed-attempt MB), 31.9 decoded MB/s
+   85.3s  104/130 jobs  2676.1 MB received (0.0 failed-attempt MB), 31.4 decoded MB/s
+   90.4s  107/130 jobs  2810.8 MB received (0.0 failed-attempt MB), 31.1 decoded MB/s
+   95.4s  111/130 jobs  2964.0 MB received (0.0 failed-attempt MB), 31.1 decoded MB/s
+  100.4s  119/130 jobs  3118.7 MB received (0.0 failed-attempt MB), 31.1 decoded MB/s
+  105.4s  125/130 jobs  3239.4 MB received (0.0 failed-attempt MB), 30.7 decoded MB/s
+  110.4s  128/130 jobs  3266.4 MB received (0.0 failed-attempt MB), 29.6 decoded MB/s
+  115.4s  129/130 jobs  3288.3 MB received (0.0 failed-attempt MB), 28.5 decoded MB/s
+
+jobs       130 planned: 130 done, 0 failed, 0 retries, 963.2 s slot/backoff waiting
+time       116.6 s reading, 0.421 s planning, 117.1 s end-to-end
+received   3290.6 decoded MB, 0.0 failed/incomplete MB (not wire bytes)
+read       3290.6 MB, 5000001 rows
+rate       28.2 MB/s, 42875 rows/s
+end-to-end 28.1 useful MB/s
+ttfb incl queue/retries  median 34.595 s, p95 97.603 s
+job latency incl queue/retries  median 41.429 s, p95 102.365 s
+queue      median 23.040 s, p95 82.115 s; failures 0
+attempt failures  exhausted 0, unavailable 0, timeout 0, other 0
+per server (jobs, MB/s over the run, MB/s per stream):
+  grpc+tcp://147.182.143.85:50051             37 jobs       8.2 MB/s      2.3 MB/s
+  grpc+tcp://157.245.140.110:50051            50 jobs      10.8 MB/s      2.9 MB/s
+  grpc+tcp://204.48.27.189:50051              43 jobs       9.3 MB/s      2.6 MB/s
+
+=== 04-cap8.log ===
+130 jobs for blocks 40000000..45000000 (finalized), 4 processes x 6 threads, compression zstd
+local cap  8 concurrent reads per server (not discovered capacity)
+    5.0s  12/130 jobs  357.0 MB received (0.0 failed-attempt MB), 70.9 decoded MB/s
+   10.0s  23/130 jobs  714.8 MB received (0.0 failed-attempt MB), 71.2 decoded MB/s
+   15.0s  34/130 jobs  966.0 MB received (0.0 failed-attempt MB), 64.2 decoded MB/s
+   20.1s  44/130 jobs  1203.4 MB received (0.0 failed-attempt MB), 60.0 decoded MB/s
+   25.1s  59/130 jobs  1430.7 MB received (0.0 failed-attempt MB), 57.1 decoded MB/s
+   30.1s  67/130 jobs  1677.1 MB received (0.0 failed-attempt MB), 55.7 decoded MB/s
+   35.1s  76/130 jobs  1917.0 MB received (0.0 failed-attempt MB), 54.6 decoded MB/s
+   40.1s  85/130 jobs  2146.5 MB received (0.0 failed-attempt MB), 53.5 decoded MB/s
+   45.1s  91/130 jobs  2373.1 MB received (0.0 failed-attempt MB), 52.6 decoded MB/s
+   50.1s  98/130 jobs  2605.9 MB received (0.0 failed-attempt MB), 52.0 decoded MB/s
+   55.1s  104/130 jobs  2811.7 MB received (0.0 failed-attempt MB), 51.0 decoded MB/s
+   60.1s  110/130 jobs  3027.9 MB received (0.0 failed-attempt MB), 50.3 decoded MB/s
+   65.2s  119/130 jobs  3200.9 MB received (0.0 failed-attempt MB), 49.1 decoded MB/s
+   70.3s  127/130 jobs  3279.1 MB received (0.0 failed-attempt MB), 46.7 decoded MB/s
+
+jobs       130 planned: 130 done, 0 failed, 0 retries, 0.0 s slot/backoff waiting
+time       73.4 s reading, 0.470 s planning, 73.9 s end-to-end
+received   3290.6 decoded MB, 0.0 failed/incomplete MB (not wire bytes)
+read       3290.6 MB, 5000001 rows
+rate       44.8 MB/s, 68113 rows/s
+end-to-end 44.5 useful MB/s
+ttfb incl queue/retries  median 19.217 s, p95 51.510 s
+job latency incl queue/retries  median 29.498 s, p95 69.016 s
+queue      median 18.464 s, p95 50.933 s; failures 0
+attempt failures  exhausted 0, unavailable 0, timeout 0, other 0
+per server (jobs, MB/s over the run, MB/s per stream):
+  grpc+tcp://147.182.143.85:50051             46 jobs      15.8 MB/s      2.2 MB/s
+  grpc+tcp://157.245.140.110:50051            40 jobs      13.8 MB/s      2.0 MB/s
+  grpc+tcp://204.48.27.189:50051              44 jobs      15.2 MB/s      2.1 MB/s
+
+=== 05-cap8.log ===
+130 jobs for blocks 40000000..45000000 (finalized), 4 processes x 6 threads, compression zstd
+local cap  8 concurrent reads per server (not discovered capacity)
+    5.0s  13/130 jobs  390.1 MB received (0.0 failed-attempt MB), 77.9 decoded MB/s
+   10.0s  25/130 jobs  741.9 MB received (0.0 failed-attempt MB), 74.1 decoded MB/s
+   15.0s  34/130 jobs  1000.8 MB received (0.0 failed-attempt MB), 66.6 decoded MB/s
+   20.0s  48/130 jobs  1226.9 MB received (0.0 failed-attempt MB), 61.3 decoded MB/s
+   25.0s  59/130 jobs  1455.5 MB received (0.0 failed-attempt MB), 58.1 decoded MB/s
+   30.1s  65/130 jobs  1661.9 MB received (0.0 failed-attempt MB), 55.3 decoded MB/s
+   35.1s  72/130 jobs  1884.7 MB received (0.0 failed-attempt MB), 53.7 decoded MB/s
+   40.1s  86/130 jobs  2138.0 MB received (0.0 failed-attempt MB), 53.3 decoded MB/s
+   45.1s  93/130 jobs  2387.3 MB received (0.0 failed-attempt MB), 53.0 decoded MB/s
+   50.1s  99/130 jobs  2618.2 MB received (0.0 failed-attempt MB), 52.3 decoded MB/s
+   55.1s  104/130 jobs  2880.5 MB received (0.0 failed-attempt MB), 52.3 decoded MB/s
+   60.1s  111/130 jobs  3099.7 MB received (0.0 failed-attempt MB), 51.6 decoded MB/s
+   65.2s  123/130 jobs  3251.8 MB received (0.0 failed-attempt MB), 49.9 decoded MB/s
+   70.2s  129/130 jobs  3284.9 MB received (0.0 failed-attempt MB), 46.8 decoded MB/s
+
+jobs       130 planned: 130 done, 0 failed, 0 retries, 0.0 s slot/backoff waiting
+time       74.3 s reading, 0.426 s planning, 74.7 s end-to-end
+received   3290.6 decoded MB, 0.0 failed/incomplete MB (not wire bytes)
+read       3290.6 MB, 5000001 rows
+rate       44.3 MB/s, 67302 rows/s
+end-to-end 44.0 useful MB/s
+ttfb incl queue/retries  median 17.600 s, p95 51.416 s
+job latency incl queue/retries  median 30.127 s, p95 65.467 s
+queue      median 17.033 s, p95 50.794 s; failures 0
+attempt failures  exhausted 0, unavailable 0, timeout 0, other 0
+per server (jobs, MB/s over the run, MB/s per stream):
+  grpc+tcp://147.182.143.85:50051             41 jobs      13.8 MB/s      2.0 MB/s
+  grpc+tcp://157.245.140.110:50051            42 jobs      14.6 MB/s      2.1 MB/s
+  grpc+tcp://204.48.27.189:50051              47 jobs      15.9 MB/s      2.3 MB/s
+
+=== 06-cap4.log ===
+130 jobs for blocks 40000000..45000000 (finalized), 4 processes x 6 threads, compression zstd
+local cap  4 concurrent reads per server (not discovered capacity)
+    5.0s  11/130 jobs  261.2 MB received (0.0 failed-attempt MB), 52.2 decoded MB/s
+   10.1s  20/130 jobs  530.0 MB received (0.0 failed-attempt MB), 52.7 decoded MB/s
+   15.1s  27/130 jobs  695.0 MB received (0.0 failed-attempt MB), 46.1 decoded MB/s
+   20.1s  32/130 jobs  810.6 MB received (0.0 failed-attempt MB), 40.4 decoded MB/s
+   25.1s  36/130 jobs  918.6 MB received (0.0 failed-attempt MB), 36.6 decoded MB/s
+   30.1s  43/130 jobs  1064.6 MB received (0.0 failed-attempt MB), 35.3 decoded MB/s
+   35.1s  51/130 jobs  1202.1 MB received (0.0 failed-attempt MB), 34.2 decoded MB/s
+   40.2s  54/130 jobs  1325.6 MB received (0.0 failed-attempt MB), 33.0 decoded MB/s
+   45.2s  61/130 jobs  1427.5 MB received (0.0 failed-attempt MB), 31.6 decoded MB/s
+   50.2s  64/130 jobs  1546.3 MB received (0.0 failed-attempt MB), 30.8 decoded MB/s
+   55.2s  70/130 jobs  1688.4 MB received (0.0 failed-attempt MB), 30.6 decoded MB/s
+   60.3s  77/130 jobs  1824.5 MB received (0.0 failed-attempt MB), 30.3 decoded MB/s
+   65.3s  80/130 jobs  1957.2 MB received (0.0 failed-attempt MB), 30.0 decoded MB/s
+   70.3s  83/130 jobs  2072.8 MB received (0.0 failed-attempt MB), 29.5 decoded MB/s
+   75.3s  87/130 jobs  2180.7 MB received (0.0 failed-attempt MB), 29.0 decoded MB/s
+   80.3s  90/130 jobs  2323.2 MB received (0.0 failed-attempt MB), 28.9 decoded MB/s
+   85.5s  94/130 jobs  2497.9 MB received (0.0 failed-attempt MB), 29.2 decoded MB/s
+   90.5s  100/130 jobs  2625.3 MB received (0.0 failed-attempt MB), 29.0 decoded MB/s
+   95.5s  104/130 jobs  2749.6 MB received (0.0 failed-attempt MB), 28.8 decoded MB/s
+  100.5s  107/130 jobs  2869.2 MB received (0.0 failed-attempt MB), 28.6 decoded MB/s
+  105.5s  115/130 jobs  3059.6 MB received (0.0 failed-attempt MB), 29.0 decoded MB/s
+  110.5s  124/130 jobs  3259.7 MB received (0.0 failed-attempt MB), 29.5 decoded MB/s
+  115.7s  129/130 jobs  3286.8 MB received (0.0 failed-attempt MB), 28.4 decoded MB/s
+
+jobs       130 planned: 130 done, 0 failed, 0 retries, 1044.5 s slot/backoff waiting
+time       117.9 s reading, 0.428 s planning, 118.3 s end-to-end
+received   3290.6 decoded MB, 0.0 failed/incomplete MB (not wire bytes)
+read       3290.6 MB, 5000001 rows
+rate       27.9 MB/s, 42422 rows/s
+end-to-end 27.8 useful MB/s
+ttfb incl queue/retries  median 38.179 s, p95 106.071 s
+job latency incl queue/retries  median 50.599 s, p95 110.464 s
+queue      median 27.682 s, p95 89.728 s; failures 0
+attempt failures  exhausted 0, unavailable 0, timeout 0, other 0
+per server (jobs, MB/s over the run, MB/s per stream):
+  grpc+tcp://147.182.143.85:50051             43 jobs       9.2 MB/s      2.5 MB/s
+  grpc+tcp://157.245.140.110:50051            42 jobs       9.3 MB/s      2.5 MB/s
+  grpc+tcp://204.48.27.189:50051              45 jobs       9.3 MB/s      2.5 MB/s
+
+=== 07-cap4.log ===
+130 jobs for blocks 40000000..45000000 (finalized), 4 processes x 6 threads, compression zstd
+local cap  4 concurrent reads per server (not discovered capacity)
+    5.0s  12/130 jobs  275.5 MB received (0.0 failed-attempt MB), 55.0 decoded MB/s
+   10.0s  18/130 jobs  509.8 MB received (0.0 failed-attempt MB), 50.8 decoded MB/s
+   15.1s  25/130 jobs  652.7 MB received (0.0 failed-attempt MB), 43.3 decoded MB/s
+   20.1s  30/130 jobs  773.5 MB received (0.0 failed-attempt MB), 38.4 decoded MB/s
+   25.1s  36/130 jobs  878.6 MB received (0.0 failed-attempt MB), 35.0 decoded MB/s
+   30.1s  40/130 jobs  978.4 MB received (0.0 failed-attempt MB), 32.5 decoded MB/s
+   35.1s  45/130 jobs  1071.8 MB received (0.0 failed-attempt MB), 30.5 decoded MB/s
+   40.2s  49/130 jobs  1173.4 MB received (0.0 failed-attempt MB), 29.2 decoded MB/s
+   45.2s  54/130 jobs  1301.6 MB received (0.0 failed-attempt MB), 28.8 decoded MB/s
+   50.2s  61/130 jobs  1438.8 MB received (0.0 failed-attempt MB), 28.7 decoded MB/s
+   55.3s  66/130 jobs  1597.1 MB received (0.0 failed-attempt MB), 28.9 decoded MB/s
+   60.3s  74/130 jobs  1719.0 MB received (0.0 failed-attempt MB), 28.5 decoded MB/s
+   65.4s  76/130 jobs  1822.0 MB received (0.0 failed-attempt MB), 27.9 decoded MB/s
+   70.4s  77/130 jobs  1930.7 MB received (0.0 failed-attempt MB), 27.4 decoded MB/s
+   75.5s  84/130 jobs  2060.3 MB received (0.0 failed-attempt MB), 27.3 decoded MB/s
+   80.5s  86/130 jobs  2188.7 MB received (0.0 failed-attempt MB), 27.2 decoded MB/s
+   85.5s  90/130 jobs  2309.5 MB received (0.0 failed-attempt MB), 27.0 decoded MB/s
+   90.6s  94/130 jobs  2422.1 MB received (0.0 failed-attempt MB), 26.7 decoded MB/s
+   95.6s  97/130 jobs  2531.8 MB received (0.0 failed-attempt MB), 26.5 decoded MB/s
+  100.6s  101/130 jobs  2644.6 MB received (0.0 failed-attempt MB), 26.3 decoded MB/s
+  105.6s  104/130 jobs  2768.3 MB received (0.0 failed-attempt MB), 26.2 decoded MB/s
+  110.6s  109/130 jobs  2907.4 MB received (0.0 failed-attempt MB), 26.3 decoded MB/s
+  115.6s  115/130 jobs  3089.9 MB received (0.0 failed-attempt MB), 26.7 decoded MB/s
+  120.7s  126/130 jobs  3272.9 MB received (0.0 failed-attempt MB), 27.1 decoded MB/s
+
+jobs       130 planned: 130 done, 0 failed, 0 retries, 1126.8 s slot/backoff waiting
+time       124.3 s reading, 0.422 s planning, 124.8 s end-to-end
+received   3290.6 decoded MB, 0.0 failed/incomplete MB (not wire bytes)
+read       3290.6 MB, 5000001 rows
+rate       26.5 MB/s, 40216 rows/s
+end-to-end 26.4 useful MB/s
+ttfb incl queue/retries  median 44.343 s, p95 113.618 s
+job latency incl queue/retries  median 54.658 s, p95 119.024 s
+queue      median 31.962 s, p95 99.446 s; failures 0
+attempt failures  exhausted 0, unavailable 0, timeout 0, other 0
+per server (jobs, MB/s over the run, MB/s per stream):
+  grpc+tcp://147.182.143.85:50051             45 jobs       9.4 MB/s      2.4 MB/s
+  grpc+tcp://157.245.140.110:50051            39 jobs       8.2 MB/s      2.1 MB/s
+  grpc+tcp://204.48.27.189:50051              46 jobs       8.9 MB/s      2.3 MB/s
+
+=== 08-cap8.log ===
+130 jobs for blocks 40000000..45000000 (finalized), 4 processes x 6 threads, compression zstd
+local cap  8 concurrent reads per server (not discovered capacity)
+    5.0s  11/130 jobs  381.7 MB received (0.0 failed-attempt MB), 76.1 decoded MB/s
+   10.0s  24/130 jobs  734.5 MB received (0.0 failed-attempt MB), 73.2 decoded MB/s
+   15.1s  36/130 jobs  1006.0 MB received (0.0 failed-attempt MB), 66.7 decoded MB/s
+   20.1s  48/130 jobs  1261.0 MB received (0.0 failed-attempt MB), 62.8 decoded MB/s
+   25.1s  60/130 jobs  1479.8 MB received (0.0 failed-attempt MB), 59.0 decoded MB/s
+   30.1s  68/130 jobs  1716.1 MB received (0.0 failed-attempt MB), 57.0 decoded MB/s
+   35.1s  77/130 jobs  1947.6 MB received (0.0 failed-attempt MB), 55.5 decoded MB/s
+   40.2s  86/130 jobs  2189.5 MB received (0.0 failed-attempt MB), 54.5 decoded MB/s
+   45.2s  94/130 jobs  2473.7 MB received (0.0 failed-attempt MB), 54.8 decoded MB/s
+   50.2s  102/130 jobs  2773.8 MB received (0.0 failed-attempt MB), 55.3 decoded MB/s
+   55.2s  108/130 jobs  3040.8 MB received (0.0 failed-attempt MB), 55.1 decoded MB/s
+   60.2s  122/130 jobs  3212.3 MB received (0.0 failed-attempt MB), 53.3 decoded MB/s
+   65.3s  127/130 jobs  3273.3 MB received (0.0 failed-attempt MB), 50.1 decoded MB/s
+   70.5s  129/130 jobs  3290.1 MB received (0.0 failed-attempt MB), 46.7 decoded MB/s
+
+jobs       130 planned: 130 done, 0 failed, 0 retries, 0.0 s slot/backoff waiting
+time       70.5 s reading, 0.434 s planning, 71.0 s end-to-end
+received   3290.6 decoded MB, 0.0 failed/incomplete MB (not wire bytes)
+read       3290.6 MB, 5000001 rows
+rate       46.7 MB/s, 70913 rows/s
+end-to-end 46.4 useful MB/s
+ttfb incl queue/retries  median 18.866 s, p95 48.652 s
+job latency incl queue/retries  median 28.634 s, p95 61.439 s
+queue      median 18.362 s, p95 48.020 s; failures 0
+attempt failures  exhausted 0, unavailable 0, timeout 0, other 0
+per server (jobs, MB/s over the run, MB/s per stream):
+  grpc+tcp://147.182.143.85:50051             45 jobs      16.3 MB/s      2.5 MB/s
+  grpc+tcp://157.245.140.110:50051            41 jobs      14.9 MB/s      2.2 MB/s
+  grpc+tcp://204.48.27.189:50051              44 jobs      15.4 MB/s      2.3 MB/s
+
+=== 09-cap8.log ===
+130 jobs for blocks 40000000..45000000 (finalized), 4 processes x 6 threads, compression zstd
+local cap  8 concurrent reads per server (not discovered capacity)
+    5.0s  17/130 jobs  399.8 MB received (0.0 failed-attempt MB), 79.6 decoded MB/s
+   10.0s  33/130 jobs  913.2 MB received (0.0 failed-attempt MB), 91.1 decoded MB/s
+   15.1s  51/130 jobs  1248.5 MB received (0.0 failed-attempt MB), 82.9 decoded MB/s
+   20.1s  60/130 jobs  1509.9 MB received (0.0 failed-attempt MB), 75.2 decoded MB/s
+   25.1s  69/130 jobs  1745.0 MB received (0.0 failed-attempt MB), 69.6 decoded MB/s
+   30.1s  79/130 jobs  1984.0 MB received (0.0 failed-attempt MB), 65.9 decoded MB/s
+   35.1s  87/130 jobs  2239.5 MB received (0.0 failed-attempt MB), 63.8 decoded MB/s
+   40.1s  97/130 jobs  2473.4 MB received (0.0 failed-attempt MB), 61.7 decoded MB/s
+   45.1s  102/130 jobs  2713.3 MB received (0.0 failed-attempt MB), 60.1 decoded MB/s
+   50.1s  107/130 jobs  2960.3 MB received (0.0 failed-attempt MB), 59.0 decoded MB/s
+   55.2s  114/130 jobs  3160.1 MB received (0.0 failed-attempt MB), 57.3 decoded MB/s
+   60.2s  125/130 jobs  3251.3 MB received (0.0 failed-attempt MB), 54.0 decoded MB/s
+   65.3s  129/130 jobs  3280.1 MB received (0.0 failed-attempt MB), 50.2 decoded MB/s
+   70.3s  129/130 jobs  3285.4 MB received (0.0 failed-attempt MB), 46.7 decoded MB/s
+
+jobs       130 planned: 130 done, 0 failed, 0 retries, 0.0 s slot/backoff waiting
+time       75.3 s reading, 0.423 s planning, 75.7 s end-to-end
+received   3290.6 decoded MB, 0.0 failed/incomplete MB (not wire bytes)
+read       3290.6 MB, 5000001 rows
+rate       43.7 MB/s, 66421 rows/s
+end-to-end 43.5 useful MB/s
+ttfb incl queue/retries  median 12.923 s, p95 43.306 s
+job latency incl queue/retries  median 23.319 s, p95 58.996 s
+queue      median 12.402 s, p95 42.475 s; failures 0
+attempt failures  exhausted 0, unavailable 0, timeout 0, other 0
+per server (jobs, MB/s over the run, MB/s per stream):
+  grpc+tcp://147.182.143.85:50051             42 jobs      14.0 MB/s      2.3 MB/s
+  grpc+tcp://157.245.140.110:50051            39 jobs      13.4 MB/s      2.2 MB/s
+  grpc+tcp://204.48.27.189:50051              49 jobs      16.3 MB/s      2.7 MB/s
+
+=== 10-cap4.log ===
+130 jobs for blocks 40000000..45000000 (finalized), 4 processes x 6 threads, compression zstd
+local cap  4 concurrent reads per server (not discovered capacity)
+    5.0s  7/130 jobs  188.4 MB received (0.0 failed-attempt MB), 37.6 decoded MB/s
+   10.0s  15/130 jobs  363.6 MB received (0.0 failed-attempt MB), 36.3 decoded MB/s
+   15.0s  19/130 jobs  511.7 MB received (0.0 failed-attempt MB), 34.0 decoded MB/s
+   20.1s  25/130 jobs  636.2 MB received (0.0 failed-attempt MB), 31.7 decoded MB/s
+   25.1s  32/130 jobs  772.3 MB received (0.0 failed-attempt MB), 30.8 decoded MB/s
+   30.1s  35/130 jobs  894.6 MB received (0.0 failed-attempt MB), 29.7 decoded MB/s
+   35.1s  44/130 jobs  1014.6 MB received (0.0 failed-attempt MB), 28.9 decoded MB/s
+   40.1s  49/130 jobs  1127.7 MB received (0.0 failed-attempt MB), 28.1 decoded MB/s
+   45.2s  52/130 jobs  1243.4 MB received (0.0 failed-attempt MB), 27.5 decoded MB/s
+   50.2s  59/130 jobs  1366.3 MB received (0.0 failed-attempt MB), 27.2 decoded MB/s
+   55.2s  62/130 jobs  1492.1 MB received (0.0 failed-attempt MB), 27.0 decoded MB/s
+   60.2s  67/130 jobs  1617.8 MB received (0.0 failed-attempt MB), 26.9 decoded MB/s
+   65.3s  74/130 jobs  1757.0 MB received (0.0 failed-attempt MB), 26.9 decoded MB/s
+   70.3s  78/130 jobs  1918.5 MB received (0.0 failed-attempt MB), 27.3 decoded MB/s
+   75.3s  88/130 jobs  2108.3 MB received (0.0 failed-attempt MB), 28.0 decoded MB/s
+   80.3s  88/130 jobs  2271.5 MB received (0.0 failed-attempt MB), 28.3 decoded MB/s
+   85.3s  92/130 jobs  2395.6 MB received (0.0 failed-attempt MB), 28.1 decoded MB/s
+   90.3s  97/130 jobs  2512.5 MB received (0.0 failed-attempt MB), 27.8 decoded MB/s
+   95.3s  102/130 jobs  2683.1 MB received (0.0 failed-attempt MB), 28.1 decoded MB/s
+  100.3s  107/130 jobs  2822.8 MB received (0.0 failed-attempt MB), 28.1 decoded MB/s
+  105.3s  112/130 jobs  3004.1 MB received (0.0 failed-attempt MB), 28.5 decoded MB/s
+  110.4s  123/130 jobs  3223.3 MB received (0.0 failed-attempt MB), 29.2 decoded MB/s
+  115.4s  128/130 jobs  3278.2 MB received (0.0 failed-attempt MB), 28.4 decoded MB/s
+  120.5s  129/130 jobs  3288.8 MB received (0.0 failed-attempt MB), 27.3 decoded MB/s
+
+jobs       130 planned: 130 done, 0 failed, 0 retries, 1045.4 s slot/backoff waiting
+time       121.6 s reading, 0.430 s planning, 122.0 s end-to-end
+received   3290.6 decoded MB, 0.0 failed/incomplete MB (not wire bytes)
+read       3290.6 MB, 5000001 rows
+rate       27.1 MB/s, 41130 rows/s
+end-to-end 27.0 useful MB/s
+ttfb incl queue/retries  median 48.324 s, p95 106.218 s
+job latency incl queue/retries  median 57.868 s, p95 110.491 s
+queue      median 33.317 s, p95 93.122 s; failures 0
+attempt failures  exhausted 0, unavailable 0, timeout 0, other 0
+per server (jobs, MB/s over the run, MB/s per stream):
+  grpc+tcp://147.182.143.85:50051             43 jobs       9.1 MB/s      2.5 MB/s
+  grpc+tcp://157.245.140.110:50051            44 jobs       9.3 MB/s      2.5 MB/s
+  grpc+tcp://204.48.27.189:50051              43 jobs       8.8 MB/s      2.4 MB/s

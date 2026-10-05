@@ -19,7 +19,7 @@ env:
   CARGO_TERM_COLOR: always
   # The toolchain the repository is checked with; bump it on purpose.
   RUST_TOOLCHAIN: "1.99.0"
-  BINARIES: indexer server import balancer
+  BINARIES: indexer server import balancer bench
 
 jobs:
   build:

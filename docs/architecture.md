@@ -1,9 +1,10 @@
 # Architecture
 
 What the system is today: its programs, how data flows through them and why it can be
-trusted. Status 2026-10-05: all four programs are built and have run live: nodes on OP
+trusted. Status 2026-10-05: the node, directory and import programs are built and have run live: nodes on OP
 Mainnet and Unichain, a Unichain fleet of three servers and a balancer serving from R2, and
-Base's import (downloaded, being completed). What is left is in
+Base's import (downloaded, being completed). A native `bench` client measures Flight reads,
+including heavy multi-table workloads. What is left is in
 [roadmap.md](roadmap.md); how it got here is in [decisions.md](decisions.md).
 
 The platform supplies verified OP Stack chain data without executing transactions or keeping
@@ -61,6 +62,7 @@ flowchart LR
 | `server` | The same node with its history in R2; with `--export`, the deployment's one exporter of newly finalized chunks | Identity, peers, the unsafe chain's journal and the fjall tail not sealed yet |
 | `balancer` | The fleet's directory: servers register and report load; it splits a Flight range into per-chunk jobs on the least-loaded servers, locates subscriptions, and signs R2 URLs for raw chunk downloads. No block data passes through it | Registrations in memory, rebuilt as servers report |
 | `import` | `download` (from HyperSync, each answer checked and asked again when incomplete), `verify` (check, seal, upload, list in the manifest once the range matches its anchor), `run` (both), `fetch` (raw chunks from R2 for a client) | The plan and the downloaded chunks until they are uploaded |
+| `bench` | Native Flight consumer: validates plans and streamed block ranges, measures throughput and retries, repeats single-table or heavy four-table workloads ([usage](bench.md)) | Optional JSON reports; decoded batches are discarded |
 
 `indexer`, `server` and `balancer` also take `start`, `stop`, `restart`, `status`, `logs` and
 `install-service`, to run in the background; settings are environment variables, read from

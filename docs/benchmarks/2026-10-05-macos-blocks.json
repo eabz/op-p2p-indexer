@@ -1,0 +1,98 @@
+{
+  "client": "macOS-26.6.2-arm64-arm-64bit",
+  "python": "3.9.6",
+  "commit": "8a2bcdb5e7aa398497c8f294697f7aadd550d5b9",
+  "script_sha256": "01d2a8f3966ad3640eb55bdd1ac850be9bbae8fa10f1d9628a438fb3b6bce2b9",
+  "caps": [
+    8,
+    4,
+    4,
+    8,
+    8,
+    4,
+    4,
+    8,
+    8,
+    4
+  ],
+  "server_revision": "unverified",
+  "server_utilization": "unavailable",
+  "cache_state": "uncontrolled; repeated same range",
+  "range": [
+    40000000,
+    45000000
+  ],
+  "pyarrow": "21.0.0",
+  "runs": [
+    {
+      "run": "01-cap8.log",
+      "cap": 8,
+      "end_to_end_MB_s": 43.3,
+      "end_to_end_seconds": 76.0,
+      "exit_code": 0
+    },
+    {
+      "run": "02-cap4.log",
+      "cap": 4,
+      "end_to_end_MB_s": 28.2,
+      "end_to_end_seconds": 116.8,
+      "exit_code": 0
+    },
+    {
+      "run": "03-cap4.log",
+      "cap": 4,
+      "end_to_end_MB_s": 28.1,
+      "end_to_end_seconds": 117.1,
+      "exit_code": 0
+    },
+    {
+      "run": "04-cap8.log",
+      "cap": 8,
+      "end_to_end_MB_s": 44.5,
+      "end_to_end_seconds": 73.9,
+      "exit_code": 0
+    },
+    {
+      "run": "05-cap8.log",
+      "cap": 8,
+      "end_to_end_MB_s": 44.0,
+      "end_to_end_seconds": 74.7,
+      "exit_code": 0
+    },
+    {
+      "run": "06-cap4.log",
+      "cap": 4,
+      "end_to_end_MB_s": 27.8,
+      "end_to_end_seconds": 118.3,
+      "exit_code": 0
+    },
+    {
+      "run": "07-cap4.log",
+      "cap": 4,
+      "end_to_end_MB_s": 26.4,
+      "end_to_end_seconds": 124.8,
+      "exit_code": 0
+    },
+    {
+      "run": "08-cap8.log",
+      "cap": 8,
+      "end_to_end_MB_s": 46.4,
+      "end_to_end_seconds": 71.0,
+      "exit_code": 0
+    },
+    {
+      "run": "09-cap8.log",
+      "cap": 8,
+      "end_to_end_MB_s": 43.5,
+      "end_to_end_seconds": 75.7,
+      "exit_code": 0
+    },
+    {
+      "run": "10-cap4.log",
+      "cap": 4,
+      "end_to_end_MB_s": 27.0,
+      "end_to_end_seconds": 122.0,
+      "exit_code": 0
+    }
+  ]
+}

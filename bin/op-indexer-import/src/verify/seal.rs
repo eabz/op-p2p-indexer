@@ -24,9 +24,10 @@ use op_indexer_chunks::{
 use op_indexer_primitives::{ArchivedBlock, decode_transaction, is_zero_signature, split_body};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::{Check, ChunkError, Forks, IN_FLIGHT_BYTES, Stats, block};
+use crate::backoff::Backoff;
 use crate::cli::VerifyArgs;
 use crate::progress::{self, Rate};
 use crate::state::{Anchor, Chunk, Plan, State, covered};
@@ -83,7 +84,8 @@ pub(super) fn check_continues(
         ensure!(
             entry.first == next,
             "the records in the state directory's sealed/ skip from block {next} to {}: delete \
-             the records from {next} on and run `verify` again",
+             the records from {next} on, run `download` to restore missing raw files, then \
+             run `verify` again",
             entry.first
         );
         check_link(entry, parent)?;
@@ -253,6 +255,13 @@ impl<'a> Sealing<'a> {
         let sealed = self.seal_chunks(chunks, &stored, &mut run, cancel).await;
         // The chunks in flight are uploaded and recorded before stopping, failed or not.
         let settled = self.settle(&mut run.uploads, 0, &mut run.read).await;
+        // A failed upload or record leaves a gap. Finish the remaining requests, but do
+        // not record them or delete their input: the next run must resume at the gap.
+        for (_, handle) in run.uploads.drain(..) {
+            if let Some(handle) = handle {
+                let _ = handle.await;
+            }
+        }
         run.progress.summary();
         sealed?;
         settled?;
@@ -321,6 +330,8 @@ impl<'a> Sealing<'a> {
         stored: &HashSet<String>,
         run: &mut Run,
     ) -> eyre::Result<()> {
+        self.settle(&mut run.uploads, run.keep, &mut run.read)
+            .await?;
         run.progress.chunks = run.progress.chunks.saturating_add(1);
         let upload = if stored.contains(&chunk.entry.key()) {
             run.progress.skipped = run.progress.skipped.saturating_add(1);
@@ -330,8 +341,6 @@ impl<'a> Sealing<'a> {
                 run.progress.uploaded_bytes.saturating_add(chunk.entry.size);
             upload(self.store, chunk)
         };
-        self.settle(&mut run.uploads, run.keep, &mut run.read)
-            .await?;
         run.uploads.push_back(upload);
         Ok(())
     }
@@ -375,6 +384,15 @@ impl<'a> Sealing<'a> {
             if let Some(handle) = handle {
                 handle.await??;
             }
+            // settle is called again during cleanup after an error. Never commit a
+            // later upload across the failed entry, even if its PUT succeeded.
+            ensure!(
+                entry.first == self.next,
+                "cannot record chunk {}-{}: block {} has not been sealed; run `verify` again",
+                entry.first,
+                entry.last,
+                self.next
+            );
             let mut done = Vec::new();
             while let Some(chunk) = read.pop_front_if(|chunk| covered(Some(entry.last), *chunk)) {
                 done.push(chunk);
@@ -441,14 +459,45 @@ fn upload(
     let store = store.clone();
     let entry = sealed.entry;
     let handle = tokio::spawn(async move {
-        store.put_chunk(&sealed).await.wrap_err_with(|| {
-            format!(
-                "failed to upload chunk {}-{}",
-                sealed.entry.first, sealed.entry.last
-            )
-        })
+        retry_upload(|| store.put_chunk(&sealed), entry)
+            .await
+            .wrap_err_with(|| {
+                format!(
+                    "failed to upload chunk {}-{}",
+                    sealed.entry.first, sealed.entry.last
+                )
+            })
     });
     (entry, Some(handle))
+}
+
+/// Conditional S3 PUTs may fail on transport timeouts without the client's retries.
+/// A chunk's content-derived key makes retrying safe even if the first PUT succeeded.
+async fn retry_upload<F, Fut>(
+    mut put: F,
+    entry: ChunkEntry,
+) -> Result<(), op_indexer_chunks::ChunksError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<(), op_indexer_chunks::ChunksError>>,
+{
+    let mut backoff = Backoff::new();
+    loop {
+        match put().await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                let attempt = backoff.attempt();
+                let wait = err.is_transient().then(|| backoff.next()).flatten();
+                let Some(wait) = wait else {
+                    return Err(err);
+                };
+                warn!(first = entry.first, last = entry.last, attempt,
+                    retry_in_ms = wait.as_millis(), error = %err,
+                    "chunk upload failed; retrying");
+                tokio::time::sleep(wait).await;
+            }
+        }
+    }
 }
 
 /// The downloaded chunks `chunks`, which must all be on disk, with their sizes. Blocking.
@@ -652,5 +701,122 @@ impl Progress {
             secs,
             "blocks verified and sealed in this run"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser as _;
+
+    #[tokio::test]
+    async fn upload_retries_transport_failure_but_not_permanent_failure() {
+        let entry = ChunkEntry {
+            first: 0,
+            last: 1,
+            first_parent: B256::ZERO,
+            last_hash: B256::ZERO,
+            sha256: B256::ZERO,
+            size: 0,
+            footer_offset: 0,
+            level: 0,
+        };
+        let mut attempts = 0;
+        retry_upload(
+            || {
+                attempts += 1;
+                std::future::ready(if attempts == 1 {
+                    Err(op_indexer_chunks::ChunksError::Store(
+                        object_store::Error::Generic {
+                            store: "test",
+                            source: Box::new(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "PUT timed out",
+                            )),
+                        },
+                    ))
+                } else {
+                    Ok(())
+                })
+            },
+            entry,
+        )
+        .await
+        .expect("retry should succeed");
+        assert_eq!(attempts, 2);
+        attempts = 0;
+        let result = retry_upload(
+            || {
+                attempts += 1;
+                std::future::ready(Err(op_indexer_chunks::ChunksError::Io(
+                    std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+                )))
+            },
+            entry,
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(attempts, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_upload_keeps_later_records_and_raw_data_uncommitted() -> eyre::Result<()> {
+        let root = std::env::temp_dir().join(format!("import-upload-{}", fastrand::u128(..)));
+        let state = State::open(&root)?;
+        let crate::cli::Command::Verify(args) =
+            crate::cli::Cli::try_parse_from(["import", "verify"])?.command
+        else {
+            return Err(eyre!("expected verify arguments"));
+        };
+        let plan = Plan {
+            chain: &op_indexer_chainspec::BASE,
+            first: 0,
+            last: 2,
+            anchor: Anchor::Hash(B256::ZERO),
+            chunk_blocks: 10,
+        };
+        let store = ChunkStore::local(
+            &root.join("store"),
+            "archive",
+            plan.chain,
+            ReadOptions::default(),
+        )?;
+        let mut sealing = Sealing::new(&args, &state, &plan, &store, &[], Vec::new()).await?;
+        let entry = |number| ChunkEntry {
+            first: number,
+            last: number,
+            first_parent: B256::ZERO,
+            last_hash: B256::ZERO,
+            sha256: B256::ZERO,
+            size: 0,
+            footer_offset: 0,
+            level: 0,
+        };
+        let raw = Chunk { from: 0, to: 3 };
+        std::fs::write(state.raw_path(raw), b"retained input")?;
+        let mut read = VecDeque::from([raw]);
+        let mut uploads = VecDeque::from([
+            (entry(0), None),
+            (
+                entry(1),
+                Some(tokio::spawn(async { Err(eyre!("upload timed out")) })),
+            ),
+            (entry(2), Some(tokio::spawn(async { Ok(()) }))),
+        ]);
+        assert!(sealing.settle(&mut uploads, 0, &mut read).await.is_err());
+        // This second call is the cleanup path that used to commit across the gap.
+        assert!(sealing.settle(&mut uploads, 0, &mut read).await.is_err());
+        assert_eq!(state.read_sealed()?, vec![entry(0)]);
+        assert_eq!(sealing.next, 1);
+        assert!(state.raw_path(raw).exists());
+        // Retrying the missing chunk allows the successful tail to be committed normally.
+        let mut retry = VecDeque::from([(entry(1), None), (entry(2), None)]);
+        sealing.settle(&mut retry, 0, &mut read).await?;
+        assert_eq!(state.read_sealed()?, vec![entry(0), entry(1), entry(2)]);
+        assert!(!state.raw_path(raw).exists());
+        drop(sealing);
+        drop(state);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 }

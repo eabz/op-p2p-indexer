@@ -14,7 +14,7 @@ Supported chains: **OP Mainnet** (10), **Unichain** (130) and **Base** (8453).
 
 ## Binaries
 
-The project builds four programs. One machine serving one user needs only the first; serving
+The project builds five programs. One machine serving one user needs only the first; serving
 many users means running several servers behind one balancer.
 
 | Binary | Role | Storage | Status |
@@ -23,6 +23,7 @@ many users means running several servers behind one balancer.
 | **`server`** | A full node for serving at scale: the same p2p participation and live data, but stateless for history: it keeps no archive and reads sealed, immutable block chunks from Cloudflare R2 on demand (no block cache; only the indexes of recently opened chunks are kept). One server per deployment runs with `--export` (or `OP_INDEXER_EXPORT=true`) and is the single exporter, which seals finalized blocks into new chunks | R2 (sealed chunks), a small local tail of unsealed blocks | built; run against R2 in a three-server bench ([serving.md](docs/serving.md)) |
 | **`import`** (package `op-indexer-import`) | Fills history once from an external archive (Envio HyperSync), with an optional RPC for fields the archive leaves out: `download`, then `verify`, which checks every block and uploads it as sealed chunks to R2, deleting each downloaded chunk once uploaded (`run` does both); `fetch` downloads sealed chunks straight from R2 through URLs a balancer signs | Its state directory | built |
 | **`balancer`** | The single entry point for users: tracks server health, contiguous coverage and load, directs clients to servers sharing the same sealed history, and signs R2 URLs for raw chunk downloads. No block data passes through it | In-memory registrations and the shared manifest | built; run in the bench |
+| **`bench`** | Native Flight benchmark client: bounded concurrent reads, exact plan coverage, retries, repeated runs and a heavy four-table workload ([usage](docs/bench.md)) | Optional JSON report; batches are discarded after validation | included in release builds |
 
 R2 holds the sealed history the servers read. Live data always comes from the p2p networks,
 and chunks are sealed only once all their blocks are finalized on L1, so they never change.

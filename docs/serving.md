@@ -654,7 +654,12 @@ the raw download (6.8) hands them out anyway; the manifest and index stay privat
 MB/s on 48 streams (about 43 MB/s a server), `transactions` 406 MB/s, `logs` with lz4
 329 MB/s. v0.1.8 predates the CPU changes of 5.8.
 
-**Running it.** `scripts/bench.py` reads a range of one table through the balancer, as a
+**Native client.** The release now includes `bench`, a Rust client with `--concurrency`,
+`--repeat`, per-job JSON reports and `--heavy` for sequential blocks/transactions/receipts/logs
+with longer read budgets. See [native benchmark usage](bench.md). Keep its performance series
+separate from Python; both clients validate plan coverage and count logical decoded bytes.
+
+**Python client.** `scripts/bench.py` reads a range of one table through the balancer, as a
 Flight client would: it asks the balancer to plan the range (`GetFlightInfo`), then runs the
 jobs across `--processes` processes with `--threads` threads each (default 4), so one Python
 process is not the limit. `--per-server` (default 8) limits concurrent reads to each server
@@ -728,6 +733,57 @@ deadline is 120 seconds; longer streams need both `--rpc-timeout` and `--retry-f
 A smaller transaction check over 48,000,000–48,020,000, with a 120-second RPC deadline and
 150-second job budget, completed its one job in 60.6 seconds: 179,890 rows, 158.6 decoded MB,
 no failures or retries. This is a single-stream transfer check, not a fleet saturation run.
+
+**Importer-hosted client, user-reported 2026-10-05.** On `op-ingestor`, `scripts/bench.py`
+read finalized blocks 40,000,000–45,000,000 through the same three-server fleet, with
+four processes, six threads each, Zstd, a 120-second RPC deadline and a 300-second job
+budget. Both runs returned all 130 jobs, 5,000,001 rows and 3,290.6 decoded MB, with zero
+failed jobs, retries or failed-attempt bytes. Server/client revisions, resource usage and
+cache state were not captured in the supplied output; these are observations, not a
+controlled before/after comparison with earlier runs.
+
+| Per-server cap (run order) | Read seconds | End-to-end seconds | Decoded MB/s | End-to-end useful MB/s | Queue p95 seconds | Job latency p95 seconds | Aggregate slot/backoff wait seconds |
+|---|---|---|---|---|---|---|---|
+| 4 (first) | 29.0 | 29.4 | 113.3 | 112.0 | 22.084 | 27.864 | 299.5 |
+| 8 (second) | 23.3 | 23.7 | 141.3 | 139.0 | 18.942 | 22.672 | 0.0 |
+
+Cap 8 improved observed end-to-end throughput by 24.1% and reduced end-to-end time by
+19.4%. Aggregate slot wait sums across workers, so it can exceed wall time. Zero slot wait
+does not mean zero work-queue delay. Per-server throughput increased from 36.1–39.5 to
+43.6–49.4 decoded MB/s, while per-stream throughput fell from 9.6–10.1 to 5.9–6.5 MB/s.
+More overlapping reads helped this run, but do not identify whether CPU, R2, client or
+network limits dominate. Repeat both caps in alternating order before choosing a default.
+
+The immediate repeat sequence is five runs per cap, alternating `8,4` then `4,8` pairs,
+on this same host, table, range, compression and worker count. Preserve each full output
+and exit status; compare only complete runs, reporting median and range of end-to-end
+throughput and any failures separately. Capture revisions, limits and resource usage first
+as below. Do not increase admission above 8 until available server capacity is verified.
+
+**Repeated macOS comparison, 2026-10-05.** The same five-million-block workload above
+was subsequently run from macOS 26.6.2 arm64, Python 3.9.6 and PyArrow 21.0.0, using
+`scripts/bench.py` at commit `8a2bcdb`. All settings matched the importer-hosted run.
+Ten sequential runs used caps `8,4,4,8,8,4,4,8,8,4` (five per cap). Every run completed
+130 jobs, returned 5,000,001 rows and 3,290.6 decoded MB, and exited 0 with no failures,
+retries or failed/incomplete bytes. Full [run output](benchmarks/2026-10-05-macos-blocks.txt)
+and [revision, script hash and per-run results](benchmarks/2026-10-05-macos-blocks.json)
+are preserved without credentials.
+
+| Per-server cap | End-to-end useful MB/s, in sample order | Median MB/s | Median end-to-end seconds |
+|---|---|---|---|
+| 4 | 28.2, 28.1, 27.8, 26.4, 27.0 | 27.8 | 118.3 |
+| 8 | 43.3, 44.5, 44.0, 46.4, 43.5 | 44.0 | 74.7 |
+
+Cap 8's median throughput was 58.3% higher, and median completion time 36.9% shorter,
+than cap 4's on this client. All cap-8 runs reported zero local slot/backoff waiting;
+cap-4 runs reported 963.2–1,126.8 aggregate worker-seconds of waiting. Both still queued
+jobs behind busy workers. These repeats support retaining cap 8 for this workload;
+they do not establish a server capacity limit or justify raising admission further.
+Server revision, available capacity, utilization, competing traffic and index-cache state
+remain unverified. No nodes were restarted. The same range was repeatedly read, without
+controlled cold/warm classification. Client/network conditions differ from `op-ingestor`,
+so the rates must not be pooled or used as evidence of a server regression. Repeated
+importer-hosted measurements with server telemetry remain outstanding.
 
 **Next measurements, after the CPU changes of 5.8:**
 

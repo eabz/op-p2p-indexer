@@ -51,5 +51,8 @@ tracing.workspace = true
 mimalloc.workspace = true
 zstd.workspace = true
 
+[dev-dependencies]
+object_store.workspace = true
+
 [lints]
 workspace = true
