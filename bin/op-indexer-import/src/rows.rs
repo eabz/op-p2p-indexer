@@ -12,16 +12,52 @@ use alloy_eips::eip7702::SignedAuthorization;
 use alloy_primitives::{Address, B64, B256, Bytes, U64, U128, U256};
 use flate2::bufread::MultiGzDecoder;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 
 use crate::source::Encoding;
 
 /// Bytes of text reserved per stored byte of a compressed chunk.
 const TEXT_PER_STORED_BYTE: usize = 16;
 
-/// One answer of the service.
+/// Selector of the Bedrock form of the L1-attributes deposit (`setL1BlockValues`, ABI words);
+/// the forms from Ecotone on are packed.
+const BEDROCK_SELECTOR: [u8; 4] = [0x01, 0x5d, 0x8e, 0xb9];
+
+/// What a block's L1-attributes deposit says of its L1 origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct L1Info {
+    /// The L1 origin's number and hash.
+    pub(crate) number: u64,
+    pub(crate) hash: B256,
+    /// The block's place in its epoch: 0 for the epoch's first, where its user deposits are.
+    pub(crate) sequence: u64,
+}
+
+impl L1Info {
+    /// Reads the deposit's calldata: the origin's number at bytes 28..36 and hash at 100..132,
+    /// in the Bedrock form and the packed forms alike, and the sequence number at 156..164 in
+    /// the Bedrock form, 12..20 in the packed ones. `None` if it is too short.
+    pub(crate) fn of(input: &[u8]) -> Option<Self> {
+        let word = |at: std::ops::Range<usize>| -> Option<u64> {
+            Some(u64::from_be_bytes(input.get(at)?.try_into().ok()?))
+        };
+        let sequence = if input.get(..4) == Some(&BEDROCK_SELECTOR[..]) {
+            word(156..164)?
+        } else {
+            word(12..20)?
+        };
+        Some(Self {
+            number: word(28..36)?,
+            hash: B256::from_slice(input.get(100..132)?),
+            sequence,
+        })
+    }
+}
+
+/// One answer of the service, of batches `B`.
 #[derive(Debug, Deserialize)]
-struct Response {
-    data: Vec<Batch>,
+struct Response<B> {
+    data: Vec<B>,
 }
 
 /// One batch of an answer.
@@ -33,6 +69,26 @@ struct Batch {
     transactions: Vec<TransactionRow>,
     #[serde(default)]
     logs: Vec<LogRow>,
+}
+
+/// One batch of an answer without its logs, which are skipped as they are read: what a check
+/// of the fields the rows lack reads.
+#[derive(Debug, Deserialize)]
+struct BatchWithoutLogs {
+    #[serde(default)]
+    blocks: Vec<BlockRow>,
+    #[serde(default)]
+    transactions: Vec<TransactionRow>,
+}
+
+impl From<BatchWithoutLogs> for Batch {
+    fn from(batch: BatchWithoutLogs) -> Self {
+        Self {
+            blocks: batch.blocks,
+            transactions: batch.transactions,
+            logs: Vec::new(),
+        }
+    }
 }
 
 /// A block header.
@@ -220,6 +276,21 @@ pub(crate) enum RowsError {
 /// Returns [`RowsError::Io`] if the file cannot be read or decompressed, and
 /// [`RowsError::Row`] if its content is not the expected JSON.
 pub(crate) fn read(path: &Path) -> Result<Rows, RowsError> {
+    read_batches::<Batch>(path)
+}
+
+/// Reads a downloaded chunk as [`read`] does, without its logs: for counting the fields its
+/// rows lack, which no log has. Blocking.
+///
+/// # Errors
+///
+/// As [`read`].
+pub(crate) fn read_without_logs(path: &Path) -> Result<Rows, RowsError> {
+    read_batches::<BatchWithoutLogs>(path)
+}
+
+/// Reads a downloaded chunk's answers as batches `B`.
+fn read_batches<B: DeserializeOwned + Into<Batch>>(path: &Path) -> Result<Rows, RowsError> {
     let mut rows = Rows::default();
     {
         // The text is dropped before the rows are sorted: both are large.
@@ -254,8 +325,8 @@ pub(crate) fn read(path: &Path) -> Result<Rows, RowsError> {
         // Checked as text once, so the parser does not check every string again.
         let text = String::from_utf8(data)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.utf8_error()))?;
-        for response in serde_json::Deserializer::from_str(&text).into_iter::<Response>() {
-            for batch in response?.data {
+        for response in serde_json::Deserializer::from_str(&text).into_iter::<Response<B>>() {
+            for batch in response?.data.into_iter().map(Into::<Batch>::into) {
                 rows.blocks.extend(batch.blocks);
                 rows.transactions.extend(batch.transactions);
                 rows.logs.extend(batch.logs);

@@ -49,9 +49,9 @@ use tokio::time::{MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use self::derive::{DepositRow, HeaderRow, L1Data, L1Info, Parent};
+use self::derive::{DepositRow, HeaderRow, L1Data, Parent};
 use crate::progress::{self, Rate};
-use crate::rows::{self, LogRow, Rows, TransactionRow};
+use crate::rows::{self, L1Info, LogRow, Rows, TransactionRow};
 use crate::rpc::{FilledBlock, Rpc, RpcHeader, Wanted};
 use crate::source::HyperSync;
 use crate::state::{Chunk, Plan, State, covered, read_json, write_json};
@@ -927,6 +927,38 @@ impl Work {
             );
         }
     }
+}
+
+/// How many fields the rows of the downloaded chunk at `raw` lack, one per field of each row
+/// and a hole's transactions once, as the scan lists them ([`missing`]): alone, and with what
+/// the fill at `fill` holds, if given and the rows lack any (else the same count). Blocking,
+/// CPU-bound.
+///
+/// # Errors
+///
+/// Returns [`rows::RowsError`] if the chunk or the fill cannot be read.
+pub(crate) fn lacking(
+    forks: &Forks,
+    raw: &Path,
+    fill: Option<&Path>,
+) -> Result<(u64, u64), rows::RowsError> {
+    let count = |rows: &Rows| {
+        let mut count = 0_u64;
+        missing(forks, rows, |_field, _block| {
+            count = count.saturating_add(1);
+        });
+        count
+    };
+    let mut rows = rows::read_without_logs(raw)?;
+    let alone = count(&rows);
+    if alone == 0 {
+        return Ok((0, 0));
+    }
+    let Some(fill) = fill.map(read_json::<Fill>).transpose()?.flatten() else {
+        return Ok((alone, alone));
+    };
+    apply(&mut rows, fill);
+    Ok((alone, count(&rows)))
 }
 
 /// The chunks downloaded and not sealed yet, with the size of their download. Blocking.

@@ -252,7 +252,16 @@ async fn download(
     let source = HyperSync::new(&endpoint, &api_token)?;
     let requests = usize::try_from(args.requests).wrap_err("--requests is too large")?;
     download::ensure_open_files(args.requests)?;
-    download::run(&source, state, &plan, requests, cancel).await?;
+    download::run(
+        &source,
+        state,
+        &plan,
+        requests,
+        threads(None),
+        args.refetch_incomplete,
+        cancel,
+    )
+    .await?;
     // What the service left out of the rows, from the chain's RPC.
     // Rebuilding from L1, an RPC is used only if one is given: the chain's public one is no
     // fallback to count on.

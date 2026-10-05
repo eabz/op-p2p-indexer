@@ -203,6 +203,12 @@ pub(crate) struct DownloadArgs {
         value_parser = clap::value_parser!(u64).range(1..=4096)
     )]
     pub(crate) requests: u64,
+    /// Also read every downloaded chunk not sealed yet, with its fill, and download again those
+    /// whose rows still lack a field or cannot be read: the service's servers do not all answer
+    /// alike, and asking again often gives what an answer left out. A new answer replaces the
+    /// chunk, and drops its fill, only if it lacks fewer fields.
+    #[arg(long, env = "OP_INDEXER_IMPORT_REFETCH_INCOMPLETE")]
+    pub(crate) refetch_incomplete: bool,
 }
 
 impl DownloadArgs {
