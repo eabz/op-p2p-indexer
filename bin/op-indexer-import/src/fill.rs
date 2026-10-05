@@ -37,6 +37,7 @@ use std::time::Instant;
 
 use alloy_eips::BlockNumHash;
 use alloy_eips::eip7702::SignedAuthorization;
+use alloy_primitives::B256;
 use eyre::WrapErr;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
@@ -62,6 +63,17 @@ pub(crate) struct Fill {
     /// Header fields of blocks whose header row lacks some.
     #[serde(default)]
     headers: Vec<RpcHeader>,
+    /// Source hashes of deposits whose row lacks it.
+    #[serde(default)]
+    sources: Vec<FilledSource>,
+}
+
+/// One deposit's source hash.
+#[derive(Debug, Serialize, Deserialize)]
+struct FilledSource {
+    block_number: u64,
+    transaction_index: u64,
+    source_hash: B256,
 }
 
 /// One transaction's authorization list, in the RPC's form.
@@ -111,6 +123,19 @@ pub(crate) fn apply(rows: &mut Rows, fill: Fill) -> u64 {
             .binary_search_by_key(&key, |row| (row.block_number, row.transaction_index));
         if let Some(row) = at.ok().and_then(|at| rows.transactions.get_mut(at)) {
             row.filled_authorization_list = Some(transaction.authorization_list);
+            filled = filled.saturating_add(1);
+        }
+    }
+    for source in fill.sources {
+        let key = (source.block_number, source.transaction_index);
+        let at = rows
+            .transactions
+            .binary_search_by_key(&key, |row| (row.block_number, row.transaction_index));
+        // Only into a row that lacks it: what the service sent is kept.
+        if let Some(row) = at.ok().and_then(|at| rows.transactions.get_mut(at))
+            && row.source_hash.is_none()
+        {
+            row.source_hash = Some(source.source_hash);
             filled = filled.saturating_add(1);
         }
     }
@@ -195,6 +220,9 @@ struct Fetch {
     holes: Vec<BlockNumHash>,
     /// The blocks whose header fields to fetch.
     headers: Vec<BlockNumHash>,
+    /// The blocks with deposits whose source hash to fetch; their header fields come with
+    /// them.
+    sources: Vec<Wanted>,
 }
 
 impl Fetch {
@@ -208,6 +236,7 @@ impl Fetch {
             .len()
             .saturating_add(self.holes.len())
             .saturating_add(self.headers.len())
+            .saturating_add(self.sources.len())
     }
 }
 
@@ -431,8 +460,8 @@ impl Work {
         if rpc.is_none() && self.queued_blocks > 0 {
             eyre::bail!(
                 "the archive service left out what {} block reads need (authorization lists, \
-                 transactions, header fields), and no RPC endpoint is known for chain {}: give \
-                 one with --rpc-endpoint",
+                 transactions, header fields, deposit source hashes), and no RPC endpoint is \
+                 known for chain {}: give one with --rpc-endpoint",
                 self.queued_blocks,
                 plan.chain.chain_id
             );
@@ -504,28 +533,43 @@ fn scan(forks: &Forks, raw: &Path, fill: &Path) -> eyre::Result<Scanned> {
         .filter_map(|number| rows.block(number))
         .map(|block| BlockNumHash::new(block.number, block.hash))
         .collect();
-    let mut lists: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
-    for tx in rows
-        .transactions
-        .iter()
-        .filter(|tx| tx.lacks_authorization_list())
-    {
-        lists
+    scanned.fetch.wanted = wanted(&rows, TransactionRow::lacks_authorization_list);
+    scanned.fetch.sources = wanted(&rows, |tx| {
+        tx.kind == Some(op_alloy_consensus::DEPOSIT_TX_TYPE_ID) && tx.source_hash.is_none()
+    });
+    // A block read with its transactions for its deposits brings its header fields too.
+    scanned.fetch.headers.retain(|header| {
+        scanned
+            .fetch
+            .sources
+            .binary_search_by_key(&header.number, |block| block.number)
+            .is_err()
+    });
+    Ok(scanned)
+}
+
+/// The blocks with transactions `lacks` a field of, with those transactions' indexes, in block
+/// order.
+fn wanted(rows: &Rows, lacks: impl Fn(&TransactionRow) -> bool) -> Vec<Wanted> {
+    let mut indexes: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    for tx in rows.transactions.iter().filter(|tx| lacks(tx)) {
+        indexes
             .entry(tx.block_number)
             .or_default()
             .push(tx.transaction_index);
     }
-    for (number, indexes) in lists {
+    indexes
+        .into_iter()
         // A block the chunk lacks fails `verify` on its own; nothing to fetch for it.
-        if let Some(block) = rows.block(number) {
-            scanned.fetch.wanted.push(Wanted {
+        .filter_map(|(number, indexes)| {
+            let block = rows.block(number)?;
+            Some(Wanted {
                 number,
                 hash: block.hash,
                 indexes,
-            });
-        }
-    }
-    Ok(scanned)
+            })
+        })
+        .collect()
 }
 
 /// What fetching one chunk's fill added.
@@ -569,10 +613,33 @@ async fn fill_chunk(rpc: &Rpc, fetch: &Fetch, path: PathBuf) -> eyre::Result<Fet
     for batch in fetch.headers.chunks(rpc.batch_calls()) {
         headers.extend(rpc.headers(batch).await?);
     }
+    let mut sources = Vec::new();
+    for batch in fetch.sources.chunks(rpc.batch_calls()) {
+        for (block, (header, hashes)) in batch.iter().zip(rpc.deposit_sources(batch).await?) {
+            headers.push(header);
+            sources.extend(
+                block
+                    .indexes
+                    .iter()
+                    .zip(hashes)
+                    .map(|(&index, hash)| FilledSource {
+                        block_number: block.number,
+                        transaction_index: index,
+                        source_hash: hash,
+                    }),
+            );
+        }
+    }
     let added: usize = blocks.iter().map(|block| block.transactions.len()).sum();
     let fetched = Fetched {
         blocks: u64::try_from(fetch.blocks()).unwrap_or(u64::MAX),
-        transactions: u64::try_from(lists.len().saturating_add(added)).unwrap_or(u64::MAX),
+        transactions: u64::try_from(
+            lists
+                .len()
+                .saturating_add(added)
+                .saturating_add(sources.len()),
+        )
+        .unwrap_or(u64::MAX),
         headers: u64::try_from(headers.len()).unwrap_or(u64::MAX),
     };
     tokio::task::spawn_blocking(move || {
@@ -584,6 +651,7 @@ async fn fill_chunk(rpc: &Rpc, fetch: &Fetch, path: PathBuf) -> eyre::Result<Fet
         fill.headers
             .retain(|kept| headers.iter().all(|new| new.number != kept.number));
         fill.headers.extend(headers);
+        fill.sources.extend(sources);
         write_json(&path, &fill)
     })
     .await??;

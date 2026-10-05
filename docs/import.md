@@ -95,7 +95,7 @@ again; a completed chunk is never redone.
 
 ### 3.1a What the service leaves out, from the chain's RPC
 
-Three gaps are known: two on Unichain, one on Base; OP Mainnet's whole chain verified without
+Four gaps are known: two on Unichain, two on Base; OP Mainnet's whole chain verified without
 any.
 
 - **Authorization lists.** HyperSync sends EIP-7702 transactions (type 4) without their
@@ -119,6 +119,14 @@ any.
   its fork's header fields are kept; whether the later forks' fields (`withdrawals_root`, the
   blob gas fields, the parent beacon block root) are missing there too shows in the scan's
   report, per field.
+- **Deposit source hashes (Base).** In the same stretches the deposit rows lack `source_hash`
+  (every deposit of the first 251 chunks, 9,404 of them, in the user's run of 2026-10-05). A
+  deposit's encoding, so the transactions root, includes it. For a block whose deposits lack
+  it, the block is read with its transactions (`eth_getBlockByNumber` with full transactions)
+  and each deposit's source hash kept, by transaction index; the header fields come from the
+  same answer, so such a block costs one call. (L1 could give them too, not built: an
+  L1-attributes deposit's from its L1 origin hash and sequence number, a user deposit's from
+  its L1 block hash and log index.)
 
 - **Checked after every download.** Once the chunks are on disk, `download` reads every chunk
   not sealed yet (one per core at a time, within 256 MiB of downloaded bytes in flight, the
@@ -180,7 +188,9 @@ any.
 - **Endpoint**: `--rpc-endpoint` (`OP_INDEXER_IMPORT_RPC_ENDPOINT`), by default
   `https://mainnet.unichain.org` for Unichain, `https://mainnet.base.org` for Base, and none
   for OP Mainnet, whose rows need none so far; without one, `download` stops with a message
-  when something is missing.
+  when something is missing. Only its scheme and host are shown, in logs and errors alike (a
+  provider's key is in the path or the query: the rest shows as `/…`), and the HTTP client's
+  errors are kept without the URL.
 - **Counted**: `blocks_to_fetch`, `blocks_fetched`, `rpc_filled_transactions` and
   `rpc_filled_headers` in `download`'s summary, and one warning per missing field with its
   count and first block (counted before that run's fills); `rpc_filled_transactions` (lists
@@ -206,6 +216,14 @@ and access list, coming from the endpoint) verified too. The receipt-by-receipt 
 not run: Unichain's endpoint has `eth_getBlockReceipts`. Not checked against HyperSync's own
 Unichain answers. (These checks ran with the build of the time, whose `verify` wrote a
 verified copy instead of sealing.)
+
+Deposit source hashes, checked on 2026-10-05: the same chunk with, besides `mix_hash` and
+`base_fee_per_gas`, the `source_hash` of all 103 deposits taken out. `verify` stopped at the
+first block; `download` reported the three fields (`deposit`/`source_hash` 103 times), read the
+100 blocks with their transactions (100 calls: the headers came with them) in 8.1 s, and filled
+103 source hashes and 100 headers; a second `download` fetched nothing; `verify` accepted the
+chunk (`rpc_filled_transactions=103`). An endpoint given as `http://127.0.0.1:18998/<key>?token=<key>`
+showed as `http://127.0.0.1:18998/…` in the log and the error, and the key nowhere.
 
 Header fields, checked on 2026-10-05: a chunk of OP Mainnet (blocks 140,000,063 to
 140,000,162) with `mix_hash` and `base_fee_per_gas` taken out of all 100 header rows.

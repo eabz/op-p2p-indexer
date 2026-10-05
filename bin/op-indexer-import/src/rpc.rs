@@ -134,8 +134,9 @@ pub(crate) struct RpcLog {
 /// Why a block could not be read from the endpoint.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RpcError {
+    /// Without its URL, which may hold a key ([`Rpc::url`]).
     #[error("request failed: {0}")]
-    Transport(#[from] reqwest::Error),
+    Transport(reqwest::Error),
     #[error("the endpoint is limiting the request rate")]
     RateLimited {
         /// How long the endpoint asks to wait (`Retry-After`, in seconds), if it says.
@@ -160,6 +161,14 @@ pub(crate) enum RpcError {
     },
     #[error("transaction {index} of block {number} has no authorization list at the endpoint")]
     NoAuthorizations { number: u64, index: u64 },
+    #[error("transaction {index} of block {number} has no source hash at the endpoint")]
+    NoSource { number: u64, index: u64 },
+}
+
+impl From<reqwest::Error> for RpcError {
+    fn from(err: reqwest::Error) -> Self {
+        Self::Transport(err.without_url())
+    }
 }
 
 impl RpcError {
@@ -173,7 +182,8 @@ impl RpcError {
             Self::Refused { .. }
             | Self::NoBlock(_)
             | Self::OtherBlock { .. }
-            | Self::NoAuthorizations { .. } => false,
+            | Self::NoAuthorizations { .. }
+            | Self::NoSource { .. } => false,
         }
     }
 }
@@ -182,7 +192,11 @@ impl RpcError {
 #[derive(Debug, Clone)]
 pub(crate) struct Rpc {
     client: Client,
-    url: String,
+    /// The URL requests go to; never shown: a provider's holds its key in the path or the
+    /// query.
+    address: String,
+    /// The scheme and host, to show.
+    shown: String,
     /// Calls in one request; at least two (a whole block takes two).
     batch_calls: usize,
 }
@@ -193,22 +207,39 @@ impl Rpc {
     ///
     /// # Errors
     ///
-    /// Returns an error if the HTTP client cannot be built.
+    /// Returns an error if `url` is not a URL (without showing it) or the HTTP client cannot
+    /// be built.
     pub(crate) fn new(url: &str, batch: usize) -> eyre::Result<Self> {
+        let parsed = reqwest::Url::parse(url)
+            .map_err(|err| eyre::eyre!("--rpc-endpoint is not a URL: {err}"))?;
+        let mut shown = format!(
+            "{}://{}",
+            parsed.scheme(),
+            parsed.host_str().unwrap_or_default()
+        );
+        if let Some(port) = parsed.port() {
+            shown = format!("{shown}:{port}");
+        }
+        // Said, not shown: there may be a key in it.
+        if parsed.path() != "/" || parsed.query().is_some() {
+            shown.push_str("/…");
+        }
         let client = Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .connect_timeout(CONNECT_TIMEOUT)
             .build()?;
         Ok(Self {
             client,
-            url: url.to_owned(),
+            address: url.to_owned(),
+            shown,
             batch_calls: batch.max(2),
         })
     }
 
-    /// The URL, for messages.
+    /// The endpoint, for messages: its scheme and host only, as a provider's key may be in
+    /// the rest.
     pub(crate) fn url(&self) -> &str {
-        &self.url
+        &self.shown
     }
 
     /// Calls in one request.
@@ -281,6 +312,45 @@ impl Rpc {
             }
         }
         Ok(lists)
+    }
+
+    /// The source hashes of the deposits `blocks` want, in their order (block by block, index
+    /// by index), with each block's header fields, read with one batch request of the blocks
+    /// with their transactions: at most [`Self::batch_calls`] blocks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RpcError`] once the attempts are spent or the error cannot pass.
+    pub(crate) async fn deposit_sources(
+        &self,
+        blocks: &[Wanted],
+    ) -> Result<Vec<(RpcHeader, Vec<B256>)>, RpcError> {
+        let calls: Vec<_> = blocks
+            .iter()
+            .map(|block| block_call(block.number))
+            .collect();
+        let mut found = Vec::with_capacity(blocks.len());
+        for (wanted, answer) in blocks.iter().zip(self.batch(&calls).await?) {
+            let answer = answer?;
+            let number = wanted.number;
+            let header =
+                parse::<Option<RpcHeader>>(answer.clone())?.ok_or(RpcError::NoBlock(number))?;
+            let block: Block<SourcedTransaction> = block(answer, number, wanted.hash)?;
+            let sources = wanted
+                .indexes
+                .iter()
+                .map(|&index| {
+                    // Transactions come in block order; the header hash proves what is taken.
+                    usize::try_from(index)
+                        .ok()
+                        .and_then(|at| block.transactions.get(at))
+                        .and_then(|transaction| transaction.source_hash)
+                        .ok_or(RpcError::NoSource { number, index })
+                })
+                .collect::<Result<_, _>>()?;
+            found.push((header, sources));
+        }
+        Ok(found)
     }
 
     /// The transactions and receipts of the blocks `holes`, in their order, read with one batch
@@ -365,7 +435,7 @@ impl Rpc {
                     };
                     // What the endpoint asks for, within reason.
                     let wait = retry_after.map_or(wait, |after| after.min(MAX_RETRY_AFTER));
-                    warn!(endpoint = %self.url, ?wait, "the RPC endpoint is rate limiting; waiting");
+                    warn!(endpoint = %self.shown, ?wait, "the RPC endpoint is rate limiting; waiting");
                     sleep(wait).await;
                 }
                 Err(err) if err.is_retryable() => {
@@ -390,7 +460,7 @@ impl Rpc {
         let count = calls.len();
         let response = self
             .client
-            .post(&self.url)
+            .post(&self.address)
             .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
             .body(Value::Array(calls).to_string())
             .send()
@@ -541,6 +611,13 @@ impl From<CallError> for RpcError {
 struct Block<T> {
     hash: B256,
     transactions: Vec<T>,
+}
+
+/// The part of a transaction a deposit's source hash is read from.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SourcedTransaction {
+    source_hash: Option<B256>,
 }
 
 /// The part of a transaction an authorization list is read from.
