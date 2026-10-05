@@ -447,6 +447,12 @@ impl SessionDriver {
                     )));
                 }
                 Ok(update) => {
+                    debug!(
+                        peer = %self.peer_id,
+                        earliest = update.earliest,
+                        latest = update.latest,
+                        "block range update"
+                    );
                     self.range.send_replace(BlockRange {
                         earliest: update.earliest,
                         latest: update.latest,

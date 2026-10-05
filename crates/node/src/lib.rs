@@ -26,7 +26,7 @@ use std::time::Duration;
 use alloy_primitives::BlockNumber;
 use eyre::WrapErr;
 use op_indexer_chainspec::ChainSpec;
-use op_indexer_el::{ExecutionNetwork, RangeSync, RoundEnd, SyncPlan};
+use op_indexer_el::{ExecutionNetwork, Peers, RangeSync, RoundEnd, SyncPlan};
 use op_indexer_l1::{BeaconConfig, L1Config, L1Network, LightClient};
 use op_indexer_p2p::{Network, NodeStore, PayloadSource, StoreError};
 use op_indexer_pipeline::{Pipeline, ReceiptsChannels};
@@ -531,7 +531,7 @@ fn execution_network<A: Archive>(
             let (plans_tx, plans_rx) = mpsc::channel(1);
             let (blocks_tx, batches) = mpsc::channel(SYNC_BATCH_CAPACITY);
             let (checkpoints_tx, checkpoints_rx) = mpsc::channel(SYNC_CHECKPOINT_CAPACITY);
-            let plan = plan_sync(Arc::clone(store), inputs, plans_tx);
+            let plan = plan_sync(Arc::clone(store), inputs, network.peers(), plans_tx);
             follow(followers, "range sync planner", plan);
             saves.push(tokio::spawn(save_sync_checkpoints(
                 Arc::clone(store),
@@ -603,6 +603,7 @@ struct Rest {
 async fn plan_sync<A: Archive>(
     store: Arc<NodeStore>,
     mut inputs: SyncInputs<A>,
+    peers: Peers,
     plans: mpsc::Sender<SyncPlan>,
 ) {
     let mut resume = {
@@ -624,7 +625,7 @@ async fn plan_sync<A: Archive>(
         let anchor = match resumed {
             Some(anchor) => anchor,
             None => {
-                match next_anchor(&mut inputs, from, rest.as_ref(), &plans).await {
+                match next_anchor(&mut inputs, &peers, from, rest.as_ref(), &plans).await {
                     Some(Some(anchor)) => anchor,
                     // Something moved, or a wait ended: look again.
                     Some(None) => continue,
@@ -687,10 +688,14 @@ async fn plan_sync<A: Archive>(
 /// the safe head, or below the committed safe block, and is anchored on the safe head only:
 /// everything the sync writes is then committed on L1, so no reorg can leave it behind.
 /// Without it a round is needed while the archive is that far below the gossiped head, and is
-/// anchored on the block [`ANCHOR_DEPTH`] below it: an unsafe reorg deeper than that would
-/// leave the archive on a dead branch, which only rebuilding the archive repairs.
+/// anchored on the gossiped block [`ANCHOR_DEPTH`] below it, or lower, at the newest block
+/// peers say they hold ([`Peers::advertised_latest`]): peers announce their range only every
+/// few minutes, so an anchor at the head would wait on a height none of them has announced.
+/// An unsafe reorg deeper than the anchor would leave the archive on a dead branch, which only
+/// rebuilding the archive repairs.
 async fn next_anchor<A: Archive>(
     inputs: &mut SyncInputs<A>,
+    peers: &Peers,
     from: BlockNumber,
     rest: Option<&Rest>,
     plans: &mpsc::Sender<SyncPlan>,
@@ -710,7 +715,10 @@ async fn next_anchor<A: Archive>(
         safe.filter(|safe| safe.number >= from && (far(safe.number) || behind_committed))
     } else {
         match head.filter(|head| far(head.number)) {
-            Some(head) => below_head(&inputs.unsafe_store, head).await,
+            Some(head) => {
+                let advertised = peers.advertised_latest();
+                anchor_below(&inputs.unsafe_store, head, advertised, from).await
+            }
             None => None,
         }
     };
@@ -734,17 +742,27 @@ async fn next_anchor<A: Archive>(
     Some(None)
 }
 
-/// The gossiped block [`ANCHOR_DEPTH`] below `head`, if the unsafe store holds the chain that
-/// far down (it does not right after a start: then the next head is tried).
-async fn below_head(unsafe_store: &MemoryStore, head: BlockRef) -> Option<BlockRef> {
-    let stop_at = head.number.checked_sub(ANCHOR_DEPTH.saturating_add(1))?;
-    match unsafe_store.ancestry(head, stop_at).await {
-        Ok(blocks) => blocks.first().map(|block| BlockRef {
-            number: block.block.header.number,
+/// The gossiped canonical block [`ANCHOR_DEPTH`] below `head`, or lower at `advertised`, the
+/// newest block peers say they hold; `None` without a peer saying so, below `from`, or if the
+/// unsafe store does not hold the chain that far down (right after a start: then the next head
+/// is tried).
+async fn anchor_below(
+    unsafe_store: &MemoryStore,
+    head: BlockRef,
+    advertised: Option<BlockNumber>,
+    from: BlockNumber,
+) -> Option<BlockRef> {
+    let height = head.number.checked_sub(ANCHOR_DEPTH)?.min(advertised?);
+    if height < from {
+        return None;
+    }
+    match unsafe_store.canonical(height).await {
+        Ok(block) => block.map(|block| BlockRef {
+            number: height,
             hash: block.hash,
         }),
         Err(err) => {
-            debug!(%err, head = head.number, "no range sync anchor below this head yet");
+            debug!(%err, height, "no range sync anchor at this height yet");
             None
         }
     }

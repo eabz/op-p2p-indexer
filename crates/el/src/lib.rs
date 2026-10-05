@@ -116,6 +116,12 @@ impl<P: BlockProvider> ExecutionNetwork<P> {
         })
     }
 
+    /// The open sessions, as requesters see them: for what peers advertise.
+    #[must_use]
+    pub fn peers(&self) -> Peers {
+        self.peers.clone()
+    }
+
     /// Adds a range of blocks to fetch from peers and verify, next to the receipts of new
     /// blocks. It uses the same sessions, one request at a time on each.
     #[must_use]

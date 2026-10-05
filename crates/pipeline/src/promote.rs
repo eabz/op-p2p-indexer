@@ -315,7 +315,9 @@ where
     /// when that is higher and below `safe`, up to `safe` and appends them to the archive,
     /// oldest part first. When only the part next to `safe` can be read, that part is written
     /// and the rest is a hole. Returns the newest block it appended (all of `safe`'s chain,
-    /// above `committed`), which is what may be recorded as committed; `None` if none.
+    /// above `committed`), which is what may be recorded as committed; `None` if none. When the
+    /// archive already reaches `safe` and holds it by hash (range sync stored it), nothing is
+    /// read or written and `safe` is returned.
     async fn commit_range(
         &mut self,
         committed: Option<BlockRef>,
@@ -330,6 +332,21 @@ where
             self.archive.range()
         });
         let tip = range.await?.map(|(_, tip)| tip);
+        if tip.is_some_and(|tip| tip.number >= safe.number) {
+            let archive = &self.archive;
+            let number = call(cancel, Store::Archive, "archive number_of", || {
+                archive.number_of(safe.hash)
+            })
+            .await?;
+            // Another block at that height falls through to the checks below.
+            if number == Some(safe.number) {
+                debug!(
+                    ?safe,
+                    "the archive already holds the safe head; nothing to promote"
+                );
+                return Ok(Some(safe));
+            }
+        }
         let base = match (committed, tip) {
             (committed, Some(tip))
                 if tip.number < safe.number
