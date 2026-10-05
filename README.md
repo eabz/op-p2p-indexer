@@ -20,12 +20,10 @@ Ubuntu 22.04 or newer, x86-64, as root (it writes `/usr/local/bin` and systemd u
 sudo bash -c "$(curl -fsSL https://eabz.github.io/op-p2p-indexer/install.sh)"
 ```
 
-The installer takes no options. Two checklists (↑/↓ move, Space ticks, Enter confirms): the
-programs, then the chains. It installs the programs from the latest release (checksum
-verified) to `/usr/local/bin`; missing prerequisites are installed with apt in the background.
-
-Each service (`server`, `indexer`, `balancer`) runs once per chain, as
-`op-indexer-<program>-<chain>`, run by the account that ran sudo, from its own directory:
+The installer takes no options. The first run asks for the programs, then the chains
+(↑/↓ move, Space ticks, Enter confirms), installs the programs from the latest release
+(checksum verified) to `/usr/local/bin` and sets up each service once per chain, as the systemd
+unit `<chain>-<program>` (`unichain-server`, `base-balancer`), run by the account that ran sudo:
 
 ```text
 ~/.op-indexer/config.toml             shared by every chain: keys, R2 (each chain extends it)
@@ -35,11 +33,18 @@ Each service (`server`, `indexer`, `balancer`) runs once per chain, as
 ```
 
 Each chain gets its own block of ports (the defaults, plus 1000 per chain, recorded in its
-file), so chains never collide. A program added later gets its section appended; nothing
-written is rewritten. Services whose configuration was just written are not started: fill in
-the keys, then `sudo systemctl start op-indexer-<program>-<chain>`. Run the installer again to
-update (services whose configuration checks are restarted), or to add or remove programs and
-chains: what is unticked is stopped and removed; configuration and data are kept.
+file), so chains never collide. A service whose configuration was just written is not started:
+fill in the keys, then `sudo systemctl start <chain>-<program>`. `import` and `bench` are
+tools, run by hand; missing prerequisites are installed with apt in the background.
+
+Once installed, running it again offers:
+
+- **Update the programs** to the latest release, then restart the services whose
+  configuration checks.
+- **Add services**: more programs, or the same ones on more chains (their sections are
+  appended; nothing written is rewritten).
+- **Remove services**: stops them and deletes their units, and lists where their
+  configuration, data and log are. Nothing is deleted from `~/.op-indexer`.
 
 ## Configure and run
 
@@ -86,8 +91,8 @@ For a local source build, run `cargo build --release` and use the binaries in `t
 ## Control services
 
 ```bash
-sudo systemctl restart op-indexer-server-unichain
-sudo systemctl status op-indexer-server-unichain
+sudo systemctl restart unichain-server
+sudo systemctl status unichain-server
 tail -f ~/.op-indexer/unichain/server.log
 ```
 
