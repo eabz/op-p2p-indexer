@@ -42,6 +42,11 @@ use crate::table::Table;
 
 /// How often the manifest is read again for new chunks.
 const MANIFEST_REFRESH: Duration = Duration::from_secs(30);
+/// How often each server's status is logged.
+const STATUS_INTERVAL: Duration = Duration::from_secs(30);
+/// Blocks a server may hold behind the newest head before its status is a warning: about
+/// a minute of blocks at 1 to 2 s each.
+const BEHIND_WARN: u64 = 64;
 /// How long open calls and tasks get to end after shutdown begins.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// How often an idle connection is pinged, and how long the answer may take: on the
@@ -153,6 +158,7 @@ impl Balancer {
             chunks,
             cancel.child_token(),
         ));
+        tasks.spawn(report_servers(table.clone(), cancel.child_token()));
         let users = ApiKeys::new(&config.api_keys);
         let service = Service {
             chain,
@@ -196,6 +202,57 @@ impl Balancer {
             warn!("balancer tasks still running after the grace period; leaving them");
         }
         served.map_err(|source| BalancerError::Serve { addr, source })
+    }
+}
+
+/// Logs every [`STATUS_INTERVAL`] one line per registered server: its heads, how far it
+/// holds every block, and how far that is behind the newest head any server has. A server
+/// unhealthy or more than [`BEHIND_WARN`] blocks behind is logged as a warning.
+async fn report_servers(table: Table, cancel: CancellationToken) {
+    let mut ticks = tokio::time::interval(STATUS_INTERVAL);
+    ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    ticks.tick().await;
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            _ = ticks.tick() => {}
+        }
+        let servers = table.snapshot();
+        let tip = servers
+            .iter()
+            .filter_map(|(_, server)| server.unsafe_head)
+            .max();
+        if servers.is_empty() {
+            warn!("no server registered");
+        }
+        for (id, server) in servers {
+            let behind = tip
+                .zip(server.contiguous_through)
+                .map(|(tip, through)| tip.saturating_sub(through));
+            let lagging = behind.is_none_or(|behind| behind > BEHIND_WARN);
+            macro_rules! status {
+                ($level:ident) => {
+                    $level!(
+                        server = %id,
+                        address = %server.address,
+                        healthy = server.healthy,
+                        unsafe_head = ?server.unsafe_head,
+                        safe = ?server.safe_head,
+                        finalized = ?server.finalized_head,
+                        contiguous_through = ?server.contiguous_through,
+                        behind = ?behind,
+                        in_flight = server.requests_in_flight,
+                        "server status"
+                    )
+                };
+            }
+            if !server.healthy || lagging {
+                status!(warn);
+            } else {
+                status!(info);
+            }
+        }
     }
 }
 

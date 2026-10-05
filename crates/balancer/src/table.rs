@@ -80,6 +80,17 @@ impl Table {
         }
     }
 
+    /// Every registered server with its id, healthy or not, ordered by id.
+    pub(crate) fn snapshot(&self) -> Vec<(String, Server)> {
+        let mut servers: Vec<_> = self
+            .lock()
+            .iter()
+            .map(|(id, (_, server))| (id.clone(), server.clone()))
+            .collect();
+        servers.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        servers
+    }
+
     /// A picker over the healthy servers now.
     pub(crate) fn picker(&self) -> Picker {
         let mut servers: Vec<Server> = self
