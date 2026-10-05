@@ -218,6 +218,11 @@ async fn handshake(
         .map_err(|_elapsed| SessionError::Timeout { stage: "status" })?
         .map_err(|err| status_error(ctx, &err))?;
 
+    // A peer on our chain announcing a fork we do not know, still ahead.
+    if ctx.spec().is_unknown_next(theirs.forkid) {
+        ctx.warn_build_behind(theirs.forkid, "eth status");
+        ctx.horizon().announced(addr.ip(), theirs.forkid.next);
+    }
     let peer = PeerStatus {
         peer_id,
         addr,

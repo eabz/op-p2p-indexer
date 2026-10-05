@@ -10,7 +10,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use alloy_eip2124::{ForkFilter, ForkFilterKey, Head};
+use alloy_eip2124::{ForkFilter, ForkFilterKey, ForkId, Head};
 use alloy_primitives::{B256, BlockNumber};
 use op_indexer_chainspec::ChainSpec;
 use op_indexer_primitives::{BlockRef, ExecutionPeer};
@@ -59,6 +59,10 @@ pub struct NetworkSpec {
     pub fork_times: Vec<u64>,
     /// Discovery bootnodes, as `enr:` records or `enode://` URLs.
     pub bootnodes: Vec<String>,
+    /// The discv5 protocol id of the network's discovery: `discv5` for the global DHT, or a
+    /// chain's own (`basev0` on Base, whose execution nodes run a discovery network apart).
+    /// Nodes on another id cannot decode each other's packets.
+    pub discovery_id: [u8; 6],
     /// The node record keys this network's nodes publish their fork id under, preferred
     /// first. Our own record carries all of them.
     pub record_keys: &'static [&'static str],
@@ -74,7 +78,7 @@ impl NetworkSpec {
     #[must_use]
     pub fn op_stack(chain: &ChainSpec, bootnodes: Vec<String>) -> Self {
         let bootnodes = if bootnodes.is_empty() {
-            chain.bootnodes().map(str::to_owned).collect()
+            chain.execution_bootnodes().map(str::to_owned).collect()
         } else {
             bootnodes
         };
@@ -84,8 +88,9 @@ impl NetworkSpec {
             genesis_hash: chain.genesis_hash,
             genesis_time: chain.genesis_time,
             fork_blocks: chain.fork_blocks.to_vec(),
-            fork_times: chain.fork_times().to_vec(),
+            fork_times: chain.fork_times(),
             bootnodes,
+            discovery_id: chain.execution_discovery_id,
             record_keys: &[OPEL_RECORD_KEY, ETH_RECORD_KEY],
             indexers_only_below: Some(chain.bedrock_block),
         }
@@ -116,9 +121,9 @@ impl NetworkSpec {
         )
     }
 
-    /// Whether `time` is a hardfork activation this build knows.
-    pub(crate) fn knows_fork_time(&self, time: u64) -> bool {
-        self.fork_times.contains(&time)
+    /// Whether `fork_id` announces a next hardfork this build does not know.
+    pub(crate) fn is_unknown_next(&self, fork_id: ForkId) -> bool {
+        fork_id.next != 0 && !self.fork_times.contains(&fork_id.next)
     }
 }
 

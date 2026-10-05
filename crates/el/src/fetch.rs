@@ -269,7 +269,7 @@ impl Fetcher {
         // The peer furthest ahead gets the newest block.
         sessions.sort_unstable_by_key(|session| std::cmp::Reverse(session.range().latest));
         let now = Instant::now();
-        let canyon_time = self.chain.canyon_time;
+        let canyon_time = self.chain.canyon_time();
         for session in sessions {
             if !session.is_askable() {
                 continue;

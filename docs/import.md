@@ -521,6 +521,55 @@ What differs from OP Mainnet:
 `verify` that stopped at block 16,068,511 on the missing authorization list (section 3.1a).
 The fill, the rest of `verify` and `load` have not run on Unichain yet.
 
+### Base (chain 8453)
+
+```bash
+import --state-dir base-state download --chain 8453 --api-token <TOKEN>
+```
+
+```bash
+import --state-dir base-state verify
+```
+
+```bash
+import --state-dir base-state load
+```
+
+What differs (`docs/base.md`):
+
+- **No legacy chain**, as Unichain: Bedrock at block 0, every chunk 100 blocks by default.
+  About 52 million blocks (2 s blocks), so about 520,000 chunks: fewer than OP Mainnet's
+  630,336, which `verify`'s linking pass and `verified.json` already handle.
+- **The endpoint** is `https://base.hypersync.xyz` (the service's list of networks); not yet
+  reached from here.
+- **Base's own forks** (Azul, Beryl, Cobalt) change nothing the import rebuilds: the header,
+  the transaction types (0, 1, 2, 4, 0x7E) and the receipts are OP's. `verify` takes its fork
+  times (Regolith, Canyon, Ecotone, Isthmus) from the chain's fork list. Checked on
+  2026-10-04: blocks 1,000,000, 13,000,000, 46,700,000 (Azul), 47,900,000 (Beryl) and
+  52,100,000 (Cobalt) rebuilt to their hashes, from Base's public endpoints in the rows'
+  form (as holes, section 3.1a). Not checked against HyperSync's own Base answers.
+- **The top anchor** is the newest game of Base's factory
+  (`0x43edB88C4B80fDD2AdFF2412A7BebF9dF42cB40e` on Ethereum): `AggregateVerifier` games (type
+  621), created with `createWithInitData`, whose extra data starts with the L2 block number and
+  whose root claim is that block's output root, read through the chain spec's claim formats
+  like the other types.
+- **No RPC endpoint by default.** Whether HyperSync's Base rows lack anything is not known;
+  if they do, `download` lists it and stops, asking for `--rpc-endpoint`. Two public ones
+  work: `https://mainnet.base.org` (Base's own; it has no `eth_getBlockReceipts`, so a hole's
+  receipts are read one by one, and it limits the rate with an error in the answer, which is
+  waited out like HTTP 429) and `https://base.drpc.org` (has it).
+- **Size.** The archive is estimated at 2 to 3.5 TB (`docs/base.md` section 6). Scaled from
+  OP Mainnet's 589 GB downloaded for a 914 GB archive, the download is about 1.3 to 2.3 TB, and
+  the verified chunks about as much again: up to three copies at once is 5 to 9 TB. `download`
+  stops at 16 GiB free and `verify` refuses to start without half the downloaded bytes free.
+  `load` refuses to start when the archive's disk has less free than the verified chunks to
+  load (the archive is larger, its values compressed with snappy rather than zstd), and stops
+  between appends at 16 GiB free; a later run resumes after the archive's last block. Once
+  `verify` has accepted the range, `raw/` (with its fills) is not needed by `load` and can be
+  deleted, or kept on another disk, to make room. Chunks are about ten times larger per block
+  than OP Mainnet's, so `verify` runs fewer at once (its 256 MiB in-flight bound) and `load`
+  holds more in memory while preparing (up to 32 chunks read ahead and a 1 GiB append).
+
 ## 11. Where the import stops, and the top anchor
 
 The archive service's newest blocks are unsafe: not yet committed to L1. And parent hashes
@@ -533,8 +582,10 @@ trusted hash at its top (section 3.2); a range that reaches the present needs on
   game is recorded with the plan in the state directory, so `verify` and `load` stay offline
   and a resumed download keeps the same end. The lookup uses the service's L1 endpoint, so it
   counts against the token's window like any download.
-- **Two kinds of game, chosen by game type** from a table in `op-indexer-chainspec`
-  (`claim_format`): a fault dispute game (types 0, 1, 2, 3, 8) names an L2 block number and
+- **The kind of game is chosen by its type**, from the chain's table in
+  `op-indexer-chainspec` (read through `ChainSpec::game_claim`): an aggregate game (type 621,
+  Base) names an L2 block number and its root claim is that block's output root; a fault
+  dispute game (types 0, 1, 2, 3, 8) names an L2 block number and
   its root claim is that block's output root; a super fault dispute game (types 4, 5, 7, 9;
   OP Mainnet creates type 9 as of 2026-10) carries the preimage of a super root, a timestamp
   and one output root per chain, and its root claim is the hash of that preimage. The claim
@@ -559,9 +610,9 @@ trusted hash at its top (section 3.2); a range that reaches the present needs on
 - **Before Isthmus** the header does not carry the message passer's storage root, so the
   output root cannot be computed from what is downloaded and a game cannot anchor such a
   block. A range that ends there needs the trusted hash of its last block instead.
-- A game not created by a plain call of the factory's `create` with a one-word extra data
-  (created through another contract, or another kind of game) is refused with a message
-  rather than misread.
+- A game not created by a plain call of the factory (`create`, or for type 621
+  `createWithInitData`) with the extra data of its type (created through another contract, or
+  another kind of game) is refused with a message rather than misread.
 - From the chain specification: the factory (OP Mainnet:
   `0xe5965Ab5962eDc7477C8520243A95517CD252fA9`, superchain registry,
   `superchain/configs/mainnet/op.toml`, `DisputeGameFactoryProxy`), the Bedrock block and its

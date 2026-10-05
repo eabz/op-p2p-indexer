@@ -14,6 +14,7 @@ use secp256k1::SecretKey;
 use tokio::sync::{mpsc, watch};
 use tracing::warn;
 
+use crate::horizon::Horizon;
 use crate::network::NetworkSpec;
 use crate::serve::{Serving, SessionServing};
 use crate::warn_limit::WarnLimit;
@@ -36,8 +37,10 @@ pub(crate) struct SessionContext {
     tip: watch::Receiver<Option<BlockRef>>,
     /// When the "build looks behind" warning was last logged.
     behind_warned: WarnLimit,
+    /// Unknown fork times peers announce, and the horizon they set.
+    horizon: Horizon,
     /// Peers whose node record says they are op-p2p-indexers, as discovery saw them in
-    /// this run (a saved flag is not trusted). At most [`MAX_INDEXERS`].
+    /// this run (the flag is not saved). At most [`MAX_INDEXERS`].
     indexers: Mutex<HashSet<PeerId>>,
 }
 
@@ -49,6 +52,7 @@ impl SessionContext {
         serving: Serving,
         tip: watch::Receiver<Option<BlockRef>>,
     ) -> Self {
+        let horizon = Horizon::new(spec.label, spec.fork_times.last().copied());
         Self {
             key,
             spec,
@@ -56,6 +60,7 @@ impl SessionContext {
             serving,
             tip,
             behind_warned: WarnLimit::default(),
+            horizon,
             indexers: Mutex::new(HashSet::new()),
         }
     }
@@ -136,6 +141,11 @@ impl SessionContext {
     /// The fork filter now: yields our fork id and validates a peer's.
     pub(crate) fn fork_filter(&self) -> ForkFilter {
         self.spec.fork_filter()
+    }
+
+    /// The known-forks horizon.
+    pub(crate) const fn horizon(&self) -> &Horizon {
+        &self.horizon
     }
 
     /// Warns, at most once per [`BEHIND_WARN_INTERVAL`], that peers are on a fork this build

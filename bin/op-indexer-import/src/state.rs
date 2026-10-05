@@ -300,15 +300,7 @@ impl State {
     ///
     /// Returns the I/O error of the system call.
     pub(crate) fn free_bytes(&self) -> io::Result<Option<u64>> {
-        #[cfg(unix)]
-        {
-            let stat = rustix::fs::statvfs(&self.root)?;
-            Ok(Some(stat.f_bavail.saturating_mul(stat.f_frsize)))
-        }
-        #[cfg(not(unix))]
-        {
-            Ok(None)
-        }
+        free_bytes(&self.root)
     }
 
     /// File of the downloaded chunk.
@@ -355,6 +347,24 @@ pub(crate) fn write_atomic(
     // The contents are synced first, so a crash never leaves a short file under the final
     // name; the rename itself becomes durable when the directory is synced ([`sync_dir`]).
     fs::rename(&temporary, path)
+}
+
+/// Free space on the disk of `path`, where the system tells. Blocking.
+///
+/// # Errors
+///
+/// Returns the I/O error of asking.
+pub(crate) fn free_bytes(path: &Path) -> io::Result<Option<u64>> {
+    #[cfg(unix)]
+    {
+        let stat = rustix::fs::statvfs(path)?;
+        Ok(Some(stat.f_bavail.saturating_mul(stat.f_frsize)))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(None)
+    }
 }
 
 /// Removes the file at `path`, if there is one. Blocking.

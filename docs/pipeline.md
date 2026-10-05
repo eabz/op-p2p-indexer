@@ -47,10 +47,16 @@ its own two data tasks, the L1 heads forwarder and the range sync planner.
 1. **Decode.** `p2p` already builds the full block from the SSZ payload to check
    its hash, and used to discard it and send the raw SSZ. `UnsafeBlock` now carries that
    `OpBlock` instead of the raw payload, so the block is decoded once and the pipeline needs no
-   SSZ or engine-API dependencies. A block that passes every gossip rule but holds a
-   transaction this build cannot decode (a type newer than it) is ignored by `p2p`, not
-   rejected: it is our limitation, so the peer is not penalised, but the block is neither
-   stored nor forwarded.
+   SSZ or engine-API dependencies. A block the sequencer signed that this build cannot read
+   is ignored by `p2p`, not rejected: the peer is not at fault. It is neither stored nor
+   forwarded, and three distinct ones within ten minutes stop the node
+   (`NetworkError::ProtocolChanged`): the chain activated a change this build does not know,
+   and the operator must upgrade. Only what the sequencer alone can produce counts: a signed
+   payload that decodes as no payload version this build knows; one on the topic the current
+   time requires that breaks a fork rule or does not rebuild to its hash; a transaction of an
+   unknown type. A genuine payload a peer replays on another version's topic (the signature
+   covers the bytes, not the topic) decodes as its own version and is rejected as the peer's
+   fault, so no peer can stop the node.
 2. **Recover senders.** One secp256k1 recovery per signed transaction; deposits carry their
    sender. It is CPU work, so it runs on a blocking thread, one block at a time. A transaction
    whose sender cannot be recovered makes the block invalid: it is dropped with a warning and a

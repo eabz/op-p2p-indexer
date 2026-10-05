@@ -3,6 +3,7 @@
 
 use alloy_hardforks::{EthereumHardfork, ForkCondition};
 use alloy_primitives::{B256, b256};
+use op_indexer_chainspec::DISCV5_PROTOCOL_ID;
 use op_indexer_el::{ETH_RECORD_KEY, NetworkSpec};
 
 /// The network id of Ethereum mainnet.
@@ -52,6 +53,7 @@ pub(crate) fn mainnet(bootnodes: Vec<String>) -> NetworkSpec {
         fork_blocks,
         fork_times,
         bootnodes,
+        discovery_id: DISCV5_PROTOCOL_ID,
         record_keys: &[ETH_RECORD_KEY],
         // Ethereum's network has no op-p2p-indexers.
         indexers_only_below: None,

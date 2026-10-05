@@ -136,10 +136,10 @@ impl Forks {
     pub(crate) const fn new(chain: &ChainSpec) -> Self {
         Self {
             bedrock_block: chain.bedrock_block,
-            regolith: chain.regolith_time,
-            canyon: chain.canyon_time,
-            ecotone: chain.ecotone_time,
-            isthmus: chain.isthmus_time,
+            regolith: chain.regolith_time(),
+            canyon: chain.canyon_time(),
+            ecotone: chain.ecotone_time(),
+            isthmus: chain.isthmus_time(),
         }
     }
 }
@@ -678,7 +678,7 @@ fn check_top(state: &State, plan: &Plan, chunk: Chunk, link: Link) -> io::Result
     Ok(game
         .check(
             link.last_hash,
-            (header.timestamp, plan.chain.isthmus_time),
+            (header.timestamp, plan.chain.isthmus_time()),
             header.state_root,
             header.withdrawals_root,
         )

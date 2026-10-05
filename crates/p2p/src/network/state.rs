@@ -48,6 +48,12 @@ const BAN_DURATION: Duration = Duration::from_secs(3600);
 const BAN_THRESHOLD: f64 = -100.0;
 /// Most peers banned at once; past it a peer is only disconnected.
 const MAX_BANNED_PEERS: usize = 4096;
+/// Distinct blocks the sequencer signed that this build cannot read, within
+/// [`PROTOCOL_CHANGE_WINDOW`], before the node stops: one could be a fluke of a single
+/// message; several close together mean the protocol changed under this build.
+const PROTOCOL_CHANGE_BLOCKS: usize = 3;
+/// How long such a block counts: rare flukes over months do not add up to a stop.
+const PROTOCOL_CHANGE_WINDOW: Duration = Duration::from_secs(600);
 
 /// Mutable state of the running node, separate from the swarm so handlers can borrow both.
 pub(super) struct State {
@@ -65,8 +71,12 @@ pub(super) struct State {
     ignored_overload: u64,
     /// Accepted blocks dropped because the consumer channel was full.
     dropped_blocks: u64,
-    /// Blocks skipped because this build could not decode one of their transactions.
-    undecodable_blocks: u64,
+    /// Messages of blocks the sequencer signed that this build cannot read, with when they
+    /// came, within [`PROTOCOL_CHANGE_WINDOW`] (by message id, which is the content's: the same
+    /// block from several peers counts once).
+    unreadable_blocks: VecDeque<(Instant, MessageId)>,
+    /// The error that made them enough to stop, once they are.
+    protocol_change: Option<String>,
     /// Set when the block consumer dropped its receiver; the node then shuts down.
     consumer_closed: bool,
     /// Known good peers from the node store still to dial, most recently seen first; drained as
@@ -120,7 +130,8 @@ impl State {
             next_dial: HashMap::new(),
             ignored_overload: 0,
             dropped_blocks: 0,
-            undecodable_blocks: 0,
+            unreadable_blocks: VecDeque::new(),
+            protocol_change: None,
             consumer_closed: false,
             known_peers: VecDeque::new(),
             clock_skew_warned: None,
@@ -289,8 +300,8 @@ impl State {
                 if let Some(ahead_secs) = err.local_clock_lag_secs() {
                     self.warn_clock_skew(ahead_secs);
                 }
-                if let BlockError::UndecodableTransaction { number, .. } = err {
-                    self.warn_undecodable(number);
+                if err.is_protocol_change() {
+                    self.unreadable(&id, &err);
                 }
                 self.report_failed(swarm, &id, source, &err);
             }
@@ -323,17 +334,33 @@ impl State {
         metrics::gap_detected(missed);
     }
 
-    /// Warns that a sequencer-signed block holds a transaction this build cannot decode, which
-    /// means the chain has upgraded past it and every block from now on may be skipped. Logged
-    /// at 1, 2, 4, 8, ... blocks, like the other repeated warnings.
-    fn warn_undecodable(&mut self, number: BlockNumber) {
-        self.undecodable_blocks += 1;
-        if self.undecodable_blocks.is_power_of_two() {
-            warn!(
-                number,
-                skipped_total = self.undecodable_blocks,
-                "skipped block with a transaction this build cannot decode, upgrade the indexer"
-            );
+    /// Counts a block the sequencer signed that this build cannot read (`err` says how). At
+    /// [`PROTOCOL_CHANGE_BLOCKS`] distinct ones within [`PROTOCOL_CHANGE_WINDOW`] the protocol
+    /// has changed under this build, and [`Self::protocol_change`] says so.
+    fn unreadable(&mut self, id: &MessageId, err: &BlockError) {
+        let now = Instant::now();
+        while self
+            .unreadable_blocks
+            .front()
+            .is_some_and(|(at, _)| now.duration_since(*at) > PROTOCOL_CHANGE_WINDOW)
+        {
+            self.unreadable_blocks.pop_front();
+        }
+        if self.protocol_change.is_some()
+            || self.unreadable_blocks.iter().any(|(_, seen)| seen == id)
+        {
+            return;
+        }
+        self.unreadable_blocks.push_back((now, id.clone()));
+        warn!(
+            %err,
+            seen = self.unreadable_blocks.len(),
+            stop_at = PROTOCOL_CHANGE_BLOCKS,
+            "the sequencer signed a block this build cannot read: the chain may have activated a \
+             change this build does not know"
+        );
+        if self.unreadable_blocks.len() >= PROTOCOL_CHANGE_BLOCKS {
+            self.protocol_change = Some(err.to_string());
         }
     }
 
@@ -358,6 +385,12 @@ impl State {
     /// Whether the block consumer dropped its receiver, so the node should shut down.
     pub(super) const fn consumer_closed(&self) -> bool {
         self.consumer_closed
+    }
+
+    /// The last of [`PROTOCOL_CHANGE_BLOCKS`] blocks the sequencer signed that this build
+    /// cannot read, once there are that many: the node must stop.
+    pub(super) fn protocol_change(&mut self) -> Option<String> {
+        self.protocol_change.take()
     }
 
     /// Loads the peers that delivered valid blocks before and starts dialing them, to reconnect

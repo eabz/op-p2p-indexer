@@ -55,7 +55,7 @@ use tracing::info;
 
 use crate::chunk::{self, VerifiedBlock};
 use crate::progress::{self, Rate};
-use crate::state::{Chunk, Plan, State};
+use crate::state::{Chunk, MIN_SPACE_BYTES, Plan, State, free_bytes};
 
 /// Fewest and most chunks read, decompressed and prepared at once ahead of the archive's
 /// writer: one per core within these bounds. Preparing (recovering the senders, hashing the
@@ -143,7 +143,7 @@ pub(crate) async fn run(
     })?;
 
     let held_to = archive_tip(&archive, &archive_dir, state, plan).await?;
-    let stopped_at = fill_archive(&archive, held_to, state, plan, cancel).await?;
+    let stopped_at = fill_archive(&archive, &archive_dir, held_to, state, plan, cancel).await?;
     if stopped_at.is_none() {
         check_top(&archive, &archive_dir, plan, accepted.last_hash).await?;
     }
@@ -166,6 +166,7 @@ pub(crate) async fn run(
 /// open of the archive removes, and running `load` again resumes after the archive's tip.
 async fn fill_archive(
     archive: &FjallArchive,
+    archive_dir: &Path,
     held_to: Option<u64>,
     state: &State,
     plan: &Plan,
@@ -185,6 +186,17 @@ async fn fill_archive(
         blocks_to_append = to_append,
         chunk_bytes = file_bytes,
         "loading the block archive"
+    );
+    // The archive takes more than the verified chunks it is loaded from (its values are
+    // compressed with snappy, not zstd): a disk with less free is refused before anything is
+    // written. A whole chain is hundreds of gigabytes to terabytes (Base: 2 to 3.5 TB).
+    let free = archive_free_bytes(archive_dir).await?;
+    ensure!(
+        free.is_none_or(|free| free >= file_bytes),
+        "the archive will not fit: {file_bytes} bytes of verified chunks to load, which the \
+         archive takes more than, and {} bytes free on the disk of {}",
+        free.unwrap_or_default(),
+        archive_dir.display()
     );
     let mut progress = Progress::new(to_append, file_bytes);
     let read_ahead = std::thread::available_parallelism()
@@ -222,6 +234,16 @@ async fn fill_archive(
                 .wrap_err("archive bulk_append")?;
             progress.appended(written);
         }
+        // Nothing more is appended on a disk nearly full (the append before is in); a later
+        // run resumes after the archive's last block.
+        let free = archive_free_bytes(archive_dir).await?;
+        ensure!(
+            free.is_none_or(|free| free >= MIN_SPACE_BYTES),
+            "less than {} GiB free on the disk of {}: free some and run `load` again, which \
+             resumes after the archive's last block",
+            MIN_SPACE_BYTES >> 30,
+            archive_dir.display()
+        );
         if !pending.blocks.is_empty() {
             let Collected { blocks, amount } = std::mem::take(&mut pending);
             let archive = archive.clone();
@@ -238,6 +260,13 @@ async fn fill_archive(
     progress.summary(range.map(|(first, last)| (first.number, last.number)));
     let appended_to = next.saturating_add(progress.done.blocks);
     Ok((appended_to <= plan.last).then_some(appended_to))
+}
+
+/// Free space on the disk of the archive at `dir`, where the system tells.
+async fn archive_free_bytes(dir: &Path) -> eyre::Result<Option<u64>> {
+    let dir = dir.to_owned();
+    let free = spawn_blocking(move || free_bytes(&dir)).await?;
+    free.wrap_err("failed to read the free disk space")
 }
 
 /// How much was read or appended.

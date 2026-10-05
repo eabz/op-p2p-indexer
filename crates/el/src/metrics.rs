@@ -26,6 +26,7 @@
 //! | `op_indexer_el_verification_failures_total` | counter | `kind` | Answers that failed verification: `count` or `root`. |
 //! | `op_indexer_el_receipts_delivered_total` | counter | | Receipts in those blocks. |
 //! | `op_indexer_el_queue_depth` | gauge | | Blocks waiting for receipts. |
+//! | `op_indexer_el_fork_horizon_seconds` | gauge | `network` | Unix time of a hardfork this build does not know, agreed on by execution peers; 0 while there is none. |
 //! | `op_indexer_el_queue_dropped_total` | counter | | Requests dropped because the queue was full, oldest first. |
 //! | `op_indexer_el_fetch_duration_seconds` | histogram | | Time from a request's arrival to its verified receipts. |
 //! | `op_indexer_el_sync_requests_total` | counter | `outcome` | Jobs of the range sync on one session (a page of headers, or a segment of blocks): `verified`, `not_held`, `invalid`, `malformed`, `unsupported`, `timeout` or `closed`. |
@@ -56,6 +57,7 @@ const REQUESTS: &str = "op_indexer_el_requests_total";
 const VERIFICATION_FAILURES: &str = "op_indexer_el_verification_failures_total";
 const RECEIPTS_DELIVERED: &str = "op_indexer_el_receipts_delivered_total";
 const QUEUE_DEPTH: &str = "op_indexer_el_queue_depth";
+const FORK_HORIZON: &str = "op_indexer_el_fork_horizon_seconds";
 const QUEUE_DROPPED: &str = "op_indexer_el_queue_dropped_total";
 const FETCH_DURATION: &str = "op_indexer_el_fetch_duration_seconds";
 const SYNC_REQUESTS: &str = "op_indexer_el_sync_requests_total";
@@ -327,6 +329,11 @@ pub(crate) fn describe() {
         "Verified receipts handed on"
     );
     describe_gauge!(QUEUE_DEPTH, Unit::Count, "Blocks waiting for receipts");
+    describe_gauge!(
+        FORK_HORIZON,
+        Unit::Seconds,
+        "Unix time of a hardfork this build does not know, agreed on by execution peers"
+    );
     describe_counter!(
         QUEUE_DROPPED,
         Unit::Count,
@@ -429,6 +436,12 @@ pub(crate) fn queue_dropped() {
 /// A count as a counter increment. `usize` is at most 64 bits on every supported target.
 fn count(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+/// Records the known-forks horizon of `network`.
+pub(crate) fn fork_horizon(network: &'static str, fork_time: u64) {
+    gauge!(FORK_HORIZON, "network" => network)
+        .set(f64::from(u32::try_from(fork_time).unwrap_or(u32::MAX)));
 }
 
 /// A small count as a gauge value, saturating at `u32::MAX`: `f64::from(u32)` is lossless and
