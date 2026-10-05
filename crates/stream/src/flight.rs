@@ -37,6 +37,7 @@ use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status, Streaming};
 
 pub use self::tables::Table;
+use crate::Sent;
 use crate::convert::Prepared;
 use crate::sink::Sink;
 use crate::source::{Source, read_status};
@@ -184,6 +185,8 @@ pub(crate) struct Flight<U, A> {
     /// One permit per `DoGet` at once.
     pub(crate) streams: Arc<Semaphore>,
     pub(crate) tasks: TaskTracker,
+    /// The bytes sent, which each `FlightData` adds to as it leaves.
+    pub(crate) sent: Sent,
 }
 
 impl<U, A> Flight<U, A>
@@ -435,10 +438,15 @@ where
         let (batches, rx) = Sink::channel(BATCHES_AHEAD);
         self.tasks
             .spawn(produce(self.source.clone(), query, batches, permit));
+        let sent = self.sent.clone();
         let encoded = FlightDataEncoderBuilder::new()
             .with_schema(schema)
             .build(ReceiverStream::new(rx))
-            .map(|data| data.map_err(Status::from));
+            .map(move |data| {
+                let data = data.map_err(Status::from)?;
+                sent.message(&data);
+                Ok(data)
+            });
         let mut response = Response::new(Box::pin(encoded) as Self::DoGetStream);
         response
             .metadata_mut()

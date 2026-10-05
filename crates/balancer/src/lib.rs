@@ -23,6 +23,7 @@ pub mod register;
 mod service;
 mod table;
 
+use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -87,8 +88,8 @@ pub struct BalancerConfig {
     pub server_keys: Vec<String>,
 }
 
-impl std::fmt::Debug for BalancerConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for BalancerConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // The keys themselves never appear in a log.
         f.debug_struct("BalancerConfig")
             .field("listen_addr", &self.listen_addr)
@@ -209,7 +210,8 @@ impl Balancer {
 }
 
 /// Logs every [`STATUS_INTERVAL`] one line per registered server: its heads, how far it
-/// holds every block, how far that is behind the newest head any server has, and its peers.
+/// holds every block, how far that is behind the newest head any server has, its load (bytes
+/// per second, Flight streams and subscriptions taken of its limits), and its peers.
 /// A server unhealthy, more than [`BEHIND_WARN`] blocks behind, or with no consensus peer or
 /// no execution session for more than [`NO_PEERS_WARN`] is logged as a warning.
 async fn report_servers(table: Table, cancel: CancellationToken) {
@@ -236,6 +238,7 @@ async fn report_servers(table: Table, cancel: CancellationToken) {
                 .map(|(tip, through)| tip.saturating_sub(through));
             let lagging = behind.is_none_or(|behind| behind > BEHIND_WARN);
             let peers = server.peers;
+            let slots = server.slots;
             let stalled = server
                 .peerless_since
                 .is_some_and(|since| since.elapsed() > NO_PEERS_WARN);
@@ -251,6 +254,9 @@ async fn report_servers(table: Table, cancel: CancellationToken) {
                         contiguous_through = ?server.contiguous_through,
                         behind = ?behind,
                         in_flight = server.requests_in_flight,
+                        bytes_per_second = server.bytes_per_second,
+                        flights = %Used(slots.flights_in_use, slots.max_flights),
+                        subscriptions = %Used(slots.subscriptions_in_use, slots.max_subscriptions),
                         consensus_peers = ?peers.consensus_peers,
                         execution_sessions = ?peers.execution_sessions,
                         execution_inbound = ?peers.execution_inbound,
@@ -265,6 +271,18 @@ async fn report_servers(table: Table, cancel: CancellationToken) {
             } else {
                 status!(info);
             }
+        }
+    }
+}
+
+/// Places taken of a limit, as `taken/max`, or `-` when the server does not report them.
+struct Used(Option<u32>, Option<u32>);
+
+impl fmt::Display for Used {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (self.0, self.1) {
+            (Some(taken), Some(max)) => write!(f, "{taken}/{max}"),
+            _ => f.write_str("-"),
         }
     }
 }

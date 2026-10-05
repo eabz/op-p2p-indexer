@@ -23,8 +23,8 @@ use tracing::{debug, info, warn};
 
 use crate::proto::balancer_server;
 use crate::proto::{Heartbeat, LocateRequest, LocateResponse, Registered};
-use crate::register::{HEARTBEAT_INTERVAL, PeerReport, is_valid_address};
-use crate::table::{Server, Table};
+use crate::register::{HEARTBEAT_INTERVAL, PeerReport, SlotReport, is_valid_address};
+use crate::table::{Server, Slot, Table};
 
 /// A server is down once no heartbeat came for this long: three missed (6.3).
 const DOWN_AFTER: Duration = HEARTBEAT_INTERVAL.saturating_mul(3);
@@ -100,7 +100,7 @@ impl balancer_server::Balancer for Service {
         let endpoints: Vec<String> = self
             .table
             .picker()
-            .pick(usize::MAX, |server| {
+            .pick(usize::MAX, Slot::Subscription, |server| {
                 server
                     .reach(Cap::Any)
                     .is_some_and(|last| last.saturating_add(1) >= from_block)
@@ -194,6 +194,10 @@ fn checked(chain: &ChainSpec, heartbeat: Heartbeat) -> Result<(String, Server), 
         execution_inbound,
         l1_sessions,
         beacon_peers,
+        max_flights,
+        flights_in_use,
+        max_subscriptions,
+        subscriptions_in_use,
     } = heartbeat;
     if chain_id != chain.chain_id {
         return Err(Status::failed_precondition(other_chain(chain, chain_id)));
@@ -221,6 +225,12 @@ fn checked(chain: &ChainSpec, heartbeat: Heartbeat) -> Result<(String, Server), 
             execution_inbound,
             l1_sessions,
             beacon_peers,
+        },
+        slots: SlotReport {
+            max_flights,
+            flights_in_use,
+            max_subscriptions,
+            subscriptions_in_use,
         },
         peerless_since: None,
     };

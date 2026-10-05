@@ -25,6 +25,7 @@ mod subscription;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use op_indexer_storage::{ArchiveStore, UnsafeStore};
@@ -119,12 +120,41 @@ pub struct StreamServer<U, A> {
     load: Load,
 }
 
-/// How busy the server is, for a balancer: the requests holding one of its places.
+/// How busy the server is, for a balancer: the requests holding one of its places, and the
+/// bytes it has sent.
 #[derive(Debug, Clone)]
 pub struct Load {
     subscriptions: Places,
     flights: Places,
     lookups: Places,
+    sent: Sent,
+}
+
+/// How many of one limit's places are taken, of how many.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Slots {
+    /// Places taken now.
+    pub in_use: usize,
+    /// Places in all: the configured limit.
+    pub max: usize,
+}
+
+/// The bytes of the responses sent to clients so far, counted where each one leaves: one
+/// atomic add per message, shared by every clone.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Sent(Arc<AtomicU64>);
+
+impl Sent {
+    /// Counts `message`, as encoded for the wire.
+    pub(crate) fn message(&self, message: &impl prost::Message) {
+        let bytes = u64::try_from(message.encoded_len()).unwrap_or(u64::MAX);
+        self.0.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// The bytes counted so far.
+    fn total(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
 }
 
 /// One limit: its places and how many there are.
@@ -146,6 +176,13 @@ impl Places {
     fn taken(&self) -> usize {
         self.size.saturating_sub(self.free.available_permits())
     }
+
+    fn slots(&self) -> Slots {
+        Slots {
+            in_use: self.taken(),
+            max: self.size,
+        }
+    }
 }
 
 impl Load {
@@ -154,7 +191,28 @@ impl Load {
             subscriptions: Places::new(config.max_subscriptions),
             flights: Places::new(config.max_flights),
             lookups: Places::new(MAX_LOOKUPS),
+            sent: Sent::default(),
         }
+    }
+
+    /// Flight `DoGet` streams being served, of the most allowed at once.
+    #[must_use]
+    pub fn flights(&self) -> Slots {
+        self.flights.slots()
+    }
+
+    /// Subscriptions being served, of the most allowed at once.
+    #[must_use]
+    pub fn subscriptions(&self) -> Slots {
+        self.subscriptions.slots()
+    }
+
+    /// The bytes of the responses sent to clients since the server started: subscription
+    /// events, lookups and Flight data, as encoded for the wire (before compression and
+    /// framing). It only grows; a rate is its change over time.
+    #[must_use]
+    pub fn bytes_sent(&self) -> u64 {
+        self.sent.total()
     }
 
     /// Subscriptions, Flight streams and block lookups being served now.
@@ -224,12 +282,14 @@ where
             source: source.clone(),
             streams: Arc::clone(&load.flights.free),
             tasks: tasks.clone(),
+            sent: load.sent.clone(),
         };
         let service = Service {
             source,
             live,
             subscriptions: Arc::clone(&load.subscriptions.free),
             lookups: Arc::clone(&load.lookups.free),
+            sent: load.sent.clone(),
             tasks: tasks.clone(),
             cancel: cancel.clone(),
             receipts: config.receipts,

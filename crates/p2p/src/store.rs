@@ -42,6 +42,8 @@ const L1_CHECKPOINT_KEY: &str = "l1_beacon_checkpoint";
 /// Known good peers: multiaddr bytes -> last time (Unix seconds, big-endian) they delivered a
 /// valid block.
 const PEERS: &str = "known_peers";
+/// Failed dials in a row, across restarts, after which a known peer is forgotten.
+const KNOWN_PEER_FAILURES: u8 = 3;
 /// Peers kept; the least recently seen is evicted beyond this.
 const MAX_KNOWN_PEERS: usize = 64;
 /// Execution peers that served us: node id (64 bytes) -> last time they served a request
@@ -309,6 +311,37 @@ impl NodeStore {
             addr.as_ref(),
             &seen_secs.to_be_bytes(),
         )
+    }
+
+    /// Records that dialing the known peer at `addr` failed. After three
+    /// failures in a row, across restarts, it is forgotten; [`Self::save_peer`] starts the count
+    /// again. Returns whether it was forgotten. A peer not saved is a no-op.
+    ///
+    /// The count is one byte after the time the peer was last seen.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Database`] if reading or writing fails.
+    pub fn peer_failed(&self, addr: &Multiaddr) -> Result<bool, StoreError> {
+        let _write = self.write.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(value) = self.peers.get(addr.as_ref())? else {
+            return Ok(false);
+        };
+        let Some((seen, rest)) = value.split_first_chunk::<8>() else {
+            return Ok(false);
+        };
+        let failures = rest.first().copied().unwrap_or(0).saturating_add(1);
+        let mut batch = self.durable_batch();
+        let forgotten = failures >= KNOWN_PEER_FAILURES;
+        if forgotten {
+            batch.remove(&self.peers, addr.as_ref());
+        } else {
+            let mut value = seen.to_vec();
+            value.push(failures);
+            batch.insert(&self.peers, addr.as_ref(), value);
+        }
+        batch.commit()?;
+        Ok(forgotten)
     }
 
     /// Returns the saved execution peers, most recently served first.

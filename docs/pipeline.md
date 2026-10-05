@@ -68,19 +68,22 @@ its own two data tasks, the L1 heads forwarder and the range sync planner.
 4. **Order.** Blocks are inserted in arrival order, one at a time. Fork choice in the store
    handles out-of-order and competing blocks.
 
-### Missed gossip blocks (with the execution network)
+### Missed blocks (with the execution network)
 
-When the head moves past heights the unsafe store does not hold (`NewHead { gap: true }`),
-ingest finds the missing span below the head (`fill::missing_below`): from the parent of the
-lowest stored block above the hole, whose hash that block names, down to the next stored
-height, the store's lowest, or 1,024 blocks below the head; deeper holes are range sync's. It
-asks the execution network for it (`FillRequest`, never waited on). `el` fetches the span from
-its top down, 64 blocks at a time, as range sync fetches a segment: headers by the hash chain
-down from the trusted top, bodies and receipts checked against them; a segment no peer serves
-is tried again with a growing pause (2 s doubling to 30 s, 6 tries), then left to range sync.
-The fill task recovers the senders and inserts the blocks highest first, so each closes the
-gap below the canonical block above it (the store's step 7), with their receipts. One info line
-per segment stored: "missed unsafe blocks fetched from execution peers".
+Every 10 s the fill task looks for the lowest hole in the unsafe chain above the archive's last
+block, within 32,768 blocks of the head (`fill::lowest_hole`): from the first missing height up
+to the parent of the next stored canonical block, whose hash that block names. Holes come from
+gossip that skipped blocks, a restart, or a node whose gossip chain starts above its archive (a
+new server: thousands of blocks above the sealed range, which L1 games then name). It asks the
+execution network for the span (`FillRequest`), and again only after 2 minutes if the same
+span is still there. `el` fetches it from its top down, 64 blocks at a time, as range sync
+fetches a segment: headers by the hash chain down from the trusted top, bodies and receipts
+checked against them; a segment no peer serves is tried again with a growing pause (2 s
+doubling to 30 s, 6 tries). The fill task recovers the senders and inserts the blocks highest
+first, so each closes the gap below the canonical block above it (the store's step 7), with
+their receipts; the unsafe store's memory cap bounds them. One info line per segment stored:
+"missed unsafe blocks fetched from execution peers". Holes older than that span are range
+sync's.
 
 ## 4. Promotion
 

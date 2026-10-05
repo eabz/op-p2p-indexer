@@ -95,6 +95,22 @@ pub struct Report {
     pub bytes_per_second: u64,
     /// Its peers: `Heartbeat.consensus_peers` and the fields after it in the proto.
     pub peers: PeerReport,
+    /// Its stream limits: `Heartbeat.max_flights` and the fields after it in the proto.
+    pub slots: SlotReport,
+}
+
+/// The stream limits a server reports, and how many places of each are taken; `None` when it
+/// does not say.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SlotReport {
+    /// Flight `DoGet` streams at once.
+    pub max_flights: Option<u32>,
+    /// Flight streams being served.
+    pub flights_in_use: Option<u32>,
+    /// Subscriptions at once.
+    pub max_subscriptions: Option<u32>,
+    /// Subscriptions being served.
+    pub subscriptions_in_use: Option<u32>,
 }
 
 /// The peers a server reports; each count is `None` when its network does not run.
@@ -278,6 +294,13 @@ fn heartbeat(template: Heartbeat, report: Report) -> Heartbeat {
                 l1_sessions,
                 beacon_peers,
             },
+        slots:
+            SlotReport {
+                max_flights,
+                flights_in_use,
+                max_subscriptions,
+                subscriptions_in_use,
+            },
     } = report;
     Heartbeat {
         healthy,
@@ -293,6 +316,10 @@ fn heartbeat(template: Heartbeat, report: Report) -> Heartbeat {
         execution_inbound,
         l1_sessions,
         beacon_peers,
+        max_flights,
+        flights_in_use,
+        max_subscriptions,
+        subscriptions_in_use,
         ..template
     }
 }

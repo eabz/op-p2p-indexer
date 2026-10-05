@@ -6,14 +6,13 @@
 
 use std::ops::ControlFlow;
 
-use op_indexer_primitives::{BlockRef, FillRequest, ReceiptsRequest, UnsafeBlock, UnsafeEvent};
+use op_indexer_primitives::{BlockRef, ReceiptsRequest, UnsafeBlock, UnsafeEvent};
 use op_indexer_storage::{StorageError, Store, UnsafeStore};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::PipelineError;
-use crate::fill::missing_below;
 use crate::receipts;
 use crate::recover::{RecoverError, recover};
 use crate::retry::{RetryError, retry};
@@ -23,9 +22,7 @@ pub(crate) const INSERT: &str = "unsafe insert";
 
 /// Stores every block received on `blocks` until the channel closes or `cancel` fires, and
 /// asks for the receipts of each block it stores on `receipts`, when there is a fetcher, and
-/// publishes the unsafe head on `head` whenever it moves, when something follows it. When the
-/// head moves past heights the store does not hold, the span is asked for on `fills`, when
-/// something fetches blocks.
+/// publishes the unsafe head on `head` whenever it moves, when something follows it.
 ///
 /// On cancellation the blocks already in the channel are still stored, without waiting for
 /// more; a store that is failing then is not waited for.
@@ -40,15 +37,10 @@ pub(crate) async fn run<U: UnsafeStore>(
     mut blocks: mpsc::Receiver<UnsafeBlock>,
     receipts: Option<mpsc::Sender<ReceiptsRequest>>,
     head: Option<watch::Sender<Option<BlockRef>>>,
-    fills: Option<mpsc::Sender<FillRequest>>,
     cancel: CancellationToken,
 ) -> Result<(), PipelineError> {
     let (receipts, head) = (receipts.as_ref(), head.as_ref());
-    let outputs = Outputs {
-        receipts,
-        head,
-        fills: fills.as_ref(),
-    };
+    let outputs = Outputs { receipts, head };
 
     loop {
         tokio::select! {
@@ -80,11 +72,7 @@ async fn ingest<U: UnsafeStore>(
     outputs: &Outputs<'_>,
     cancel: &CancellationToken,
 ) -> Result<ControlFlow<()>, PipelineError> {
-    let Outputs {
-        receipts,
-        head,
-        fills,
-    } = *outputs;
+    let Outputs { receipts, head } = *outputs;
     let (number, hash) = (block.number(), block.hash);
     let block = match recover(block).await {
         Ok(block) => block,
@@ -134,12 +122,6 @@ async fn ingest<U: UnsafeStore>(
         if let (Some(head), Some(moved)) = (head, moved) {
             head.send_replace(Some(moved));
         }
-        if let (UnsafeEvent::NewHead { head, gap: true }, Some(fills)) = (event, fills)
-            && let Some(request) = missing_below(store, *head).await
-        {
-            // Never waited on; a span not asked for stays for range sync.
-            let _sent = fills.try_send(request);
-        }
     }
     Ok(ControlFlow::Continue(()))
 }
@@ -149,7 +131,6 @@ async fn ingest<U: UnsafeStore>(
 struct Outputs<'a> {
     receipts: Option<&'a mpsc::Sender<ReceiptsRequest>>,
     head: Option<&'a watch::Sender<Option<BlockRef>>>,
-    fills: Option<&'a mpsc::Sender<FillRequest>>,
 }
 
 /// Logs one thing fork choice did.

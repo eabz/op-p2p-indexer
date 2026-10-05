@@ -10,7 +10,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use alloy_eip2124::{ForkFilter, ForkFilterKey, ForkId, Head};
+use alloy_eip2124::{ForkFilter, ForkFilterKey, ForkHash, ForkId, Head};
 use alloy_primitives::{B256, BlockNumber};
 use op_indexer_chainspec::ChainSpec;
 use op_indexer_primitives::{BlockRef, ExecutionPeer};
@@ -121,9 +121,36 @@ impl NetworkSpec {
         )
     }
 
-    /// Whether `fork_id` announces a next hardfork this build does not know.
+    /// Whether `fork_id` announces a next hardfork this build does not know: its `next` is
+    /// none of our forks (by block or by time), and its hash is not one we already passed. A
+    /// peer on a past fork set announces the fork it has not reached yet (a node syncing
+    /// Ethereum from genesis: Frontier's hash, next Homestead's block); it is behind us, not
+    /// ahead ([EIP-2124], "Validation rules"), and the handshake rejects it as stale.
+    ///
+    /// [EIP-2124]: https://eips.ethereum.org/EIPS/eip-2124
     pub(crate) fn is_unknown_next(&self, fork_id: ForkId) -> bool {
-        fork_id.next != 0 && !self.fork_times.contains(&fork_id.next)
+        let next = fork_id.next;
+        if next == 0 || self.fork_times.contains(&next) || self.fork_blocks.contains(&next) {
+            return false;
+        }
+        !self.past_fork_hashes().contains(&fork_id.hash)
+    }
+
+    /// The fork hashes of our fork sets before the current one, oldest first.
+    fn past_fork_hashes(&self) -> Vec<ForkHash> {
+        let now = unix_now();
+        let mut hash = ForkHash::from(self.genesis_hash);
+        let mut past = Vec::new();
+        let blocks = self.fork_blocks.iter().filter(|block| **block > 0);
+        let times = self
+            .fork_times
+            .iter()
+            .filter(|time| **time > self.genesis_time && **time <= now);
+        for fork in blocks.chain(times) {
+            past.push(hash);
+            hash += *fork;
+        }
+        past
     }
 }
 

@@ -84,9 +84,13 @@ pub(super) struct State {
     /// When the slow-clock warning was last logged.
     clock_skew_warned: Option<Instant>,
     store: Arc<NodeStore>,
-    /// Dial addresses of connected outbound peers not yet saved as known good (inbound peers
-    /// have ephemeral ports, so they cannot be re-dialed).
+    /// Dial addresses of connected outbound peers (inbound peers have ephemeral ports, so they
+    /// cannot be re-dialed): the ones that may be saved as known good.
     outbound: HashMap<PeerId, Multiaddr>,
+    /// Outbound peers saved as known good while connected this time.
+    saved: HashSet<PeerId>,
+    /// Known peers dialed from the store this run and not connected yet, with their address.
+    known_dials: HashMap<PeerId, Multiaddr>,
     pub(super) persists: JoinSet<Result<(), StoreError>>,
     /// Connected peers subscribed to our block topics, read by discovery to pace itself.
     peer_count: watch::Sender<usize>,
@@ -100,6 +104,23 @@ pub(super) struct State {
     pub(super) server: Server,
     /// Banned peers and when their ban ends.
     banned: HashMap<PeerId, Instant>,
+    /// Where peers came and went since the last status line.
+    tally: PeerTally,
+}
+
+/// What happened to peers since the last status line, to show where they are lost.
+#[derive(Debug, Default)]
+struct PeerTally {
+    /// Addresses discovery reported.
+    discovered: u32,
+    /// Dials started.
+    dialed: u32,
+    /// Dials that failed.
+    failed: u32,
+    /// Connections established, either direction.
+    connected: u32,
+    /// Peers disconnected for not subscribing to a block topic.
+    evicted: u32,
 }
 
 /// Result of validating one message on a blocking thread.
@@ -136,12 +157,15 @@ impl State {
             clock_skew_warned: None,
             store,
             outbound: HashMap::new(),
+            saved: HashSet::new(),
+            known_dials: HashMap::new(),
             persists: JoinSet::new(),
             peer_count,
             highest: None,
             safe_head,
             server,
             banned: HashMap::new(),
+            tally: PeerTally::default(),
         }
     }
 
@@ -197,6 +221,8 @@ impl State {
             } => {
                 debug!(peer = %peer_id, addr = %endpoint.get_remote_address(), "peer connected");
                 self.peers.connected(peer_id, Instant::now());
+                self.tally.connected = self.tally.connected.saturating_add(1);
+                self.known_dials.remove(&peer_id);
                 if endpoint.is_dialer()
                     && let Ok(addr) = endpoint.get_remote_address().clone().with_p2p(peer_id)
                 {
@@ -207,6 +233,7 @@ impl State {
             SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                 debug!(peer = %peer_id, ?cause, "peer disconnected");
                 self.outbound.remove(&peer_id);
+                self.saved.remove(&peer_id);
                 self.peers.disconnected(&peer_id);
                 self.update_peer_count(swarm);
             }
@@ -215,6 +242,10 @@ impl State {
             )) => self.update_peer_count(swarm),
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                 debug!(peer = ?peer_id, err = %error, "dial failed");
+                self.tally.failed = self.tally.failed.saturating_add(1);
+                if let Some(peer) = peer_id {
+                    self.known_dial_failed(peer);
+                }
                 self.dial_queued_known_peers(swarm);
             }
             SwarmEvent::Behaviour(BehaviourEvent::Payloads(request_response::Event::Message {
@@ -403,6 +434,9 @@ impl State {
             let Some(addr) = self.known_peers.pop_front() else {
                 return;
             };
+            if let Some(Protocol::P2p(peer)) = addr.iter().last() {
+                self.known_dials.insert(peer, addr.clone());
+            }
             self.dial(swarm, addr);
         }
     }
@@ -485,19 +519,90 @@ impl State {
         let subscribed: HashSet<PeerId> = self.subscribed_peers(swarm).copied().collect();
         for peer in self.peers.idle(now, |peer| subscribed.contains(peer)) {
             debug!(%peer, "disconnecting peer not subscribed to block topics");
+            self.tally.evicted = self.tally.evicted.saturating_add(1);
             // `Err` only means the peer was already disconnected, which is what we want.
             let _disconnected = swarm.disconnect_peer_id(peer);
             self.back_off(peer, now + EVICTED_PEER_BACKOFF, now);
         }
     }
 
-    /// Saves `peer` as known good when it first delivers a valid block on a connection we dialed.
+    /// Saves `peer` as known good when it first delivers a valid block on a connection we
+    /// dialed.
     fn remember(&mut self, peer: PeerId, seen_secs: u64) {
-        if let Some(addr) = self.outbound.remove(&peer) {
-            let store = Arc::clone(&self.store);
+        if let Some(addr) = self.outbound.get(&peer)
+            && self.saved.insert(peer)
+        {
+            let (store, addr) = (Arc::clone(&self.store), addr.clone());
             self.persists
                 .spawn_blocking(move || store.save_peer(&addr, seen_secs));
         }
+    }
+
+    /// Counts an address discovery reported.
+    pub(super) fn discovered(&mut self) {
+        self.tally.discovered = self.tally.discovered.saturating_add(1);
+    }
+
+    /// Logs where peers came from and went since the last call, and the peers held now: the
+    /// way to see whether discovery, dials or subscriptions lose them.
+    pub(super) fn log_peers(&mut self, swarm: &Swarm<Behaviour>) {
+        let tally = std::mem::take(&mut self.tally);
+        let gossipsub = &swarm.behaviour().gossipsub;
+        let mesh = gossipsub.all_mesh_peers().count();
+        info!(
+            connected = swarm.connected_peers().count(),
+            subscribed = self.subscribed_peers(swarm).count(),
+            mesh,
+            outbound = self.outbound.len(),
+            discovered = tally.discovered,
+            dialed = tally.dialed,
+            dial_failed = tally.failed,
+            new_connections = tally.connected,
+            evicted_unsubscribed = tally.evicted,
+            "consensus peers"
+        );
+    }
+
+    /// Saves every good outbound peer as known good, so a restart dials them at once: connected,
+    /// subscribed to a block topic, and not scored below zero. Called every
+    /// [`SAVE_INTERVAL`](super::SAVE_INTERVAL); the table keeps the most recently seen.
+    pub(super) fn save_good_peers(&mut self, swarm: &Swarm<Behaviour>) {
+        let subscribed: HashSet<PeerId> = self.subscribed_peers(swarm).copied().collect();
+        let gossipsub = &swarm.behaviour().gossipsub;
+        let good: Vec<Multiaddr> = self
+            .outbound
+            .iter()
+            .filter(|(peer, _)| {
+                subscribed.contains(peer)
+                    && gossipsub.peer_score(peer).is_none_or(|score| score >= 0.0)
+            })
+            .map(|(_, addr)| addr.clone())
+            .collect();
+        if good.is_empty() {
+            return;
+        }
+        debug!(peers = good.len(), "saving good gossip peers");
+        let store = Arc::clone(&self.store);
+        let seen_secs = unix_now_secs();
+        self.persists.spawn_blocking(move || {
+            good.iter()
+                .try_for_each(|addr| store.save_peer(addr, seen_secs))
+        });
+    }
+
+    /// Counts a failed dial of a known peer in the store, which forgets it after a few in a row
+    /// across restarts.
+    fn known_dial_failed(&mut self, peer: PeerId) {
+        let Some(addr) = self.known_dials.remove(&peer) else {
+            return;
+        };
+        let store = Arc::clone(&self.store);
+        self.persists.spawn_blocking(move || {
+            if store.peer_failed(&addr)? {
+                debug!(%addr, "forgot a known peer that keeps failing to connect");
+            }
+            Ok(())
+        });
     }
 
     /// Dials `addr` unless its peer is connected, being dialed, in backoff, or the backoff map is
@@ -518,6 +623,7 @@ impl State {
             .build();
         match swarm.dial(opts) {
             Ok(()) => {
+                self.tally.dialed = self.tally.dialed.saturating_add(1);
                 self.back_off(peer, now + DIAL_BACKOFF, now);
             }
             Err(err) => {

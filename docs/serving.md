@@ -474,7 +474,15 @@ heartbeat:
   before) up to the first still waiting for receipts, extended through its unsafe chain's
   canonical blocks that link to them and have theirs, each search continuing from the last;
   never below the last sealed block;
-- load: requests in flight (subscriptions, Flight streams, lookups) and bytes sent per second;
+- load: requests in flight (subscriptions, Flight streams, lookups) and bytes sent per second
+  (the stream's responses as encoded for the wire: subscription events, lookups and Flight
+  data, counted with one atomic add each as they leave; the server turns the count into a
+  rate over each heartbeat interval);
+- stream limits: Flight `DoGet` streams and subscriptions at once (`max_flights`,
+  `max_subscriptions`) and how many of each are taken now. A server with none free refuses
+  with `RESOURCE_EXHAUSTED` ("too many Flight streams at once", "too many subscriptions"), so
+  the picker counts them (6.4, 6.5). Unset from an older server, which is then taken to have
+  room;
 - peers: consensus gossip peers connected (what unsafe blocks arrive from); sessions with the
   chain's execution peers, in all and inbound (receipts, gap fill, range sync), unset without
   the execution network; sessions with L1 execution peers and the beacon light client's
@@ -489,7 +497,8 @@ manifest itself, once per refresh (every 30 s), only for the chunk boundaries.
 ### 6.2 Registration
 
 A server opens a `Register` stream to the balancer and sends a heartbeat every 5 s with its
-health, heads, contiguity, load and peers. Three missed heartbeats (15 s) mark it down and remove it.
+health, heads, contiguity, load, stream limits and peers. Three missed heartbeats (15 s) mark
+it down and remove it.
 
 ### 6.3 Health and failover
 
@@ -499,12 +508,18 @@ health, heads, contiguity, load and peers. Three missed heartbeats (15 s) mark i
   head covers the work and so does its `contiguous_through` (6.4, 6.5). A server that falls
   behind, or has a gap above the sealed chunks, gets none there, but still serves sealed
   chunks. A server that reports no `contiguous_through` gets no work above them.
-- Failover is on the client side: every answer names more than one server when there are.
+- Failover is on the client side: every answer names more than one server when there are
+  (a Flight endpoint up to three locations, `Locate` every server that can take the
+  subscription), in the order to try them. A client moves to the next on `UNAVAILABLE` (the
+  server is down or shutting down) or `RESOURCE_EXHAUSTED` (its limit is reached, or the
+  client read too slowly); a Flight job resumes as the same ticket, a subscription from the
+  last block received.
 - Every 30 s the balancer logs one `server status` line per server: its heads,
   `contiguous_through` and how far that is behind the newest head any server has, requests in
-  flight, and its peers. It is a warning when the server is unhealthy, more than 64 blocks
-  behind, or has had no consensus peer or no execution session for more than a minute: gossip,
-  or receipts and gap fill, have stalled. `no server registered` is a warning too.
+  flight, bytes per second, Flight streams and subscriptions as `taken/max`, and its peers. It
+  is a warning when the server is unhealthy, more than 64 blocks behind, or has had no consensus
+  peer or no execution session for more than a minute: gossip, or receipts and gap fill, have
+  stalled. `no server registered` is a warning too.
 
 ### 6.4 Flight: per-chunk jobs
 
@@ -516,9 +531,12 @@ into per-chunk jobs, so one big range runs in parallel over the servers:
   the ticket's cap) and `contiguous_through` both reach the job's last block.
 - Every job is also cut to the servers' `DoGet` limit (100,000 blocks).
 - Each job goes to the least loaded server that can take it, and its `location` lists up to
-  three, least loaded first. The load counts the jobs already given out for the same range, so
-  a big range spreads over every server while one busy with other requests gets fewer; ties go
-  round-robin. Pure round-robin would ignore that one request can be 1,000 times another.
+  three, least loaded first. A server whose free Flight places are used up (those it reported,
+  less the jobs this plan already gave it) would refuse, so it comes after every server with
+  room: first only when all are full, and otherwise a location to try next. The load counts the
+  jobs already given out for the same range, so a big range spreads over every server while one
+  busy with other requests gets fewer; ties go round-robin. Pure round-robin would ignore that
+  one request can be 1,000 times another.
 - A Flight client fetches the endpoints in parallel, straight from the servers, and moves to
   the next location if one fails.
 - The ticket code is `crates/stream/src/flight.rs`'s (`op_indexer_stream::ticket`).
@@ -527,8 +545,10 @@ into per-chunk jobs, so one big range runs in parallel over the servers:
 
 **D17.** `Locate(chain, from_block) → [server endpoints]` for gRPC subscriptions: the healthy
 servers whose `contiguous_through` reaches the block before `from_block` (they hold every
-block up to it), least loaded first. The client
-subscribes to the first and, on failure, resubscribes from its last block at the next.
+block up to it), those with a free subscription place first, then least loaded first (a full
+one after them, as in 6.4). The client
+subscribes to the first and, on `UNAVAILABLE` or `RESOURCE_EXHAUSTED`, resubscribes from its
+last block at the next.
 Subscriptions already resume by number.
 
 ### 6.6 Cost of reads
@@ -571,8 +591,10 @@ environment and are never logged. TLS is not part of this design.
   `OP_INDEXER_BALANCER_URL`) heartbeats every 5 s from a `watch` of the server's `Report`,
   and registers again after a backoff of 1 s doubling to 30 s with jitter; it never stops the
   server. A server's address must be exactly `host:port` (`register::is_valid_address`).
-- **Picking** (6.4, 6.5): by requests in flight plus the jobs given out for the same request,
-  then bytes per second, ties round-robin. Above the sealed chunks a server serves up to its
+- **Picking** (6.4, 6.5): servers with a free place of the kind the request takes (Flight or
+  subscription; the jobs given out for the same request count against it) first, then by
+  requests in flight plus those jobs, then bytes per second, ties round-robin
+  (`table::Picker::pick`). Above the sealed chunks a server serves up to its
   reach, min(head under the cap, `contiguous_through`) (`table::Server::reach`): Flight jobs
   by the ticket's cap, `Locate` by the unsafe head. The heads and `contiguous_through` are the
   heartbeats'; no separate `GetHeads` probe.

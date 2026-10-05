@@ -213,17 +213,16 @@ where
             .receipts
             .as_ref()
             .map(|channels| channels.requests.clone());
-        let (fill_requests, filled) = self.fills.unzip();
         let ingest = ingest::run(
             self.unsafe_store.clone(),
             self.blocks,
             requests,
             self.head,
-            fill_requests,
             stop.clone(),
         );
-        if let Some(filled) = filled {
-            let fill = fill::run(self.unsafe_store.clone(), filled, stop.clone());
+        if let Some((requests, filled)) = self.fills {
+            let (store, archive) = (self.unsafe_store.clone(), self.archive.clone());
+            let fill = fill::run(store, archive, requests, filled, stop.clone());
             tasks.spawn(async move { (Task::Fill, fill.await) });
         }
         tasks.spawn(async move { (Task::Ingest, ingest.await) });

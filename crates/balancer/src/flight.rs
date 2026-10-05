@@ -33,7 +33,7 @@ use tokio::sync::watch;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::table::Table;
+use crate::table::{Slot, Table};
 
 /// Servers named by each job: the client moves to the next if one fails.
 const LOCATIONS: usize = 3;
@@ -104,7 +104,7 @@ impl Flight {
         let mut next = from;
         for chunk in touched {
             for (piece_from, piece_to) in pieces(next.max(chunk.first), chunk.last.min(to)) {
-                let locations = picker.pick(LOCATIONS, |_| true);
+                let locations = picker.pick(LOCATIONS, Slot::Flight, |_| true);
                 jobs.push(Job {
                     from: piece_from,
                     to: piece_to,
@@ -116,7 +116,7 @@ impl Flight {
         // Above the sealed chunks: only a server that holds every block through the piece
         // under the cap. The best reaches `to`, so every piece has one.
         for (piece_from, piece_to) in pieces(next, to) {
-            let locations = picker.pick(LOCATIONS, |server| {
+            let locations = picker.pick(LOCATIONS, Slot::Flight, |server| {
                 server.reach(query.cap).is_some_and(|last| last >= piece_to)
             });
             jobs.push(Job {

@@ -1,84 +1,109 @@
-//! Missed gossip blocks: finding the spans of the unsafe chain gossip skipped, and storing the
-//! blocks peers sent for them.
+//! Missed blocks: finding the holes in the unsafe chain between the archive's tip and the head,
+//! and storing the blocks peers sent for them.
 //!
-//! When the unsafe store's head jumps over heights it does not hold, [`missing_below`] finds
-//! the span under the head: from the parent of the lowest stored block above the hole (its hash
-//! is what that block names, so the span is trusted through it) down to the next stored block,
-//! within [`MAX_FILL_DEPTH`] of the head. Deeper holes are range sync's. The fill task then
-//! stores what the fetcher returns, highest block first, so each closes the gap below the
-//! canonical block above it (the store's fork choice, "closes a gap below the head").
+//! Every [`CHECK_INTERVAL`] the fill task looks for the lowest hole above the archive's last
+//! block, within [`MAX_FILL_SPAN`] of the head: the heights from the first missing one up to
+//! the parent of the next stored canonical block, whose hash that block names, so the span is
+//! trusted through it. Holes come from gossip that skipped blocks, a restart, or a node that
+//! starts above its archive (a new server's gossip chain begins thousands of blocks above the
+//! sealed range). It asks the fetcher for the span, again only after [`ASK_AGAIN`] if it is
+//! still there, and stores what comes back highest block first, so each closes the gap below
+//! the canonical block above it (the store's fork choice, "closes a gap below the head").
+//! The unsafe store's memory cap bounds what fills hold.
 //!
-//! It does not fetch (the fetcher does, verified by the hash chain down from the span's top)
-//! and does not decide which spans are worth asking for again.
+//! It does not fetch (the fetcher does, verified by the hash chain down from the span's top).
 
+use std::time::{Duration, Instant};
+
+use alloy_primitives::BlockNumber;
 use op_indexer_primitives::{BlockRef, EncodedBlock, FillRequest};
-use op_indexer_storage::{StorageError, Store, UnsafeStore};
+use op_indexer_storage::{ArchiveStore, StorageError, Store, UnsafeStore};
 use tokio::sync::mpsc;
+use tokio::time::{MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::PipelineError;
 use crate::ingest::INSERT;
 use crate::recover::{RecoverError, recover_encoded};
 use crate::retry::{RetryError, retry};
 
-/// Heights below the unsafe head a missed span may reach to be fetched: about what promotion
-/// reads back from a head. Deeper holes are left to range sync.
-pub(crate) const MAX_FILL_DEPTH: u64 = 1024;
+/// Heights below the unsafe head a hole may reach to be filled: about 12 hours of a 1 s
+/// chain, a few hundred MB at most of unsafe blocks. Older holes are left to range sync.
+const MAX_FILL_SPAN: u64 = 32_768;
+/// How often the unsafe chain is looked at for holes.
+const CHECK_INTERVAL: Duration = Duration::from_secs(10);
+/// How long a span asked for is not asked for again while it is being fetched.
+const ASK_AGAIN: Duration = Duration::from_mins(2);
 
-/// The span of missing heights right below `head`, if its parent is not stored: up to the
-/// parent of the lowest stored block above it, down to the next stored height, the store's
-/// lowest, or [`MAX_FILL_DEPTH`] below the head. `None` if nothing is missing or the store
-/// cannot be read.
-pub(crate) async fn missing_below<U: UnsafeStore>(
+/// The lowest hole in the unsafe chain above the archive's last block (or [`MAX_FILL_SPAN`]
+/// below the head, if that is higher): from its first missing height up to the parent of the
+/// next stored canonical block. `None` without a hole, or if a store cannot be read.
+async fn lowest_hole<U: UnsafeStore, A: ArchiveStore>(
     store: &U,
-    head: BlockRef,
+    archive: &A,
 ) -> Option<FillRequest> {
-    let lowest = store.lowest().await.ok()??;
-    let floor = head.number.saturating_sub(MAX_FILL_DEPTH).max(lowest);
-    // The run of canonical blocks down from the head, by their headers: it ends where a
-    // height is missing (or no longer links).
-    let count = usize::try_from(head.number.saturating_sub(floor))
+    let head = store.head().await.ok()??;
+    let tip = archive.range().await.ok()?.map(|(_, tip)| tip.number);
+    let floor = tip
+        .map_or(0, |tip| tip.saturating_add(1))
+        .max(head.number.saturating_sub(MAX_FILL_SPAN));
+    let span = usize::try_from(head.number.saturating_sub(floor))
         .ok()?
         .saturating_add(1);
-    let run = store
-        .canonical_headers(head.number, count, false)
-        .await
-        .ok()?;
-    let lowest_held = run.last()?;
-    let top = BlockRef {
-        number: lowest_held.block.number.checked_sub(1)?,
-        hash: lowest_held.parent_hash,
-    };
-    if top.number < floor || store.canonical(top.number).await.ok()?.is_some() {
-        return None;
-    }
-    let mut first = top.number;
-    while let Some(below) = first.checked_sub(1).filter(|below| *below >= floor) {
-        if store.canonical(below).await.ok()?.is_some() {
-            break;
+    // The canonical run up from the floor ends at the first missing height.
+    let run = store.canonical_headers(floor, span, true).await.ok()?;
+    let first = run
+        .last()
+        .map_or(floor, |held| held.block.number.saturating_add(1));
+    let mut above = first.saturating_add(1);
+    while above <= head.number {
+        let stored = store.canonical_headers(above, 1, true).await.ok()?;
+        if let Some(stored) = stored.first() {
+            let top = BlockRef {
+                number: above.checked_sub(1)?,
+                hash: stored.parent_hash,
+            };
+            return Some(FillRequest { top, first });
         }
-        first = below;
+        above = above.saturating_add(1);
     }
-    Some(FillRequest { top, first })
+    None
 }
 
-/// Stores the blocks received on `filled` (each batch a consecutive span, ascending, verified
-/// by the fetcher) until the channel closes or `cancel` fires.
+/// Asks for the lowest hole on `requests` every [`CHECK_INTERVAL`], and stores the blocks
+/// received on `filled` (each batch a consecutive span, ascending, verified by the fetcher),
+/// until the channel closes or `cancel` fires.
 ///
 /// # Errors
 ///
 /// Returns [`PipelineError::Storage`] if the unsafe store fails in a way retrying cannot fix,
 /// and [`PipelineError::Task`] if sender recovery panics.
-pub(crate) async fn run<U: UnsafeStore>(
+pub(crate) async fn run<U: UnsafeStore, A: ArchiveStore>(
     store: U,
+    archive: A,
+    requests: mpsc::Sender<FillRequest>,
     mut filled: mpsc::Receiver<Vec<EncodedBlock>>,
     cancel: CancellationToken,
 ) -> Result<(), PipelineError> {
+    let mut check = interval(CHECK_INTERVAL);
+    check.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // The first height of the span asked for last, and when.
+    let mut asked: Option<(BlockNumber, Instant)> = None;
     loop {
         let batch = tokio::select! {
             biased;
             () = cancel.cancelled() => return Ok(()),
+            _ = check.tick() => {
+                if let Some(request) = lowest_hole(&store, &archive).await
+                    && asked.is_none_or(|(first, at)| first != request.first || at.elapsed() >= ASK_AGAIN)
+                    && requests.try_send(request).is_ok()
+                {
+                    debug!(from = request.first, to = request.top.number, "asking peers for missed blocks");
+                    asked = Some((request.first, Instant::now()));
+                }
+                continue;
+            }
             batch = filled.recv() => batch,
         };
         // Closed: the fetcher has stopped.

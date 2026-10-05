@@ -14,9 +14,10 @@
 mod config;
 
 use std::path::PathBuf;
+use std::time::Instant;
 
 use eyre::WrapErr;
-use op_indexer_balancer::register::{HEARTBEAT_INTERVAL, PeerReport, Report};
+use op_indexer_balancer::register::{HEARTBEAT_INTERVAL, PeerReport, Report, SlotReport};
 use op_indexer_chunks::ChunkStore;
 use op_indexer_node::{Config, NodeView, PeerCounts, Task};
 use op_indexer_server::{ChunkSource, Exporter, R2Archive, R2Chunks};
@@ -135,6 +136,8 @@ async fn report<S: ChunkSource>(
 ) {
     let mut tick = tokio::time::interval(HEARTBEAT_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The bytes sent as of the last report, and when: the rate is the change since.
+    let mut sent = (Instant::now(), view.load.bytes_sent());
     loop {
         tokio::select! {
             biased;
@@ -147,6 +150,9 @@ async fn report<S: ChunkSource>(
         let heads = heads.unwrap_or_default();
         let contiguous = contiguous.unwrap_or_default();
         let last_sealed = archive.last_sealed();
+        let now = (Instant::now(), view.load.bytes_sent());
+        let bytes_per_second = rate(sent, now);
+        sent = now;
         sender.send_replace(Report {
             healthy,
             unsafe_head: view.head.borrow().map(|head| head.number),
@@ -156,16 +162,33 @@ async fn report<S: ChunkSource>(
             // The tail can trail the manifest a moment, before it drops what was sealed.
             contiguous_through: contiguous.max(last_sealed),
             requests_in_flight: view.load.in_flight(),
-            // Not counted yet: the stream does not track the bytes it sends.
-            bytes_per_second: 0,
+            bytes_per_second,
             peers: peer_report(view.peers()),
+            slots: slot_report(view),
         });
+    }
+}
+
+/// Bytes per second between two readings of the bytes sent, each with when it was taken.
+fn rate((then, before): (Instant, u64), (now, after): (Instant, u64)) -> u64 {
+    let millis = now.duration_since(then).as_millis().max(1);
+    let bytes = u128::from(after.saturating_sub(before));
+    u64::try_from(bytes.saturating_mul(1000) / millis).unwrap_or(u64::MAX)
+}
+
+/// The stream's limits and the places taken, as the heartbeat carries them.
+fn slot_report(view: &NodeView) -> SlotReport {
+    let (flights, subscriptions) = (view.load.flights(), view.load.subscriptions());
+    SlotReport {
+        max_flights: Some(count(flights.max)),
+        flights_in_use: Some(count(flights.in_use)),
+        max_subscriptions: Some(count(subscriptions.max)),
+        subscriptions_in_use: Some(count(subscriptions.in_use)),
     }
 }
 
 /// The node's peer counts as the heartbeat carries them.
 fn peer_report(peers: PeerCounts) -> PeerReport {
-    let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
     PeerReport {
         consensus_peers: Some(count(peers.consensus)),
         execution_sessions: peers.execution.map(|sessions| count(sessions.total)),
@@ -173,4 +196,9 @@ fn peer_report(peers: PeerCounts) -> PeerReport {
         l1_sessions: peers.l1_execution.map(count),
         beacon_peers: peers.beacon.map(count),
     }
+}
+
+/// A count as the heartbeat carries it, saturating.
+fn count(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
 }

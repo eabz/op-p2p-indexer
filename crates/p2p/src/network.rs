@@ -37,12 +37,17 @@ use crate::{NetworkConfig, NodeStore, PayloadSource};
 /// Peers found by discovery and waiting to be dialed. Each lookup round reports the routing
 /// table's peers of our chain; extras are dropped and reported again by the next round.
 const DISCOVERED_PEERS_CAPACITY: usize = 256;
+/// The protocol version identify announces, as op-node's (go-libp2p's default).
+const IDENTIFY_PROTOCOL: &str = "ipfs/0.1.0";
 /// Close connections with no open streams after this long.
 const IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
 /// Connections being established at once, per direction. Bounds dial bursts from discovery.
 const MAX_PENDING_CONNECTIONS: u32 = 16;
 /// How often connected peers are checked for eviction.
 const EVICTION_INTERVAL: Duration = Duration::from_secs(10);
+/// How often good gossip peers are saved, so a restart, even one that kills the process,
+/// dials them at once.
+const SAVE_INTERVAL: Duration = Duration::from_mins(1);
 
 /// Errors that stop the network.
 #[derive(Debug, thiserror::Error)]
@@ -99,6 +104,10 @@ pub struct Network {
 struct Behaviour {
     limits: connection_limits::Behaviour,
     gossipsub: gossip::Behaviour,
+    /// Tells peers which protocols we speak. op-node (go-libp2p) opens its gossip stream to a
+    /// new peer only once identify says it speaks gossipsub: without it, peers connect and never
+    /// subscribe, and are evicted.
+    identify: libp2p::identify::Behaviour,
     ping: libp2p::ping::Behaviour,
     payloads: libp2p::request_response::Behaviour<crate::sync::Codec>,
     /// Banned peers: their connections are refused.
@@ -130,9 +139,15 @@ fn swarm(
             yamux::Config::default,
         )
         .map_err(NetworkError::Transport)?
-        .with_behaviour(|_| Behaviour {
+        .with_behaviour(|key| Behaviour {
             limits,
             gossipsub,
+            identify: libp2p::identify::Behaviour::new(
+                libp2p::identify::Config::new(IDENTIFY_PROTOCOL.to_owned(), key.public())
+                    .with_agent_version(
+                        concat!("op-indexer/", env!("CARGO_PKG_VERSION")).to_owned(),
+                    ),
+            ),
             ping: libp2p::ping::Behaviour::default(),
             payloads: crate::sync::behaviour(chain.chain_id),
             bans: libp2p::allow_block_list::Behaviour::default(),
@@ -246,6 +261,10 @@ impl Network {
 
         let mut evictions = interval(EVICTION_INTERVAL);
         evictions.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut saves = interval(SAVE_INTERVAL);
+        saves.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // The first tick is at once: nothing is connected yet.
+        saves.tick().await;
         let result = loop {
             tokio::select! {
                 biased;
@@ -266,7 +285,10 @@ impl Network {
                     }
                     Err(err) => warn!(%err, "payload_by_number task failed"),
                 },
-                Some(addr) = discovered_rx.recv() => state.dial(&mut swarm, addr),
+                Some(addr) = discovered_rx.recv() => {
+                    state.discovered();
+                    state.dial(&mut swarm, addr);
+                }
                 Some(result) = state.persists.join_next() => match result {
                     Ok(Ok(())) => {}
                     Ok(Err(err)) => warn!(%err, "failed to save known peer"),
@@ -277,6 +299,10 @@ impl Network {
                     Ok(()) => NetworkError::DiscoveryStopped,
                     Err(err) => NetworkError::DiscoveryFailed(err),
                 }),
+                _ = saves.tick() => {
+                    state.save_good_peers(&swarm);
+                    state.log_peers(&swarm);
+                }
                 _ = evictions.tick() => {
                     state.evict_idle_peers(&mut swarm);
                     state.dial_queued_known_peers(&mut swarm);

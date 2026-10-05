@@ -20,8 +20,10 @@ service Balancer {
   // - DEADLINE_EXCEEDED after missed heartbeats;
   // - UNAVAILABLE when it shuts down.
   rpc Register(stream Heartbeat) returns (stream Registered);
-  // The servers to subscribe at, for a gRPC subscription from `from_block`: those that hold
-  // every block before it (`Heartbeat.contiguous_through`), least loaded first. Subscribe at the first; on failure,
+  // The servers to subscribe at, for a gRPC subscription from `from_block`: every one that
+  // holds every block before it (`Heartbeat.contiguous_through`), those with a free
+  // subscription place first, then least loaded first. On UNAVAILABLE or RESOURCE_EXHAUSTED,
+  // subscribe at the next. Subscribe at the first; on failure,
   // subscribe again at the next, from the last block received. UNAVAILABLE if none is.
   rpc Locate(LocateRequest) returns (LocateResponse);
 }
@@ -62,6 +64,14 @@ message Heartbeat {
   optional uint32 execution_inbound = 14;
   optional uint32 l1_sessions = 15;
   optional uint32 beacon_peers = 16;
+  // Its stream limits: Flight `DoGet` streams and subscriptions at once, and how many are
+  // taken now. A server with none free refuses with RESOURCE_EXHAUSTED, so the balancer lists
+  // it for Flight jobs or subscriptions after every server with room.
+  // Unset, from a server built before they were sent: it is taken to have room.
+  optional uint32 max_flights = 17;
+  optional uint32 flights_in_use = 18;
+  optional uint32 max_subscriptions = 19;
+  optional uint32 subscriptions_in_use = 20;
 }
 
 // The balancer took the registration.

@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tonic::{Request, Response, Status};
 
+use crate::Sent;
 use crate::convert::{Payload, heads_message};
 use crate::follower::Live;
 use crate::proto;
@@ -31,6 +32,8 @@ pub(crate) struct Service<U, A> {
     pub(crate) subscriptions: Arc<Semaphore>,
     /// One permit per `GetHeads` or `GetBlock` being served.
     pub(crate) lookups: Arc<Semaphore>,
+    /// The bytes sent, counted here for the lookups and by each subscription for its events.
+    pub(crate) sent: Sent,
     pub(crate) tasks: TaskTracker,
     pub(crate) cancel: CancellationToken,
     pub(crate) receipts: bool,
@@ -86,6 +89,7 @@ where
             sink,
             permit,
             self.receipts,
+            self.sent.clone(),
         );
         self.tasks
             .spawn(subscription.run(start, self.cancel.child_token()));
@@ -98,11 +102,9 @@ where
     ) -> Result<Response<proto::Heads>, Status> {
         let _permit = self.lookup()?;
         let (unsafe_head, heads) = self.source.heads().await.map_err(|err| read_status(&err))?;
-        Ok(Response::new(heads_message(
-            unsafe_head,
-            heads,
-            self.receipts,
-        )))
+        let heads = heads_message(unsafe_head, heads, self.receipts);
+        self.sent.message(&heads);
+        Ok(Response::new(heads))
     }
 
     async fn get_block(
@@ -130,10 +132,11 @@ where
             .archive_heads()
             .await
             .map_err(|err| read_status(&err))?;
-        tokio::task::spawn_blocking(move || block.message(payload, &heads))
+        let block = tokio::task::spawn_blocking(move || block.message(payload, &heads))
             .await
             .map_err(|_failed| Status::internal("the node failed to convert the block"))?
-            .map(Response::new)
-            .map_err(|err| read_status(&err.into()))
+            .map_err(|err| read_status(&err.into()))?;
+        self.sent.message(&block);
+        Ok(Response::new(block))
     }
 }

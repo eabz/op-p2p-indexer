@@ -29,6 +29,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::Status;
 use tracing::warn;
 
+use crate::Sent;
 use crate::convert::{Payload, Prepared, heads_message};
 use crate::follower::{CHAIN_WINDOW, ChainEvent, Live};
 use crate::proto;
@@ -90,6 +91,8 @@ pub(crate) struct Subscription<U, A> {
     _permit: OwnedSemaphorePermit,
     /// Whether receipts are fetched at all, for the `Heads` messages.
     receipts: bool,
+    /// The server's count of bytes sent, which every event adds to.
+    traffic: Sent,
     /// The blocks sent, oldest first, at most [`CHAIN_WINDOW`].
     sent: VecDeque<BlockRef>,
     /// Blocks sent without receipts.
@@ -121,6 +124,7 @@ impl<U: UnsafeStore, A: ArchiveStore> Subscription<U, A> {
         sink: Sink<proto::Event, Status>,
         permit: OwnedSemaphorePermit,
         receipts: bool,
+        traffic: Sent,
     ) -> Self {
         Self {
             source,
@@ -129,6 +133,7 @@ impl<U: UnsafeStore, A: ArchiveStore> Subscription<U, A> {
             sink,
             _permit: permit,
             receipts,
+            traffic,
             sent: VecDeque::new(),
             without_receipts: HashMap::new(),
             heads: L1Heads::default(),
@@ -356,7 +361,9 @@ impl<U: UnsafeStore, A: ArchiveStore> Subscription<U, A> {
 
     async fn send(&mut self, event: proto::event::Event) -> Result<(), Stop> {
         let event = proto::Event { event: Some(event) };
-        Ok(self.sink.send(event).await?)
+        self.traffic.message(&event);
+        self.sink.send(event).await?;
+        Ok(())
     }
 
     /// Sends `block`; `covered` when it comes from the window, which then brings its receipts.
