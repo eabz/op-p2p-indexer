@@ -43,6 +43,9 @@ const DEFAULT_STREAM_LISTEN_ADDR: SocketAddr =
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50051);
 const DEFAULT_STREAM_MAX_SUBSCRIPTIONS: usize = 64;
 const DEFAULT_STREAM_MAX_FLIGHTS: usize = 8;
+/// How long a `DoGet` waits for a free stream before it is refused: enough for one to end
+/// under a client that asks for more streams than the server has.
+const DEFAULT_STREAM_FLIGHT_QUEUE_MS: u64 = 2000;
 
 /// What the environment says about the execution network. The rest of its configuration,
 /// the peers saved by earlier runs, comes from the node store.
@@ -243,6 +246,8 @@ impl Config {
     /// - `OP_INDEXER_STREAM_MAX_SUBSCRIPTIONS`: stream subscriptions at once (default 64).
     /// - `OP_INDEXER_STREAM_MAX_FLIGHTS`: Arrow Flight `DoGet` streams at once, on the same
     ///   listener (default 8).
+    /// - `OP_INDEXER_STREAM_FLIGHT_QUEUE_MS`: how long one more `DoGet` waits for a free
+    ///   stream before `RESOURCE_EXHAUSTED`, in ms (default 2000; 0 refuses at once).
     /// - `OP_INDEXER_STREAM_API_KEYS`: comma-separated API keys; with any set, a gRPC or Flight
     ///   request is served only with one of them as `authorization: Bearer <key>` (default:
     ///   none, no check). Never logged.
@@ -303,6 +308,10 @@ impl Config {
                 .unwrap_or(DEFAULT_STREAM_MAX_SUBSCRIPTIONS),
             max_flights: parse_var("OP_INDEXER_STREAM_MAX_FLIGHTS")?
                 .unwrap_or(DEFAULT_STREAM_MAX_FLIGHTS),
+            flight_queue: Duration::from_millis(
+                parse_var("OP_INDEXER_STREAM_FLIGHT_QUEUE_MS")?
+                    .unwrap_or(DEFAULT_STREAM_FLIGHT_QUEUE_MS),
+            ),
             block_time: Duration::from_secs(chain.block_time_secs),
             receipts: el.is_some(),
             sync,

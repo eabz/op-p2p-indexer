@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use op_indexer_storage::{ArchiveStore, UnsafeStore};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::info;
@@ -79,8 +79,12 @@ pub struct StreamConfig {
     pub listen_addr: SocketAddr,
     /// Most subscriptions at once; one more is refused.
     pub max_subscriptions: usize,
-    /// Most Arrow Flight `DoGet` streams at once; one more is refused.
+    /// Most Arrow Flight `DoGet` streams at once; one more waits up to
+    /// [`Self::flight_queue`] for a place, then is refused.
     pub max_flights: usize,
+    /// How long a `DoGet` waits for a place when [`Self::max_flights`] are taken, among at
+    /// most that many waiters; zero refuses at once.
+    pub flight_queue: Duration,
     /// The chain's block time: how long the follower waits to read again after a store
     /// failed.
     pub block_time: Duration,
@@ -132,7 +136,7 @@ pub struct Load {
 /// How many of one limit's places are taken, of how many.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Slots {
-    /// Places taken now.
+    /// Places taken now, and requests waiting for one (so above `max` while some wait).
     pub in_use: usize,
     /// Places in all: the configured limit.
     pub max: usize,
@@ -156,10 +160,12 @@ impl Sent {
     }
 }
 
-/// One limit: its places and how many there are.
+/// One limit: its places, how many there are, and the requests waiting for one (at most as
+/// many as there are places).
 #[derive(Debug, Clone)]
-struct Places {
+pub(crate) struct Places {
     free: Arc<Semaphore>,
+    waiters: Arc<Semaphore>,
     size: usize,
 }
 
@@ -168,17 +174,41 @@ impl Places {
         let size = size.min(Semaphore::MAX_PERMITS);
         Self {
             free: Arc::new(Semaphore::new(size)),
+            waiters: Arc::new(Semaphore::new(size)),
             size,
         }
+    }
+
+    /// A place now, if one is free.
+    pub(crate) fn try_place(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.free).try_acquire_owned().ok()
+    }
+
+    /// A place: at once if one is free, else after waiting up to `wait` for one, among at most
+    /// as many waiters as places; `None` if none frees in time or the waiters are full.
+    pub(crate) async fn place_within(&self, wait: Duration) -> Option<OwnedSemaphorePermit> {
+        if let Some(place) = self.try_place() {
+            return Some(place);
+        }
+        if wait.is_zero() {
+            return None;
+        }
+        let _waiting = Arc::clone(&self.waiters).try_acquire_owned().ok()?;
+        tokio::time::timeout(wait, Arc::clone(&self.free).acquire_owned())
+            .await
+            .ok()?
+            .ok()
     }
 
     fn taken(&self) -> usize {
         self.size.saturating_sub(self.free.available_permits())
     }
 
+    /// Places taken, and the requests waiting for one: a pool with waiters is full.
     fn slots(&self) -> Slots {
+        let waiting = self.size.saturating_sub(self.waiters.available_permits());
         Slots {
-            in_use: self.taken(),
+            in_use: self.taken().saturating_add(waiting),
             max: self.size,
         }
     }
@@ -279,7 +309,8 @@ where
         tasks.spawn(follower.run(cancel.child_token()));
         let flight = Flight {
             source: source.clone(),
-            streams: Arc::clone(&load.flights.free),
+            streams: load.flights.clone(),
+            queue: config.flight_queue,
             builds: Arc::new(Semaphore::new(flight::max_builds())),
             tasks: tasks.clone(),
             sent: load.sent.clone(),

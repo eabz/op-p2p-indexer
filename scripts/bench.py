@@ -4,12 +4,14 @@
 Asks the balancer (`GetFlightInfo`) to plan the range into jobs, each naming up to three
 servers, then runs the jobs across `--processes` processes with `--threads` threads each, so one
 Python process (its GIL, its gRPC client) is not what limits the read. A job reads its ticket
-from its first location; on UNAVAILABLE or RESOURCE_EXHAUSTED (a server down or full) it moves
-to the next, and after the last starts again from the first, up to `--retries` rounds. Other
-errors fail the job.
+from its first location. On UNAVAILABLE (a server down) it moves to the next at once; on
+RESOURCE_EXHAUSTED (a server full) it tries the next too, and once it has tried them all it
+backs off before the next round, 200 ms doubling to 5 s with jitter. It keeps going round
+until `--retry-for` seconds have passed since the job began. Other errors fail the job.
 
-Prints progress every few seconds, then: jobs done and failed, MB/s and rows/s, retries, time
-to first batch (median and p95), and per server its jobs and MB/s. MB are the Arrow bytes
+Prints progress every few seconds, then: jobs done and failed, MB/s and rows/s, retries and the
+time spent backing off, time to first batch (median and p95), and per server its jobs and
+MB/s. MB are the Arrow bytes
 received, decoded (compressed IPC is counted after decompression).
 
     KEY=<api key> scripts/bench.py --balancer grpc://balancer:50060 \\
@@ -24,6 +26,7 @@ import argparse
 import multiprocessing
 import os
 import queue
+import random
 import sys
 import threading
 import time
@@ -31,17 +34,26 @@ from collections import defaultdict
 
 import pyarrow.flight as flight
 
-# What a failover is for: UNAVAILABLE (the server is down or shutting down) or
-# RESOURCE_EXHAUSTED (at its limit). pyarrow raises these as several exception types, so the
+# The failures a job is retried on, as pyarrow reports them: as several exception types, so the
 # status is matched in the message too.
-RETRYABLE = ("unavailable", "resource_exhausted", "resource exhausted")
+EXHAUSTED = ("resource_exhausted", "resource exhausted")
+# Backoff after a round over a job's locations in which one was full (RESOURCE_EXHAUSTED):
+# from the first, doubling each such round to the most, with jitter.
+BACKOFF_FIRST = 0.2
+BACKOFF_MOST = 5.0
+# Pause after a round in which every location was down (UNAVAILABLE).
+ROUND_PAUSE = 0.2
 
 
-def retryable(err):
-    if isinstance(err, flight.FlightUnavailableError):
-        return True
+def failure(err):
+    """"exhausted" (the server is at its limit), "unavailable" (down or shutting down), or
+    None (not retried)."""
     text = str(err).lower()
-    return any(word in text for word in RETRYABLE)
+    if any(word in text for word in EXHAUSTED):
+        return "exhausted"
+    if isinstance(err, flight.FlightUnavailableError) or "unavailable" in text:
+        return "unavailable"
+    return None
 
 
 def options(key, compression):
@@ -51,8 +63,9 @@ def options(key, compression):
     return flight.FlightCallOptions(headers=headers)
 
 
-def record(index, server, retries, rows=0, nbytes=0, ttfb=None, seconds=0.0, error=None):
-    """One job's result."""
+def record(index, server, retries, rows=0, nbytes=0, ttfb=None, seconds=0.0, error=None,
+           waited=0.0):
+    """One job's result; `waited` is the time it spent backing off."""
     return {
         "index": index,
         "server": server,
@@ -62,15 +75,22 @@ def record(index, server, retries, rows=0, nbytes=0, ttfb=None, seconds=0.0, err
         "seconds": seconds,
         "retries": retries,
         "error": error,
+        "waited": waited,
     }
 
 
-def read_job(clients, job, call, retries):
-    """Reads one job; returns its result record."""
+def read_job(clients, job, call, retry_for):
+    """Reads one job, retrying it until `retry_for` seconds have passed; returns its record.
+
+    Each round tries the job's locations in turn; after a round in which one was full it
+    backs off before the next, after one in which all were down it pauses briefly."""
     index, ticket, locations = job
+    deadline = time.monotonic() + retry_for
     failovers = 0
-    error = None
-    for attempt in range(retries + 1):
+    waited = 0.0
+    backoff = BACKOFF_FIRST
+    while True:
+        exhausted = False
         for location in locations:
             started = time.monotonic()
             try:
@@ -88,14 +108,24 @@ def read_job(clients, job, call, retries):
                     nbytes += chunk.data.nbytes
                 seconds = time.monotonic() - started
                 return record(index, location, failovers, rows, nbytes,
-                              ttfb if ttfb is not None else seconds, seconds)
+                              ttfb if ttfb is not None else seconds, seconds, waited=waited)
             except Exception as err:  # noqa: BLE001: a job's failure is reported, not raised
-                error = describe(err)
-                if not retryable(err):
-                    return record(index, location, failovers, error=error)
+                kind = failure(err)
+                if kind is None:
+                    return record(index, location, failovers, error=describe(err), waited=waited)
+                if time.monotonic() >= deadline:
+                    return record(index, location, failovers, waited=waited,
+                                  error="gave up after {:.0f} s: {}".format(retry_for, describe(err)))
                 failovers += 1
-        time.sleep(min(2.0, 0.2 * (attempt + 1)))
-    return record(index, locations[-1] if locations else "-", failovers, error=error)
+                exhausted = exhausted or kind == "exhausted"
+        left = max(0.0, deadline - time.monotonic())
+        if exhausted:
+            pause = min(left, backoff * random.uniform(0.5, 1.0))
+            backoff = min(BACKOFF_MOST, backoff * 2)
+        else:
+            pause = min(left, ROUND_PAUSE)
+        time.sleep(pause)
+        waited += pause
 
 
 def describe(err):
@@ -104,7 +134,7 @@ def describe(err):
     return "{}: {}".format(type(err).__name__, lines[0] if lines else repr(err))
 
 
-def worker(jobs, results, threads, key, compression, retries):
+def worker(jobs, results, threads, key, compression, retry_for):
     """One process: `threads` threads taking jobs until each gets a stop marker.
 
     Each job is announced ("started", index, pid) before it is read and reported ("done",
@@ -122,7 +152,7 @@ def worker(jobs, results, threads, key, compression, retries):
             index = job[0]
             results.put(("started", index, pid))
             try:
-                result = read_job(clients, job, call, retries)
+                result = read_job(clients, job, call, retry_for)
             except BaseException as err:  # noqa: BLE001: reported as the job's failure
                 result = record(index, "-", 0, error=describe(err))
             results.put(("done", result))
@@ -184,7 +214,8 @@ def main():
     parser.add_argument("--processes", type=int, default=4)
     parser.add_argument("--threads", type=int, default=4, help="threads per process")
     parser.add_argument("--compression", default="none", choices=["none", "lz4", "zstd"])
-    parser.add_argument("--retries", type=int, default=3, help="rounds over a job's locations")
+    parser.add_argument("--retry-for", type=float, default=120.0,
+                        help="seconds a job is retried for, from its start")
     parser.add_argument("--progress", type=float, default=5.0, help="seconds between lines")
     args = parser.parse_args()
 
@@ -215,7 +246,7 @@ def main():
     processes = [
         context.Process(
             target=worker,
-            args=(job_queue, results, args.threads, key, args.compression, args.retries),
+            args=(job_queue, results, args.threads, key, args.compression, args.retry_for),
             daemon=True,
         )
         for _ in range(args.processes)
@@ -280,10 +311,12 @@ def main():
     ok = [result for result in done if result["error"] is None]
     errors = [result for result in done if result["error"] is not None]
     nbytes, rows, _ = totals(ok)
+    retries = totals(done)[2]
+    waited = sum(result["waited"] for result in done)
     ttfbs = [result["ttfb"] for result in ok if result["ttfb"] is not None]
     print()
-    print("jobs       {} planned: {} done, {} failed, {} retries".format(
-        len(jobs), len(ok), len(errors), totals(done)[2]))
+    print("jobs       {} planned: {} done, {} failed, {} retries, {:.1f} s backing off".format(
+        len(jobs), len(ok), len(errors), retries, waited))
     print("time       {:.1f} s".format(elapsed))
     print("read       {:.1f} MB, {} rows".format(mb(nbytes), rows))
     print("rate       {:.1f} MB/s, {:.0f} rows/s".format(mb(nbytes) / elapsed, rows / elapsed))

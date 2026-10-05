@@ -21,6 +21,7 @@ mod tables;
 use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use alloy_primitives::{B256, BlockNumber};
 use arrow_array::RecordBatch;
@@ -43,10 +44,10 @@ use tonic::metadata::{MetadataMap, MetadataValue};
 use tonic::{Request, Response, Status, Streaming};
 
 use self::tables::TableRows;
-use crate::Sent;
 use crate::convert::Prepared;
 use crate::sink::Sink;
 use crate::source::{Source, read_status};
+use crate::{Places, Sent};
 use op_indexer_api::ticket::{Cap, MAX_FLIGHT_BLOCKS, Query, Table};
 
 /// Reads of one `DoGet` built at once, each on a blocking thread: the cores one stream may
@@ -81,8 +82,10 @@ type Responses<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 #[derive(Debug)]
 pub(crate) struct Flight<U, A> {
     pub(crate) source: Source<U, A>,
-    /// One permit per `DoGet` at once.
-    pub(crate) streams: Arc<Semaphore>,
+    /// One place per `DoGet` at once, and the waiters for one.
+    pub(crate) streams: Places,
+    /// How long a `DoGet` waits for a stream when all are taken; zero refuses at once.
+    pub(crate) queue: Duration,
     /// One permit per build at once, of every `DoGet` ([`max_builds`]).
     pub(crate) builds: Arc<Semaphore>,
     pub(crate) tasks: TaskTracker,
@@ -95,6 +98,19 @@ where
     U: UnsafeStore + Clone + Send + Sync + 'static,
     A: ArchiveStore,
 {
+    /// A place for one more `DoGet`, waiting up to [`Self::queue`] for one
+    /// ([`Places::place_within`]). Holds no build place while it waits.
+    ///
+    /// # Errors
+    ///
+    /// `RESOURCE_EXHAUSTED` if no place frees in time, or the waiters are full.
+    async fn stream_place(&self) -> Result<OwnedSemaphorePermit, Status> {
+        self.streams
+            .place_within(self.queue)
+            .await
+            .ok_or_else(|| Status::resource_exhausted("too many Flight streams at once"))
+    }
+
     /// The range `query` covers now: `from` the lowest block held when it names none, `to`
     /// lowered to what its cap allows, below a gap above `from`, and to [`MAX_FLIGHT_BLOCKS`]
     /// blocks.
@@ -399,9 +415,7 @@ where
     ) -> Result<Response<Self::DoGetStream>, Status> {
         let options = write_options(request.metadata())?;
         let query = Query::parse(&request.into_inner().ticket)?;
-        let permit = Arc::clone(&self.streams)
-            .try_acquire_owned()
-            .map_err(|_full| Status::resource_exhausted("too many Flight streams at once"))?;
+        let permit = self.stream_place().await?;
         let query = self.resolve(query).await?;
         let schema: FlightData = SchemaAsIpc::new(&query.table.schema(), &options).into();
         let (messages, rx) = Sink::channel(MESSAGES_AHEAD);

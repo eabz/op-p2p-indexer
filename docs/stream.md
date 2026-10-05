@@ -152,6 +152,7 @@ execution network disabled no receipts come, and `Heads.receipts` says so.
 | `OP_INDEXER_STREAM_LISTEN_ADDR` | `127.0.0.1:50051` | Shared gRPC/Flight listen address; local by default. |
 | `OP_INDEXER_STREAM_MAX_SUBSCRIPTIONS` | `64` | Concurrent subscriptions (at most `Semaphore::MAX_PERMITS`; more is lowered to it). |
 | `OP_INDEXER_STREAM_MAX_FLIGHTS` | `8` | Concurrent Arrow Flight `DoGet` streams (section 6), with the same ceiling. |
+| `OP_INDEXER_STREAM_FLIGHT_QUEUE_MS` | `2000` | How long a `DoGet` waits for a free stream before `RESOURCE_EXHAUSTED` (section 6); `0` refuses at once. |
 | `OP_INDEXER_STREAM_API_KEYS` | unset | Comma-separated bearer keys; unset disables authentication. |
 
 Use API keys or a suitable proxy when exposing the listener beyond localhost.
@@ -229,8 +230,12 @@ A range ends early with an error in two cases:
 - `ABORTED`: a block does not build on the one before it (a reorg during the read; only with
   `any`).
 
-At most `OP_INDEXER_STREAM_MAX_FLIGHTS` `DoGet`s run at once (default 8); one more is refused
-with `RESOURCE_EXHAUSTED`.
+At most `OP_INDEXER_STREAM_MAX_FLIGHTS` `DoGet`s run at once (default 8). One more waits for
+a place up to `OP_INDEXER_STREAM_FLIGHT_QUEUE_MS` (default 2000; 0 refuses at once), among at
+most as many waiters as there are places, before it reads anything; past that, or with the
+waiters full, it is refused with `RESOURCE_EXHAUSTED`, and a client backs off and asks again
+(or asks the next location). A `DoGet` waiting counts as a stream in use in the load a `server`
+reports to its balancer, so a server with waiters looks full and gets new jobs last.
 
 **Tables.** Types are Arrow's. `FSB(n)` is `FixedSizeBinary(n)`. A `?` marks a nullable
 column. Hashes are `FSB(32)`, addresses `FSB(20)`. Wei amounts (value, mint, gas prices) are
