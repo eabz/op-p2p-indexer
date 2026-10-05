@@ -199,12 +199,28 @@ not remove it, and would duplicate the server's wiring.
 
 **Reads.** A `DoGet` reads the range as the subscription's history does: archive batches of at
 most 64 blocks or 16 MiB, senders from the archive. `blocks` reads the headers alone; the other
-tables decode each block once. Each read becomes one record batch, built off the async runtime
-while the next is read, so a large range is never held whole. A task produces the batches at
-most one ahead of the consumer (about 50 MiB per stream at most, with the one being built and
-the one being read); HTTP/2 flow control does the rest. A consumer that does not read for 30 s
-is ended with `RESOURCE_EXHAUSTED`; one slot of the queue is held back for that error. On
-shutdown a `DoGet` ends with `UNAVAILABLE` at once, not after its next batch.
+tables decode each block once. A task reads the stores in order and hands each read to a
+blocking thread, which converts it to one record batch and encodes it as Flight messages:
+arrow-flight's encoder, which cuts it into pieces of about 2 MiB for gRPC. Up to
+`PARALLEL_BUILDS` reads are built at once, so one stream uses that many cores, and their
+messages are sent in order, `MESSAGES_AHEAD` of them queued ahead of the consumer
+(`crates/stream/src/flight.rs`). A large range is never held whole: a build runs to its end
+even while the consumer is slow, so a stream holds up to that many reads with their batches
+and encoded messages (about 100 MiB at most); HTTP/2 flow control does the rest. A consumer
+that does not read for 30 s is ended with `RESOURCE_EXHAUSTED`; one slot of the queue is held
+back for that error. On shutdown a `DoGet` ends with `UNAVAILABLE` at once, not after its
+next batch.
+
+**Compression.** A `DoGet` may ask for the record batches' IPC buffers compressed, with the
+request metadata `op-indexer-compression: lz4` (LZ4 frame) or `zstd` (`none`, the default,
+sends them uncompressed; anything else is `INVALID_ARGUMENT`). Compression is Arrow's own
+(the IPC format's buffer compression): readers that support it, such as pyarrow, undo it
+transparently; the schema message is never compressed. It costs server CPU in the build
+threads above, never on the async runtime. gRPC's own message compression would serve every
+client, not only Arrow readers, but it compresses each message again on the async runtime
+and gzip alone is common to all gRPC clients; Arrow's lets the build threads do it. In
+pyarrow:
+`flight.FlightCallOptions(headers=[(b"op-indexer-compression", b"zstd"), ...])`.
 
 A range ends early with an error in two cases:
 

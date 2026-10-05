@@ -3,9 +3,13 @@
 //! A ticket names a table, an inclusive block range and an optional status cap, as text:
 //! `table:from:to[:cap]`, with `cap` one of `finalized`, `safe`, `any` (the default). `DoGet`
 //! streams the table's rows for the range, one record batch per read of the stores (at most 64
-//! blocks or 16 MiB), produced by a task that reads the next batch while it builds one and
-//! stays at most one ahead of the consumer. A range longer than [`MAX_FLIGHT_BLOCKS`] is cut
-//! to that; the response's `op-indexer-range-to` header gives the last block it covers. A
+//! blocks or 16 MiB). A task reads the stores in order and hands each read to a blocking
+//! thread, which converts it to a record batch and encodes it as Flight messages (cut to
+//! gRPC-sized pieces, IPC buffers compressed when asked); up to [`PARALLEL_BUILDS`] reads are
+//! built at once, so one stream uses several cores, and their messages are sent in order. A
+//! `DoGet` asks for compression with the [`COMPRESSION_HEADER`] metadata (`lz4` or `zstd`);
+//! readers such as pyarrow undo it transparently. A range longer than [`MAX_FLIGHT_BLOCKS`] is
+//! cut to that; the response's `op-indexer-range-to` header gives the last block it covers. A
 //! consumer that does not read for 30 s is ended with `RESOURCE_EXHAUSTED`. The live chain,
 //! with reorgs, is the gRPC subscription's: Flight serves ranges.
 //!
@@ -14,6 +18,7 @@
 
 mod tables;
 
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -26,6 +31,7 @@ use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo,
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaAsIpc, SchemaResult, Ticket,
 };
+use arrow_ipc::CompressionType;
 use arrow_ipc::writer::IpcWriteOptions;
 use op_indexer_storage::{ArchiveStore, UnsafeStore};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -33,7 +39,7 @@ use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt as _};
 use tokio_util::task::TaskTracker;
-use tonic::metadata::MetadataValue;
+use tonic::metadata::{MetadataMap, MetadataValue};
 use tonic::{Request, Response, Status, Streaming};
 
 use self::tables::TableRows;
@@ -43,9 +49,17 @@ use crate::sink::Sink;
 use crate::source::{Source, read_status};
 use op_indexer_api::ticket::{Cap, MAX_FLIGHT_BLOCKS, Query, Table};
 
-/// Record batches a `DoGet` producer may hold ready ahead of the consumer: with the one being
-/// built and the one being read, about 50 MiB per stream at most.
-const BATCHES_AHEAD: usize = 1;
+/// Reads of one `DoGet` built at once, each on a blocking thread: the cores one stream may
+/// use. A build runs to its end even while the consumer is slow, so each holds up to a read
+/// (16 MiB), its record batch and its encoded messages: about 100 MiB per stream at most.
+const PARALLEL_BUILDS: usize = 2;
+
+/// Encoded Flight messages (about 2 MiB each) queued ahead of the consumer.
+const MESSAGES_AHEAD: usize = 4;
+
+/// The request metadata a `DoGet` names the compression of its record batches' IPC buffers
+/// with: `lz4` (LZ4 frame), `zstd`, or `none` (the default).
+const COMPRESSION_HEADER: &str = "op-indexer-compression";
 
 /// A response stream.
 type Responses<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
@@ -138,44 +152,46 @@ where
     }
 }
 
-/// A `DoGet`'s queue of record batches.
-type Batches = Sink<RecordBatch, FlightError>;
+/// A `DoGet`'s queue of encoded Flight messages.
+type Messages = Sink<FlightData, FlightError>;
 
-/// Reads `query` (resolved) and sends its record batches on `batches`, until it is done, the
-/// consumer leaves or stops reading, a read fails, or the node shuts down; the last two end
-/// the stream with their error.
+/// Reads `query` (resolved) and sends its record batches on `messages`, encoded with
+/// `options`, until it is done, the consumer leaves or stops reading, a read fails, or the node
+/// shuts down; the last two end the stream with their error.
 async fn produce<U: UnsafeStore, A: ArchiveStore>(
     source: Source<U, A>,
     query: Query,
-    mut batches: Batches,
+    options: IpcWriteOptions,
+    mut messages: Messages,
     _permit: OwnedSemaphorePermit,
 ) {
     // A consumer that leaves ends it at once, even while a store call is being retried.
-    let left = batches.closed();
+    let left = messages.closed();
     let read = tokio::select! {
         biased;
         () = source.cancel.cancelled() => Err(Status::unavailable("the node is shutting down").into()),
         () = left => Ok(()),
-        read = read_range(&source, query, &mut batches) => read,
+        read = read_range(&source, query, &options, &mut messages) => read,
     };
     if let Err(err) = read {
-        batches.end(err);
+        messages.end(err);
     }
 }
 
-/// A batch being built off the runtime.
-type Building = JoinHandle<Result<RecordBatch, FlightError>>;
+/// A read being converted and encoded off the runtime.
+type Building = JoinHandle<Result<Vec<FlightData>, FlightError>>;
 
 async fn read_range<U: UnsafeStore, A: ArchiveStore>(
     source: &Source<U, A>,
     query: Query,
-    batches: &mut Batches,
+    options: &IpcWriteOptions,
+    messages: &mut Messages,
 ) -> Result<(), FlightError> {
     let mut next = query.from.unwrap_or(0);
     let mut history = crate::source::History::default();
     let mut parent: Option<B256> = None;
-    // The previous batch, built while the next one is read.
-    let mut building: Option<Building> = None;
+    // The reads being built, oldest first, each sent once it is built and those before it are.
+    let mut building: VecDeque<Building> = VecDeque::with_capacity(PARALLEL_BUILDS);
     while next <= query.to {
         let heads = source
             .archive_heads()
@@ -202,28 +218,70 @@ async fn read_range<U: UnsafeStore, A: ArchiveStore>(
             }
             parent = Some(block.at.hash);
         }
-        let table = query.table;
-        let built = tokio::task::spawn_blocking(move || table.batch(&blocks, &heads));
-        if let Some(previous) = building.replace(built)
-            && !send(previous, batches).await?
-        {
+        let (table, options) = (query.table, options.clone());
+        building.push_back(tokio::task::spawn_blocking(move || {
+            encode(table.batch(&blocks, &heads)?, options)
+        }));
+        if !flush(&mut building, PARALLEL_BUILDS - 1, messages).await? {
             return Ok(());
         }
         next = last.number.saturating_add(1);
     }
-    if let Some(last) = building {
-        send(last, batches).await?;
-    }
+    flush(&mut building, 0, messages).await?;
     Ok(())
 }
 
-/// Waits for a batch and sends it. `false` when the stream has ended (the consumer left, or
-/// was told it is too slow).
-async fn send(building: Building, batches: &mut Batches) -> Result<bool, FlightError> {
-    let batch = building
-        .await
-        .map_err(|err| FlightError::ExternalError(Box::new(err)))??;
-    Ok(batches.send(batch).await.is_ok())
+/// Sends the oldest reads, in order, as each is built, until `keep` are left being built.
+/// `false` when the stream has ended (the consumer left, or was told it is too slow).
+async fn flush(
+    building: &mut VecDeque<Building>,
+    keep: usize,
+    messages: &mut Messages,
+) -> Result<bool, FlightError> {
+    while building.len() > keep {
+        let Some(oldest) = building.pop_front() else {
+            break;
+        };
+        let built = oldest
+            .await
+            .map_err(|err| FlightError::ExternalError(Box::new(err)))??;
+        for message in built {
+            if messages.send(message).await.is_err() {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Encodes `batch` as Flight messages with `options`: arrow-flight's encoder, which cuts it
+/// into gRPC-sized pieces and compresses as asked, without the schema message it starts with
+/// (the stream sends that once). CPU work, for a blocking thread of the runtime.
+fn encode(batch: RecordBatch, options: IpcWriteOptions) -> Result<Vec<FlightData>, FlightError> {
+    let encoder = FlightDataEncoderBuilder::new()
+        .with_options(options)
+        .build(tokio_stream::iter([Ok(batch)]));
+    // Its input is ready at once: this returns as soon as the batch is encoded.
+    let messages: Vec<FlightData> =
+        tokio::runtime::Handle::current().block_on(encoder.collect::<Result<_, _>>())?;
+    Ok(messages.into_iter().skip(1).collect())
+}
+
+/// The IPC options a `DoGet` asked for with [`COMPRESSION_HEADER`].
+fn write_options(metadata: &MetadataMap) -> Result<IpcWriteOptions, Status> {
+    let compression = match metadata.get(COMPRESSION_HEADER).map(|value| value.to_str()) {
+        None | Some(Ok("none")) => None,
+        Some(Ok("lz4")) => Some(CompressionType::LZ4_FRAME),
+        Some(Ok("zstd")) => Some(CompressionType::ZSTD),
+        Some(_) => {
+            return Err(Status::invalid_argument(format!(
+                "{COMPRESSION_HEADER} must be lz4, zstd or none"
+            )));
+        }
+    };
+    IpcWriteOptions::default()
+        .try_with_compression(compression)
+        .map_err(|err| Status::internal(err.to_string()))
 }
 
 fn unimplemented<T>() -> Result<T, Status> {
@@ -302,19 +360,24 @@ where
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
+        let options = write_options(request.metadata())?;
         let query = Query::parse(&request.into_inner().ticket)?;
         let permit = Arc::clone(&self.streams)
             .try_acquire_owned()
             .map_err(|_full| Status::resource_exhausted("too many Flight streams at once"))?;
         let query = self.resolve(query).await?;
-        let schema = query.table.schema();
-        let (batches, rx) = Sink::channel(BATCHES_AHEAD);
-        self.tasks
-            .spawn(produce(self.source.clone(), query, batches, permit));
+        let schema: FlightData = SchemaAsIpc::new(&query.table.schema(), &options).into();
+        let (messages, rx) = Sink::channel(MESSAGES_AHEAD);
+        self.tasks.spawn(produce(
+            self.source.clone(),
+            query,
+            options,
+            messages,
+            permit,
+        ));
         let sent = self.sent.clone();
-        let encoded = FlightDataEncoderBuilder::new()
-            .with_schema(schema)
-            .build(ReceiverStream::new(rx))
+        let encoded = tokio_stream::once(Ok(schema))
+            .chain(ReceiverStream::new(rx))
             .map(move |data| {
                 let data = data.map_err(Status::from)?;
                 sent.message(&data);

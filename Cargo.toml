@@ -131,8 +131,10 @@ governor = { version = "0.10", default-features = false, features = ["std"] }
 arrow-flight = { version = "60", default-features = false }
 arrow-array = { version = "60", default-features = false }
 arrow-schema = { version = "60", default-features = false }
-# `IpcWriteOptions` for the schemas Flight answers with.
-arrow-ipc = { version = "60", default-features = false }
+# `IpcWriteOptions` for the schemas and record batches Flight sends; `lz4` and `zstd` for the
+# IPC buffer compression a client may ask for per `DoGet` (LZ4 frame, ZSTD), which readers such
+# as pyarrow undo transparently.
+arrow-ipc = { version = "60", default-features = false, features = ["lz4", "zstd"] }
 
 # Importer (`bin/op-indexer-import`) only. Command line: flags with environment fallbacks and
 # generated help.

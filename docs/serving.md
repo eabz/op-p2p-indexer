@@ -548,7 +548,8 @@ into per-chunk jobs, so one big range runs in parallel over the servers:
   busy with other requests gets fewer; ties go round-robin. Pure round-robin would ignore that
   one request can be 1,000 times another.
 - A Flight client fetches the endpoints in parallel, straight from the servers, and moves to
-  the next location if one fails.
+  the next location if one fails. It may ask each server for compressed record batches
+  (`op-indexer-compression: lz4` or `zstd`, [stream.md](stream.md) §6).
 - The ticket code is `crates/stream/src/flight.rs`'s (`op_indexer_stream::ticket`).
 
 ### 6.5 Locate
@@ -699,6 +700,24 @@ The public domain makes the chunks world-readable. They are the chain's public h
 the raw download (6.8) hands them out anyway; the manifest and index stay private.
 
 ## 7. The bench (3 to 4 small droplets, one R2 bucket)
+
+**Running it.** `scripts/bench.py` reads a range of one table through the balancer, as a
+Flight client would: it asks the balancer to plan the range (`GetFlightInfo`), then runs the
+jobs across `--processes` processes with `--threads` threads each, so one Python process is
+not the limit. A job fails over to its next location on `UNAVAILABLE` or `RESOURCE_EXHAUSTED`
+(and back to the first, up to `--retries` rounds). It prints progress, then jobs done and
+failed, MB/s and rows/s (Arrow bytes received, decoded), retries, time to first batch (median
+and p95), and per server its jobs and MB/s. It needs pyarrow and an API key in `KEY`:
+
+```bash
+KEY=<api key> scripts/bench.py --balancer grpc://<balancer>:50060 --table logs --from 120000000 --to 120100000 --processes 4 --threads 8 --compression zstd
+```
+
+- **Client or server limit?** Run the same command from two machines at once. If the two
+  runs' MB/s add up to about twice one run's, the client was the limit; if they share the
+  same total, the servers (or R2 behind them) are.
+- Vary `--threads` (jobs in flight per process) and `--processes` (client cores); compare
+  `--compression none`, `lz4` and `zstd` for bytes on the wire against server CPU.
 
 Setup:
 - 2 or 3 `server`s (no cache), one of them with `--export`;
