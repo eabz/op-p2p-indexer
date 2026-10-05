@@ -15,6 +15,10 @@
 //!   (`derive`, `--fill-from l1`, the default), with deposits' source hashes and mints; what
 //!   cannot be rebuilt is fetched, and a block that does not hash is fetched whole, replacing
 //!   its rows (one may be wrong); `--fill-from rpc` fetches them all.
+//! - Rows that lack nothing and are still wrong: Base's at 3,107,702 left out a transaction's
+//!   access list, which reads as an empty one. A chunk whose rows lack nothing is rebuilt as
+//!   `verify` does, once (`hashed.json` keeps those that hash), and a block that does not hash
+//!   is fetched whole, replacing its rows.
 //!
 //! After the chunks are downloaded, every chunk not sealed yet is read, several at once
 //! within `verify`'s memory bound ([`IN_FLIGHT_BYTES`]), and checked for every field its rows
@@ -54,7 +58,7 @@ use crate::progress::{self, Rate};
 use crate::rows::{self, L1Info, LogRow, Rows, TransactionRow};
 use crate::rpc::{FilledBlock, Rpc, RpcHeader, Wanted};
 use crate::source::HyperSync;
-use crate::state::{Chunk, Plan, State, covered, read_json, write_json};
+use crate::state::{Chunk, Hashed, Plan, State, covered, read_json, write_json};
 use crate::verify::{
     Forks, IN_FLIGHT_BYTES, Missing, Roots, Unhashed, encode_access_list, holes, missing,
     unhashed_blocks,
@@ -303,6 +307,8 @@ struct Scanned {
     /// Every block's header row, for the rebuild from L1 (none when the headers come from
     /// the RPC).
     header_rows: Vec<HeaderRow>,
+    /// Whether its rows lack nothing and every block rebuilt to its hash.
+    hashed: bool,
 }
 
 /// What one chunk needs from the RPC.
@@ -362,7 +368,7 @@ pub(crate) async fn run(
     threads: usize,
     cancel: &CancellationToken,
 ) -> eyre::Result<()> {
-    let chunks = {
+    let (chunks, mut hashed) = {
         let (state, plan) = (state.clone(), *plan);
         tokio::task::spawn_blocking(move || to_scan(&state, &plan)).await??
     };
@@ -404,7 +410,11 @@ pub(crate) async fn run(
             in_flight_bytes = in_flight_bytes.saturating_add(bytes);
             let (raw, fill) = (state.raw_path(chunk), state.fill_path(chunk));
             let rebuild = rebuilding.is_some();
-            scans.spawn_blocking(move || (chunk, bytes, scan(&forks, &raw, &fill, rebuild)));
+            let check = hashed.get(&chunk.from) != Some(&bytes);
+            scans.spawn_blocking(move || {
+                let found = scan(&forks, chunk, &raw, &fill, rebuild, check);
+                (chunk, bytes, found)
+            });
         }
         if let Some(rpc) = rpc {
             while go_on
@@ -440,6 +450,9 @@ pub(crate) async fn run(
                 let found = found.wrap_err_with(|| {
                     format!("blocks {}..{}: failed to read the chunk", chunk.from, chunk.to)
                 })?;
+                if found.hashed {
+                    hashed.insert(chunk.from, bytes);
+                }
                 ready.insert(chunk.from, (chunk, bytes, found));
                 // Not after a stop or a failure: the run is ending.
                 if work.failure.is_none() && !cancel.is_cancelled() {
@@ -456,6 +469,10 @@ pub(crate) async fn run(
             _ = tick.tick() => work.log(fetches.len()),
         }
     }
+    let (keep, kept_plan) = (state.clone(), *plan);
+    tokio::task::spawn_blocking(move || keep.write_hashed(&kept_plan, hashed))
+        .await?
+        .wrap_err("failed to write hashed.json")?;
     work.finish(rpc, plan, cancel)
 }
 
@@ -989,8 +1006,9 @@ fn count_lacking(forks: &Forks, rows: &Rows) -> u64 {
     count
 }
 
-/// The chunks downloaded and not sealed yet, with the size of their download. Blocking.
-fn to_scan(state: &State, plan: &Plan) -> io::Result<Vec<(Chunk, u64)>> {
+/// The chunks downloaded and not sealed yet, with the size of their download, and those of
+/// them found to hash as downloaded now (`hashed.json`). Blocking.
+fn to_scan(state: &State, plan: &Plan) -> io::Result<(Vec<(Chunk, u64)>, Hashed)> {
     let sealed = state.sealed_through()?;
     let mut chunks = Vec::new();
     for chunk in plan.chunks().filter(|chunk| !covered(sealed, *chunk)) {
@@ -1001,7 +1019,13 @@ fn to_scan(state: &State, plan: &Plan) -> io::Result<Vec<(Chunk, u64)>> {
         };
         chunks.push((chunk, bytes));
     }
-    Ok(chunks)
+    let mut hashed = state.read_hashed(plan)?;
+    hashed.retain(|from, bytes| {
+        chunks
+            .binary_search_by_key(from, |(chunk, _)| chunk.from)
+            .is_ok_and(|at| chunks.get(at).is_some_and(|(_, size)| size == bytes))
+    });
+    Ok((chunks, hashed))
 }
 
 /// Every block's rows as the rebuild from L1 reads them, with the header fields `lacking`
@@ -1072,8 +1096,16 @@ fn header_rows(rows: &Rows, lacking: Vec<(u64, Vec<&'static str>)>) -> Vec<Heade
 
 /// Reads one downloaded chunk with its fill and lists what its rows lack. Blocking.
 /// With `rebuild`, the rows are kept for the rebuild from L1 and no header field or source
-/// hash is listed to fetch: the rebuild decides.
-fn scan(forks: &Forks, raw: &Path, fill: &Path, rebuild: bool) -> eyre::Result<Scanned> {
+/// hash is listed to fetch: the rebuild decides. With `check`, rows that lack nothing are
+/// rebuilt as `verify` does, and the blocks that do not hash are listed to fetch whole.
+fn scan(
+    forks: &Forks,
+    chunk: Chunk,
+    raw: &Path,
+    fill: &Path,
+    rebuild: bool,
+    check: bool,
+) -> eyre::Result<Scanned> {
     let mut rows = rows::read(raw)?;
     if let Some(fill) = read_json(fill)? {
         apply(&mut rows, fill);
@@ -1121,6 +1153,32 @@ fn scan(forks: &Forks, raw: &Path, fill: &Path, rebuild: bool) -> eyre::Result<S
             .binary_search_by_key(&header.number, |block| block.number)
             .is_err()
     });
+    if check && scanned.missing.is_empty() {
+        let unhashed = unhashed_blocks(forks, chunk, raw, fill, Fill::default())
+            .map_err(|why| eyre::eyre!("blocks {}..{}: {why}", chunk.from, chunk.to))?;
+        scanned.hashed = unhashed.is_empty();
+        if let Some(first) = unhashed.first() {
+            warn!(
+                from = chunk.from,
+                to = chunk.to,
+                blocks = unhashed.len(),
+                why = %first.why,
+                "downloaded rows that lack nothing do not hash: fetching those blocks whole \
+                 from the RPC"
+            );
+        }
+        for block in unhashed {
+            if let Some(row) = rows.block(block.number) {
+                scanned
+                    .fetch
+                    .holes
+                    .push(BlockNumHash::new(block.number, row.hash));
+            }
+            if let Some(roots) = block.roots {
+                scanned.fetch.unhashed.push((block.number, roots));
+            }
+        }
+    }
     Ok(scanned)
 }
 

@@ -7,6 +7,7 @@
 //! <state>/sealed/<first>-<last>.json    a sealed chunk `verify` uploaded: its manifest entry
 //! <state>/index-build/                  the hash index being built (`verify`)
 //! <state>/refetch.json                  chunks a scan found lacking a field, still to ask for again
+//! <state>/hashed.json                   downloaded chunks whose rows `download` found to hash
 //! <state>/lock                          held by the one process working on the directory
 //! ```
 //!
@@ -19,6 +20,7 @@
 //! left by a killed run are removed when the directory is opened. Holds no credentials. Does
 //! not know what the chunk files contain.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, File, TryLockError};
 use std::io::{self, Write};
@@ -38,6 +40,11 @@ use crate::game::GameAnchor;
 const LAYOUT_VERSION: u32 = 1;
 /// The list of chunks to ask for again ([`State::read_refetch`]).
 const REFETCH_FILE: &str = "refetch.json";
+/// The downloaded chunks found to hash ([`State::read_hashed`]).
+const HASHED_FILE: &str = "hashed.json";
+
+/// Downloaded chunks found to hash: by first block, the size of the download checked.
+pub(crate) type Hashed = BTreeMap<u64, u64>;
 
 /// Free space below which a step warns with its progress.
 pub(crate) const LOW_SPACE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
@@ -81,6 +88,14 @@ impl Lacking {
 struct RefetchList {
     plan: RefetchPlan,
     chunks: Vec<Lacking>,
+}
+
+/// `hashed.json`: the downloaded chunks whose blocks all rebuilt to their hashes, by first
+/// block, each with the size of its download then.
+#[derive(Debug, Serialize, Deserialize)]
+struct HashedList {
+    plan: RefetchPlan,
+    chunks: Hashed,
 }
 
 /// What of a plan decides its chunks.
@@ -349,6 +364,34 @@ impl State {
             chunks,
         };
         write_json(&self.root.join(REFETCH_FILE), &list)
+    }
+
+    /// The downloaded chunks `download` found to hash, by first block, each with the size of
+    /// its download then: a chunk downloaded again since has another size and is checked
+    /// again. Empty if there is no list, or one made for another plan. Blocking.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidData` if the file is damaged, and the I/O error of reading it.
+    pub(crate) fn read_hashed(&self, plan: &Plan) -> io::Result<Hashed> {
+        let list = read_json::<HashedList>(&self.root.join(HASHED_FILE))?;
+        Ok(list
+            .filter(|list| list.plan == RefetchPlan::of(plan))
+            .map(|list| list.chunks)
+            .unwrap_or_default())
+    }
+
+    /// Keeps `chunks` as the list [`Self::read_hashed`] reads, for `plan`. Blocking.
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error of writing the file.
+    pub(crate) fn write_hashed(&self, plan: &Plan, chunks: Hashed) -> io::Result<()> {
+        let list = HashedList {
+            plan: RefetchPlan::of(plan),
+            chunks,
+        };
+        write_json(&self.root.join(HASHED_FILE), &list)
     }
 
     /// Records that the sealed chunk `entry` is uploaded, durably. Blocking.
