@@ -1,9 +1,10 @@
 //! Pacing of the requests one requester makes of one peer: a few at a time at most (one for the
-//! receipts fetcher), a pause between two, and a count of the answers that did not come.
+//! receipts fetcher, four for range sync and the fill), a pause between two starts, and a count
+//! of the answers that did not come.
 //!
-//! This node only asks, so it asks slowly. Each requester (the receipts fetcher, range sync)
-//! keeps one [`Pacing`] per open session; they are not shared, so a peer can have one request
-//! of each in flight.
+//! This node asks slowly. Each requester (the receipts fetcher, range sync, the fill) keeps one
+//! [`Pacing`] per open session; they are not shared, so a peer can have each requester's
+//! requests in flight at once.
 
 use std::time::Duration;
 

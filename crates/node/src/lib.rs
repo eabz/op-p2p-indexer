@@ -20,10 +20,11 @@ mod sync;
 pub use op_indexer_runtime::{env_file, shutdown_signal};
 mod peers;
 mod provider;
+pub mod sizing;
 
 use std::future::Future;
+use std::net::IpAddr;
 use std::pin::Pin;
-
 use std::sync::Arc;
 
 use alloy_primitives::BlockNumber;
@@ -69,8 +70,8 @@ const SERVED_PEERS_CAPACITY: usize = 32;
 /// L1 blocks the light client vouches for, waiting for the L1 network: a head every 12 s and
 /// a finalized block every few minutes.
 const TRUSTED_L1_BLOCKS_CAPACITY: usize = 16;
-/// Batches of a range sync waiting for the pipeline. A batch is up to 256 blocks, so this is
-/// kept small; the sync waits when it is full.
+/// Batches of a range sync waiting for the pipeline. A batch is a segment, up to 1,024 blocks
+/// (`el`'s `MAX_SEGMENT_BLOCKS`), so this is kept small; the sync waits when it is full.
 const SYNC_BATCH_CAPACITY: usize = 2;
 /// Missed gossip spans waiting for the execution network: a gap is rare and one at a time is
 /// enough; one that does not fit is left to range sync.
@@ -130,6 +131,14 @@ impl NodeView {
     #[must_use]
     pub fn served(&self) -> NodeServed {
         self.peers.served()
+    }
+
+    /// The public IP the execution network's node record advertises
+    /// ([`ExecutionNetwork::public_ip`]): `None` without the execution network, and a value of
+    /// `None` until it is learned.
+    #[must_use]
+    pub fn public_ip(&self) -> Option<watch::Receiver<Option<IpAddr>>> {
+        self.peers.public_ip()
     }
 
     /// The highest block N such that the node holds every block from `archive`'s first

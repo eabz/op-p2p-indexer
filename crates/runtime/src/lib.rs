@@ -9,6 +9,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::time::ChronoUtc;
 
 pub mod env_file;
+pub mod machine;
 pub mod service;
 
 /// What a node binary does once [`startup`] returns.
@@ -92,6 +93,17 @@ pub enum SignalPolicy {
 /// Reads a nonempty Unicode environment value; absent, empty and non-Unicode values are absent.
 pub fn env_var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+/// Reads `name`, which is read for this release only, warning if the environment sets it:
+/// `instead` says what replaces it (another variable, a flag, or nothing because it is now
+/// automatic). Call it once at startup, after [`init_tracing`]. Never logs the value.
+pub fn deprecated(name: &str, instead: impl fmt::Display) -> Option<String> {
+    let value = env_var(name);
+    if value.is_some() {
+        tracing::warn!("{name} is deprecated and read for this release only: {instead}");
+    }
+    value
 }
 
 /// Resolves with the signal's name on Ctrl-C (SIGINT) or, on Unix, SIGTERM.

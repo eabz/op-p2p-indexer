@@ -11,15 +11,15 @@ use op_indexer_el::{ElConfig, PeerConfig};
 use op_indexer_p2p::{Bootnode, NetworkConfig};
 use op_indexer_primitives::{ChainIdentity, ExecutionPeer};
 use op_indexer_runtime::env_var as var;
+use op_indexer_runtime::machine::Machine;
 use op_indexer_storage::{ArchiveConfig, StorageConfig, UnsafeConfig};
 use op_indexer_stream::StreamConfig;
+
+use crate::sizing;
 
 const DEFAULT_CHAIN_ID: u64 = OP_MAINNET.chain_id;
 const DEFAULT_LISTEN_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9222);
 const DEFAULT_MAX_PEERS: u32 = 30;
-/// The memory the unsafe chain's blocks may take: about a day of a busy chain's blocks
-/// (measured in docs/storage.md section 3).
-const DEFAULT_UNSAFE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// Directory of the local block archive, inside the data directory.
 const ARCHIVE_DIR: &str = "archive";
 /// The unsafe chain's journal, inside the data directory.
@@ -42,7 +42,6 @@ const DEFAULT_L1_LISTEN_ADDR: SocketAddr =
 const DEFAULT_STREAM_LISTEN_ADDR: SocketAddr =
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50051);
 const DEFAULT_STREAM_MAX_SUBSCRIPTIONS: usize = 64;
-const DEFAULT_STREAM_MAX_FLIGHTS: usize = 8;
 /// How long a `DoGet` waits for a free stream before it is refused: enough for one to end
 /// under a client that asks for more streams than the server has.
 const DEFAULT_STREAM_FLIGHT_QUEUE_MS: u64 = 2000;
@@ -77,7 +76,8 @@ impl ElSettings {
 /// What a binary changes of the configuration's defaults.
 #[derive(Debug, Clone, Copy)]
 pub struct Defaults {
-    /// `OP_INDEXER_EL_MAX_SESSIONS` when unset.
+    /// `OP_INDEXER_EL_MAX_SESSIONS` when unset (the server's is
+    /// [`sizing::server_el_sessions`]).
     pub el_max_sessions: usize,
 }
 
@@ -186,10 +186,12 @@ impl Config {
     ///   the node refuses to start while `data`, an earlier build's default, holds an archive
     ///   or a node store and `data-<chain>` does not exist.
     /// - `OP_INDEXER_UNSAFE_MAX_BYTES`: memory the unsafe chain's blocks may take, in bytes
-    ///   (default 2 GiB); past it the lowest heights leave. Its journal is `unsafe/` in the data
+    ///   (default sized from the machine: an eighth of its memory, 256 MiB to 2 GiB, see
+    ///   [`sizing`]); past it the lowest heights leave. Its journal is `unsafe/` in the data
     ///   directory, replayed on start.
     /// - `OP_INDEXER_EL_ENABLED`: `true` to join the execution p2p network (devp2p) and fetch
-    ///   the receipts gossip does not carry (default `false`: blocks stay without receipts).
+    ///   the receipts gossip does not carry (default `false`: blocks stay without receipts;
+    ///   `true` with a profile or the range sync, which needs it).
     ///   The variables below only apply when it is enabled.
     /// - `OP_INDEXER_EL_LISTEN_ADDR`: execution p2p listen socket, TCP and UDP (default
     ///   `0.0.0.0:30303`).
@@ -199,7 +201,7 @@ impl Config {
     ///   UDP) announced in the execution node record, for a node behind NAT or in a container
     ///   (default: unset, the address other peers observe).
     /// - `OP_INDEXER_EL_MAX_SESSIONS`: execution sessions kept in each direction, dialed and
-    ///   accepted (default 4; the server's binary sets 32, see [`Defaults`]). Four more are
+    ///   accepted (default 4; the server's is sized from its cores, see [`Defaults`]). Four more are
     ///   accepted for peers that want history (op-p2p-indexers, nodes syncing far behind), and
     ///   one more dialed for an op-p2p-indexer. Full nodes ration their slots: an `indexer`
     ///   keeps it low; a `server` exists to serve and keeps many.
@@ -208,7 +210,8 @@ impl Config {
     ///   and counted against no limit (default: none).
     /// - `OP_INDEXER_EL_SYNC`: `true` to fetch from execution peers the blocks between the
     ///   archive's last block and the chain that gossip cannot fill, into the archive
-    ///   (default `false`), in rounds from the block after the archive's last
+    ///   (default `false`; `true` with the archive or fleet profile or the L1 side, which needs
+    ///   it), in rounds from the block after the archive's last
     ///   one (block 0 on an empty archive) to a trusted anchor that every fetched block is
     ///   verified against. With the L1 side a round runs while the archive is 1,024 blocks or
     ///   more below the safe head (the unsafe store's read limit) and is anchored on the safe
@@ -217,14 +220,16 @@ impl Config {
     ///   blocks L1 has not committed (the stream marks them unsafe), and an unsafe reorg deeper
     ///   than 64 blocks leaves it on a dead branch, which only rebuilding the archive repairs.
     ///   Promotion extends the archive otherwise. A restart continues after the archive's last
-    ///   block. Needs the execution network. Required with the L1 side.
+    ///   block. Needs the execution network, which it turns on (`OP_INDEXER_EL_ENABLED=false`
+    ///   with it is refused). Required with the L1 side.
     /// - `OP_INDEXER_L1_ENABLED`: `true` to follow Ethereum L1 for what it commits to
     ///   (default `false`: no safe or finalized head, nothing is promoted). The node then
     ///   runs a beacon light client, which follows Ethereum's finality from the checkpoint,
     ///   and joins L1's execution p2p network to read the dispute games of the chain from
     ///   the L1 blocks the light client vouches for; it checks each claim against its own
     ///   block and promotes on a match. Needs `OP_INDEXER_L1_CHECKPOINT`, and the range sync
-    ///   (`OP_INDEXER_EL_SYNC=true`, so the execution network too): promotion records only
+    ///   (and so the execution network), which it turns on (`OP_INDEXER_EL_SYNC=false` with
+    ///   it is refused): promotion records only
     ///   what the archive holds, and range sync fills the gaps gossip leaves. If no peer serves
     ///   the checkpoint (nor the saved one) any more the node stops and asks for a newer one.
     /// - `OP_INDEXER_L1_CHECKPOINT`: root of a recent finalized beacon block, from a source
@@ -245,7 +250,11 @@ impl Config {
     ///   `127.0.0.1:50051`, local only; API keys are configured separately).
     /// - `OP_INDEXER_STREAM_MAX_SUBSCRIPTIONS`: stream subscriptions at once (default 64).
     /// - `OP_INDEXER_STREAM_MAX_FLIGHTS`: Arrow Flight `DoGet` streams at once, on the same
-    ///   listener (default 8).
+    ///   listener (default sized from the machine: as many as the Flight builds it runs at
+    ///   once, at least 8, see [`sizing`]).
+    /// - `OP_INDEXER_STREAM_MAX_BUILDS`: reads of Flight streams built at once, server-wide,
+    ///   each on a blocking thread holding about 100 MiB (default sized from the machine: two
+    ///   per core, within an eighth of its memory, see [`sizing`]).
     /// - `OP_INDEXER_STREAM_FLIGHT_QUEUE_MS`: how long one more `DoGet` waits for a free
     ///   stream before `RESOURCE_EXHAUSTED`, in ms (default 2000; 0 refuses at once).
     /// - `OP_INDEXER_STREAM_API_KEYS`: comma-separated API keys; with any set, a gRPC or Flight
@@ -286,28 +295,38 @@ impl Config {
             path: data_dir.join(ARCHIVE_DIR),
         };
 
-        let el = el_settings(chain, profile.is_some(), defaults.el_max_sessions)?;
-        let sync = parse_var(SYNC_VAR)?.unwrap_or(history);
+        // Each side turns on what it needs unless told not to, which is refused below.
+        let l1 = l1_settings(history)?;
+        let sync = parse_var(SYNC_VAR)?.unwrap_or(history || l1.is_some());
+        let el = el_settings(chain, profile.is_some() || sync, defaults.el_max_sessions)?;
         ensure!(
             !sync || el.is_some(),
-            "{SYNC_VAR} needs the execution network: set OP_INDEXER_EL_ENABLED=true"
+            "{SYNC_VAR} needs the execution network, but OP_INDEXER_EL_ENABLED is false"
         );
-        let l1 = l1_settings(history)?;
         // Promotion records only what the archive holds; with the L1 side, range sync is what
         // fills a gap gossip left, so without it the committed chain would stop at the first.
         ensure!(
             l1.is_none() || sync,
-            "{L1_ENABLED_VAR} needs {SYNC_VAR}=true: range sync fills the gaps in the archive \
-             that promotion cannot, and the committed heads never pass the archive"
+            "{L1_ENABLED_VAR} needs the range sync, but {SYNC_VAR} is false: range sync fills \
+             the gaps in the archive that promotion cannot, and the committed heads never pass \
+             the archive"
         );
 
+        let machine = Machine::get();
+        let max_builds = parse_var("OP_INDEXER_STREAM_MAX_BUILDS")?
+            .unwrap_or_else(|| sizing::max_builds(machine));
+        ensure!(
+            max_builds > 0,
+            "OP_INDEXER_STREAM_MAX_BUILDS must be at least 1"
+        );
         let stream = StreamConfig {
             listen_addr: parse_var("OP_INDEXER_STREAM_LISTEN_ADDR")?
                 .unwrap_or(DEFAULT_STREAM_LISTEN_ADDR),
             max_subscriptions: parse_var("OP_INDEXER_STREAM_MAX_SUBSCRIPTIONS")?
                 .unwrap_or(DEFAULT_STREAM_MAX_SUBSCRIPTIONS),
             max_flights: parse_var("OP_INDEXER_STREAM_MAX_FLIGHTS")?
-                .unwrap_or(DEFAULT_STREAM_MAX_FLIGHTS),
+                .unwrap_or_else(|| sizing::max_flights(max_builds)),
+            max_builds,
             flight_queue: Duration::from_millis(
                 parse_var("OP_INDEXER_STREAM_FLIGHT_QUEUE_MS")?
                     .unwrap_or(DEFAULT_STREAM_FLIGHT_QUEUE_MS),
@@ -338,7 +357,7 @@ impl Config {
                     path: data_dir.join(UNSAFE_DIR),
                     canyon_time: chain.canyon_time(),
                     max_bytes: parse_var("OP_INDEXER_UNSAFE_MAX_BYTES")?
-                        .unwrap_or(DEFAULT_UNSAFE_MAX_BYTES),
+                        .unwrap_or_else(|| sizing::unsafe_max_bytes(machine)),
                 },
                 archive,
                 chain: ChainIdentity {
@@ -367,6 +386,16 @@ impl Config {
             l1_tracking = self.l1.is_some(),
             stream = %self.stream.listen_addr,
             "node capabilities"
+        );
+        let machine = Machine::get();
+        tracing::info!(
+            cores = machine.cores,
+            memory_mib = machine.memory.map(sizing::mib),
+            unsafe_max_mib = sizing::mib(self.storage.unsafe_chain.max_bytes),
+            max_flights = self.stream.max_flights,
+            max_builds = self.stream.max_builds,
+            el_max_sessions = self.el.as_ref().map(|el| el.max_sessions),
+            "settings sized from the machine, or set in the environment"
         );
     }
 

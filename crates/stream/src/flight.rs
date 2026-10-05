@@ -51,22 +51,14 @@ use crate::{Places, Sent};
 use op_indexer_api::ticket::{Cap, MAX_FLIGHT_BLOCKS, Query, Table};
 
 /// Reads of one `DoGet` built at once, each on a blocking thread: the cores one stream may
-/// use. A build runs to its end even while the consumer is slow, so each holds up to a read
-/// (16 MiB), its record batch and its encoded messages, about 100 MiB, until they are sent;
-/// across streams, [`max_builds`] bounds them.
-const PARALLEL_BUILDS: usize = 2;
+/// use. A build runs to its end even while the consumer is slow, so each holds up to
+/// [`BUILD_BYTES`] until its messages are sent; across streams,
+/// [`StreamConfig::max_builds`](crate::StreamConfig::max_builds) bounds them.
+pub const PARALLEL_BUILDS: usize = 2;
 
-/// Builds of all `DoGet`s at once, server-wide, per core. A build is CPU work, so more than
-/// a couple per core only holds memory: each holds up to about 100 MiB until its messages are
-/// sent, so the builds of any number of streams hold at most this many times that.
-const BUILDS_PER_CORE: usize = 2;
-
-/// The builds the server runs at once ([`BUILDS_PER_CORE`]).
-pub(crate) fn max_builds() -> usize {
-    std::thread::available_parallelism()
-        .map_or(1, std::num::NonZero::get)
-        .saturating_mul(BUILDS_PER_CORE)
-}
+/// What one build holds until its messages are sent, about: a read (16 MiB), its record
+/// batch and its encoded messages.
+pub const BUILD_BYTES: u64 = 100 << 20;
 
 /// Encoded Flight messages (about 2 MiB each) queued ahead of the consumer.
 const MESSAGES_AHEAD: usize = 4;
@@ -86,7 +78,7 @@ pub(crate) struct Flight<U, A> {
     pub(crate) streams: Places,
     /// How long a `DoGet` waits for a stream when all are taken; zero refuses at once.
     pub(crate) queue: Duration,
-    /// One permit per build at once, of every `DoGet` ([`max_builds`]).
+    /// One permit per build at once, of every `DoGet` ([`StreamConfig::max_builds`](crate::StreamConfig::max_builds)).
     pub(crate) builds: Arc<Semaphore>,
     pub(crate) tasks: TaskTracker,
     /// The bytes sent, which each `FlightData` adds to as it leaves.

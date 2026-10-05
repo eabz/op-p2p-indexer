@@ -7,7 +7,7 @@
 //! header's logs bloom may contain the factory's `DisputeGameCreated` event, and (2) one of
 //! its transactions was sent to the factory. The bloom is tested first because it costs
 //! nothing, but on mainnet it is a weak filter: blooms are about three quarters full, and
-//! about one header in six passes (measured 2026-10-04). So the transactions are fetched next
+//! about one header in five passes (19% of 718 headers, measured 2026-10-04). So the transactions are fetched next
 //! (checked against the header), and only a block with a transaction to the factory has its
 //! receipts fetched (checked too); the game is read from the event and that call (`create`,
 //! or `createWithInitData` for a format that says so, Base's games).

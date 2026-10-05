@@ -5444,6 +5444,7 @@ version = "0.1.8"
 dependencies = [
  "dotenvy",
  "eyre",
+ "rustix",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -7468,6 +7469,7 @@ dependencies = [
  "op-indexer-storage",
  "tokio",
  "tokio-util",
+ "tracing",
 ]
 
 [[package]]

@@ -8,12 +8,16 @@ use eyre::eyre;
 use op_indexer_balancer::register::{Registration, is_valid_address};
 use op_indexer_chainspec::ChainSpec;
 use op_indexer_chunks::{R2Config, ReadOptions};
-use op_indexer_runtime::env_file;
+use op_indexer_node::sizing;
 use op_indexer_runtime::env_var as var;
-/// Default memory for consumers' reads of sealed history, in MiB.
-const DEFAULT_READ_BUDGET_MB: u64 = 1024;
-/// The exporter's name in the manifest when none is configured.
+use op_indexer_runtime::machine::Machine;
+use op_indexer_runtime::{deprecated, env_file};
+
+/// The exporter's name in the manifest when the server has none: no `OP_INDEXER_SERVER_ID`
+/// and no host name.
 const DEFAULT_EXPORTER_ID: &str = "server";
+/// The exporter's name before it followed the server's, read for one more release.
+const EXPORT_ID_VAR: &str = "OP_INDEXER_EXPORT_ID";
 
 /// What the server needs beyond the node's configuration.
 #[derive(Debug)]
@@ -25,8 +29,11 @@ pub(crate) struct ServerConfig {
     pub(crate) read_budget: u64,
     /// With `--export` or `OP_INDEXER_EXPORT=true`: the exporter's name in the manifest.
     pub(crate) export: Option<String>,
-    /// With `OP_INDEXER_BALANCER_URL`: how this server registers with the balancer.
+    /// With `OP_INDEXER_BALANCER_URL`: how this server registers with the balancer. Its
+    /// `address` is filled in once the node runs ([`crate::address::resolve`]).
     pub(crate) balancer: Option<Registration>,
+    /// `OP_INDEXER_SERVER_ADDRESS`; unset, the registered address is derived.
+    pub(crate) address: Option<String>,
 }
 
 /// Where the sealed chunks are read from.
@@ -60,19 +67,23 @@ impl ServerConfig {
     ///   (`docs/serving.md` 6.9). Default: none, every read through the S3 API.
     /// - `OP_INDEXER_SERVER_READ_BUDGET_MB`: memory, in MiB, that streams and Flight reads of
     ///   sealed history may hold in all, whatever the number of readers: decoded blocks read
-    ///   ahead and chunk streams open (default 1024). Past it readers wait.
+    ///   ahead and chunk streams open (default sized from the machine:
+    ///   [`sizing::server_read_budget`]). Past it readers wait.
     /// - `OP_INDEXER_CHUNKS_DIR`: read the chunks from this local directory instead of R2,
     ///   under `OP_INDEXER_R2_PREFIX` (for local runs and the bench); the R2 variables are
     ///   then not needed.
-    /// - `OP_INDEXER_EXPORT_ID`: the exporter's name in the manifest (default `server`).
+    /// - `OP_INDEXER_SERVER_ID`: this server's name, unique in the deployment, in the balancer
+    ///   and, on the exporter, the manifest (default: the host name). `OP_INDEXER_EXPORT_ID`,
+    ///   the exporter's own name before, is still read for this release, with a warning.
     /// - `OP_INDEXER_BALANCER_URL`: the balancer's gRPC URL (e.g.
     ///   `http://balancer.internal:50060`); set, the server registers there and reports its
     ///   health, load and heads every few seconds. Unset (the default), it runs standalone.
-    ///   With it, these are required:
-    ///   - `OP_INDEXER_BALANCER_SERVER_KEY`: the key servers register with; never logged;
-    ///   - `OP_INDEXER_SERVER_ID`: this server's name, unique in the deployment;
+    ///   With it:
+    ///   - `OP_INDEXER_BALANCER_SERVER_KEY` (required): the key servers register with; never
+    ///     logged;
     ///   - `OP_INDEXER_SERVER_ADDRESS`: the public `host:port` clients reach this server's
     ///     stream and Flight at (its `OP_INDEXER_STREAM_LISTEN_ADDR`, as seen from outside).
+    ///     Default: derived ([`crate::address::resolve`]).
     ///
     /// The API keys of the gRPC and Flight services are the node's `OP_INDEXER_STREAM_API_KEYS`.
     ///
@@ -113,19 +124,27 @@ impl ServerConfig {
             },
             None => Chunks::R2(R2Config::from_env(chain)?),
         };
+        let id = var("OP_INDEXER_SERVER_ID").or_else(|| Machine::get().hostname.clone());
+        let export_id = deprecated(
+            EXPORT_ID_VAR,
+            "the exporter is named after the server, OP_INDEXER_SERVER_ID (default: the host name)",
+        );
         let balancer = var("OP_INDEXER_BALANCER_URL")
-            .map(|balancer| {
+            .map(|url| {
                 Ok::<_, eyre::Report>(Registration {
-                    balancer,
+                    balancer: url,
                     key: required("OP_INDEXER_BALANCER_SERVER_KEY")?,
-                    id: required("OP_INDEXER_SERVER_ID")?,
+                    id: id.clone().ok_or_else(|| {
+                        eyre!("OP_INDEXER_SERVER_ID is required: the host name cannot be read")
+                    })?,
                     chain_id: chain.chain_id,
-                    address: server_address()?,
+                    address: String::new(),
                 })
             })
             .transpose()?;
         Ok(Self {
             balancer,
+            address: server_address()?,
             chunks,
             // How wide a chunk stream reads is the read budget's to decide (the server's
             // `feed`): the store's own options only set what every GET does.
@@ -134,10 +153,14 @@ impl ServerConfig {
                 .map(|mib| mib.parse::<u64>())
                 .transpose()
                 .map_err(|_err| eyre!("OP_INDEXER_SERVER_READ_BUDGET_MB must be a number of MiB"))?
-                .unwrap_or(DEFAULT_READ_BUDGET_MB)
-                .saturating_mul(1 << 20),
+                .map_or_else(
+                    || sizing::server_read_budget(Machine::get()),
+                    |mib| mib.saturating_mul(1 << 20),
+                ),
             export: export.then(|| {
-                var("OP_INDEXER_EXPORT_ID").unwrap_or_else(|| DEFAULT_EXPORTER_ID.to_owned())
+                export_id
+                    .or(id)
+                    .unwrap_or_else(|| DEFAULT_EXPORTER_ID.to_owned())
             }),
         })
     }
@@ -147,13 +170,16 @@ fn required(name: &str) -> eyre::Result<String> {
     var(name).ok_or_else(|| eyre!("{name} is required"))
 }
 
-/// `OP_INDEXER_SERVER_ADDRESS`, checked as the balancer checks it (exactly `host:port`, no
-/// scheme): a wrong one stops startup instead of being refused by the balancer at every retry.
-fn server_address() -> eyre::Result<String> {
-    let address = required("OP_INDEXER_SERVER_ADDRESS")?;
+/// `OP_INDEXER_SERVER_ADDRESS`, when set, checked as the balancer checks it (exactly
+/// `host:port`, no scheme): a wrong one stops startup instead of being refused by the
+/// balancer at every retry.
+fn server_address() -> eyre::Result<Option<String>> {
+    let Some(address) = var("OP_INDEXER_SERVER_ADDRESS") else {
+        return Ok(None);
+    };
     eyre::ensure!(
         is_valid_address(&address),
         "OP_INDEXER_SERVER_ADDRESS must be host:port with no scheme, e.g. server1.example:50051"
     );
-    Ok(address)
+    Ok(Some(address))
 }

@@ -27,7 +27,7 @@ use enr::{CombinedKey, CombinedPublicKey, EnrPublicKey, NodeId};
 use futures_util::future::join_all;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use reth_network_peers::{NodeRecord, PeerId};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::error::Elapsed;
 use tokio::time::{Instant, MissedTickBehavior, interval, timeout};
 use tokio_util::sync::CancellationToken;
@@ -86,6 +86,8 @@ pub(crate) struct Discovery {
     known: HashMap<NodeId, Candidate>,
     /// What the node record advertised when it was last logged.
     advertised: Option<Advertised>,
+    /// The last IP the node record advertised.
+    public_ip: watch::Sender<Option<IpAddr>>,
     /// The fork id in the node record.
     fork_id: ForkId,
     /// Node records with an `opel` entry of another fork seen since the last warning: OP Stack
@@ -113,6 +115,7 @@ impl Discovery {
         ctx: Arc<SessionContext>,
         listen: SocketAddr,
         advertised: Option<SocketAddr>,
+        public_ip: watch::Sender<Option<IpAddr>>,
     ) -> Result<Self, ElError> {
         let mut secret = ctx.key().secret_bytes();
         let key =
@@ -168,6 +171,7 @@ impl Discovery {
             ctx,
             known: HashMap::new(),
             advertised: None,
+            public_ip,
             fork_id,
             other_forks: 0,
         })
@@ -191,7 +195,7 @@ impl Discovery {
             bootnodes = self.ctx.spec().bootnodes.len(),
             "execution discovery started"
         );
-        self.log_advertised();
+        self.follow_advertised();
 
         let mut rounds = interval(LOOKUP_INTERVAL);
         rounds.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -233,7 +237,7 @@ impl Discovery {
                 _ = no_peers.tick() => self.warn_no_peers(),
                 _ = table_scans.tick() => {
                     self.refresh_fork_id();
-                    self.log_advertised();
+                    self.follow_advertised();
                     self.consider(&self.discv5.table_entries_enr(), &candidates);
                 }
                 // Fast phase: top the lookups in flight up, one per tick.
@@ -291,11 +295,12 @@ impl Discovery {
         }
     }
 
-    /// Logs the address the node record advertises, when it differs from what was last
-    /// logged. discv5 changes it by itself: it sets the IP and UDP port once enough nodes
+    /// Follows the address the node record advertises: logs it when it differs from what was
+    /// last logged, and publishes its IP ([`PeerNetwork::public_ip`](crate::PeerNetwork::public_ip)).
+    /// discv5 changes it by itself: it sets the IP and UDP port once enough nodes
     /// report the same address, follows a change of that address, and withdraws both for six
     /// hours if nobody dials in within five minutes (it then takes the node to be unreachable).
-    fn log_advertised(&mut self) {
+    fn follow_advertised(&mut self) {
         let enr = self.discv5.local_enr();
         let current = Advertised {
             ip: enr
@@ -313,6 +318,11 @@ impl Discovery {
                 tcp = ?current.tcp,
                 "execution node record advertises"
             );
+            // A withdrawn IP is still ours: only a new one replaces it.
+            if let Some(ip) = current.ip {
+                self.public_ip
+                    .send_if_modified(|known| known.replace(ip) != Some(ip));
+            }
         }
     }
 

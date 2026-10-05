@@ -22,9 +22,9 @@
 //! It is never a tight loop: no peer is dialed more often than once per [`FULL_PEER_RETRY`],
 //! at most [`MAX_DIALS_IN_FLIGHT`] dials run at once, and at most 30 start in any minute.
 //!
-//! On a network op-p2p-indexers share (`NetworkSpec::indexers_only_below`), one outbound slot,
-//! and one inbound, beyond `max_sessions` is kept for an indexer; otherwise indexers compete
-//! like any peer.
+//! On a network op-p2p-indexers share (`NetworkSpec::indexers_only_below`), one outbound slot
+//! beyond `max_sessions` is kept for an indexer; inbound, [`HISTORY_SLOTS`] more are shared by
+//! indexers and peers syncing far behind. Otherwise indexers compete like any peer.
 //! Outbound sessions we have not used for [`IDLE_RELEASE`] are closed, keeping [`KEEP_IDLE`]
 //! for the receipts of new blocks; the outbound target then drops to what is kept, and rises
 //! back to `max_sessions` once every kept session has been in use for a while. A released peer

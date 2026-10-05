@@ -31,6 +31,8 @@ mod verify;
 mod warn_limit;
 mod wire;
 
+use std::net::IpAddr;
+
 use alloy_primitives::B256;
 use op_indexer_primitives::{
     BlockRef, EncodedBlock, ExecutionPeer, FillRequest, ReceiptsRequest, VerifiedReceipts,
@@ -140,6 +142,12 @@ impl<P: BlockProvider> ExecutionNetwork<P> {
     #[must_use]
     pub fn serving(&self) -> watch::Receiver<ExecutionServed> {
         self.network.serving()
+    }
+
+    /// The public IP this node's record advertises ([`PeerNetwork::public_ip`]).
+    #[must_use]
+    pub fn public_ip(&self) -> watch::Receiver<Option<IpAddr>> {
+        self.network.public_ip()
     }
 
     /// The open sessions, as requesters see them: for what peers advertise.

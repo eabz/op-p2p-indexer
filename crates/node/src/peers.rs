@@ -6,6 +6,8 @@
 //! their last serving line, the beacon swarm's count of peers): nothing is polled, and a read
 //! is a few loads.
 
+use std::net::IpAddr;
+
 use op_indexer_el::{BlockProvider, ExecutionNetwork, ExecutionServed, Peers, SessionCounts};
 use op_indexer_l1::{L1Network, LightClient};
 use op_indexer_p2p::{GossipServed, Network};
@@ -43,6 +45,7 @@ pub(crate) struct PeerSources {
     beacon: Option<watch::Receiver<usize>>,
     consensus_served: Option<watch::Receiver<GossipServed>>,
     execution_served: Option<watch::Receiver<ExecutionServed>>,
+    public_ip: Option<watch::Receiver<Option<IpAddr>>>,
 }
 
 impl PeerSources {
@@ -59,7 +62,13 @@ impl PeerSources {
             beacon: l1.map(|(_, light_client)| light_client.peer_count()),
             consensus_served: Some(consensus.served()),
             execution_served: execution.map(ExecutionNetwork::serving),
+            public_ip: execution.map(ExecutionNetwork::public_ip),
         }
+    }
+
+    /// The public IP the execution network learns; `None` without it.
+    pub(crate) fn public_ip(&self) -> Option<watch::Receiver<Option<IpAddr>>> {
+        self.public_ip.clone()
     }
 
     /// The counts now.

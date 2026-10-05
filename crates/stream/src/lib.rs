@@ -37,6 +37,7 @@ use crate::flight::Flight;
 use crate::follower::{Follower, Live};
 use crate::service::Service;
 use crate::source::Source;
+pub use flight::{BUILD_BYTES, PARALLEL_BUILDS};
 pub use op_indexer_api::ApiKeys;
 
 /// How long open connections and tasks get to end after shutdown begins.
@@ -85,6 +86,10 @@ pub struct StreamConfig {
     /// How long a `DoGet` waits for a place when [`Self::max_flights`] are taken, among at
     /// most that many waiters; zero refuses at once.
     pub flight_queue: Duration,
+    /// Reads of `DoGet`s built at once, server-wide, each on a blocking thread: a build is
+    /// CPU work and holds up to [`BUILD_BYTES`] until its messages are sent, so this bounds
+    /// both. At least 1.
+    pub max_builds: usize,
     /// The chain's block time: how long the follower waits to read again after a store
     /// failed.
     pub block_time: Duration,
@@ -311,7 +316,7 @@ where
             source: source.clone(),
             streams: load.flights.clone(),
             queue: config.flight_queue,
-            builds: Arc::new(Semaphore::new(flight::max_builds())),
+            builds: Arc::new(Semaphore::new(config.max_builds)),
             tasks: tasks.clone(),
             sent: load.sent.clone(),
         };

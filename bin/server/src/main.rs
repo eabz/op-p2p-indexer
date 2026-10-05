@@ -11,6 +11,7 @@
 //! tail and the chunk store, and runs the node ([`op_indexer_node::run`]) with the manifest
 //! follower and, when exporting, the exporter next to it.
 
+mod address;
 mod config;
 
 use std::path::PathBuf;
@@ -21,8 +22,9 @@ use op_indexer_balancer::register::{
     HEARTBEAT_INTERVAL, PeerReport, Report, ServedReport, SlotReport,
 };
 use op_indexer_chunks::ChunkStore;
-use op_indexer_node::{Config, Defaults, NodeServed, NodeView, PeerCounts, Task};
+use op_indexer_node::{Config, Defaults, NodeServed, NodeView, PeerCounts, Task, sizing};
 use op_indexer_runtime::Startup;
+use op_indexer_runtime::machine::Machine;
 use op_indexer_server::{ChunkSource, Exporter, R2Archive, R2Chunks};
 use op_indexer_storage::ArchiveStore;
 use op_indexer_storage::archive_store::FjallArchive;
@@ -30,9 +32,6 @@ use tokio::sync::watch;
 
 use crate::config::{Chunks, ServerConfig};
 
-/// Default `OP_INDEXER_EL_MAX_SESSIONS` of a server: it holds every sealed block and serves
-/// peers that sync from it, so it keeps many sessions in each direction.
-const EL_MAX_SESSIONS: usize = 32;
 /// Directory of the hash-index builder's spill files, inside the data directory.
 const INDEX_DIR: &str = "index-build";
 /// Directory of the tail, inside the data directory. Not the indexer's `archive`: the tail
@@ -55,12 +54,17 @@ fn main() -> eyre::Result<()> {
 async fn run(env_file: Option<PathBuf>) -> eyre::Result<()> {
     op_indexer_runtime::init_tracing(env_file.as_deref());
 
-    // A server exists to serve: it keeps many execution sessions, where an indexer keeps few.
+    // A server exists to serve: it holds every sealed block and serves peers that sync from
+    // it, so it keeps many execution sessions, where an indexer keeps few.
     let config = Config::from_env_with(Defaults {
-        el_max_sessions: EL_MAX_SESSIONS,
+        el_max_sessions: sizing::server_el_sessions(Machine::get()),
     })?;
     let chain = config.chain();
     let server = ServerConfig::from_env_and_args(chain)?;
+    tracing::info!(
+        read_budget_mib = sizing::mib(server.read_budget),
+        "server read budget, sized from the machine or set in the environment"
+    );
     // Startup-only blocking I/O, before any task runs: the tail before the node store, so a
     // data directory of another chain is refused before anything else is written.
     std::fs::create_dir_all(config.data_dir()).wrap_err("failed to create data dir")?;
@@ -103,13 +107,20 @@ async fn run(env_file: Option<PathBuf>) -> eyre::Result<()> {
             Box::new(move |_view, cancel| Box::pin(async move { Ok(exporter.run(cancel).await?) })),
         ));
     }
-    if let Some(registration) = server.balancer {
+    if let Some(mut registration) = server.balancer {
+        let given = server.address;
         let (report_tx, report_rx) = watch::channel(Report::default());
         let reported = archive.clone();
+        let listen = config.stream.listen_addr;
         tasks.push((
             "balancer registration",
             Box::new(move |view, cancel| {
                 Box::pin(async move {
+                    let Some(address) = address::resolve(given, listen, &view, &cancel).await?
+                    else {
+                        return Ok(());
+                    };
+                    registration.address = address;
                     // Registration fails only before it connects (a bad URL or key): then
                     // at once, which stops the node. Reporting ends with `cancel`.
                     tokio::select! {

@@ -77,6 +77,7 @@ fn main() -> eyre::Result<()> {
 
 async fn run(cli: Cli, env_file: Option<PathBuf>) -> eyre::Result<()> {
     op_indexer_runtime::init_tracing(env_file.as_deref());
+    cli::warn_deprecated();
     // Startup-only blocking I/O, before any task runs; `fetch` needs no state directory.
     let open = || State::open(&cli.state_dir).wrap_err("failed to open the state directory");
 
@@ -298,8 +299,7 @@ async fn download(
 /// Threads for the CPU-bound work: `asked`, else one per CPU.
 fn threads(asked: Option<usize>) -> usize {
     asked
-        .or_else(|| std::thread::available_parallelism().ok().map(usize::from))
-        .unwrap_or(1)
+        .unwrap_or(op_indexer_runtime::machine::Machine::get().cores)
         .max(1)
 }
 

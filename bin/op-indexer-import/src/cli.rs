@@ -1,17 +1,20 @@
-//! The command line: subcommands, flags with their environment fallbacks, and defaults.
+//! The command line: subcommands, flags, and defaults. Only what is secret or names a place
+//! falls back to the environment (the token, the endpoints, the state directory, the chain,
+//! R2, the balancer); the rest are flags.
 //!
 //! The range is decided by the flags of [`DownloadArgs`]; chain parameters come from the
 //! chainspec. Does not read files or connect anywhere; reads the environment only through clap,
-//! and for the API token's former name.
+//! and for the former variables ([`warn_deprecated`], the API token's former name).
 
+use std::collections::BTreeSet;
+use std::ffi::OsStr;
+use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::{env, fmt};
 
 use alloy_primitives::B256;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory as _, Parser, Subcommand};
 use eyre::eyre;
-use tracing::warn;
 
 /// The former name of `OP_INDEXER_IMPORT_API_TOKEN`, still read.
 const DEPRECATED_API_TOKEN_VAR: &str = "ENVIO_API_TOKEN";
@@ -124,12 +127,12 @@ pub(crate) struct VerifyArgs {
     pub(crate) r2_endpoint: Option<String>,
     /// Downloaded chunks verified at once (rebuilt, checked, senders recovered; default: one
     /// per CPU).
-    #[arg(long, env = "OP_INDEXER_IMPORT_VERIFY_THREADS")]
+    #[arg(long, env = "OP_INDEXER_IMPORT_VERIFY_THREADS", hide_env = true)]
     pub(crate) threads: Option<usize>,
     /// Sealed chunks uploaded at once.
     #[arg(
         long,
-        env = "OP_INDEXER_IMPORT_VERIFY_UPLOADS",
+        env = "OP_INDEXER_IMPORT_VERIFY_UPLOADS", hide_env = true,
         default_value_t = 4,
         value_parser = clap::value_parser!(u64).range(1..=64)
     )]
@@ -150,31 +153,37 @@ pub(crate) struct DownloadArgs {
     #[arg(long, env = "OP_INDEXER_CHAIN_ID")]
     pub(crate) chain: Option<u64>,
     /// First block of the range [default: 0].
-    #[arg(long, env = "OP_INDEXER_IMPORT_FIRST_BLOCK")]
+    #[arg(long, env = "OP_INDEXER_IMPORT_FIRST_BLOCK", hide_env = true)]
     pub(crate) first_block: Option<u64>,
     /// Last block of the range, with `--anchor-hash`, in place of the default: the L2 block of
     /// the newest dispute game on L1, which `verify` checks against the game's claim.
     #[arg(
         long,
         env = "OP_INDEXER_IMPORT_LAST_BLOCK",
+        hide_env = true,
         requires = "anchor_hash",
         conflicts_with = "legacy_only"
     )]
     pub(crate) last_block: Option<u64>,
     /// The trusted hash of `--last-block`. Every block is verified by the chain of parent
     /// hashes down from it.
-    #[arg(long, env = "OP_INDEXER_IMPORT_ANCHOR_HASH", requires = "last_block")]
+    #[arg(
+        long,
+        env = "OP_INDEXER_IMPORT_ANCHOR_HASH",
+        hide_env = true,
+        requires = "last_block"
+    )]
     pub(crate) anchor_hash: Option<B256>,
     /// Import only the blocks before Bedrock: the range ends at the chain's last legacy
     /// block, checked against its known hash. Needs no lookup on L1. Refused for a chain that
     /// began with Bedrock (Unichain).
-    #[arg(long, env = "OP_INDEXER_IMPORT_LEGACY_ONLY")]
+    #[arg(long, env = "OP_INDEXER_IMPORT_LEGACY_ONLY", hide_env = true)]
     pub(crate) legacy_only: bool,
     /// Blocks per chunk: one file on disk, and one request when the service answers it in
     /// full [default: 1000].
     #[arg(
         long,
-        env = "OP_INDEXER_IMPORT_CHUNK_BLOCKS",
+        env = "OP_INDEXER_IMPORT_CHUNK_BLOCKS", hide_env = true,
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     pub(crate) chunk_blocks: Option<u64>,
@@ -197,7 +206,7 @@ pub(crate) struct DownloadArgs {
     /// does not hash; `rpc` fetches them all from the RPC (by default the chain's public one).
     #[arg(
         long,
-        env = "OP_INDEXER_IMPORT_FILL_FROM",
+        env = "OP_INDEXER_IMPORT_FILL_FROM", hide_env = true,
         value_enum,
         default_value_t = FillFrom::L1
     )]
@@ -206,7 +215,7 @@ pub(crate) struct DownloadArgs {
     /// (Unichain's at 10); a provider of your own may take more.
     #[arg(
         long,
-        env = "OP_INDEXER_IMPORT_RPC_BATCH",
+        env = "OP_INDEXER_IMPORT_RPC_BATCH", hide_env = true,
         default_value_t = 10,
         value_parser = clap::value_parser!(u64).range(2..=1000)
     )]
@@ -214,7 +223,7 @@ pub(crate) struct DownloadArgs {
     /// Requests to `--rpc-endpoint` in flight at once: kept low for a public endpoint.
     #[arg(
         long,
-        env = "OP_INDEXER_IMPORT_RPC_REQUESTS",
+        env = "OP_INDEXER_IMPORT_RPC_REQUESTS", hide_env = true,
         default_value_t = 4,
         value_parser = clap::value_parser!(u64).range(1..=256)
     )]
@@ -230,7 +239,7 @@ pub(crate) struct DownloadArgs {
     /// Requests in flight at once.
     #[arg(
         long,
-        env = "OP_INDEXER_IMPORT_REQUESTS",
+        env = "OP_INDEXER_IMPORT_REQUESTS", hide_env = true,
         default_value_t = 64,
         value_parser = clap::value_parser!(u64).range(1..=4096)
     )]
@@ -244,7 +253,7 @@ pub(crate) struct DownloadArgs {
     /// `refetch.json` and a later run asks for those, in block order, without scanning again
     /// (`--rescan` scans again). When the service limits requests (HTTP 429) for longer than a
     /// couple of short waits, the run stops and keeps what is left for the next.
-    #[arg(long, env = "OP_INDEXER_IMPORT_REFETCH_INCOMPLETE")]
+    #[arg(long, env = "OP_INDEXER_IMPORT_REFETCH_INCOMPLETE", hide_env = true)]
     pub(crate) refetch_incomplete: bool,
     /// With `--refetch-incomplete`: scan the chunks on disk again, even with a list kept.
     #[arg(long, requires = "refetch_incomplete")]
@@ -257,7 +266,7 @@ pub(crate) struct DownloadArgs {
     /// `--requests`, to stay under the service's rate limit.
     #[arg(
         long,
-        env = "OP_INDEXER_IMPORT_REFETCH_REQUESTS",
+        env = "OP_INDEXER_IMPORT_REFETCH_REQUESTS", hide_env = true,
         default_value_t = 16,
         value_parser = clap::value_parser!(u64).range(1..=4096)
     )]
@@ -279,15 +288,18 @@ impl DownloadArgs {
     ///
     /// # Errors
     ///
-    /// Returns an error if none is set, or `ENVIO_API_TOKEN` is blank.
+    /// Returns an error if none is set.
     pub(crate) fn api_token(&self) -> eyre::Result<Secret> {
         if let Some(token) = &self.api_token {
             return Ok(token.clone());
         }
-        let token = env::var(DEPRECATED_API_TOKEN_VAR).map_err(|_unset| {
+        let token = op_indexer_runtime::deprecated(
+            DEPRECATED_API_TOKEN_VAR,
+            "rename it OP_INDEXER_IMPORT_API_TOKEN",
+        )
+        .ok_or_else(|| {
             eyre!("the API token is required: set OP_INDEXER_IMPORT_API_TOKEN, or --api-token")
         })?;
-        warn!("{DEPRECATED_API_TOKEN_VAR} is deprecated: rename it OP_INDEXER_IMPORT_API_TOKEN");
         token
             .parse()
             .map_err(|err| eyre!("{DEPRECATED_API_TOKEN_VAR}: {err}"))
@@ -340,6 +352,26 @@ impl FromStr for Secret {
             return Err("the value is empty");
         }
         Ok(Self(secret.to_owned()))
+    }
+}
+
+/// Warns once about each variable that was a setting and is a flag now, if set: the
+/// arguments whose `env` is hidden from the help, still read for this release.
+pub(crate) fn warn_deprecated() {
+    let command = Cli::command();
+    let mut warned = BTreeSet::new();
+    let args = command
+        .get_subcommands()
+        .flat_map(clap::Command::get_arguments)
+        .filter(|arg| arg.is_hide_env_set());
+    for arg in args {
+        let (Some(name), Some(long)) = (arg.get_env().and_then(OsStr::to_str), arg.get_long())
+        else {
+            continue;
+        };
+        if warned.insert(name) {
+            op_indexer_runtime::deprecated(name, format_args!("give --{long} instead"));
+        }
     }
 }
 

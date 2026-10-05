@@ -7,7 +7,7 @@
 //! how answers are verified is not here: a requester gets the open sessions through
 //! [`Peers`].
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use alloy_eip2124::{ForkFilter, ForkFilterKey, ForkHash, ForkId, Head};
@@ -188,6 +188,7 @@ pub struct PeerNetwork {
     served: mpsc::Sender<ExecutionPeer>,
     reports: mpsc::Receiver<Report>,
     published: watch::Sender<Arc<[SessionHandle]>>,
+    public_ip: watch::Sender<Option<IpAddr>>,
 }
 
 impl PeerNetwork {
@@ -241,6 +242,7 @@ impl PeerNetwork {
             served,
             reports,
             published,
+            public_ip: watch::Sender::new(None),
         };
         Ok((network, peers))
     }
@@ -250,6 +252,15 @@ impl PeerNetwork {
     #[must_use]
     pub fn serving(&self) -> watch::Receiver<ExecutionServed> {
         self.ctx.serve_counters().subscribe()
+    }
+
+    /// The public IP the node record advertises: the advertised address's, or the one
+    /// discovery learns once enough peers report the same (tens of seconds after start).
+    /// `None` until then; kept when discovery withdraws it from the record, until another
+    /// replaces it.
+    #[must_use]
+    pub fn public_ip(&self) -> watch::Receiver<Option<IpAddr>> {
+        self.public_ip.subscribe()
     }
 
     /// Runs discovery, the listener and the peer set until `cancel` fires.
@@ -265,9 +276,14 @@ impl PeerNetwork {
             served,
             reports,
             published,
+            public_ip,
         } = self;
-        let discovery =
-            Discovery::new(Arc::clone(&ctx), config.listen_addr, config.advertised_addr)?;
+        let discovery = Discovery::new(
+            Arc::clone(&ctx),
+            config.listen_addr,
+            config.advertised_addr,
+            public_ip,
+        )?;
         // What another node of our deployment lists in `OP_INDEXER_EL_TRUSTED_PEERS`.
         let id = reth_network_peers::pk2id(&ctx.key().public_key(secp256k1::SECP256K1));
         let reached_at = config.advertised_addr.unwrap_or(config.listen_addr);

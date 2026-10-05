@@ -9,6 +9,8 @@ publish.workspace = true
 [dependencies]
 dotenvy.workspace = true
 eyre.workspace = true
+# The host name (`uname`) of `machine`.
+rustix = { workspace = true, features = ["system"] }
 tokio = { workspace = true, features = ["signal", "macros"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true

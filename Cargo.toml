@@ -148,9 +148,9 @@ clap = { version = "4", default-features = false, features = ["std", "derive", "
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 # Decoding of gzip answers when the service does not send zstd (already in the tree).
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
-# Free space of the state directory's filesystem and the open-files limit, and the host name
-# and memory the binaries size their settings from (`crates/runtime`, feature `system`; already
-# in the tree; std has no call for any of them).
+# Free space of the state directory's filesystem and the open-files limit, and the host name a
+# server is named after (`crates/runtime`, feature `system`). Already in the tree; std has no
+# call for any of them.
 rustix = { version = "1", default-features = false, features = ["std", "fs", "process"] }
 # The chunk indexes a server read last (`crates/chunks`); already in the tree through fjall.
 quick_cache = { version = "0.6", default-features = false }
