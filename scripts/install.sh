@@ -151,6 +151,9 @@ except ImportError:
     for item in "${companions[@]}"; do
         [[ ! -d "$prefix/share/op-p2p-indexer/$item" ]] || die "companion destination is a directory: $item"
     done
+    if grep -Fxq "$name/setup.py" "$download_dir/members" && grep -Fxq "$name/config.toml.example" "$download_dir/members"; then
+        [[ ! -d "$prefix/share/op-p2p-indexer/setup-binaries.sha256" ]] || die 'capability checksum destination is a directory'
+    fi
     # Each destination directory may be on its own mounted filesystem. Stage inside each
     # one so every final rename stays atomic, then finish all copies before replacing files.
     mkdir -p -- "$prefix/bin" "$prefix/share/op-p2p-indexer" || die "cannot create $prefix; use sudo or a writable --prefix"

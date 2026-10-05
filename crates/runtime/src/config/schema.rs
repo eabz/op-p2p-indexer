@@ -570,7 +570,7 @@ pub(super) fn migrate_value(field: &Field, value: &str, base: &Path) -> eyre::Re
         } else {
             base.join(value).to_string_lossy().into_owned()
         }),
-        Kind::Bool => Value::Boolean(value.parse().map_err(|_| invalid())?),
+        Kind::Bool => Value::Boolean(value.parse().map_err(|_err| invalid())?),
         Kind::Number => Value::Integer(
             value
                 .parse::<i64>()

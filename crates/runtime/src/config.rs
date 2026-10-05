@@ -110,7 +110,7 @@ pub fn initialize(binary: &str) -> eyre::Result<Option<PathBuf>> {
             chain_override,
             path,
         })
-        .map_err(|_| eyre!("configuration was already initialized"))?;
+        .map_err(|_err| eyre!("configuration was already initialized"))?;
     Ok(loaded)
 }
 
@@ -220,10 +220,10 @@ fn discover(
     }
     let chain = chain_name(chain)?;
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    if let Some(path) = home.map(|home| home.join("indexer").join(chain).join("config.toml")) {
-        if path.try_exists()? {
-            return Ok(Some(path.canonicalize()?));
-        }
+    if let Some(path) = home.map(|home| home.join("indexer").join(chain).join("config.toml"))
+        && path.try_exists()?
+    {
+        return Ok(Some(path.canonicalize()?));
     }
     ensure!(
         !selected,
@@ -235,7 +235,7 @@ fn discover(
 fn read(path: &Path) -> eyre::Result<toml::Table> {
     let text = std::fs::read_to_string(path).wrap_err("cannot read TOML configuration")?;
     text.parse::<toml::Table>()
-        .map_err(|_| eyre!("invalid TOML configuration (contents redacted)"))
+        .map_err(|_err| eyre!("invalid TOML configuration (contents redacted)"))
 }
 
 fn argument(flag: &str, args: &[OsString]) -> eyre::Result<Option<OsString>> {

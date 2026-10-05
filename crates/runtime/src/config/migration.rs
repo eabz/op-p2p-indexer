@@ -21,7 +21,7 @@ pub(super) fn run(
     let mut values = BTreeMap::new();
     for entry in dotenvy::from_read_iter(text.as_bytes()) {
         let (name, value) =
-            entry.map_err(|_| eyre!("invalid legacy env file (contents redacted)"))?;
+            entry.map_err(|_err| eyre!("invalid legacy env file (contents redacted)"))?;
         values.entry(name).or_insert(value);
     }
     values.retain(|_, value| !value.is_empty());

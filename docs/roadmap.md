@@ -27,8 +27,9 @@ What runs today is in [architecture.md](architecture.md), and how it got here is
   systemd services with chain start/stop targets.
 - Implemented: checksum-verified installation and atomic binary replacement from published
   releases; updates preserve configuration and state, and restart only selected services.
-- Release gate: local configuration/installer validation and Ubuntu CI (including generated
-  systemd units) must pass before merging and publishing. The one-liner requires a published
+- Validated locally: all four binaries, configuration precedence and migration, installer
+  preservation/collision checks, and scoped service lifecycle generation. Rust checks pass.
+- Release gate: Ubuntu CI (including generated systemd units) must pass before merging and publishing. The one-liner requires a published
   release containing the new setup helper and TOML-capable binaries.
 - Pending operational validation: install on a fresh Ubuntu fleet host, migrate its existing
   environment configuration, and confirm graceful restart and boot startup with real state.
