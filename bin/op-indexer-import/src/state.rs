@@ -36,9 +36,6 @@ use crate::game::GameAnchor;
 /// version is refused.
 const LAYOUT_VERSION: u32 = 1;
 
-/// The block `download`'s rebuild from L1 left off at (`fill`): what the next base fee is
-/// computed from.
-
 /// Free space below which a step warns with its progress.
 pub(crate) const LOW_SPACE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 /// Free space below which a step starts no new chunk: the chunks in flight still have to fit.

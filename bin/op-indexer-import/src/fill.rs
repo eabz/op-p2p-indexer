@@ -501,7 +501,7 @@ struct Rebuilding<'a> {
 }
 
 impl<'a> Rebuilding<'a> {
-    const fn new(l1: &'a HyperSync, rpc: Option<&'a Rpc>, plan: Plan) -> Self {
+    fn new(l1: &'a HyperSync, rpc: Option<&'a Rpc>, plan: Plan) -> Self {
         Self {
             l1,
             rpc,
