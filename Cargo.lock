@@ -1279,7 +1279,7 @@ dependencies = [
 
 [[package]]
 name = "balancer"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "eyre",
  "op-indexer-balancer",
@@ -3686,7 +3686,7 @@ checksum = "964de6e86d545b246d84badc0fef527924ace5134f30641c203ef52ba83f58d5"
 
 [[package]]
 name = "indexer"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "eyre",
  "op-indexer-node",
@@ -5207,7 +5207,7 @@ dependencies = [
 
 [[package]]
 name = "op-indexer-api"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "alloy-primitives",
  "arrow-flight",
@@ -5218,7 +5218,7 @@ dependencies = [
 
 [[package]]
 name = "op-indexer-balancer"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "alloy-primitives",
  "arrow-flight",
@@ -5242,7 +5242,7 @@ dependencies = [
 
 [[package]]
 name = "op-indexer-chainspec"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "alloy-primitives",
  "thiserror 2.0.21",
@@ -5250,7 +5250,7 @@ dependencies = [
 
 [[package]]
 name = "op-indexer-chunks"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -5273,7 +5273,7 @@ dependencies = [
 
 [[package]]
 name = "op-indexer-el"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "alloy-consensus",
  "alloy-eip2124",
@@ -5300,7 +5300,7 @@ dependencies = [
 
 [[package]]
 name = "op-indexer-import"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -5333,7 +5333,7 @@ dependencies = [
 
 [[package]]
 name = "op-indexer-l1"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -5365,7 +5365,7 @@ dependencies = [
 
 [[package]]
 name = "op-indexer-node"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "alloy-primitives",
  "eyre",
@@ -5385,7 +5385,7 @@ dependencies = [
 
 [[package]]
 name = "op-indexer-p2p"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
@@ -5412,7 +5412,7 @@ dependencies = [
 
 [[package]]
 name = "op-indexer-pipeline"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -5428,7 +5428,7 @@ dependencies = [
 
 [[package]]
 name = "op-indexer-primitives"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -5440,7 +5440,7 @@ dependencies = [
 
 [[package]]
 name = "op-indexer-runtime"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "dotenvy",
  "eyre",
@@ -5452,7 +5452,7 @@ dependencies = [
 
 [[package]]
 name = "op-indexer-server"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -5471,7 +5471,7 @@ dependencies = [
 
 [[package]]
 name = "op-indexer-storage"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -5490,7 +5490,7 @@ dependencies = [
 
 [[package]]
 name = "op-indexer-stream"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -7457,7 +7457,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "eyre",
  "op-indexer-balancer",
