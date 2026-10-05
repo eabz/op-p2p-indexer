@@ -103,7 +103,7 @@ pub(super) fn verify_chunk(
 
 /// Rebuilds one block from its rows and checks it against the reported block hash. Returns
 /// the verified encodings, and counts in `stats` the transactions signed with all zeros and
-/// a header whose missing `mix_hash` was taken as zero (before Bedrock only).
+/// a header whose missing `mix_hash` was taken as zero (up to the Bedrock block only).
 fn verify_block(
     forks: &Forks,
     row: &BlockRow,
@@ -118,11 +118,12 @@ fn verify_block(
         return Err(Check::Hole);
     }
     let timestamp: u64 = row.timestamp.to();
-    // Every legacy header has a zero `mix_hash`; the header hash below proves the guess. From
-    // Bedrock on it is the L1 block's randomness and cannot be rebuilt.
+    // Every legacy header has a zero `mix_hash`, and so has the Bedrock block itself (the
+    // genesis of a chain that began with Bedrock); the header hash below proves the guess.
+    // After Bedrock it is the L1 block's randomness and cannot be rebuilt.
     let (mix_hash, rebuilt) = match row.mix_hash {
         Some(mix_hash) => (mix_hash, false),
-        None if row.number < forks.bedrock_block => (B256::ZERO, true),
+        None if row.number <= forks.bedrock_block => (B256::ZERO, true),
         None => return Err(Check::MissingMixHash),
     };
     stats.rebuilt_header_fields = stats

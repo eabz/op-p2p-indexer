@@ -93,7 +93,7 @@ enum Check {
     HeaderHash { computed: B256, reported: B256 },
     #[error("parent hash is {parent}, the block before has hash {previous}")]
     ParentLink { parent: B256, previous: B256 },
-    #[error("the header lacks `mix_hash`, which a block from Bedrock on must have")]
+    #[error("the header lacks `mix_hash`, which a block after the Bedrock block must have")]
     MissingMixHash,
 }
 
