@@ -4,7 +4,8 @@
 //! key for its identity on the execution network, and the peers worth returning to, so a
 //! restart can reconnect without waiting for discovery: consensus peers that recently
 //! delivered valid blocks, and execution peers that served requests. It also keeps the progress
-//! of a range sync, so a restart resumes it. It records the chain it was made for, so a node of
+//! of a range sync, so a restart resumes it, and the L1 light client's newest finalized beacon
+//! block, so a restart bootstraps from it. It records the chain it was made for, so a node of
 //! another chain refuses it instead of dialing that chain's peers.
 //!
 //! This is a second fjall database next to the block archive's, on purpose: the archive lives
@@ -24,7 +25,7 @@ use alloy_primitives::{B256, B512, BlockNumber};
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 use libp2p::Multiaddr;
 use libp2p::identity::{DecodingError, secp256k1};
-use op_indexer_primitives::{BlockRef, ChainIdentity, ExecutionPeer};
+use op_indexer_primitives::{BeaconCheckpoint, BlockRef, ChainIdentity, ExecutionPeer};
 
 const NODE: &str = "node";
 const IDENTITY_KEY: &str = "secp256k1_secret";
@@ -34,6 +35,10 @@ const EXECUTION_KEY: &str = "execution_secp256k1_secret";
 const L1_KEY: &str = "l1_secp256k1_secret";
 /// The chain the store's peers and sync progress belong to ([`ChainIdentity::to_bytes`]).
 const CHAIN_KEY: &str = "chain";
+/// The newest finalized beacon block the L1 light client verified ([`BeaconCheckpoint`]): the
+/// configured checkpoint it descends from (32 bytes), its root (32 bytes) and its slot (8
+/// bytes, big-endian).
+const L1_CHECKPOINT_KEY: &str = "l1_beacon_checkpoint";
 /// Known good peers: multiaddr bytes -> last time (Unix seconds, big-endian) they delivered a
 /// valid block.
 const PEERS: &str = "known_peers";
@@ -345,6 +350,37 @@ impl NodeStore {
         self.write_execution_peer(&self.l1_peers, peer)
     }
 
+    /// Returns the newest finalized beacon block the L1 light client saved, if any. One of
+    /// another shape (not written by this code) is taken as none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Database`] if reading fails.
+    pub fn l1_checkpoint(&self) -> Result<Option<BeaconCheckpoint>, StoreError> {
+        Ok(self
+            .node
+            .get(L1_CHECKPOINT_KEY)?
+            .as_deref()
+            .and_then(decode_l1_checkpoint))
+    }
+
+    /// Saves the newest finalized beacon block the L1 light client verified, replacing the
+    /// one saved before.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Database`] if writing fails.
+    pub fn save_l1_checkpoint(&self, checkpoint: &BeaconCheckpoint) -> Result<(), StoreError> {
+        let mut value = checkpoint.origin.to_vec();
+        value.extend_from_slice(checkpoint.root.as_slice());
+        value.extend_from_slice(&checkpoint.slot.to_be_bytes());
+        let _write = self.write.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut batch = self.durable_batch();
+        batch.insert(&self.node, L1_CHECKPOINT_KEY, value);
+        batch.commit()?;
+        Ok(())
+    }
+
     fn read_execution_peers(table: &Keyspace) -> Result<Vec<ExecutionPeer>, StoreError> {
         let mut peers = Vec::new();
         for entry in table.iter() {
@@ -510,6 +546,17 @@ fn decode_checkpoint(key: &[u8], hash: &[u8]) -> Option<BlockRef> {
     Some(BlockRef {
         number: u64::from_be_bytes(number.try_into().ok()?),
         hash: B256::try_from(hash).ok()?,
+    })
+}
+
+/// Decodes the saved beacon checkpoint; `None` if it has another shape.
+fn decode_l1_checkpoint(value: &[u8]) -> Option<BeaconCheckpoint> {
+    let (origin, rest) = value.split_first_chunk::<32>()?;
+    let (root, slot) = rest.split_first_chunk::<32>()?;
+    Some(BeaconCheckpoint {
+        origin: B256::from(*origin),
+        root: B256::from(*root),
+        slot: u64::from_be_bytes(<[u8; 8]>::try_from(slot).ok()?),
     })
 }
 

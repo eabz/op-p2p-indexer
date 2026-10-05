@@ -269,6 +269,20 @@ pub struct ExecutionPeer {
     pub last_served_secs: u64,
 }
 
+/// The newest finalized beacon block the L1 light client has verified, kept so a restart
+/// bootstraps from it instead of from the configured checkpoint, which in time grows too old
+/// for peers to serve. It adds no trust: it was verified, step by step, from `origin`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BeaconCheckpoint {
+    /// The configured checkpoint (the root of a finalized beacon block the operator trusts)
+    /// the light client verified this block from.
+    pub origin: B256,
+    /// The block's root.
+    pub root: B256,
+    /// The block's slot.
+    pub slot: u64,
+}
+
 /// A range of blocks to fetch from execution peers: from `from` up to the anchor, a block
 /// whose hash is trusted (configured, or verified on gossip) and that every fetched header
 /// must chain to.

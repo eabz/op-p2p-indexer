@@ -30,7 +30,9 @@ use op_indexer_el::{ExecutionNetwork, RangeSync, RoundEnd, SyncPlan};
 use op_indexer_l1::{BeaconConfig, L1Config, L1Network, LightClient};
 use op_indexer_p2p::{Network, NodeStore, PayloadSource, StoreError};
 use op_indexer_pipeline::{Pipeline, ReceiptsChannels};
-use op_indexer_primitives::{BlockRef, EncodedBlock, ExecutionPeer, L1Games, L1Heads, SyncRange};
+use op_indexer_primitives::{
+    BeaconCheckpoint, BlockRef, EncodedBlock, ExecutionPeer, L1Games, L1Heads, SyncRange,
+};
 use op_indexer_storage::unsafe_store::MemoryStore;
 use op_indexer_storage::{ArchiveStore, StorageConfig, UnsafeStore};
 use op_indexer_stream::{Load, StreamServer};
@@ -223,6 +225,7 @@ pub async fn run<A: Archive>(
         Some(settings) => {
             let l1 = l1_side(settings, config.network.chain, &store)?;
             saves.push(l1.served);
+            saves.push(l1.checkpoints);
             let isthmus_time = config.network.chain.isthmus_time();
             let pipeline = pipeline.with_l1_games(l1.games, l1_source_tx, isthmus_time);
             (Some((l1.network, l1.light_client)), pipeline, None)
@@ -270,6 +273,8 @@ struct L1Side {
     games: watch::Receiver<L1Games>,
     /// Saves the L1 peers that served us.
     served: JoinHandle<()>,
+    /// Saves the light client's newest finalized beacon block.
+    checkpoints: JoinHandle<()>,
 }
 
 /// Builds the L1 side: a beacon light client that follows Ethereum's finality from the
@@ -299,25 +304,32 @@ fn l1_side(
     };
     let network = L1Network::new(config, key, trusted_rx, games_tx, served_tx)
         .wrap_err("failed to create the L1 network")?;
+    let (finalized_tx, finalized_rx) = watch::channel(None);
     let light_client = LightClient::new(
         BeaconConfig {
             checkpoint: settings.checkpoint,
+            saved: store
+                .l1_checkpoint()
+                .wrap_err("failed to load the saved beacon checkpoint")?,
             listen_addr: settings.beacon_listen_addr,
             // Beacon nodes share the discovery network of the chain's bootnodes.
             bootnodes: chain.consensus_bootnodes().map(str::to_owned).collect(),
         },
         trusted_tx,
+        finalized_tx,
     );
     let served = tokio::spawn(save_peers(
         Arc::clone(store),
         served_rx,
         NodeStore::save_l1_peer,
     ));
+    let checkpoints = tokio::spawn(save_l1_checkpoints(Arc::clone(store), finalized_rx));
     Ok(L1Side {
         network,
         light_client,
         games,
         served,
+        checkpoints,
     })
 }
 
@@ -896,6 +908,25 @@ async fn save_peers(
             Ok(Ok(())) => {}
             Ok(Err(err)) => warn!(%err, "failed to save execution peer"),
             Err(err) => warn!(%err, "execution peer save task failed"),
+        }
+    }
+}
+
+/// Saves each newer finalized beacon block the light client verifies, so a restart
+/// bootstraps from it. Ends when the light client drops its sender.
+async fn save_l1_checkpoints(
+    store: Arc<NodeStore>,
+    mut finalized: watch::Receiver<Option<BeaconCheckpoint>>,
+) {
+    while finalized.changed().await.is_ok() {
+        let Some(checkpoint) = *finalized.borrow_and_update() else {
+            continue;
+        };
+        let store = Arc::clone(&store);
+        match tokio::task::spawn_blocking(move || store.save_l1_checkpoint(&checkpoint)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => warn!(%err, "failed to save the beacon checkpoint"),
+            Err(err) => warn!(%err, "beacon checkpoint save task failed"),
         }
     }
 }
