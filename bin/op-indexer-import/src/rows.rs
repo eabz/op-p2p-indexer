@@ -121,6 +121,15 @@ impl TransactionRow {
                 .as_ref()
                 .is_none_or(|list| list.get(..8).is_none_or(|count| count == [0_u8; 8]))
     }
+
+    /// Whether this is a deposit after a block's first (the L1-attributes one, which mints
+    /// nothing) whose row lacks the mint: a user deposit's is what it says on L1, an
+    /// upgrade's is none.
+    pub(crate) fn lacks_mint(&self) -> bool {
+        self.kind == Some(op_alloy_consensus::DEPOSIT_TX_TYPE_ID)
+            && self.transaction_index > 0
+            && self.mint.is_none()
+    }
 }
 
 /// A log.

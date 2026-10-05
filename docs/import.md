@@ -124,9 +124,19 @@ any.
   deposit's encoding, so the transactions root, includes it. For a block whose deposits lack
   it, the block is read with its transactions (`eth_getBlockByNumber` with full transactions)
   and each deposit's source hash kept, by transaction index; the header fields come from the
-  same answer, so such a block costs one call. (L1 could give them too, not built: an
-  L1-attributes deposit's from its L1 origin hash and sequence number, a user deposit's from
-  its L1 block hash and log index.)
+  same answer, so such a block costs one call. With `--fill-from l1` (the default) they are
+  rebuilt from L1 instead (`fill/derive.rs`): an L1-attributes deposit's from its L1 origin
+  hash and sequence number, a user deposit's from its L1 block hash and its log's index in
+  that block.
+- **User deposits' `mint` (Base).** Base's rows also lack a user deposit's `mint` (first seen
+  at block 1,322,905, three ETH deposits), which the deposit's hash covers. The rebuild from
+  L1 takes it from the deposit's `TransactionDeposited` log (its opaque data packs mint,
+  value, gas limit, creation flag and calldata). It also checks the row's `from`, `to`,
+  `value`, `gas` and `input` against the log, and a difference stops the run, naming the
+  field. Only an epoch's first block has user deposits, so only there is a missing mint
+  rebuilt; an upgrade deposit mints nothing, which `verify` reads for a missing one. The RPC
+  fill reads it with the source hash; a deposit the RPC gives without a mint mints nothing.
+  The scan lists `mint` missing for every deposit after the first, upgrade deposits included.
 
 - **Checked after every download.** Once the chunks are on disk, `download` reads every chunk
   not sealed yet (one per core at a time, within 256 MiB of downloaded bytes in flight, the
@@ -579,10 +589,11 @@ rebuilds legacy, EIP-2930, EIP-1559, EIP-7702 and deposit transactions, their re
 headers of every fork (base fee, withdrawals root, blob fields, beacon root, and from Isthmus
 the hash of an empty requests list, which has no column in HyperSync).
 
-- **Deposits are rebuilt from HyperSync's `source_hash` and `mint` columns.** A deposit
-  without a reported source hash fails `verify` with a named check: the source hash comes from
-  the deposit's event on L1, which this tool does not read. On OP Mainnet the endpoint fills
-  them for every deposit: the whole chain verified (section 6).
+- **Deposits are rebuilt from HyperSync's `source_hash` and `mint` columns**, or what
+  `download` filled where they lack them (from L1 or the RPC). A deposit without a source hash
+  fails `verify` with a named check; one without a mint is read as minting nothing, which the
+  header hash proves. On OP Mainnet the endpoint fills them for every deposit: the whole chain
+  verified (section 6).
 - The system-transaction flag, which has no column, follows the protocol's rule: only the
   L1-attributes deposit before Regolith has it.
 - A deposit receipt carries the sender's nonce and the receipt version from Canyon on, when

@@ -121,9 +121,7 @@ impl Fill {
 struct FilledSource {
     block_number: u64,
     transaction_index: u64,
-    #[serde(default)]
     source_hash: Option<B256>,
-    #[serde(default)]
     mint: Option<U128>,
 }
 
@@ -183,12 +181,13 @@ pub(crate) fn apply(rows: &mut Rows, fill: Fill) -> u64 {
             .transactions
             .binary_search_by_key(&key, |row| (row.block_number, row.transaction_index));
         // Only into a row that lacks it: what the service sent is kept.
-        if let Some(row) = at.ok().and_then(|at| rows.transactions.get_mut(at))
-            && (row.source_hash.is_none() || row.mint.is_none())
-        {
+        if let Some(row) = at.ok().and_then(|at| rows.transactions.get_mut(at)) {
+            let before = (row.source_hash, row.mint);
             row.source_hash = row.source_hash.or(source.source_hash);
             row.mint = row.mint.or(source.mint);
-            filled = filled.saturating_add(1);
+            if (row.source_hash, row.mint) != before {
+                filled = filled.saturating_add(1);
+            }
         }
     }
     filled
@@ -585,7 +584,7 @@ fn rpc_fetch(rows: &[HeaderRow]) -> Fetch {
                 indexes: row
                     .deposits
                     .iter()
-                    .filter(|deposit| deposit.lacks())
+                    .filter(|deposit| !deposit.has_source || deposit.lacks_mint)
                     .map(|deposit| deposit.index)
                     .collect(),
             });
@@ -676,11 +675,11 @@ impl Work {
     /// written.
     fn rebuilt(&mut self, fill: &Fill) {
         let count = |count: usize| u64::try_from(count).unwrap_or(u64::MAX);
-        let sources = fill.sources.iter();
-        let hashes = sources
-            .clone()
+        let hashes = fill
+            .sources
+            .iter()
             .filter(|source| source.source_hash.is_some());
-        let mints = sources.filter(|source| source.mint.is_some());
+        let mints = fill.sources.iter().filter(|source| source.mint.is_some());
         self.rebuilt_headers = self
             .rebuilt_headers
             .saturating_add(count(fill.headers.len()));
@@ -880,15 +879,13 @@ fn header_rows(rows: &Rows, lacking: Vec<(u64, Vec<&'static str>)>) -> Vec<Heade
                 .count();
             let (own, rest) = transactions.split_at(count);
             transactions = rest;
-            let deposits: Vec<_> = own
+            let deposits: Vec<DepositRow> = own
                 .iter()
                 .take_while(|tx| tx.kind == Some(op_alloy_consensus::DEPOSIT_TX_TYPE_ID))
-                .collect();
-            let deposits: Vec<DepositRow> = deposits
-                .iter()
                 .map(|tx| DepositRow {
                     index: tx.transaction_index,
                     has_source: tx.source_hash.is_some(),
+                    lacks_mint: tx.lacks_mint(),
                     from: tx.from,
                     to: tx.to,
                     mint: tx.mint,
@@ -897,7 +894,9 @@ fn header_rows(rows: &Rows, lacking: Vec<(u64, Vec<&'static str>)>) -> Vec<Heade
                     input: tx.input.clone(),
                 })
                 .collect();
-            let from_l1 = deposits.iter().any(DepositRow::lacks)
+            let from_l1 = deposits
+                .iter()
+                .any(|deposit| !deposit.has_source || deposit.lacks_mint)
                 || lacks
                     .iter()
                     .any(|field| matches!(*field, "mix_hash" | "parent_beacon_block_root"));
@@ -959,10 +958,9 @@ fn scan(forks: &Forks, raw: &Path, fill: &Path, rebuild: bool) -> eyre::Result<S
     scanned.fetch.wanted = wanted(&rows, TransactionRow::lacks_authorization_list);
     // With the rebuild from L1, it decides what the RPC is asked for.
     if !rebuild {
-        // A deposit after the L1-attributes one lacking its mint may be a user's.
         scanned.fetch.sources = wanted(&rows, |tx| {
-            tx.kind == Some(op_alloy_consensus::DEPOSIT_TX_TYPE_ID)
-                && (tx.source_hash.is_none() || (tx.transaction_index > 0 && tx.mint.is_none()))
+            (tx.kind == Some(op_alloy_consensus::DEPOSIT_TX_TYPE_ID) && tx.source_hash.is_none())
+                || tx.lacks_mint()
         });
     }
     // A block read with its transactions for its deposits brings its header fields too.
@@ -1050,8 +1048,7 @@ async fn fill_chunk(rpc: &Rpc, fetch: &Fetch, path: PathBuf) -> eyre::Result<Fet
                     block_number: block.number,
                     transaction_index: index,
                     source_hash: Some(source_hash),
-                    // The RPC leaves out a mint of zero.
-                    mint: Some(mint.unwrap_or_default()),
+                    mint: Some(mint),
                 },
             ));
         }

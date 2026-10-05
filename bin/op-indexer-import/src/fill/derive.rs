@@ -25,6 +25,8 @@
 //!   each from the origin's hash and the log's index in its block; the deposits after them, in
 //!   a fork's first block, are its upgrade transactions, from their intents (Ecotone's and
 //!   Fjord's are known here; another fork's fails naming the block).
+//! - A user deposit's `mint` comes from its log's opaque data, which the row's other fields
+//!   must agree with ([`user`]); an upgrade deposit mints nothing.
 //!
 //! L1 headers and the portal's logs are read from L1's `HyperSync`, one query per span of at
 //! least [`L1_SPAN`] blocks. Checked on 2026-10-05 against Base's own blocks: headers at 1.04 M
@@ -138,6 +140,8 @@ pub(super) struct HeaderRow {
 pub(super) struct DepositRow {
     pub(super) index: u64,
     pub(super) has_source: bool,
+    /// Whether it may be a user deposit whose row lacks its mint ([`crate::rows::TransactionRow::lacks_mint`]).
+    pub(super) lacks_mint: bool,
     pub(super) from: Option<Address>,
     pub(super) to: Option<Address>,
     pub(super) mint: Option<U128>,
@@ -146,19 +150,19 @@ pub(super) struct DepositRow {
     pub(super) input: Bytes,
 }
 
-impl DepositRow {
-    /// Whether its row lacks a field the rebuild fills: the source hash, or the mint of a
-    /// deposit after the first (the L1-attributes one mints nothing; a user deposit's mint
-    /// comes with its L1 log).
-    pub(super) fn lacks(&self) -> bool {
-        !self.has_source || (self.index > 0 && self.mint.is_none())
-    }
-}
-
 impl HeaderRow {
-    /// Whether a deposit's row lacks a field the rebuild fills.
+    /// Whether the block starts an epoch with deposits after the L1-attributes one: only
+    /// then are some of them users'.
+    fn has_user_deposits(&self) -> bool {
+        self.deposits.len() > 1 && self.l1_info.is_some_and(|info| info.sequence == 0)
+    }
+
+    /// Whether a deposit's row lacks a field the rebuild fills: a source hash, or a user
+    /// deposit's mint (an upgrade deposit, the only other kind after the first, mints
+    /// nothing, which `verify` reads for a mint left out).
     pub(super) fn lacks_deposit_fields(&self) -> bool {
-        self.deposits.iter().any(DepositRow::lacks)
+        self.deposits.iter().any(|deposit| !deposit.has_source)
+            || (self.has_user_deposits() && self.deposits.iter().any(|deposit| deposit.lacks_mint))
     }
 
     /// Whether the rebuild of its fields reads its L1 origin: a header field from there, or
@@ -167,9 +171,7 @@ impl HeaderRow {
         self.lacks
             .iter()
             .any(|field| matches!(*field, "mix_hash" | "parent_beacon_block_root"))
-            || (self.lacks_deposit_fields()
-                && self.deposits.len() > 1
-                && self.l1_info.is_some_and(|info| info.sequence == 0))
+            || (self.has_user_deposits() && self.lacks_deposit_fields())
     }
 }
 
@@ -236,21 +238,19 @@ fn base_fee(chain: &ChainSpec, parent: &Parent, timestamp: u64) -> Option<u64> {
     ))
 }
 
-/// A deposit as rebuilt: its source hash, what that is from, and for a user deposit the mint
-/// its L1 log gives.
-type DepositOf = (B256, Derivation, Option<U128>);
-
-/// Each of a block's deposits as rebuilt, in their order: its L1-attributes deposit, the
-/// portal's logs in its L1 origin (if the epoch starts here; each checked against its row)
-/// and the upgrades of the fork it is the first block of. Else the field that cannot be
-/// rebuilt, or the user deposit's that is not its log's.
+/// Each of a block's deposits as rebuilt, in their order, with the source hash's derivation:
+/// its L1-attributes deposit, the portal's logs in its L1 origin (if the epoch starts here;
+/// each checked against its row) and, if a source hash is lacking, the upgrades of the fork
+/// it is the first block of. Else the field that cannot be rebuilt, or the user deposit's that
+/// is not its log's.
 fn deposits(
     chain: &ChainSpec,
     row: &HeaderRow,
     l1: &L1Data,
-) -> Result<Vec<DepositOf>, &'static str> {
-    const UNKNOWN: &str = "source_hash";
-    let info = row.l1_info.ok_or(UNKNOWN)?;
+) -> Result<Vec<(B256, Derivation)>, &'static str> {
+    let lacks_source = row.deposits.iter().any(|deposit| !deposit.has_source);
+    let unknown = if lacks_source { "source_hash" } else { "mint" };
+    let info = row.l1_info.ok_or(unknown)?;
     let mut rebuilt = Vec::with_capacity(row.deposits.len());
     rebuilt.push((
         L1InfoDepositSource::new(info.hash, info.sequence).source_hash(),
@@ -258,10 +258,9 @@ fn deposits(
             origin: info.number,
             sequence: info.sequence,
         },
-        None,
     ));
     if info.sequence == 0 && row.deposits.len() > 1 {
-        for log in l1.logs(info).ok_or(UNKNOWN)? {
+        for log in l1.logs(info).ok_or(unknown)? {
             let deposit =
                 UserDeposit::of(log).ok_or("user deposit (its L1 log does not decode)")?;
             // More logs than deposits leaves the count to fail below.
@@ -275,8 +274,8 @@ fn deposits(
                 Derivation::User {
                     origin: info.number,
                     log_index: log.log_index,
+                    mint: deposit.mint,
                 },
-                Some(deposit.mint),
             ));
         }
     }
@@ -284,8 +283,9 @@ fn deposits(
         .deposits
         .len()
         .checked_sub(rebuilt.len())
-        .ok_or(UNKNOWN)?;
-    if upgrades > 0 {
+        .ok_or(unknown)?;
+    // Only their source hashes are rebuilt: they mint nothing.
+    if upgrades > 0 && lacks_source {
         // The fork whose first block this is.
         let starts = |fork: Hardfork| {
             chain.activation(fork).is_some_and(|time| {
@@ -295,15 +295,14 @@ fn deposits(
         let (_, intents) = UPGRADES
             .iter()
             .find(|(fork, _)| starts(*fork))
-            .ok_or(UNKNOWN)?;
+            .ok_or(unknown)?;
         if intents.len() != upgrades {
-            return Err(UNKNOWN);
+            return Err(unknown);
         }
         rebuilt.extend(intents.iter().map(|&intent| {
             (
                 UpgradeDepositSource::new(intent.to_owned()).source_hash(),
                 Derivation::Upgrade(intent),
-                None,
             )
         }));
     }
@@ -380,8 +379,16 @@ pub(super) struct Source {
 /// What a rebuilt source hash is derived from, by the deposit's kind.
 #[derive(Debug, Clone, Copy)]
 enum Derivation {
-    L1Info { origin: u64, sequence: u64 },
-    User { origin: u64, log_index: u64 },
+    L1Info {
+        origin: u64,
+        sequence: u64,
+    },
+    /// With the mint the log gives.
+    User {
+        origin: u64,
+        log_index: u64,
+        mint: U128,
+    },
     Upgrade(&'static str),
 }
 
@@ -392,7 +399,9 @@ impl fmt::Display for Derivation {
                 f,
                 "L1-attributes deposit of L1 origin {origin}, sequence number {sequence}"
             ),
-            Self::User { origin, log_index } => write!(
+            Self::User {
+                origin, log_index, ..
+            } => write!(
                 f,
                 "user deposit of the portal log at index {log_index} of L1 block {origin}"
             ),
@@ -422,25 +431,23 @@ pub(super) fn describe(number: u64, headers: &[RpcHeader], sources: &[Source]) -
         .iter()
         .find(|header| header.number.to::<u64>() == number)
     {
-        let hashes = [
-            ("mix_hash", header.mix_hash),
-            ("parent_beacon_block_root", header.parent_beacon_block_root),
-            ("withdrawals_root", header.withdrawals_root),
-        ];
-        let numbers = [
-            ("base_fee_per_gas", header.base_fee_per_gas),
-            ("blob_gas_used", header.blob_gas_used),
-            ("excess_blob_gas", header.excess_blob_gas),
+        let hash = |value: Option<B256>| value.map(|value| value.to_string());
+        let number = |value: Option<U64>| value.map(|value| value.to_string());
+        let values = [
+            ("mix_hash", hash(header.mix_hash)),
+            (
+                "parent_beacon_block_root",
+                hash(header.parent_beacon_block_root),
+            ),
+            ("withdrawals_root", hash(header.withdrawals_root)),
+            ("base_fee_per_gas", number(header.base_fee_per_gas)),
+            ("blob_gas_used", number(header.blob_gas_used)),
+            ("excess_blob_gas", number(header.excess_blob_gas)),
         ];
         fields.extend(
-            hashes
-                .iter()
-                .filter_map(|(field, value)| Some(format!("{field} {}", (*value)?))),
-        );
-        fields.extend(
-            numbers
-                .iter()
-                .filter_map(|(field, value)| Some(format!("{field} {}", (*value)?))),
+            values
+                .into_iter()
+                .filter_map(|(field, value)| Some(format!("{field} {}", value?))),
         );
     }
     for source in sources.iter().filter(|source| source.number == number) {
@@ -519,15 +526,16 @@ pub(super) fn rebuild(
         if row.lacks_deposit_fields() {
             match deposits(chain, row, l1) {
                 Ok(deposits) => {
-                    for (deposit, &(hash, from, mint)) in row.deposits.iter().zip(&deposits) {
+                    for (deposit, &(hash, from)) in row.deposits.iter().zip(&deposits) {
+                        let mint = match from {
+                            Derivation::User { mint, .. } => deposit.lacks_mint.then_some(mint),
+                            Derivation::L1Info { .. } | Derivation::Upgrade(_) => None,
+                        };
                         let source = Source {
                             number: row.number,
                             index: deposit.index,
                             hash: (!deposit.has_source).then_some(hash),
-                            // After the L1-attributes deposit, one that is not a user's (an
-                            // upgrade) mints nothing.
-                            mint: (deposit.index > 0 && deposit.mint.is_none())
-                                .then(|| mint.unwrap_or_default()),
+                            mint,
                             from,
                         };
                         if source.hash.is_some() || source.mint.is_some() {
