@@ -69,7 +69,8 @@ const MAX_QUEUED: usize = 64;
 /// Requests read from the provider at once, of all peers. A read runs on a blocking thread
 /// (the local archive) or waits on object storage (a server's sealed history, 100 to 200 ms a
 /// GET); a syncing peer keeps four open, so four in all would serve one peer and queue the
-/// rest into their timeouts.
+/// rest into their timeouts. A server's budget of R2 reads for peers matches it
+/// (`MAX_PEER_READS` in `crates/server/src/budget.rs`; the two change together).
 const MAX_CONCURRENT: usize = 16;
 
 /// Shortest time between two reads of the held range when the head moves: a block or two.

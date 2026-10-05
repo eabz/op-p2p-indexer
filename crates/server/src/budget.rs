@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-/// R2 reads for peers in progress at once: as many as `el` answers at once. A read waits on
+/// R2 reads for peers in progress at once: as many as `el` answers at once (`MAX_CONCURRENT`
+/// in `crates/el/src/serve.rs`; the two change together). A read waits on
 /// R2 (100 to 200 ms a GET), not on this host, and a syncing peer keeps four requests open:
 /// four places would let one syncing peer starve every other.
 const MAX_PEER_READS: usize = 16;

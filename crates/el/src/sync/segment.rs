@@ -199,6 +199,8 @@ fn accept<T>(
         return Err(Failure::NotHeld);
     };
     let mut accepted = Vec::with_capacity(answer.len());
+    // What did not match for the first block, when nothing was accepted.
+    let mut mismatch = String::new();
     for (block, item) in expected.iter().zip(answer) {
         match belongs(block, item) {
             Check::Belongs(kept) => accepted.push(kept),
@@ -206,16 +208,16 @@ fn accept<T>(
                 return Err(Failure::Undecodable(reason));
             }
             Check::NotHeld if accepted.is_empty() => return Err(Failure::NotHeld),
+            Check::Other(reason) if accepted.is_empty() => {
+                mismatch = format!("block {}: {reason}", block.header.header.number);
+                break;
+            }
             Check::Other(_) | Check::Undecodable(_) | Check::NotHeld => break,
         }
     }
     if !accepted.is_empty() {
         return Ok(accepted);
     }
-    let mismatch = expected.first().map(|block| match belongs(block, first) {
-        Check::Other(mismatch) => format!("block {}: {mismatch}", block.header.header.number),
-        Check::Belongs(_) | Check::Undecodable(_) | Check::NotHeld => String::new(),
-    });
     let later = expected
         .iter()
         .skip(1)
@@ -226,7 +228,7 @@ fn accept<T>(
         Failure::Invalid(format!(
             "an answer that belongs to none of the {} blocks asked for ({})",
             expected.len(),
-            mismatch.unwrap_or_default()
+            mismatch
         ))
     })
 }
@@ -254,17 +256,9 @@ fn body_of(block: &Wanted, body: &Bytes) -> Check<(Bytes, usize)> {
     }
     if parts.withdrawals != header.withdrawals_root.is_some() {
         return Check::Other(format!(
-            "withdrawals list {}, header withdrawals root {}",
-            if parts.withdrawals {
-                "present"
-            } else {
-                "absent"
-            },
-            if header.withdrawals_root.is_some() {
-                "present"
-            } else {
-                "absent"
-            },
+            "withdrawals list present: {}, header withdrawals root present: {}",
+            parts.withdrawals,
+            header.withdrawals_root.is_some()
         ));
     }
     Check::Belongs((body.clone(), parts.transactions.len()))

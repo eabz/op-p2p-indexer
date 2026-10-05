@@ -89,10 +89,9 @@ impl Sealed {
 
     /// Whether `number` is in a sealed chunk.
     pub(crate) fn holds(&self, number: BlockNumber) -> bool {
-        self.chunks
-            .first()
-            .zip(self.chunks.last())
-            .is_some_and(|(first, last)| first.first <= number && number <= last.last)
+        self.first_number()
+            .zip(self.last())
+            .is_some_and(|(first, last)| first <= number && number <= last.number)
     }
 
     /// The first sealed block's number.
@@ -241,43 +240,46 @@ impl<S: ChunkSource> R2Archive<S> {
         }
     }
 
-    /// The headers of a spaced read from `start` (every `step`-th block), with the bytes read
-    /// for each: at most [`MAX_SPACED_HEADERS`], read [`SPACED_READS`] at once, up to the first
-    /// that is not sealed.
+    /// The headers of a spaced read from `start` (every `step`-th block): at most
+    /// [`MAX_SPACED_HEADERS`], read [`SPACED_READS`] at once, up to the first that is not
+    /// sealed.
     async fn spaced_headers(
-        &self,
-        sealed: &Sealed,
+        cursor: &mut Cursor<'_, S>,
+        run: &mut Run,
         start: Option<BlockNumber>,
-        step: u64,
-        rising: bool,
-        limits: ReadLimits,
-    ) -> Result<Vec<(Bytes, u64)>, StorageError> {
-        let numbers = std::iter::successors(start, |number| {
+        (step, rising): (u64, bool),
+    ) -> Result<(), StorageError> {
+        let lowest = run.limits.lowest;
+        let chunks: Vec<(BlockNumber, ChunkRange)> = std::iter::successors(start, |number| {
             if rising {
                 number.checked_add(step)
             } else {
                 number.checked_sub(step)
             }
         })
-        .take_while(|number| *number >= limits.lowest && sealed.holds(*number))
-        .take(limits.items.min(MAX_SPACED_HEADERS));
-        let chunks: Vec<(BlockNumber, ChunkRange)> = numbers
-            .filter_map(|number| Some((number, *sealed.find(number)?)))
-            .collect();
-        let reads = futures_util::stream::iter(chunks).map(|(number, chunk)| async move {
-            let block = self.source.stream(&chunk, number, ONE_SEGMENT).next().await;
-            block
-                .transpose()
-                .map_err(remote("chunk read"))
-                .map(|block| block.map(|block| (block.encoded.header.clone(), size(&block))))
-        });
-        let mut headers = Vec::new();
-        let mut read = reads.buffered(SPACED_READS);
-        while let Some(header) = read.next().await {
-            let Some(header) = header? else { break };
-            headers.push(header);
+        .take_while(|number| *number >= lowest)
+        .map_while(|number| Some((number, *cursor.sealed.find(number)?)))
+        .take(run.limits.items.min(MAX_SPACED_HEADERS))
+        .collect();
+        let archive = cursor.archive;
+        let mut reads = futures_util::stream::iter(chunks)
+            .map(|(number, chunk)| async move {
+                let block = archive
+                    .source
+                    .stream(&chunk, number, ONE_SEGMENT)
+                    .next()
+                    .await;
+                block.transpose().map_err(remote("chunk read"))
+            })
+            .buffered(SPACED_READS);
+        let mut taking = true;
+        while let Some(block) = reads.next().await {
+            let Some(block) = block? else { break };
+            // Every read counts, those past where the run ends too.
+            cursor.bytes = cursor.bytes.saturating_add(size(&block));
+            taking = taking && run.push(&block.encoded.header);
         }
-        Ok(headers)
+        Ok(())
     }
 
     /// Reads a run through a [`Cursor`], for a read that needs R2.
@@ -308,15 +310,8 @@ impl<S: ChunkSource> R2Archive<S> {
                 let start = start.filter(|start| *start >= limits.lowest);
                 match (*step, *rising) {
                     (2.., _) => {
-                        let headers = self
-                            .spaced_headers(&cursor.sealed, start, *step, *rising, limits)
+                        Self::spaced_headers(&mut cursor, &mut run, start, (*step, *rising))
                             .await?;
-                        for (header, bytes) in &headers {
-                            cursor.bytes = cursor.bytes.saturating_add(*bytes);
-                            if !run.push(header) {
-                                break;
-                            }
-                        }
                     }
                     (_, false) => Self::headers_down(&mut cursor, &mut run, start).await?,
                     (_, true) => {
@@ -358,16 +353,13 @@ impl<S: ChunkSource> R2Archive<S> {
             .max(cursor.sealed.first_number().unwrap_or(0));
         let mut headers = Vec::new();
         for number in low..=top {
+            // A run starts at the top: without it nothing is answered.
             let Some(block) = cursor.get(number).await? else {
-                break;
+                return Ok(());
             };
             headers.push(block.encoded.header);
         }
-        // A run starts at the top: without it nothing is answered.
-        let reached = top
-            .checked_sub(low)
-            .is_some_and(|span| u64::try_from(headers.len()).ok() == Some(span + 1));
-        for header in headers.iter().rev().take_while(|_| reached) {
+        for header in headers.iter().rev() {
             if !run.push(header) {
                 break;
             }
@@ -387,7 +379,7 @@ impl<S: ChunkSource> R2Archive<S> {
     ) -> Result<(), StorageError> {
         let mut after: Option<BlockNumber> = None;
         for hash in hashes {
-            let next = match after {
+            let guess = match after {
                 Some(number) => cursor
                     .get(number)
                     .await?
@@ -395,8 +387,8 @@ impl<S: ChunkSource> R2Archive<S> {
                     .map(|block| (number, block)),
                 None => None,
             };
-            let found = if let Some(found) = next {
-                found
+            let (number, block) = if let Some(hit) = guess {
+                hit
             } else {
                 let Some(number) = self
                     .find(*hash)
@@ -410,7 +402,6 @@ impl<S: ChunkSource> R2Archive<S> {
                 };
                 (number, block)
             };
-            let (number, block) = found;
             after = number.checked_add(1);
             let item = if bodies {
                 Some(&block.encoded.body)

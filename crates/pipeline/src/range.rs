@@ -69,6 +69,7 @@ pub(crate) async fn run<A: ArchiveStore>(
             .collect();
         let count = archived.len();
         let recovered = started.elapsed();
+        let storing = Instant::now();
         let append = retry(&cancel, Store::Archive, APPEND, || {
             archive.append_batch(archived.clone())
         });
@@ -78,7 +79,7 @@ pub(crate) async fn run<A: ArchiveStore>(
                     blocks = count,
                     last,
                     recover_ms = recovered.as_millis(),
-                    store_ms = started.elapsed().saturating_sub(recovered).as_millis(),
+                    store_ms = storing.elapsed().as_millis(),
                     "stored a batch of the range sync"
                 );
             }
