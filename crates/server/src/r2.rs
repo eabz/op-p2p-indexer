@@ -7,6 +7,7 @@
 
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use alloy_primitives::{BlockHash, BlockNumber};
@@ -15,7 +16,7 @@ use futures_util::stream::{self, BoxStream};
 use op_indexer_chunks::{ChunkEntry, ChunkStore, ChunksError, IndexBuilder, Manifest, SealedChunk};
 use op_indexer_primitives::ArchivedBlock;
 use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::source::{ChunkRange, ChunkSource};
 
@@ -32,6 +33,8 @@ pub struct R2Chunks {
     manifest: Arc<Mutex<Manifest>>,
     /// Where the hash-index builder spills its shards (exporter only).
     index_dir: PathBuf,
+    /// Whether the missing hash index was warned about.
+    unindexed_warned: Arc<AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -63,6 +66,7 @@ impl R2Chunks {
             snapshot: Arc::new(RwLock::new(Snapshot::of(&manifest))),
             manifest: Arc::new(Mutex::new(manifest)),
             index_dir,
+            unindexed_warned: Arc::default(),
         })
     }
 
@@ -159,8 +163,20 @@ impl ChunkSource for R2Chunks {
         }
     }
 
+    /// Without a hash-index generation a lookup would read every chunk's index: then a hash
+    /// is not found in R2 (warned about once), so a peer asking for a block we do not hold
+    /// costs no R2 read. By number, every sealed block is still served.
     async fn number_of(&self, hash: BlockHash) -> io::Result<Option<BlockNumber>> {
         let (manifest, _) = self.snapshot();
+        if manifest.index_generation().is_none() {
+            if !self.unindexed_warned.swap(true, Ordering::Relaxed) {
+                warn!(
+                    "the R2 manifest has no hash-index generation: blocks in R2 are found by \
+                     number only until the exporter or the converter writes one"
+                );
+            }
+            return Ok(None);
+        }
         self.store.lookup_hash(&manifest, hash).await.map_err(to_io)
     }
 

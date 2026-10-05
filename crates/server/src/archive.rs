@@ -169,6 +169,12 @@ impl<S: ChunkSource> R2Archive<S> {
         }
     }
 
+    /// The last sealed block, as the manifest was last read.
+    #[must_use]
+    pub fn last_sealed(&self) -> Option<BlockNumber> {
+        self.source.chunks().last().map(|chunk| chunk.last)
+    }
+
     /// The chain this store holds.
     pub(crate) const fn chain(&self) -> &'static ChainSpec {
         self.chain

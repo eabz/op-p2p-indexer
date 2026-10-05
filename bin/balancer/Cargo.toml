@@ -1,6 +1,6 @@
 [package]
-name = "server"
-description = "Binary: a full node that keeps no history, reading sealed chunks from R2; optionally the exporter"
+name = "balancer"
+description = "Binary: the directory of a deployment's servers, telling clients which servers to read from"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,11 +11,9 @@ op-indexer-balancer.workspace = true
 op-indexer-chainspec.workspace = true
 op-indexer-chunks.workspace = true
 op-indexer-node.workspace = true
-op-indexer-server.workspace = true
-op-indexer-storage.workspace = true
 
 eyre.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

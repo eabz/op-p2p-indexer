@@ -33,7 +33,7 @@ use op_indexer_pipeline::{Pipeline, ReceiptsChannels};
 use op_indexer_primitives::{BlockRef, EncodedBlock, ExecutionPeer, L1Games, L1Heads, SyncRange};
 use op_indexer_storage::unsafe_store::MemoryStore;
 use op_indexer_storage::{ArchiveStore, StorageConfig, UnsafeStore};
-use op_indexer_stream::StreamServer;
+use op_indexer_stream::{Load, StreamServer};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -87,11 +87,26 @@ const SYNC_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Verified checkpoints of a range sync waiting to be saved; the sync waits when it is full.
 const SYNC_CHECKPOINT_CAPACITY: usize = 16;
 
-/// A task of the binary's own, run next to the node's components: it gets the token that
-/// stops the networks, and must end when it fires. It ending earlier stops the node.
+/// A task of the binary's own, run next to the node's components: it gets a view of the
+/// running node and the token that stops the networks, and must end when it fires. It ending
+/// earlier stops the node.
 pub type Task = Box<
-    dyn FnOnce(CancellationToken) -> Pin<Box<dyn Future<Output = eyre::Result<()>> + Send>> + Send,
+    dyn FnOnce(
+            NodeView,
+            CancellationToken,
+        ) -> Pin<Box<dyn Future<Output = eyre::Result<()>> + Send>>
+        + Send,
 >;
+
+/// What a binary's task can see of the running node.
+#[derive(Debug, Clone)]
+pub struct NodeView {
+    /// The newest block the node knows: the committed store's last block until gossip
+    /// delivers a head.
+    pub head: watch::Receiver<Option<BlockRef>>,
+    /// How busy the stream server is.
+    pub load: Load,
+}
 
 /// What every committed store the node runs on must be.
 pub trait Archive: ArchiveStore + Clone + std::fmt::Debug + Send + Sync + 'static {}
@@ -133,6 +148,7 @@ pub async fn run<A: Archive>(
     let (head_tx, head_rx) = watch::channel(stores.archive_range.map(|(_, tip)| tip));
     // Taken before anything is published, so its first change is the first gossiped head.
     let gossip_head = head_rx.clone();
+    let view_head = head_rx.clone();
     // With the range sync on, it closes the gaps gossip cannot: promotion extends the archive
     // from the unsafe store, which reaches only so far back, so an L1 head is held while the
     // archive is further than that below its safe block, and a sync round closes the gap.
@@ -179,6 +195,10 @@ pub async fn run<A: Archive>(
         stores.unsafe_store.clone(),
         stores.archive.clone(),
     );
+    let view = NodeView {
+        head: view_head,
+        load: stream.load(),
+    };
     let pipeline = Pipeline::new(
         stores.unsafe_store,
         stores.archive,
@@ -222,7 +242,7 @@ pub async fn run<A: Archive>(
         execution,
         l1,
         (pipeline, stream),
-        (followers, tasks),
+        (followers, tasks, view),
         saves,
     )
     .await
@@ -309,7 +329,7 @@ async fn run_components<A: Archive>(
     execution: Option<ExecutionNetwork<NodeProvider<A>>>,
     l1: Option<(L1Network, LightClient)>,
     (pipeline, stream): (Pipeline<MemoryStore, A>, StreamServer<MemoryStore, A>),
-    (mut followers, tasks): (JoinSet<&'static str>, Vec<(&'static str, Task)>),
+    (mut followers, tasks, view): (JoinSet<&'static str>, Vec<(&'static str, Task)>, NodeView),
     saves: Vec<JoinHandle<()>>,
 ) -> eyre::Result<()> {
     let cancel = CancellationToken::new();
@@ -317,7 +337,7 @@ async fn run_components<A: Archive>(
     // The binary's own tasks, stopped with the networks.
     let mut extra = JoinSet::new();
     for (name, task) in tasks {
-        let task = task(networks_cancel.clone());
+        let task = task(view.clone(), networks_cancel.clone());
         extra.spawn(async move { (name, task.await) });
     }
     let mut network = Some(tokio::spawn(network.run(networks_cancel.clone())));
@@ -930,7 +950,11 @@ async fn prepare_storage<A: Archive>(
 
 /// Resolves with the signal's name on Ctrl-C (SIGINT) or, on Unix, SIGTERM, which a service
 /// manager (systemd, a container runtime) sends on stop.
-async fn shutdown_signal() -> eyre::Result<&'static str> {
+///
+/// # Errors
+///
+/// Returns an error if the signal handlers cannot be installed.
+pub async fn shutdown_signal() -> eyre::Result<&'static str> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};

@@ -143,9 +143,8 @@ pub(crate) struct DownloadArgs {
     )]
     pub(crate) chunk_blocks: Option<u64>,
     /// `HyperSync` endpoint of the chain [default: by chain, `https://optimism.hypersync.xyz`
-    /// for OP Mainnet (10) and `https://unichain.hypersync.xyz` for Unichain (130), the host
-    /// the service's naming gives, not yet reached from here]. Needed for a chain not in
-    /// that list.
+    /// for OP Mainnet (10), `https://unichain.hypersync.xyz` for Unichain (130) and
+    /// `https://base.hypersync.xyz` for Base (8453)]. Needed for a chain not in that list.
     #[arg(long, env = "OP_INDEXER_IMPORT_ENDPOINT")]
     pub(crate) endpoint: Option<String>,
     /// JSON-RPC endpoint of the chain, read-only, for what the archive service leaves out of

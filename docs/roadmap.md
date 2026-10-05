@@ -49,13 +49,13 @@ networks it reads from.
 | # | Crate | Role | Spec | Status |
 |---|---|---|---|---|
 | 0 | `p2p`, `chainspec`, `primitives` | L2 gossip: discovery, validation, unsafe blocks on a channel | crate docs | merged |
-| 1 | `storage` | Unsafe store with fork choice (on Redis, then in memory with a fjall journal: D0 of serving.md), local block archive (the committed store from now on). The ClickHouse committed store is removed. | [storage.md](storage.md) | merged; ClickHouse removal in progress |
+| 1 | `storage` | Unsafe chain with fork choice, in memory with a fjall journal (D0 of serving.md; Redis is gone), and the local block archive, the committed store. ClickHouse is removed. | [storage.md](storage.md) | merged; in-memory unsafe chain built |
 | 2 | `pipeline` | Decode gossip payloads into blocks, write them to the unsafe store, promote to the committed store when L1 commits, append committed blocks to the archive. Owns the retry policy. | [pipeline.md](pipeline.md) | merged |
 | 7 | ~~`query`~~ (replaced by `stream`) | The read path: block by number or hash, transaction by hash, logs by filter, the heads. Routes by the safe head (above it the unsafe store, at or below it the committed store), reads the unsafe store first across the promotion boundary, and labels every result unsafe, safe or finalized. Needs read methods on `CommittedStore` that do not exist yet. A transport (JSON-RPC or REST) sits on top of it. | not written | |
 | 4 | `el` (execution p2p) | Connect to L2 execution peers over devp2p. Fetch receipts for each block and verify them against the header's receipts root, then attach them (`UnsafeStore::set_receipts`). Fetch headers and bodies by number to backfill blocks missed on gossip, verified by the hash chain. | [el.md](el.md) | built; receipts at the tip run live, range sync never run |
 | 5 | `l1` | L1 p2p: a beacon light client and L1 execution peers, giving the dispute games created for the chain and from them the safe and finalized heads. Still open: making the unsafe store reconcile itself when the safe head contradicts its canonical chain (storage.md 3.2, known gap). | [l1.md](l1.md) | built, off by default; light client run live, the whole chain never run end to end |
-| 8 | `stream` | gRPC (tonic + prost) server: subscriptions from a block number through history (archive) into the live chain (unsafe store), decoded or raw per subscription, with status changes and reorg notices; limits per client. | stream.md (to write) | not written |
-| 9 | `server`, `balancer`, chunk store | The scale-out serving tier: sealed immutable chunks (finalized blocks with receipts and senders), an exporter that uploads them to R2 with a manifest, the `server` binary (full node with an R2-backed chunk cache), and the `balancer` directory. | to write | after Base |
+| 8 | `stream` | gRPC (tonic + prost) server: subscriptions from a block number through history (archive) into the live chain (unsafe store), decoded or raw per subscription, with status changes and reorg notices; limits per client. | [stream.md](stream.md) | built, with Arrow Flight and API keys; not run in production |
+| 9 | `chunks`, `server`, `balancer` | The scale-out serving tier: sealed immutable chunks (finalized blocks with receipts and senders) in R2 with a manifest and a hash index (`crates/chunks`), filled by `import export`; the stateless `server` binary (a full node that reads history from R2 with no cache, one of them the exporter, `--export`); and the `balancer` directory. | [serving.md](serving.md) | chunks and `import export` built; `server` built, not run against R2; `balancer` built, checked locally; the bench next |
 | 6 | `el`, serving | Give back to the execution network: answer header, body and receipt requests for the range we hold, and advertise that range honestly. Unsafe blocks come from the unsafe store, committed blocks from the local archive (storage.md section 9), which keeps the whole history it was given. Only verified data is served, re-encoded and checked against the hash or root first. Request and bandwidth limits, so serving never starves ingestion. | [el.md](el.md) section 11 | built, never run live |
 
 `op-indexer-import` ([import.md](import.md)) sits outside this order: a separate binary that fills
@@ -63,6 +63,14 @@ the archive before the node starts. The viability tests behind crates
 4 and 5 are in [el-viability.md](el-viability.md) and [l1-viability.md](l1-viability.md). If
 execution peers stop serving us, the fallback is our own execution, as three crates (`state`,
 `execution`, `state-sync`); see the fallback rows in the decisions above.
+
+## Follow-ups
+
+- **A light crate for Flight tickets and `ApiKeys`**, so `crates/balancer` stops building the
+  storage stack (fjall) through `op-indexer-stream` (serving.md 6.7).
+- **A tiny crate for `env_file` and `shutdown_signal`**, so `bin/balancer` stops building the
+  node stack through `op-indexer-node`, and the importer drops its copy of `env_file`
+  (serving.md 6.7).
 
 ## Known hard problems (not solved, recorded so they are not forgotten)
 

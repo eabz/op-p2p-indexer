@@ -1,0 +1,65 @@
+# The checks the repository's hooks run locally (CLAUDE.md, "Tooling"): formatting, clippy,
+# rustdoc, cargo-deny and cargo-machete. There are no tests (project rule).
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The toolchain the repository is checked with; bump it on purpose (release.yml has the same).
+  RUST_TOOLCHAIN: "1.99.0"
+
+jobs:
+  check:
+    name: fmt, clippy, doc
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt,clippy
+          rustup default "$RUST_TOOLCHAIN"
+
+      # Only main saves the cache, so branch runs do not evict each other (10 GB limit).
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Docs
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --document-private-items --locked
+
+  dependencies:
+    name: deny, machete
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-deny and cargo-machete
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-machete
+
+      - name: cargo deny
+        run: cargo deny --log-level error check
+
+      - name: cargo machete
+        run: cargo machete

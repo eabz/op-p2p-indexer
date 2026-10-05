@@ -1,9 +1,10 @@
-//! The server's own configuration, next to the node's (`op_indexer_node::Config`): R2 and the
-//! export mode.
+//! The server's own configuration, next to the node's (`op_indexer_node::Config`): R2, the
+//! export mode and the registration with a balancer.
 
 use std::env;
 
 use eyre::eyre;
+use op_indexer_balancer::register::{Registration, is_valid_address};
 use op_indexer_chainspec::ChainSpec;
 use op_indexer_chunks::{R2Config, ReadOptions};
 use op_indexer_node::env_file;
@@ -18,6 +19,8 @@ pub(crate) struct ServerConfig {
     pub(crate) read: ReadOptions,
     /// With `--export` or `OP_INDEXER_EXPORT=true`: the exporter's name in the manifest.
     pub(crate) export: Option<String>,
+    /// With `OP_INDEXER_BALANCER_URL`: how this server registers with the balancer.
+    pub(crate) balancer: Option<Registration>,
 }
 
 impl ServerConfig {
@@ -37,6 +40,14 @@ impl ServerConfig {
     /// - `OP_INDEXER_R2_ENDPOINT`: the S3 endpoint (default
     ///   `https://<account id>.r2.cloudflarestorage.com`).
     /// - `OP_INDEXER_EXPORT_ID`: the exporter's name in the manifest (default `server`).
+    /// - `OP_INDEXER_BALANCER_URL`: the balancer's gRPC URL (e.g.
+    ///   `http://balancer.internal:50060`); set, the server registers there and reports its
+    ///   health, load and heads every few seconds. Unset (the default), it runs standalone.
+    ///   With it, these are required:
+    ///   - `OP_INDEXER_BALANCER_SERVER_KEY`: the key servers register with; never logged;
+    ///   - `OP_INDEXER_SERVER_ID`: this server's name, unique in the deployment;
+    ///   - `OP_INDEXER_SERVER_ADDRESS`: the public `host:port` clients reach this server's
+    ///     stream and Flight at (its `OP_INDEXER_STREAM_LISTEN_ADDR`, as seen from outside).
     ///
     /// The API keys of the gRPC and Flight services are the node's `OP_INDEXER_STREAM_API_KEYS`.
     ///
@@ -78,7 +89,19 @@ impl ServerConfig {
             secret_access_key: required("OP_INDEXER_R2_SECRET_ACCESS_KEY")?,
             endpoint: var("OP_INDEXER_R2_ENDPOINT"),
         };
+        let balancer = var("OP_INDEXER_BALANCER_URL")
+            .map(|balancer| {
+                Ok::<_, eyre::Report>(Registration {
+                    balancer,
+                    key: required("OP_INDEXER_BALANCER_SERVER_KEY")?,
+                    id: required("OP_INDEXER_SERVER_ID")?,
+                    chain_id: chain.chain_id,
+                    address: server_address()?,
+                })
+            })
+            .transpose()?;
         Ok(Self {
+            balancer,
             r2,
             read: ReadOptions::default(),
             export: export.then(|| {
@@ -94,4 +117,15 @@ fn var(name: &str) -> Option<String> {
 
 fn required(name: &str) -> eyre::Result<String> {
     var(name).ok_or_else(|| eyre!("{name} is required"))
+}
+
+/// `OP_INDEXER_SERVER_ADDRESS`, checked as the balancer checks it (exactly `host:port`, no
+/// scheme): a wrong one stops startup instead of being refused by the balancer at every retry.
+fn server_address() -> eyre::Result<String> {
+    let address = required("OP_INDEXER_SERVER_ADDRESS")?;
+    eyre::ensure!(
+        is_valid_address(&address),
+        "OP_INDEXER_SERVER_ADDRESS must be host:port with no scheme, e.g. server1.example:50051"
+    );
+    Ok(address)
 }

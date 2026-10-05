@@ -1,11 +1,12 @@
 # Serving at scale: chunks, `server` and `balancer`
 
-Status: **design; the storage core (`crates/chunks`, sections 1, 2 and 2.4) and the converter
-(`import export`, section 3) are built and checked end to end against a local directory (not
-against R2: no credentials here); the server side is built, not run (5.5).** Decision: [roadmap.md](roadmap.md), 2026-10-04, "Four
-binaries". To be built after Base. Decisions are marked **D**; the user's answers of
-2026-10-04 settled the open questions (they are recorded in the decisions). Measurements are
-from 2026-10-04.
+Status: **built, except the balancer.** The storage core (`crates/chunks`, sections 1, 2 and
+2.4) and the converter (`import export`, section 3) are built and checked end to end against a
+local directory. The stateless `server` (`crates/server`, `bin/server`: history from R2 with no
+cache, section 5; the exporter, `server --export`, section 4) is built and not yet run against
+R2 (5.5). The `balancer` is in progress; the bench comes next. Decision: [roadmap.md](roadmap.md),
+2026-10-04, "Four binaries". Decisions are marked **D**; the user's answers of 2026-10-04 settled
+the open questions (they are recorded in the decisions). Measurements are from 2026-10-04.
 
 Four binaries (`op-indexer` is renamed `indexer`; the importer keeps its `import` command):
 
@@ -396,7 +397,9 @@ Unchanged code over `R2Archive`:
     blocks from a number, hash lookup, publish). `R2Chunks` implements it over the chunk
     store and holds the manifest; publishing rolls the hash-index generation every 50,000
     blocks.
-  - `R2Archive<S: ChunkSource>`: the routing of 5.1, the tail pruned with
+  - `R2Archive<S: ChunkSource>`: the routing of 5.1, the tail (`<data dir>/tail`; the
+    server refuses a data directory holding an indexer's `archive/`, which the pruning would
+    empty) pruned with
     `FjallArchive::prune_below` as the manifest grows (read every 30 s), and an empty tail
     accepting only the block after the last sealed one.
   - Read-ahead (5.2): a consumer's `blocks` calls are served by a feed that streams chunk after
@@ -436,45 +439,53 @@ peers, by range sync, as today). Design:
 
 ### 6.1 Table
 
-Kept in memory and rebuilt from registrations after a restart. Per server:
-- id and endpoints (gRPC, Flight), chain;
-- health, live head and tail range;
-- load: subscriptions and Flight streams open, R2 bytes per second, CPU;
-- last heartbeat.
+Kept in memory and rebuilt from registrations after a restart. Per server, from its last
+heartbeat:
+- id, chain, and the `host:port` of its gRPC and Flight listener;
+- health: an unhealthy server gets no work;
+- heads: unsafe, safe, finalized, and the last sealed block it has read from the manifest;
+- load: requests in flight (subscriptions, Flight streams, lookups) and bytes sent per second.
 
-It reads the manifest like a server, to split ranges into chunks. It does not track which
-server holds what: every server can serve every chunk.
+The table holds no chunk ranges (corrected by the user, 2026-10-04): every server is stateless
+and reads the same bucket, so every server serves every sealed chunk. The balancer reads the
+manifest itself, once per refresh (every 30 s), only for the chunk boundaries.
 
 ### 6.2 Registration
 
 A server opens a `Register` stream to the balancer and sends a heartbeat every 5 s with its
-head and load. Three missed heartbeats mark it down.
+health, heads and load. Three missed heartbeats (15 s) mark it down and remove it.
 
 ### 6.3 Health and failover
 
-- A server is down after 3 missed heartbeats (15 s); a `GetHeads` probe also checks that its
-  head is no more than a few blocks behind the best one.
-- A server that falls behind is not given live work until it catches up.
-- Failover is on the client side: every answer names more than one server.
+- A server is down after 3 missed heartbeats, and out of the table as soon as its `Register`
+  call ends.
+- Work at the tip goes only to a server whose head covers it (6.4, 6.5): a server that falls
+  behind gets none until it catches up, but still serves sealed chunks.
+- Failover is on the client side: every answer names more than one server when there are.
 
 ### 6.4 Flight: per-chunk jobs
 
 **D16.** The balancer implements `GetFlightInfo` and `ListFlights` only, and turns a range
-into per-chunk jobs:
+into per-chunk jobs, so one big range runs in parallel over the servers:
 - One `FlightEndpoint` per chunk the range touches, its ticket clipped to the chunk
-  (`table:first:last:cap`, the stream's existing ticket).
-- Each endpoint's `location` lists two or three servers, chosen by load: least loaded first,
-  then round-robin over the rest, so a big range is spread over every server.
-- The part above the last sealed chunk is one endpoint listing every healthy server.
+  (`table:first:last:cap`, the stream's existing ticket); every healthy server can take it.
+- The part above the last sealed chunk becomes jobs only a server whose head (under the
+  ticket's cap) reaches the job's last block can take.
+- Every job is also cut to the servers' `DoGet` limit (100,000 blocks).
+- Each job goes to the least loaded server that can take it, and its `location` lists up to
+  three, least loaded first. The load counts the jobs already given out for the same range, so
+  a big range spreads over every server while one busy with other requests gets fewer; ties go
+  round-robin. Pure round-robin would ignore that one request can be 1,000 times another.
 - A Flight client fetches the endpoints in parallel, straight from the servers, and moves to
   the next location if one fails.
-- The ticket and resolve code is `crates/stream/src/flight.rs`'s.
+- The ticket code is `crates/stream/src/flight.rs`'s (`op_indexer_stream::ticket`).
 
 ### 6.5 Locate
 
 **D17.** `Locate(chain, from_block) → [server endpoints]` for gRPC subscriptions: the healthy
-servers, least loaded first. The client subscribes to the first and, on failure, resubscribes
-from its last block at the next. Subscriptions already resume by number.
+servers whose head reaches the block before `from_block`, least loaded first. The client
+subscribes to the first and, on failure, resubscribes from its last block at the next.
+Subscriptions already resume by number.
 
 ### 6.6 Cost of reads
 
@@ -503,6 +514,39 @@ configured list, sent as gRPC metadata (`authorization: Bearer <key>`). That cov
 Flight `GetFlightInfo` and Flight `DoGet`, which go straight to a server with the same key.
 Servers register with the balancer using a server key of their own. Keys come from the
 environment and are never logged. TLS is not part of this design.
+
+### 6.7 As built (2026-10-04)
+
+- `crates/balancer` (`op-indexer-balancer`): the `Balancer` component, its proto
+  (`proto/opindexer/balancer/v1/balancer.proto`, package `opindexer.balancer.v1`) and the
+  server's registration client (`register`). `bin/balancer`: the binary over it.
+- **Registration** (6.2, 6.3): a bidirectional stream; the balancer answers the first
+  heartbeat with `Registered`. A 15 s gap between heartbeats, a heartbeat of another chain or
+  id, or a newer registration of the same id ends the call, and the server's entry with it.
+  The client (`register::Registration::run`, wired into `server` by
+  `OP_INDEXER_BALANCER_URL`) heartbeats every 5 s from a `watch` of the server's `Report`,
+  and registers again after a backoff of 1 s doubling to 30 s with jitter; it never stops the
+  server. A server's address must be exactly `host:port` (`register::is_valid_address`).
+- **Picking** (6.4, 6.5): by requests in flight plus the jobs given out for the same request,
+  then bytes per second, ties round-robin. The heads are the heartbeats'; no separate
+  `GetHeads` probe.
+- **Flight** (D16): the other Flight calls are `UNIMPLEMENTED` (no `GetSchema`: the schema is
+  in each `FlightInfo`). A range is clipped by the best head of its cap among the servers, and
+  may not start below the first sealed chunk (`OUT_OF_RANGE`). `ordered` is set.
+- **Keys** (D18): `Locate` and Flight take a user key from `OP_INDEXER_STREAM_API_KEYS`, the
+  servers' own list; `Register` takes a server key from `OP_INDEXER_BALANCER_SERVER_KEYS`,
+  which is required. Checked per call (`op_indexer_stream::ApiKeys::verify`), never logged.
+- **Checked** locally with a throwaway client against the one-chunk export of 3.3 (local
+  backend, fake servers): the order by load, a server behind the tip kept out of tip jobs but
+  given sealed ones, an unhealthy server given nothing, both kinds of key, another chain, a
+  server leaving (removed at once) and a server stalling (removed after 15.0 s).
+- **Not built**: CPU in the load; servers report `bytes_per_second` as 0 for now.
+- **Follow-up** (shipped as is for v0.1.1; [roadmap.md](roadmap.md), "Follow-ups"): the
+  balancer builds two stacks it never runs. It builds storage (fjall) through
+  `op-indexer-stream`, for the ticket types and `ApiKeys`: a light crate for those removes it.
+  It builds the node through `op-indexer-node`, for `env_file` and `shutdown_signal`: a tiny
+  crate for those removes it, and the importer's copy of `env_file` with it. The binaries also
+  repeat their env helpers, R2 settings and tracing setup, which could go in the same crate.
 
 ## 7. The bench (3 to 4 small droplets, one R2 bucket)
 

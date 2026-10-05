@@ -33,6 +33,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::info;
 
+pub use crate::auth::ApiKeys;
 use crate::flight::Flight;
 use crate::follower::{Follower, Live};
 use crate::service::Service;
@@ -63,6 +64,12 @@ const MAX_LOOKUPS: usize = 16;
 )]
 pub mod proto {
     tonic::include_proto!("opindexer.v1");
+}
+
+/// Flight tickets and descriptors, as the servers read them: for a client of several servers
+/// (the balancer) to hand out tickets any server serves.
+pub mod ticket {
+    pub use crate::flight::{Cap, MAX_FLIGHT_BLOCKS, Query, Table};
 }
 
 /// Where the server listens and its limits.
@@ -109,6 +116,57 @@ pub struct StreamServer<U, A> {
     config: StreamConfig,
     unsafe_store: U,
     archive: A,
+    load: Load,
+}
+
+/// How busy the server is, for a balancer: the requests holding one of its places.
+#[derive(Debug, Clone)]
+pub struct Load {
+    subscriptions: Places,
+    flights: Places,
+    lookups: Places,
+}
+
+/// One limit: its places and how many there are.
+#[derive(Debug, Clone)]
+struct Places {
+    free: Arc<Semaphore>,
+    size: usize,
+}
+
+impl Places {
+    fn new(size: usize) -> Self {
+        let size = size.min(Semaphore::MAX_PERMITS);
+        Self {
+            free: Arc::new(Semaphore::new(size)),
+            size,
+        }
+    }
+
+    fn taken(&self) -> usize {
+        self.size.saturating_sub(self.free.available_permits())
+    }
+}
+
+impl Load {
+    fn new(config: &StreamConfig) -> Self {
+        Self {
+            subscriptions: Places::new(config.max_subscriptions),
+            flights: Places::new(config.max_flights),
+            lookups: Places::new(MAX_LOOKUPS),
+        }
+    }
+
+    /// Subscriptions, Flight streams and block lookups being served now.
+    #[must_use]
+    pub fn in_flight(&self) -> u32 {
+        let taken = self
+            .subscriptions
+            .taken()
+            .saturating_add(self.flights.taken())
+            .saturating_add(self.lookups.taken());
+        u32::try_from(taken).unwrap_or(u32::MAX)
+    }
 }
 
 impl<U, A> StreamServer<U, A>
@@ -117,12 +175,20 @@ where
     A: ArchiveStore + Clone + Send + Sync + 'static,
 {
     /// A server reading `unsafe_store` (its blocks and its event stream) and `archive`.
-    pub const fn new(config: StreamConfig, unsafe_store: U, archive: A) -> Self {
+    pub fn new(config: StreamConfig, unsafe_store: U, archive: A) -> Self {
+        let load = Load::new(&config);
         Self {
             config,
             unsafe_store,
             archive,
+            load,
         }
+    }
+
+    /// The server's load, which stays current while it runs.
+    #[must_use]
+    pub fn load(&self) -> Load {
+        self.load.clone()
     }
 
     /// Serves until `cancel` fires, then ends every subscription and Flight stream (each with
@@ -137,6 +203,7 @@ where
             config,
             unsafe_store,
             archive,
+            load,
         } = self;
         let source = Source {
             unsafe_store,
@@ -153,17 +220,16 @@ where
         };
         let tasks = TaskTracker::new();
         tasks.spawn(follower.run(cancel.child_token()));
-        let permits = |limit: usize| Arc::new(Semaphore::new(limit.min(Semaphore::MAX_PERMITS)));
         let flight = Flight {
             source: source.clone(),
-            streams: permits(config.max_flights),
+            streams: Arc::clone(&load.flights.free),
             tasks: tasks.clone(),
         };
         let service = Service {
             source,
             live,
-            subscriptions: permits(config.max_subscriptions),
-            lookups: permits(MAX_LOOKUPS),
+            subscriptions: Arc::clone(&load.subscriptions.free),
+            lookups: Arc::clone(&load.lookups.free),
             tasks: tasks.clone(),
             cancel: cancel.clone(),
             receipts: config.receipts,
@@ -175,7 +241,7 @@ where
             max_flights = config.max_flights,
             "stream server listening"
         );
-        let keys = auth::ApiKeys::new(&config.api_keys);
+        let keys = ApiKeys::new(&config.api_keys);
         let stream = proto::stream_server::StreamServer::new(service)
             .max_encoding_message_size(MAX_MESSAGE_BYTES);
         let stream = tonic::service::interceptor::InterceptedService::new(stream, {

@@ -1,10 +1,12 @@
 # Import spec (`bin/op-indexer-import`)
 
 Status: **built; the whole OP Mainnet chain (blocks 0 to 157,745,023) has been downloaded
-and verified on the real service, and Unichain's verified on the user's server. `load` (into the
-node's fjall archive) was removed on 2026-10-04: the verified history is now exported to
-object storage as sealed chunks (`export`, section 3.3), which servers read from
-(`docs/serving.md`). ClickHouse is no longer part of the project.**
+and verified on the real service, and Unichain's verified on the user's server; Base (8453) is
+supported and has not run yet (section 10). Three steps: `download` (with the fill from the
+chain's RPC of what the service leaves out, section 3.1a), `verify`, and `export` of the
+verified history to object storage as sealed chunks (section 3.3), which servers read from
+(`docs/serving.md`). `load` (into the node's fjall archive) was removed on 2026-10-04 (section
+4). ClickHouse is no longer part of the project.**
 
 **Goal (user, 2026-10-04): sync the whole chain from HyperSync as a separate process, usable
 for any chain, into the store that servers serve history from (R2 chunks since the "Four
@@ -143,7 +145,8 @@ Two gaps are known, both on Unichain; OP Mainnet's whole chain verified without 
   changed signature byte gives a header hash mismatch).
 - **Endpoint**: `--rpc-endpoint` (`OP_INDEXER_IMPORT_RPC_ENDPOINT`), by default
   `https://mainnet.unichain.org` for Unichain and none for OP Mainnet, whose rows need none so
-  far; without one, `download` stops with a message when something is missing.
+  far, nor for Base, which should be given one (`https://mainnet.base.org`, section 10);
+  without one, `download` stops with a message when something is missing.
 - **Counted**: `authorization_lists_to_fetch`, `holes_to_fetch` and `rpc_filled_transactions`
   in `download`'s summary, `rpc_filled_transactions` (lists filled and hole transactions
   added) in `verify`'s; each hole is also a `block`/`transactions` line of the missing-field
@@ -447,9 +450,11 @@ The chain is chosen with `--chain <id>` on the first `download` and recorded in 
 a later run with another `--chain` is refused, and one without it continues the recorded
 chain. Its parameters (fork times, the Bedrock block and its time, the hash of the last
 legacy block if it has a legacy chain, the block time, the dispute-game factory) come from
-`op-indexer-chainspec`, which knows OP Mainnet (10) and Unichain (130). The HyperSync
-endpoint is the importer's concern, not the chain specification's: a table in the importer
-gives `https://optimism.hypersync.xyz` for 10 and `https://unichain.hypersync.xyz` for 130,
+`op-indexer-chainspec`, which knows OP Mainnet (10), Unichain (130) and Base (8453). The
+chain is also `OP_INDEXER_CHAIN_ID`, the variable the node reads, so one `.env` sets it for
+both. The HyperSync endpoint is the importer's concern, not the chain specification's: a table
+in the importer gives `https://optimism.hypersync.xyz` for 10, `https://unichain.hypersync.xyz`
+for 130 and `https://base.hypersync.xyz` for 8453,
 `--endpoint` overrides it, and a chain without an entry needs `--endpoint`. The L1 endpoint
 (`--l1-endpoint`, default Ethereum's) is where the dispute games are looked up.
 
@@ -497,7 +502,7 @@ Since then the range was verified on the user's server (reported by the user, 20
 ### Base (chain 8453)
 
 ```bash
-import --state-dir base-state download --chain 8453 --api-token <TOKEN>
+import --state-dir base-state download --chain 8453 --api-token <TOKEN> --rpc-endpoint https://mainnet.base.org
 ```
 
 ```bash
@@ -526,9 +531,11 @@ What differs (`docs/base.md`):
   621), created with `createWithInitData`, whose extra data starts with the L2 block number and
   whose root claim is that block's output root, read through the chain spec's claim formats
   like the other types.
-- **No RPC endpoint by default.** Whether HyperSync's Base rows lack anything is not known;
-  if they do, `download` lists it and stops, asking for `--rpc-endpoint`. Two public ones
-  work: `https://mainnet.base.org` (Base's own; it has no `eth_getBlockReceipts`, so a hole's
+- **Give an RPC endpoint.** There is none by default. EIP-7702 transactions exist on Base
+  since Isthmus, and HyperSync leaves their authorization lists out (as on Unichain, section
+  3.1a), so expect `download` to need one for the missing fields; without it, `download` lists
+  what is missing and stops, asking for `--rpc-endpoint`. Not yet checked against HyperSync's
+  own Base answers. Two public ones work: `https://mainnet.base.org` (Base's own; it has no `eth_getBlockReceipts`, so a hole's
   receipts are read one by one, and it limits the rate with an error in the answer, which is
   waited out like HTTP 429) and `https://base.drpc.org` (has it).
 - **Size.** The archive is estimated at 2 to 3.5 TB (`docs/base.md` section 6). Scaled from

@@ -20,12 +20,12 @@ many users means running several servers behind one balancer.
 | Binary | Role | Storage | Status |
 |---|---|---|---|
 | **`indexer`** | The full node for a single user: every service in one process. Takes part in the p2p networks, follows L1, keeps history and serves it over gRPC and Arrow Flight | Its own local block archive (fjall) | built |
-| **`server`** | A full node for serving at scale: the same p2p participation and live data, but its history is a local cache of immutable block chunks mapped to Cloudflare R2, filled from R2 only when a chunk is missing | Chunk cache backed by R2 | planned |
-| **`importer`** | Fills history once from an external archive, verifying every block, and produces the chunks the archive and R2 are built from | Its state directory | built (`import`) |
-| **`balancer`** | The single entry point for users: keeps the table of which chunk ranges each server holds and points every request at the right server. No data passes through it | The chunk table | planned |
+| **`server`** | A full node for serving at scale: the same p2p participation and live data, but stateless for history: it keeps no archive and reads sealed, immutable block chunks from Cloudflare R2 on demand, with no cache. One server per deployment runs with `--export` (or `OP_INDEXER_EXPORT=true`) and is the single exporter, which seals finalized blocks into new chunks | R2 (sealed chunks), a small local tail of unsealed blocks | built; not yet run against R2 |
+| **`importer`** | Fills history once from an external archive (Envio HyperSync), verifying every block, and exports it as sealed chunks to R2 | Its state directory | built (`import`) |
+| **`balancer`** | The single entry point for users: keeps the table of which chunk ranges each server holds and points every request at the right server. No data passes through it | The chunk table | in progress |
 
-R2 is only used to fill history. Live data always comes from the p2p networks, and chunks are
-sealed only once all their blocks are finalized on L1, so they never change.
+R2 holds the sealed history the servers read. Live data always comes from the p2p networks,
+and chunks are sealed only once all their blocks are finalized on L1, so they never change.
 
 ## How it works
 
@@ -72,6 +72,28 @@ and its own `.env`, run from its own directory or given with `--env-file`. The e
 `.env.example` shows the settings for Unichain and Base next to an OP Mainnet node; see
 also [storage.md](docs/storage.md), "Several instances on one host".
 
+## Install on a server
+
+Each release has prebuilt Linux binaries (x86-64, glibc 2.35: Ubuntu 22.04 and newer) of
+`indexer`, `server`, `import` and `balancer`, with `.env.example`, in one archive and its
+SHA-256. To install the latest:
+
+```bash
+VERSION=$(curl -fsSL https://api.github.com/repos/eabz/op-p2p-indexer/releases/latest | grep -m1 '"tag_name"' | cut -d'"' -f4)
+NAME=op-p2p-indexer-$VERSION-x86_64-linux
+curl -fsSLO "https://github.com/eabz/op-p2p-indexer/releases/download/$VERSION/$NAME.tar.gz"
+curl -fsSLO "https://github.com/eabz/op-p2p-indexer/releases/download/$VERSION/$NAME.tar.gz.sha256"
+sha256sum -c "$NAME.tar.gz.sha256"
+tar -xzf "$NAME.tar.gz" && cd "$NAME"
+cp .env.example .env     # then edit it
+./indexer                # or ./server
+```
+
+To make a release, run `scripts/bump-version.sh patch` (or `minor`, `major`, `X.Y.Z`) on a
+clean tree; it commits the new version and tags it. Pushing the tag
+(`git push origin <branch> vX.Y.Z`) builds the archive and publishes the release
+([`release.yml`](.github/workflows/release.yml)).
+
 ## Consuming the data
 
 - **gRPC** (`opindexer.v1.Stream`, [stream.proto](crates/stream/proto/opindexer/v1/stream.proto)):
@@ -86,9 +108,11 @@ Details, schemas and limits: [stream.md](docs/stream.md).
 
 ## Status
 
-The importer has run on the full OP Mainnet chain (157.7 M blocks; a ~914 GB archive) and on
-Unichain; history can be filled with it instead of syncing from peers ([import.md](docs/import.md)).
-Base support is built but has not run yet. The node's gossip ingest and receipt fetching have run against live peers. Serving
+The importer has downloaded and verified the full OP Mainnet chain (157.7 M blocks) and
+Unichain, and exports the verified history to R2 as sealed chunks ([import.md](docs/import.md)).
+The `server` is built but has not run against R2 yet; the `balancer` is in progress
+([serving.md](docs/serving.md)). Base support is built but has not run yet. The node's gossip
+ingest and receipt fetching have run against live peers. Serving
 peers, range sync, the L1 side end to end, the stream and Arrow Flight are built and reviewed but
 not yet run in production. [citizenship.md](docs/citizenship.md) lists every duty on every network
 with its spec and status.
@@ -97,7 +121,8 @@ with its spec and status.
 
 Start with [roadmap.md](docs/roadmap.md): scope, decisions and the order of work. Each part has its
 own spec: [storage](docs/storage.md), [pipeline](docs/pipeline.md), [execution p2p](docs/el.md),
-[L1](docs/l1.md), [importer](docs/import.md), [stream](docs/stream.md), [Base](docs/base.md),
+[L1](docs/l1.md), [importer](docs/import.md), [stream](docs/stream.md),
+[serving at scale](docs/serving.md), [Base](docs/base.md),
 [good-peer duties](docs/citizenship.md).
 
 ## License
