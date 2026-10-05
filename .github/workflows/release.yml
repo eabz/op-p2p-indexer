@@ -64,7 +64,7 @@ jobs:
             cp "target/release/$bin" "dist/$name/"
           done
           cp config.toml.example README.md LICENSE "dist/$name/"
-          cp scripts/bench.py scripts/install.sh scripts/setup.py "dist/$name/"
+          cp scripts/bench.py scripts/install.sh "dist/$name/"
           cd dist
           tar -czf "$name.tar.gz" "$name"
           sha256sum "$name.tar.gz" >"$name.tar.gz.sha256"

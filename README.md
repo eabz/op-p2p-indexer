@@ -20,33 +20,19 @@ Ubuntu 22.04 or newer, x86-64, from a sudo-enabled account:
 curl -fsSL https://eabz.github.io/op-p2p-indexer/install.sh | sudo bash
 ```
 
-On a fresh box without curl, first run `sudo apt-get update && sudo apt-get install -y curl ca-certificates`.
-The installer handles its remaining Ubuntu prerequisites, including `dialog` for terminal menus.
-Prompts use `/dev/tty`, so the piped command works over an interactive SSH session.
-For automation, use `--non-interactive`; `TERM=dumb` selects numbered prompts.
+The installer takes no options. It shows the programs, with ↑/↓ to move, Space to tick
+and Enter to confirm, then installs what is ticked from the latest release (its checksum
+verified) to `/usr/local/bin`. Missing prerequisites (curl, CA certificates) are installed
+with apt in the background.
 
-Use ↑/↓ to move, Space to toggle services, and Enter to confirm. The wizard reuses shared TOML settings and
-shows the selected paths and ports before saving. Downloads display progress and stalled
-transfers time out. It can register and start systemd services. Run it again to update binaries
-or change registrations;
-configuration and data are retained. Downloads use the latest published release and verify
-its checksum before replacing binaries atomically. An update takes effect when a process
-restarts. Shared binaries live in `/usr/local/bin`.
+Each service ticked (`server`, `indexer`, `balancer`) gets a systemd unit,
+`op-indexer-<name>.service`, run by the account that ran sudo and reading
+`~/indexer/config.toml`. On the first install that file is created from the example and the
+services are not started: edit it, then `sudo systemctl start op-indexer-<name>`. `import`
+and `bench` are tools, run by hand.
 
-The installer downloads published artifacts, not the current source tree. The complete
-`dialog` wizard requires v0.1.12 or newer. Older releases can be installed with
-`--binaries-only`; updating the hosted script alone does not update an older setup helper.
-
-For unattended setup, download the script and specify the chain and roles:
-
-```bash
-bash install.sh --non-interactive --chain unichain --roles indexer --register --enable --start
-bash install.sh --action update --non-interactive --chain unichain --roles server --restart
-bash install.sh --binaries-only --version v0.1.8 --prefix "$HOME/.local"
-```
-
-Put required secrets in the private chain configuration before unattended setup. The importer
-is an on-demand command, not a restarting service.
+Run it again to update: what is ticked is updated and restarted (if its configuration
+checks), what is unticked is stopped and removed. Configuration and data are kept.
 
 ## Configure and run
 
@@ -74,8 +60,8 @@ data_dir = "data/indexer"
 listen_addr = "127.0.0.1:50051"
 ```
 
-The installer assigns separate state directories and ports to each role. Shared `[node]`
-settings apply to configured indexer/server roles; explicit role settings override them.
+Shared `[node]` settings apply to configured indexer/server roles; explicit role settings
+override them.
 
 ```bash
 indexer --chain unichain --check-config
@@ -93,15 +79,10 @@ For a local source build, run `cargo build --release` and use the binaries in `t
 ## Control services
 
 ```bash
-sudo systemctl restart server-unichain
-sudo journalctl -u server-unichain -f
-sudo systemctl start indexer-chain-unichain.target
-sudo systemctl stop indexer-chain-unichain.target
+sudo systemctl restart op-indexer-server
+sudo systemctl status op-indexer-server
+tail -f ~/indexer/server.log
 ```
-
-A chain target controls all registered roles together. Enabling a selected service starts only
-that service at boot. Stop and disable old registrations before starting replacements against
-the same state. Removing registrations keeps configuration and data.
 
 Without systemd, `indexer`, `server` and `balancer` also support `start`, `stop`, `restart`,
 `status` and `logs`; logs and PID files live beside the selected config. Use `--log-file` to

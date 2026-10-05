@@ -21,22 +21,12 @@ Open http://localhost:4173. The hero is a labeled simulation, not a connection t
 The displayed command uses the short Pages endpoint:
 
 ```sh
-curl -fsSL https://eabz.github.io/op-p2p-indexer/install.sh | sudo bash -s -- --binaries-only
-```
-
-`--binaries-only` keeps the command usable with published releases that predate guided TOML
-setup. The adjacent copy explains this release boundary. When a compatible release containing
-`setup.py` and `config.toml.example` is published, the wizard command is:
-
-```sh
 curl -fsSL https://eabz.github.io/op-p2p-indexer/install.sh | sudo bash
 ```
 
-The root installer installs missing Ubuntu prerequisites using apt (including Python TOML
-support); it does not install Python packages globally with pip. Curl itself must already be
-available to download the one-liner; the page gives the apt command for minimal images.
-The copy button reads the displayed command automatically. Keep it consistent with the root
-README; no Rust build is required.
+The installer takes no options; it asks which programs to install in a menu. The copy
+button reads the displayed command automatically. Keep it consistent with the root README;
+no Rust build is required.
 
 ## Publish
 
