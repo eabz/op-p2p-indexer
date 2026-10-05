@@ -14,29 +14,36 @@ Apache Arrow Flight. The running node needs no L1 or L2 RPC.
 
 ## Install on a server
 
-Ubuntu 22.04 or newer, x86-64, from a sudo-enabled account:
+Ubuntu 22.04 or newer, x86-64, as root (it writes `/usr/local/bin` and systemd units):
 
 ```bash
-curl -fsSL https://eabz.github.io/op-p2p-indexer/install.sh | bash
+sudo bash -c "$(curl -fsSL https://eabz.github.io/op-p2p-indexer/install.sh)"
 ```
 
-The installer takes no options. It shows the programs, with ↑/↓ to move, Space to tick
-and Enter to confirm, then installs what is ticked from the latest release (its checksum
-verified) to `/usr/local/bin`. Missing prerequisites (curl, CA certificates) are installed
-with apt in the background.
+The installer takes no options. Two checklists (↑/↓ move, Space ticks, Enter confirms): the
+programs, then the chains. It installs the programs from the latest release (checksum
+verified) to `/usr/local/bin`; missing prerequisites are installed with apt in the background.
 
-Each service ticked (`server`, `indexer`, `balancer`) gets a systemd unit,
-`op-indexer-<name>.service`, run by the account that ran sudo and reading
-`~/indexer/config.toml`. On the first install that file is created from the example and the
-services are not started: edit it, then `sudo systemctl start op-indexer-<name>`. `import`
-and `bench` are tools, run by hand.
+Each service (`server`, `indexer`, `balancer`) runs once per chain, as
+`op-indexer-<program>-<chain>`, run by the account that ran sudo, from its own directory:
 
-Run it again to update: what is ticked is updated and restarted (if its configuration
-checks), what is unticked is stopped and removed. Configuration and data are kept.
+```text
+~/.op-indexer/config.toml             shared by every chain: keys, R2 (each chain extends it)
+~/.op-indexer/<chain>/config.toml     the chain, a section per program with its own ports
+~/.op-indexer/<chain>/data/<program>/ the program's state
+~/.op-indexer/<chain>/<program>.log
+```
+
+Each chain gets its own block of ports (the defaults, plus 1000 per chain, recorded in its
+file), so chains never collide. A program added later gets its section appended; nothing
+written is rewritten. Services whose configuration was just written are not started: fill in
+the keys, then `sudo systemctl start op-indexer-<program>-<chain>`. Run the installer again to
+update (services whose configuration checks are restarted), or to add or remove programs and
+chains: what is unticked is stopped and removed; configuration and data are kept.
 
 ## Configure and run
 
-Keep reusable settings in `~/indexer/config.toml`:
+Keep reusable settings in `~/.op-indexer/config.toml`:
 
 ```toml
 [node]
@@ -47,7 +54,7 @@ api_keys = ["replace-with-client-key"]
 ```
 
 Each chain selects that shared file and its own roles. For example,
-`~/indexer/unichain/config.toml`:
+`~/.op-indexer/unichain/config.toml`:
 
 ```toml
 extends = "../config.toml"
@@ -79,9 +86,9 @@ For a local source build, run `cargo build --release` and use the binaries in `t
 ## Control services
 
 ```bash
-sudo systemctl restart op-indexer-server
-sudo systemctl status op-indexer-server
-tail -f ~/indexer/server.log
+sudo systemctl restart op-indexer-server-unichain
+sudo systemctl status op-indexer-server-unichain
+tail -f ~/.op-indexer/unichain/server.log
 ```
 
 Without systemd, `indexer`, `server` and `balancer` also support `start`, `stop`, `restart`,

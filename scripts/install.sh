@@ -1,16 +1,22 @@
 #!/usr/bin/env bash
-# Installs, updates and removes the op-p2p-indexer binaries and their systemd services.
+# Installs, updates and removes the op-p2p-indexer programs, the chains they run, and their
+# systemd services. Run as root:
 #
-#   curl -fsSL https://eabz.github.io/op-p2p-indexer/install.sh | bash
+#   sudo bash -c "$(curl -fsSL https://eabz.github.io/op-p2p-indexer/install.sh)"
 #
-# Not piped into sudo: it runs itself under sudo, with the terminal as sudo's input, so the
-# keyboard reaches the menu (piped into sudo, a sudo using a pseudo-terminal passes no keys).
+# Two checklists (arrow keys, Space, Enter): the programs, then the chains. The latest release
+# is downloaded, its checksum checked, and the programs installed to /usr/local/bin. Each
+# service (server, indexer, balancer) runs once per chain, as op-indexer-<program>-<chain>,
+# from its own directory:
 #
-# It asks which programs this machine runs (arrow keys, Space, Enter), downloads the latest
-# release, checks its checksum, and installs them to /usr/local/bin. Each service (server,
-# indexer, balancer) gets a systemd unit reading ~/indexer/config.toml. Run it again to
-# update, or to add or remove programs: what is unticked is stopped and removed, and the
-# configuration and data are kept. Takes no options.
+#   ~/.op-indexer/config.toml            shared by every chain (keys): each chain's file extends it
+#   ~/.op-indexer/<chain>/config.toml    the chain, and a section per program with its own ports
+#   ~/.op-indexer/<chain>/data/<program> the program's state
+#   ~/.op-indexer/<chain>/<program>.log
+#
+# Each chain has its own block of ports (recorded in its file), so chains never collide. Run
+# it again to update, or to add or remove programs and chains: what is unticked is stopped and
+# removed; configuration and data are always kept. Takes no options.
 
 main() (
     set -euo pipefail
@@ -20,14 +26,20 @@ main() (
     local script_url="https://eabz.github.io/op-p2p-indexer/install.sh"
     local bin_dir="/usr/local/bin" share_dir="/usr/local/share/op-p2p-indexer"
     local unit_dir="/etc/systemd/system"
-    # name|kind|what it is
-    local programs=(
-        "server|service|Serves history from R2, behind a balancer"
-        "indexer|service|Full node with its own local archive"
-        "balancer|service|Directs clients to the healthy servers"
-        "import|tool|Imports a chain's history into R2 (run by hand)"
-        "bench|tool|Benchmarks reads from a balancer (run by hand)"
+    local run_command="sudo bash -c \"\$(curl -fsSL $script_url)\""
+    # The descriptions are read through the checklist's name references.
+    local p_names=(server indexer balancer import bench)
+    # shellcheck disable=SC2034
+    local p_descs=(
+        "Serves history from R2, behind a balancer"
+        "Full node with its own local archive"
+        "Directs clients to the healthy servers"
+        "Imports a chain's history into R2 (run by hand)"
+        "Benchmarks reads from a balancer (run by hand)"
     )
+    local c_names=(op unichain base)
+    # shellcheck disable=SC2034
+    local c_descs=("OP Mainnet (chain 10)" "Unichain (chain 130)" "Base (chain 8453)")
 
     # --- Output --------------------------------------------------------------------------------
     local bold="" dim="" green="" cyan="" red="" yellow="" reset=""
@@ -37,6 +49,7 @@ main() (
     fi
     say() { printf '%s\n' "$*" >&2; }
     ok() { printf '%s✔%s %s\n' "$green" "$reset" "$*" >&2; }
+    warn() { printf '%s!%s %s\n' "$yellow" "$reset" "$*" >&2; }
     die() { printf '\r\e[2K\n%s✖ %s%s\n' "$red" "$*" "$reset" >&2; exit 1; }
     # Runs a command in the background behind a spinner and `message`; its output goes to a
     # log, shown only if it fails.
@@ -73,7 +86,7 @@ main() (
     trap 'exit 130' INT
     trap 'exit 143' TERM
 
-    [[ $# -eq 0 ]] || die "install.sh takes no options; run it and choose in the menu"
+    [[ $# -eq 0 ]] || die "install.sh takes no options; run it and choose in the menus"
 
     # --- Checks --------------------------------------------------------------------------------
     [[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]] || die "only Linux x86-64 is supported"
@@ -82,23 +95,10 @@ main() (
     if ! [[ "$libc" =~ ^glibc\ 2\.([0-9]+)$ ]] || (( BASH_REMATCH[1] < 35 )); then
         die "glibc 2.35 or newer is required (Ubuntu 22.04 or newer); found $libc"
     fi
-    if (( EUID != 0 )); then
-        command -v sudo >/dev/null || die "run it as root: curl -fsSL $script_url | bash"
-        # Piped into bash, the script is no file to run again: download it.
-        local self status=0
-        self=$(mktemp)
-        if [[ -f "${BASH_SOURCE[0]:-}" ]]; then
-            cp -- "${BASH_SOURCE[0]}" "$self"
-        else
-            curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 15 --max-time 60 \
-                -o "$self" "$script_url" || die "cannot download the installer"
-        fi
-        # shellcheck disable=SC2024 # the terminal is sudo's own input, on purpose
-        sudo bash "$self" </dev/tty || status=$?
-        rm -f -- "$self"
-        exit "$status"
-    fi
+    # Root writes /usr/local/bin and /etc/systemd/system, and runs systemctl and apt.
+    (( EUID == 0 )) || die "run it as root: $run_command"
     command -v systemctl >/dev/null || die "systemd is required"
+    { exec 3<>/dev/tty; } 2>/dev/null || die "the installer needs a terminal to show its menus"
     local tool missing=()
     for tool in curl tar sha256sum; do
         command -v "$tool" >/dev/null || missing+=("$tool")
@@ -110,58 +110,102 @@ main() (
         spin "Installing ${missing[*]}" env DEBIAN_FRONTEND=noninteractive bash -c \
             'apt-get -qq update && apt-get -qq install -y --no-install-recommends "$@"' _ "${missing[@]}"
     fi
-    { exec 3<>/dev/tty; } 2>/dev/null || die "the installer needs a terminal to show its menu"
 
-    # The account that runs the services and owns ~/indexer: whoever ran sudo.
-    local user="${SUDO_USER:-root}" home
+    # The account that runs the services and owns ~/.op-indexer: whoever ran sudo, else root.
+    local user="${SUDO_USER:-root}" home group
     home=$(getent passwd "$user" | cut -d: -f6)
     [[ -n "$home" && -d "$home" ]] || die "cannot find the home directory of $user"
-    local config_dir="$home/indexer"
-    local config="$config_dir/config.toml"
+    group=$(id -gn "$user")
+    local root_dir="$home/.op-indexer"
 
     # --- What is installed, and the latest release ---------------------------------------------
-    local installed_version="" latest
-    [[ -f "$share_dir/version" ]] && installed_version=$(<"$share_dir/version")
     work=$(mktemp -d)
-    # The release page GitHub redirects "latest" to names the tag.
+    local installed_version=""
+    if [[ -f "$share_dir/version" ]]; then installed_version=$(<"$share_dir/version"); fi
     # shellcheck disable=SC2016 # expanded by the inner bash
     spin "Finding the latest release" bash -c 'curl --proto =https --tlsv1.2 -fsSL \
         --connect-timeout 15 --max-time 60 -o /dev/null -w "%{url_effective}" "$1" >"$2"' \
         _ "$repo/releases/latest" "$work/latest"
+    local latest
     latest=$(<"$work/latest")
     latest="${latest##*/}"
     [[ "$latest" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "unexpected latest release: $latest"
 
-    local names=() kinds=() descs=() had=() picked=() entry name kind
-    for entry in "${programs[@]}"; do
-        IFS='|' read -r name kind entry <<<"$entry"
-        names+=("$name") kinds+=("$kind") descs+=("$entry")
-        if [[ -x "$bin_dir/$name" && -f "$share_dir/version" ]] \
-            && grep -Fxq "$name" "$share_dir/installed" 2>/dev/null; then
-            had+=(1) picked+=(1)
+    # Was installed (1) or not, for each program and chain.
+    local p_had=() c_had=() name i
+    for name in "${p_names[@]}"; do
+        if [[ -x "$bin_dir/$name" ]] && grep -Fxq "$name" "$share_dir/installed" 2>/dev/null; then
+            p_had+=(1)
         else
-            had+=(0) picked+=(0)
+            p_had+=(0)
         fi
     done
-    local count=${#names[@]}
+    for name in "${c_names[@]}"; do
+        if grep -Fxq "$name" "$share_dir/chains" 2>/dev/null; then c_had+=(1); else c_had+=(0); fi
+    done
+    local p_on=("${p_had[@]}") c_on=("${c_had[@]}")
 
-    # --- The menu ------------------------------------------------------------------------------
-    # One line per program: a checkbox, its name, what it is, and what will happen to it.
-    line() {
-        local i=$1 pointer="  " box status=""
-        (( i == cursor )) && pointer="${cyan}❯${reset} "
-        if (( picked[i] )); then box="${green}◉${reset}"; else box="${dim}◯${reset}"; fi
-        if (( had[i] && picked[i] )); then status="${dim}installed · update${reset}"
-        elif (( had[i] )); then status="${red}remove${reset}"
-        elif (( picked[i] )); then status="${green}install${reset}"
-        fi
-        local label
-        label=$(printf '%-9s' "${names[i]}")
-        (( i == cursor )) && label="${bold}${label}${reset}"
-        printf '\r\e[2K%s%s %s %s%-8s%s %-52s %s\n' "$pointer" "$box" "$label" \
-            "$dim" "${kinds[i]}" "$reset" "${descs[i]}" "$status" >&3
+    # --- Checklists ----------------------------------------------------------------------------
+    # checklist TITLE NAMES DESCS HAD ON ADD KEEP DROP MIN: arrow keys move, Space ticks, `a`
+    # ticks all, Enter confirms (once at least MIN are ticked), q or Esc quits. ON is updated.
+    # ADD, KEEP and DROP say what happens to a line ticked now, ticked before and now, before
+    # only.
+    checklist() {
+        local title=$1 add=$6 keep=$7 drop=$8 min=$9
+        local -n names=$2 descs=$3 had=$4 on=$5
+        local count=${#names[@]} cursor=0 key rest j all ticked
+        local hint="↑/↓ move · Space select · a all · Enter confirm · q quit"
+        draw_line() {
+            local j=$1 pointer="  " box status="" label
+            if (( j == cursor )); then pointer="${cyan}❯${reset} "; fi
+            if (( on[j] )); then box="${green}◉${reset}"; else box="${dim}◯${reset}"; fi
+            if (( had[j] && on[j] )); then status="${dim}${keep}${reset}"
+            elif (( had[j] )); then status="${red}${drop}${reset}"
+            elif (( on[j] )); then status="${green}${add}${reset}"
+            fi
+            label=$(printf '%-9s' "${names[j]}")
+            if (( j == cursor )); then label="${bold}${label}${reset}"; fi
+            printf '\r\e[2K%s%s %s %-48s %s\n' "$pointer" "$box" "$label" "${descs[j]}" "$status" >&3
+        }
+        draw() {
+            for ((j = 0; j < count; j++)); do draw_line "$j"; done
+            printf '\r\e[2K\n\r\e[2K%s  %s%s\n' "$dim" "$1" "$reset" >&3
+        }
+        printf '\n  %s%s%s\n\n' "$bold" "$title" "$reset" >&3
+        printf '\e[?25l' >&3
+        draw "$hint"
+        while :; do
+            IFS= read -rsn1 key <&3 || exit 1
+            if [[ "$key" == $'\e' ]]; then
+                rest=""
+                IFS= read -rsn2 -t 0.05 rest <&3 || true
+                key="$key$rest"
+            fi
+            local message=$hint
+            case "$key" in
+                $'\e[A'|k) cursor=$(( (cursor + count - 1) % count )) ;;
+                $'\e[B'|j) cursor=$(( (cursor + 1) % count )) ;;
+                ' ') on[cursor]=$(( 1 - on[cursor] )) ;;
+                a)
+                    all=1
+                    for ((j = 0; j < count; j++)); do (( on[j] )) || all=0; done
+                    for ((j = 0; j < count; j++)); do on[j]=$(( 1 - all )); done ;;
+                '')
+                    ticked=0
+                    for ((j = 0; j < count; j++)); do ticked=$(( ticked + on[j] )); done
+                    if (( ticked >= min )); then break; fi
+                    message="${reset}${yellow}Select at least one: Space ticks the line under ❯" ;;
+                q|$'\e') printf '\e[?25h' >&3; say ""; say "Nothing changed."; exit 0 ;;
+                *) continue ;;
+            esac
+            printf '\e[%dA' $((count + 2)) >&3
+            draw "$message"
+        done
+        printf '\e[%dA' $((count + 2)) >&3
+        draw "$hint"
+        printf '\e[?25h' >&3
     }
-    local cursor=0
+
     printf '\n%s◆ op-p2p-indexer installer%s\n' "$bold" "$reset" >&3
     if [[ -n "$installed_version" ]]; then
         printf '%s  installed %s · latest %s%s\n' "$dim" "$installed_version" "$latest" "$reset" >&3
@@ -169,58 +213,68 @@ main() (
         printf '%s  latest release %s%s\n' "$dim" "$latest" "$reset" >&3
     fi
     if [[ -n "${SUDO_USER:-}" && ! -t 0 ]]; then
-        printf '\n%s  Keys not working? Run it without sudo: curl -fsSL %s | bash%s\n' \
-            "$yellow" "$script_url" "$reset" >&3
+        printf '\n%s  Keys not working? Run it this way: %s%s\n' "$yellow" "$run_command" "$reset" >&3
     fi
-    printf '\n  Which programs run on this machine?\n\n' >&3
-    printf '\e[?25l' >&3
-    local i key rest
-    for ((i = 0; i < count; i++)); do line "$i"; done
-    printf '\n%s  ↑/↓ move · Space select · a all · Enter confirm · q quit%s\n' "$dim" "$reset" >&3
-    while :; do
-        IFS= read -rsn1 key <&3 || exit 1
-        if [[ "$key" == $'\e' ]]; then
-            rest=""
-            IFS= read -rsn2 -t 0.05 rest <&3 || true
-            key="$key$rest"
-        fi
-        case "$key" in
-            $'\e[A'|k) cursor=$(( (cursor + count - 1) % count )) ;;
-            $'\e[B'|j) cursor=$(( (cursor + 1) % count )) ;;
-            ' ') picked[cursor]=$(( 1 - picked[cursor] )) ;;
-            a)
-                local all=1
-                for ((i = 0; i < count; i++)); do (( picked[i] )) || all=0; done
-                for ((i = 0; i < count; i++)); do picked[i]=$(( 1 - all )); done ;;
-            '') break ;;
-            q|$'\e') printf '\e[?25h' >&3; say ""; say "Nothing changed."; exit 0 ;;
-            *) continue ;;
-        esac
-        printf '\e[%dA' $((count + 2)) >&3
-        for ((i = 0; i < count; i++)); do line "$i"; done
-        printf '\n\r\e[2K%s  ↑/↓ move · Space select · a all · Enter confirm · q quit%s\n' "$dim" "$reset" >&3
-    done
-    printf '\e[?25h' >&3
+    checklist "Which programs run on this machine?" p_names p_descs p_had p_on \
+        install "installed · update" remove 0
 
-    local install=() remove=()
-    for ((i = 0; i < count; i++)); do
-        if (( picked[i] )); then
-            install+=("${names[i]}")
-        elif (( had[i] )); then
-            remove+=("${names[i]}")
+    # The chains, if a program runs per chain (all but bench).
+    local per_chain=0
+    for ((i = 0; i < 4; i++)); do per_chain=$(( per_chain | p_on[i] )); done
+    if (( per_chain )); then
+        checklist "Which chains?" c_names c_descs c_had c_on "set up" "kept" remove 1
+    else
+        for i in "${!c_names[@]}"; do c_on[i]=0; done
+    fi
+
+    # --- The plan ------------------------------------------------------------------------------
+    local install=() remove=() chains=() dropped=()
+    for i in "${!p_names[@]}"; do
+        if (( p_on[i] )); then install+=("${p_names[i]}")
+        elif (( p_had[i] )); then remove+=("${p_names[i]}")
         fi
     done
-    if (( ${#install[@]} == 0 && ${#remove[@]} == 0 )); then
+    for i in "${!c_names[@]}"; do
+        if (( c_on[i] )); then chains+=("${c_names[i]}")
+        elif (( c_had[i] )); then dropped+=("${c_names[i]}")
+        fi
+    done
+    # Services wanted: each service program on each chain.
+    local services=() program chain
+    for program in server indexer balancer; do
+        [[ " ${install[*]} " == *" $program "* ]] || continue
+        for chain in "${chains[@]}"; do services+=("$program-$chain"); done
+    done
+    # Units to stop and remove: ours that are not wanted any more.
+    local stale=() unit
+    for unit in "$unit_dir"/op-indexer-*.service; do
+        [[ -f "$unit" ]] || continue
+        unit="${unit##*/op-indexer-}"
+        unit="${unit%.service}"
+        [[ " ${services[*]} " == *" $unit "* ]] || stale+=("$unit")
+    done
+    if (( ${#install[@]} == 0 && ${#remove[@]} == 0 && ${#stale[@]} == 0 )); then
         say ""; say "Nothing selected; nothing changed."; exit 0
     fi
 
-    # --- Confirm -------------------------------------------------------------------------------
     printf '\n' >&3
     if (( ${#install[@]} )); then
-        printf '  %sInstall or update%s  %s (%s)\n' "$green" "$reset" "${install[*]}" "$latest" >&3
+        printf '  %sInstall or update%s  %s %s(%s)%s\n' "$green" "$reset" "${install[*]}" "$dim" "$latest" "$reset" >&3
     fi
-    (( ${#remove[@]} == 0 )) || printf '  %sRemove%s             %s %s(configuration and data are kept)%s\n' "$red" "$reset" "${remove[*]}" "$dim" "$reset" >&3
-    local yes=1
+    if (( ${#remove[@]} )); then
+        printf '  %sRemove%s             %s\n' "$red" "$reset" "${remove[*]}" >&3
+    fi
+    if (( ${#chains[@]} )); then
+        printf '  %sChains%s             %s %s(%s/<chain>)%s\n' "$green" "$reset" "${chains[*]}" "$dim" "$root_dir" "$reset" >&3
+    fi
+    if (( ${#services[@]} )); then
+        printf '  %sServices%s           %s\n' "$green" "$reset" "${services[*]/#/op-indexer-}" >&3
+    fi
+    if (( ${#stale[@]} )); then
+        printf '  %sStop and remove%s    %s %s(configuration and data are kept)%s\n' "$red" "$reset" "${stale[*]/#/op-indexer-}" "$dim" "$reset" >&3
+    fi
+
+    local yes=1 key rest
     confirm_line() {
         local y="  Yes  " n="  No  "
         if (( yes )); then y="${cyan}${bold}❯ Yes${reset}  "; else n="${cyan}${bold}❯ No${reset} "; fi
@@ -250,13 +304,13 @@ main() (
     printf '\e[?25h\n\n' >&3
     (( yes )) || { say "Nothing changed."; exit 0; }
 
-    # --- Remove --------------------------------------------------------------------------------
+    # --- Stop and remove -----------------------------------------------------------------------
+    for unit in "${stale[@]}"; do
+        systemctl disable --now "op-indexer-$unit.service" >/dev/null 2>&1 || true
+        rm -f -- "$unit_dir/op-indexer-$unit.service"
+        ok "stopped and removed op-indexer-$unit"
+    done
     for name in "${remove[@]}"; do
-        local unit="op-indexer-$name.service"
-        if [[ -f "$unit_dir/$unit" ]]; then
-            systemctl disable --now "$unit" >/dev/null 2>&1 || true
-            rm -f -- "$unit_dir/$unit"
-        fi
         rm -f -- "$bin_dir/$name"
         ok "removed $name"
     done
@@ -283,98 +337,214 @@ main() (
         for name in "${install[@]}"; do
             members+=("$archive/$name")
         done
-        if grep -Fxq "$archive/config.toml.example" "$work/members"; then
-            members+=("$archive/config.toml.example")
-        fi
         for wanted in "${members[@]}"; do
             grep -Fxq "$wanted" "$work/members" || die "release $latest has no ${wanted#"$archive/"}"
         done
         tar -xzf "$work/release.tar.gz" -C "$work" --no-same-owner -- "${members[@]}" \
             || die "cannot unpack the release"
-
-        mkdir -p -- "$bin_dir" "$share_dir"
+        mkdir -p -- "$bin_dir"
         for name in "${install[@]}"; do
             # Renamed into place: a running service keeps the old binary until it restarts.
             install -m 0755 "$work/$archive/$name" "$bin_dir/.$name.new"
             mv -fT -- "$bin_dir/.$name.new" "$bin_dir/$name"
         done
-        if [[ -f "$work/$archive/config.toml.example" ]]; then
-            install -m 0644 "$work/$archive/config.toml.example" "$share_dir/config.toml.example"
-        fi
         ok "installed ${install[*]} to $bin_dir"
     fi
-    if (( ${#install[@]} )); then
-        printf '%s\n' "${install[@]}" >"$share_dir/installed"
-        printf '%s\n' "$latest" >"$share_dir/version"
-    else
-        rm -f -- "$share_dir/installed" "$share_dir/version"
+    mkdir -p -- "$share_dir"
+    printf '%s\n' "${install[@]}" >"$share_dir/installed"
+    printf '%s\n' "${chains[@]}" >"$share_dir/chains"
+    printf '%s\n' "$latest" >"$share_dir/version"
+
+    # --- Configuration -------------------------------------------------------------------------
+    # Ports of slot `slot`: the defaults, plus 1000 per slot; the indexer's 100 above the
+    # server's. One slot per chain directory, recorded in its file.
+    port() { printf '%d' $(( $1 + $2 * 1000 + ${3:-0} )); }
+    section() { # section PROGRAM SLOT: the program's tables for the chain file
+        local slot=$2
+        case "$1" in
+            server) cat <<EOF
+
+[server]
+data_dir = "data/server"
+# id = "server-1"                       # this server's name (default: the host name)
+# address = "203.0.113.7:$(port 50051 "$slot")"         # where the balancer sends clients
+# balancer_url = "http://balancer.example:50060"
+# balancer_server_key = "replace-me"
+export = false                          # true on the one server that exports chunks to R2
+
+[server.stream]
+listen_addr = "0.0.0.0:$(port 50051 "$slot")"
+
+[server.p2p]
+listen_addr = "0.0.0.0:$(port 9222 "$slot")"
+
+[server.el]
+sync = true
+listen_addr = "0.0.0.0:$(port 30303 "$slot")"
+
+[server.l1]
+# enabled = true
+# checkpoint = "0x..."                  # a trusted recent finalized beacon block root
+listen_addr = "0.0.0.0:$(port 30304 "$slot")"
+beacon_listen_addr = "0.0.0.0:$(port 9001 "$slot")"
+EOF
+                ;;
+            indexer) cat <<EOF
+
+[indexer]
+data_dir = "data/indexer"
+
+[indexer.stream]
+listen_addr = "127.0.0.1:$(port 50051 "$slot" 100)"
+
+[indexer.p2p]
+listen_addr = "0.0.0.0:$(port 9222 "$slot" 100)"
+
+[indexer.el]
+listen_addr = "0.0.0.0:$(port 30303 "$slot" 100)"
+
+[indexer.l1]
+listen_addr = "0.0.0.0:$(port 30304 "$slot" 100)"
+beacon_listen_addr = "0.0.0.0:$(port 9001 "$slot" 100)"
+EOF
+                ;;
+            balancer) cat <<EOF
+
+[balancer]
+listen_addr = "0.0.0.0:$(port 50060 "$slot")"
+# server_keys = ["replace-me"]          # keys servers register with
+EOF
+                ;;
+            import) cat <<EOF
+
+[importer]
+state_dir = "data/importer"
+EOF
+                ;;
+        esac
+    }
+    local mine=(install -o "$user" -g "$group")
+    if (( ${#chains[@]} )) && [[ ! -f "$root_dir/config.toml" ]]; then
+        "${mine[@]}" -d -m 0700 "$root_dir"
+        "${mine[@]}" -m 0600 /dev/stdin "$root_dir/config.toml" <<'EOF'
+# Shared by every chain under this directory: each <chain>/config.toml extends this file and
+# overrides it. Put what is the same for every chain here, once: keys, R2.
+log_filter = "info"
+
+[node.stream]
+# api_keys = ["replace-me"]             # clients send `authorization: Bearer <key>`
+
+[r2]
+# account_id = "replace-me"
+# access_key_id = "replace-me"
+# secret_access_key = "replace-me"
+EOF
+        ok "created $root_dir/config.toml (shared settings)"
     fi
+    # Slots taken by the chain directories already set up.
+    local used=" " file slot
+    for file in "$root_dir"/*/config.toml; do
+        [[ -f "$file" ]] || continue
+        slot=$(sed -n 's/^# installer port slot: \([0-9]*\)$/\1/p' "$file" | head -n 1)
+        if [[ -n "$slot" ]]; then used+="$slot "; fi
+    done
+    # Programs whose configuration was written now: not started until it is edited.
+    local fresh=" "
+    for chain in "${chains[@]}"; do
+        local dir="$root_dir/$chain" config="$root_dir/$chain/config.toml"
+        "${mine[@]}" -d -m 0700 "$dir"
+        if [[ ! -f "$config" ]]; then
+            slot=0
+            while [[ "$used" == *" $slot "* ]]; do slot=$(( slot + 1 )); done
+            used+="$slot "
+            "${mine[@]}" -m 0600 /dev/stdin "$config" <<EOF
+# $chain: set up by the installer. Shared settings (keys, R2) are in ../config.toml.
+# installer port slot: $slot
+extends = "../config.toml"
+chain = "$chain"
+EOF
+            ok "created $config"
+        fi
+        slot=$(sed -n 's/^# installer port slot: \([0-9]*\)$/\1/p' "$config" | head -n 1)
+        for program in server indexer balancer import; do
+            [[ " ${install[*]} " == *" $program "* ]] || continue
+            local table=$program
+            [[ $program == import ]] && table=importer
+            grep -q "^\[$table\]" "$config" && continue
+            if [[ -z "$slot" ]]; then
+                warn "$config has no installer port slot: add a [$table] section yourself"
+                continue
+            fi
+            section "$program" "$slot" >>"$config"
+            fresh+="$program-$chain "
+            ok "added [$table] to $config"
+        done
+    done
 
     # --- Services ------------------------------------------------------------------------------
-    local services=()
-    for name in "${install[@]}"; do
-        case "$name" in server|indexer|balancer) services+=("$name") ;; esac
-    done
-    local new_config=0 why
-    if (( ${#services[@]} )) && [[ ! -f "$config" ]]; then
-        install -d -m 0700 -o "$user" -g "$(id -gn "$user")" "$config_dir"
-        install -m 0600 -o "$user" -g "$(id -gn "$user")" "$share_dir/config.toml.example" "$config"
-        new_config=1
-        ok "created $config from the example"
-    fi
-    for name in "${services[@]}"; do
-        local unit="op-indexer-$name.service"
-        cat >"$unit_dir/$unit" <<EOF
+    for unit in "${services[@]}"; do
+        program="${unit%%-*}"
+        chain="${unit#*-}"
+        cat >"$unit_dir/op-indexer-$unit.service" <<EOF
 [Unit]
-Description=op-p2p-indexer $name
+Description=op-p2p-indexer $program ($chain)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=$user
-WorkingDirectory=$config_dir
-ExecStart=$bin_dir/$name --config $config
+WorkingDirectory=$root_dir/$chain
+ExecStart=$bin_dir/$program --config $root_dir/$chain/config.toml
 Restart=on-failure
 RestartSec=5
 KillSignal=SIGTERM
 TimeoutStopSec=150
-StandardOutput=append:$config_dir/$name.log
-StandardError=append:$config_dir/$name.log
+StandardOutput=append:$root_dir/$chain/$program.log
+StandardError=append:$root_dir/$chain/$program.log
 LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
 EOF
     done
-    systemctl daemon-reload
-    for name in "${services[@]}"; do
-        local unit="op-indexer-$name.service"
-        systemctl enable "$unit" >/dev/null 2>&1
-        if (( new_config )); then
-            ok "$name: service installed, not started (edit the configuration first)"
-        elif ! why=$(runuser -u "$user" -- "$bin_dir/$name" --config "$config" --check-config 2>&1); then
-            say "${yellow}!${reset} $name: service installed, not started: $config is not valid for it"
-            say "  ${dim}${why%%$'\n'*}${reset}"
-        elif systemctl restart "$unit"; then
-            ok "$name: running ($unit)"
+    if (( ${#services[@]} || ${#stale[@]} )); then
+        systemctl daemon-reload
+    fi
+    local waiting=() why
+    for unit in "${services[@]}"; do
+        program="${unit%%-*}"
+        chain="${unit#*-}"
+        systemctl enable "op-indexer-$unit.service" >/dev/null 2>&1
+        if [[ "$fresh" == *" $unit "* ]]; then
+            waiting+=("$unit")
+        elif ! why=$(runuser -u "$user" -- "$bin_dir/$program" \
+            --config "$root_dir/$chain/config.toml" --check-config 2>&1); then
+            warn "op-indexer-$unit: not started, its configuration does not check:"
+            why=$(grep -m 1 'Error' <<<"$why" || printf '%s' "${why%%$'\n'*}")
+            say "  ${dim}${why}${reset}"
+            waiting+=("$unit")
+        elif systemctl restart "op-indexer-$unit.service"; then
+            ok "op-indexer-$unit running"
         else
-            say "${yellow}!${reset} $name: failed to start; see: systemctl status $unit"
+            warn "op-indexer-$unit failed to start: systemctl status op-indexer-$unit"
         fi
     done
 
     # --- Next steps ----------------------------------------------------------------------------
     say ""
     say "${bold}Done.${reset}"
-    if (( ${#services[@]} )); then
-        if (( new_config )); then
-            say "  1. Edit $config (chain, keys, the [${services[0]}] section)"
-            say "  2. sudo systemctl start ${services[*]/#/op-indexer-}"
-        fi
-        say "  Status:  systemctl status ${services[*]/#/op-indexer-}"
-        say "  Logs:    tail -f $config_dir/${services[0]}.log"
+    if (( ${#waiting[@]} )); then
+        say "  Not started yet: ${waiting[*]/#/op-indexer-}"
+        say "  1. Shared keys and R2: $root_dir/config.toml"
+        say "  2. Each chain:         $root_dir/<chain>/config.toml"
+        say "  3. sudo systemctl start ${waiting[*]/#/op-indexer-}"
     fi
-    say "  Change what is installed, or update: run this installer again."
+    if (( ${#services[@]} )); then
+        say "  Status:  systemctl status 'op-indexer-*'"
+        say "  Logs:    tail -f $root_dir/<chain>/<program>.log"
+    fi
+    say "  Change programs or chains, or update: run this installer again."
 )
 
 main "$@"

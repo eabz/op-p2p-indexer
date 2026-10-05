@@ -1,4 +1,4 @@
-# Copy to ~/indexer/unichain/config.toml and keep private (chmod 600).
+# Copy to ~/.op-indexer/unichain/config.toml and keep private (chmod 600).
 # One file serves all roles for one chain. Values are examples, not production credentials.
 # Paths are relative to their source file. CLI overrides child, then parent, then defaults.
 # Environment settings are not read. Keep reusable [node]/[r2] settings in ../config.toml:

@@ -23,7 +23,7 @@ struct Settings {
 }
 
 /// Loads configuration before startup, installing an immutable role-specific overlay.
-/// Explicit `--config` wins over discovery (`./config.toml`, then `~/indexer/<chain>/config.toml`).
+/// Explicit `--config` wins over discovery (`./config.toml`, then `~/.op-indexer/<chain>/config.toml`).
 /// Normal runs require a TOML file; help and version commands do not.
 ///
 /// # Errors
@@ -242,14 +242,14 @@ fn discover(
     }
     let chain = chain_name(chain)?;
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    if let Some(path) = home.map(|home| home.join("indexer").join(chain).join("config.toml"))
+    if let Some(path) = home.map(|home| home.join(".op-indexer").join(chain).join("config.toml"))
         && path.try_exists()?
     {
         return Ok(Some(path.canonicalize()?));
     }
     ensure!(
         !selected,
-        "--chain requires ~/indexer/<chain>/config.toml; create it or provide --config PATH"
+        "--chain requires ~/.op-indexer/<chain>/config.toml; create it or provide --config PATH"
     );
     Ok(None)
 }

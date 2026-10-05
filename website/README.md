@@ -21,7 +21,7 @@ Open http://localhost:4173. The hero is a labeled simulation, not a connection t
 The displayed command uses the short Pages endpoint:
 
 ```sh
-curl -fsSL https://eabz.github.io/op-p2p-indexer/install.sh | bash
+sudo bash -c "$(curl -fsSL https://eabz.github.io/op-p2p-indexer/install.sh)"
 ```
 
 The installer takes no options; it asks which programs to install in a menu. The copy

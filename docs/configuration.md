@@ -1,7 +1,7 @@
 # Configuration
 
 Each chain uses one private `config.toml`, shared by its roles. The installer writes
-`~/indexer/<chain>/config.toml`, where the chain is `op`, `unichain` or `base`.
+`~/.op-indexer/<chain>/config.toml`, where the chain is `op`, `unichain` or `base`.
 Use `--chain unichain` to select that file or `--config PATH` to select another.
 A normal run requires a configuration file; `--help` and `--version` do not.
 Without explicit selection, discovery checks `./config.toml`, then the chain home file.
@@ -44,12 +44,12 @@ subcommands also check their operation-specific requirements when invoked.
 ## Reuse settings across roles and chains
 
 A chain file can inherit a shared file with `extends = "../config.toml"`. This produces a
-simple layout: `~/indexer/config.toml` holds reusable credentials and tuning, while
-`~/indexer/unichain/config.toml`, `~/indexer/op/config.toml` and `~/indexer/base/config.toml`
+simple layout: `~/.op-indexer/config.toml` holds reusable credentials and tuning, while
+`~/.op-indexer/unichain/config.toml`, `~/.op-indexer/op/config.toml` and `~/.op-indexer/base/config.toml`
 hold each chain's identity, configured roles, paths and ports. The shared file may omit
 `chain`; the final merged chain configuration must supply it.
 
-Shared file, `~/indexer/config.toml`:
+Shared file, `~/.op-indexer/config.toml`:
 
 ```toml
 log_filter = "info"
@@ -67,7 +67,7 @@ access_key_id = "replace-me"
 secret_access_key = "replace-me"
 ```
 
-Chain file, `~/indexer/unichain/config.toml`:
+Chain file, `~/.op-indexer/unichain/config.toml`:
 
 ```toml
 extends = "../config.toml"
