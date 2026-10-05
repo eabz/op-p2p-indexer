@@ -135,7 +135,7 @@ impl Flight {
         jobs: &[Job],
         descriptor: FlightDescriptor,
     ) -> Result<FlightInfo, Status> {
-        let schema = table.schema().map_err(Status::from)?;
+        let schema = table.schema();
         let endpoints = jobs
             .iter()
             .map(|job| {

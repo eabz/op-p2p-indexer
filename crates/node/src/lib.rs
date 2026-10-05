@@ -157,9 +157,9 @@ impl NodeView {
 }
 
 /// What every committed store the node runs on must be.
-pub trait Archive: ArchiveStore + Clone + std::fmt::Debug + Send + Sync + 'static {}
+pub trait Archive: ArchiveStore + std::fmt::Debug {}
 
-impl<A: ArchiveStore + Clone + std::fmt::Debug + Send + Sync + 'static> Archive for A {}
+impl<A: ArchiveStore + std::fmt::Debug> Archive for A {}
 
 /// Runs the node on `archive`, the committed store, which the binary has opened for
 /// `config`'s chain, with the binary's own `tasks` (each named), until a signal arrives or
@@ -391,7 +391,7 @@ impl PipelineInputs {
     fn extend<U, A>(self, pipeline: Pipeline<U, A>) -> Pipeline<U, A>
     where
         U: UnsafeStore + Clone + Send + Sync + 'static,
-        A: ArchiveStore + Clone + Send + Sync + 'static,
+        A: ArchiveStore,
     {
         let pipeline = match self.range {
             Some(range) => pipeline.with_range(range),

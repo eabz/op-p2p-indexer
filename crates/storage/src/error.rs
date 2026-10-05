@@ -245,19 +245,6 @@ impl fmt::Display for InvalidBlockReason {
 }
 
 impl StorageError {
-    /// Whether the error is the block archive's directory being open in another process:
-    /// fjall locks it, so one process uses it at a time.
-    #[must_use]
-    pub const fn is_archive_locked(&self) -> bool {
-        matches!(
-            self,
-            Self::Fjall {
-                source: fjall::Error::Locked,
-                ..
-            }
-        )
-    }
-
     /// Classifies the error: retry it, handle it, or stop for an operator.
     #[must_use]
     pub fn severity(&self) -> Severity {

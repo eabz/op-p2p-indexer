@@ -283,22 +283,12 @@ fn threads(asked: Option<usize>) -> usize {
 
 /// Cancels `cancel` on Ctrl-C or, on Unix, SIGTERM, so the running step stops between chunks.
 async fn cancel_on_signal(cancel: CancellationToken) {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        if let Ok(mut terminate) = signal(SignalKind::terminate()) {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = terminate.recv() => {}
-            }
-        } else {
-            let _signal = tokio::signal::ctrl_c().await;
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _signal = tokio::signal::ctrl_c().await;
-    }
+    // Preserve the importer policy: Ctrl-C remains usable without a SIGTERM handler,
+    // and a signal error still cancels the current step before it starts more work.
+    let _signal = op_indexer_runtime::shutdown_signal_with_policy(
+        op_indexer_runtime::SignalPolicy::CtrlCFallback,
+    )
+    .await;
     info!("stopping; finished chunks are kept");
     cancel.cancel();
 }

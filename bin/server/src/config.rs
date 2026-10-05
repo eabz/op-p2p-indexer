@@ -9,6 +9,7 @@ use op_indexer_balancer::register::{Registration, is_valid_address};
 use op_indexer_chainspec::ChainSpec;
 use op_indexer_chunks::{R2Config, ReadOptions};
 use op_indexer_runtime::env_file;
+use op_indexer_runtime::env_var as var;
 /// Bytes of one ranged chunk read: about a segment (1 MiB compressed).
 const RANGE_BYTES: u64 = 1 << 20;
 /// Ranged reads of one chunk stream in flight at once.
@@ -145,10 +146,6 @@ impl ServerConfig {
             }),
         })
     }
-}
-
-fn var(name: &str) -> Option<String> {
-    env::var(name).ok().filter(|value| !value.is_empty())
 }
 
 fn required(name: &str) -> eyre::Result<String> {

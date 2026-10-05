@@ -8,6 +8,7 @@ use op_indexer_balancer::BalancerConfig;
 use op_indexer_chainspec::{ChainSpec, OP_MAINNET};
 use op_indexer_chunks::{R2Config, ReadOptions};
 use op_indexer_runtime::env_file;
+use op_indexer_runtime::env_var as var;
 
 /// Clear of the stream's default port (50051).
 const DEFAULT_LISTEN_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 50060);
@@ -91,10 +92,6 @@ impl BalancerSettings {
             read: ReadOptions::default(),
         })
     }
-}
-
-fn var(name: &str) -> Option<String> {
-    env::var(name).ok().filter(|value| !value.is_empty())
 }
 
 /// A comma-separated list, without empty items.

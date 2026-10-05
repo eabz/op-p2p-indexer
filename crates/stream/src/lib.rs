@@ -229,7 +229,7 @@ impl Load {
 impl<U, A> StreamServer<U, A>
 where
     U: UnsafeStore + Clone + Send + Sync + 'static,
-    A: ArchiveStore + Clone + Send + Sync + 'static,
+    A: ArchiveStore,
 {
     /// A server reading `unsafe_store` (its blocks and its event stream) and `archive`.
     pub fn new(config: StreamConfig, unsafe_store: U, archive: A) -> Self {

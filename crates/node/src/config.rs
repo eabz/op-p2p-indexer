@@ -1,6 +1,5 @@
 //! Configuration from `OP_INDEXER_*` environment variables.
 
-use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -11,6 +10,7 @@ use op_indexer_chainspec::{ChainSpec, OP_MAINNET};
 use op_indexer_el::{ElConfig, PeerConfig};
 use op_indexer_p2p::{Bootnode, NetworkConfig};
 use op_indexer_primitives::{ChainIdentity, ExecutionPeer};
+use op_indexer_runtime::env_var as var;
 use op_indexer_storage::{ArchiveConfig, StorageConfig, UnsafeConfig};
 use op_indexer_stream::StreamConfig;
 
@@ -430,10 +430,6 @@ fn l1_settings(enabled_by_default: bool) -> eyre::Result<Option<L1Settings>> {
         advertised_addr: parse_var("OP_INDEXER_L1_ADVERTISED_ADDR")?,
         checkpoint,
     }))
-}
-
-fn var(name: &str) -> Option<String> {
-    env::var(name).ok().filter(|value| !value.is_empty())
 }
 
 fn parse_bootnode(bootnode: &str) -> eyre::Result<Bootnode> {

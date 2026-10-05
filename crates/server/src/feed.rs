@@ -20,14 +20,14 @@ use crate::source::ChunkSource;
 const MAX_FEED_KIB: u32 = 16 * 1024;
 /// What one open chunk stream holds, with the server's read options (two ranges of about a
 /// segment in flight, each compressed and decoded, and the decoded batch handed on).
-pub(crate) const STREAM_BYTES: u64 = 32 << 20;
+const STREAM_BYTES: u64 = 32 << 20;
 /// Blocks queued in one feed, whatever their size.
 const FEED_BLOCKS: usize = 4096;
 
 /// A block and the read-ahead places it holds until it is taken.
 type Fed = Result<(ArchivedBlock, [OwnedSemaphorePermit; 2]), StorageError>;
 
-/// The feeds of every reader.
+/// Shared read-ahead and open-stream budgets for independently owned reader feeds.
 #[derive(Debug, Clone)]
 pub(crate) struct Feeds {
     /// KiB of decoded blocks all feeds may hold.

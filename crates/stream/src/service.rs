@@ -52,7 +52,7 @@ impl<U, A> Service<U, A> {
 impl<U, A> proto::stream_server::Stream for Service<U, A>
 where
     U: UnsafeStore + Clone + Send + Sync + 'static,
-    A: ArchiveStore + Clone + Send + Sync + 'static,
+    A: ArchiveStore,
 {
     type SubscribeStream = ReceiverStream<Item>;
 

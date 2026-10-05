@@ -46,7 +46,7 @@ impl TableRows for Table {
         };
         // Check every batch against the same contract advertised by the directory.
         let batch = RecordBatch::try_from_iter_with_nullable(columns)?;
-        if batch.schema() != self.schema()? {
+        if batch.schema() != self.schema() {
             return Err(ArrowError::SchemaError(format!(
                 "{} columns do not match the shared API schema",
                 self.name()

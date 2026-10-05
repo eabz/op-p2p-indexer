@@ -21,31 +21,66 @@ pub fn init_tracing(env_file: Option<&Path>) {
     }
 }
 
-/// Resolves with the signal's name on Ctrl-C (SIGINT) or, on Unix, SIGTERM, which a service
-/// manager (systemd, a container runtime) sends on stop.
+/// How shutdown handling responds when the Unix SIGTERM handler cannot be installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SignalPolicy {
+    /// Refuses to run without both service shutdown signals.
+    RequireTerminate,
+    /// Continues waiting for Ctrl-C when SIGTERM registration fails.
+    CtrlCFallback,
+}
+
+/// Reads a nonempty Unicode environment value; absent, empty and non-Unicode values are absent.
+pub fn env_var(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+/// Resolves with the signal's name on Ctrl-C (SIGINT) or, on Unix, SIGTERM.
 ///
 /// # Errors
 ///
-/// Returns an error if the signal handlers cannot be installed.
+/// Returns an error if either required signal handler cannot be installed.
 pub async fn shutdown_signal() -> eyre::Result<&'static str> {
+    shutdown_signal_with_policy(SignalPolicy::RequireTerminate).await
+}
+
+/// Waits for a shutdown signal using the caller's SIGTERM registration policy.
+/// On non-Unix systems only Ctrl-C is available and the policy has no effect.
+///
+/// # Errors
+///
+/// Returns an error if Ctrl-C fails, or if SIGTERM registration fails under
+/// [`SignalPolicy::RequireTerminate`].
+///
+/// # Cancel safety
+///
+/// Safe to cancel while waiting; no application state is consumed.
+pub async fn shutdown_signal_with_policy(policy: SignalPolicy) -> eyre::Result<&'static str> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
-        let mut terminate =
-            signal(SignalKind::terminate()).wrap_err("failed to listen for SIGTERM")?;
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => {
-                result.wrap_err("failed to listen for Ctrl-C")?;
-                Ok("SIGINT")
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                return tokio::select! {
+                    result = ctrl_c() => result,
+                    _ = terminate.recv() => Ok("SIGTERM"),
+                };
             }
-            _ = terminate.recv() => Ok("SIGTERM"),
+            Err(err) if policy == SignalPolicy::RequireTerminate => {
+                return Err(err).wrap_err("failed to listen for SIGTERM");
+            }
+            Err(_) => {}
         }
     }
     #[cfg(not(unix))]
-    {
-        tokio::signal::ctrl_c()
-            .await
-            .wrap_err("failed to listen for Ctrl-C")?;
-        Ok("SIGINT")
-    }
+    let _ = policy;
+    ctrl_c().await
+}
+
+async fn ctrl_c() -> eyre::Result<&'static str> {
+    tokio::signal::ctrl_c()
+        .await
+        .wrap_err("failed to listen for Ctrl-C")?;
+    Ok("SIGINT")
 }

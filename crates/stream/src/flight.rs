@@ -64,7 +64,7 @@ pub(crate) struct Flight<U, A> {
 impl<U, A> Flight<U, A>
 where
     U: UnsafeStore + Clone + Send + Sync + 'static,
-    A: ArchiveStore + Clone + Send + Sync + 'static,
+    A: ArchiveStore,
 {
     /// The range `query` covers now: `from` the lowest block held when it names none, `to`
     /// lowered to what its cap allows, below a gap above `from`, and to [`MAX_FLIGHT_BLOCKS`]
@@ -126,7 +126,7 @@ where
 
     /// The `FlightInfo` of `query`, resolved.
     fn info(query: Query, descriptor: FlightDescriptor) -> Result<FlightInfo, Status> {
-        let schema = query.table.schema().map_err(Status::from)?;
+        let schema = query.table.schema();
         let info = FlightInfo::new()
             .try_with_schema(&schema)
             .map_err(|err| Status::from(FlightError::Arrow(err)))?;
@@ -236,7 +236,7 @@ fn unimplemented<T>() -> Result<T, Status> {
 impl<U, A> FlightService for Flight<U, A>
 where
     U: UnsafeStore + Clone + Send + Sync + 'static,
-    A: ArchiveStore + Clone + Send + Sync + 'static,
+    A: ArchiveStore,
 {
     type HandshakeStream = Responses<HandshakeResponse>;
     type ListFlightsStream = Responses<FlightInfo>;
@@ -292,7 +292,7 @@ where
         request: Request<FlightDescriptor>,
     ) -> Result<Response<SchemaResult>, Status> {
         let query = Query::try_from(&request.into_inner())?;
-        let schema = query.table.schema().map_err(Status::from)?;
+        let schema = query.table.schema();
         SchemaResult::try_from(SchemaAsIpc::new(&schema, &IpcWriteOptions::default()))
             .map(Response::new)
             .map_err(|err| Status::from(FlightError::Arrow(err)))
@@ -307,7 +307,7 @@ where
             .try_acquire_owned()
             .map_err(|_full| Status::resource_exhausted("too many Flight streams at once"))?;
         let query = self.resolve(query).await?;
-        let schema = query.table.schema().map_err(Status::from)?;
+        let schema = query.table.schema();
         let (batches, rx) = Sink::channel(BATCHES_AHEAD);
         self.tasks
             .spawn(produce(self.source.clone(), query, batches, permit));

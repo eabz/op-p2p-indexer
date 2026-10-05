@@ -2,17 +2,14 @@
 
 use std::sync::Arc;
 
-use arrow_flight::error::FlightError;
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 
 use crate::ticket::Table;
 
 impl Table {
     /// Returns the wire schema for this table.
-    ///
-    /// # Errors
-    /// This static schema construction is infallible; the result preserves the existing API.
-    pub fn schema(self) -> Result<SchemaRef, FlightError> {
+    #[must_use]
+    pub fn schema(self) -> SchemaRef {
         let fields = match self {
             Self::Blocks => vec![
                 Field::new("number", DataType::UInt64, false),
@@ -111,6 +108,6 @@ impl Table {
                 Field::new("data", DataType::Binary, false),
             ],
         };
-        Ok(Arc::new(Schema::new(fields)))
+        Arc::new(Schema::new(fields))
     }
 }

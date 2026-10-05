@@ -33,6 +33,16 @@ evidence unless explicitly identified as checks of the simplification branch.
 - [x] Separate current architecture, this work list and historical decisions; correct stale
   balancer, authentication and bandwidth-reporting descriptions.
 
+### Dead-code and redundancy cleanup
+
+- Removed the unused `StorageError::is_archive_locked` helper and trait bounds already
+  guaranteed by `ArchiveStore`.
+- Shared empty-environment-value handling and signal registration through `runtime`, keeping
+  the importer's SIGINT fallback when SIGTERM registration fails.
+- `Table::schema()` now returns `SchemaRef` directly; callers no longer handle an impossible
+  schema-construction error. Rust consumers must remove `?`/`map_err` on this method; the
+  Arrow wire schemas and compatibility reexports are unchanged.
+
 ### Branch verification
 
 - All four binaries build; strict workspace Clippy, rustdoc, dependency-policy and

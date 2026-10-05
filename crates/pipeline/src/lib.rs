@@ -96,7 +96,7 @@ impl Task {
 impl<U, A> Pipeline<U, A>
 where
     U: UnsafeStore + Clone + Send + Sync + 'static,
-    A: ArchiveStore + Clone + Send + Sync + 'static,
+    A: ArchiveStore,
 {
     /// Creates a pipeline over the two stores.
     ///
