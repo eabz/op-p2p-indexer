@@ -22,6 +22,7 @@ use op_indexer_balancer::register::{
 };
 use op_indexer_chunks::ChunkStore;
 use op_indexer_node::{Config, Defaults, NodeServed, NodeView, PeerCounts, Task};
+use op_indexer_runtime::Startup;
 use op_indexer_server::{ChunkSource, Exporter, R2Archive, R2Chunks};
 use op_indexer_storage::ArchiveStore;
 use op_indexer_storage::archive_store::FjallArchive;
@@ -39,11 +40,11 @@ const INDEX_DIR: &str = "index-build";
 const TAIL_DIR: &str = "tail";
 
 fn main() -> eyre::Result<()> {
-    if op_indexer_runtime::version_requested(env!("CARGO_BIN_NAME"), env!("CARGO_PKG_VERSION")) {
+    let Startup::Run { env_file } =
+        op_indexer_runtime::startup(env!("CARGO_BIN_NAME"), env!("CARGO_PKG_VERSION"))?
+    else {
         return Ok(());
-    }
-    // Before the runtime starts any thread: loading sets environment variables.
-    let env_file = op_indexer_runtime::env_file::load(std::env::args_os().skip(1))?;
+    };
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

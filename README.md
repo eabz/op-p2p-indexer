@@ -112,6 +112,43 @@ clean tree; it commits the new version and tags it. Pushing the tag
 (`git push origin <branch> vX.Y.Z`) builds the archive and publishes the release
 ([`release.yml`](.github/workflows/release.yml)).
 
+## Running in the background
+
+`indexer`, `server` and `balancer` take service commands; with none, a binary runs in the
+foreground as before (in tmux, say).
+
+```bash
+./server start            # detached; appends to server.log, writes server.pid
+./server status           # running or not, pid, uptime, memory, the last log lines
+./server logs -f          # the log, followed (Ctrl-C to leave)
+./server stop             # SIGTERM, waits up to 30 s for a clean shutdown; --force kills after
+./server restart          # stop, then start
+```
+
+- The files are next to the `.env` loaded (`--env-file`), or in the working directory: the
+  log `<binary>.log` (or `--log-file <path>` / `OP_INDEXER_LOG_FILE`), the pid file
+  `<binary>.pid`. The command goes first, before the binary's own arguments
+  (`./server start --export`).
+- `start` reports `started, pid N, log <path>` after 2 s, or, if the node exited at once, its
+  error and the log's last lines. It refuses while a live pid file exists.
+- **Restart on crash and on boot** (Linux, systemd): `./server install-service` writes
+  `op-indexer-server.service` next to the log (`Restart=on-failure`, the working directory, the
+  same arguments, output appended to the same log) and prints the commands to install it; it
+  runs no `systemctl` itself. A node systemd runs is managed with `systemctl`, not
+  `start`/`stop`.
+- **Log size**: the binaries do not rotate their log. Use logrotate with `copytruncate` (the
+  node keeps writing to the same file), e.g. in `/etc/logrotate.d/op-indexer`:
+
+  ```
+  /home/op/node/*.log {
+      size 256M
+      rotate 3
+      copytruncate
+      compress
+      missingok
+  }
+  ```
+
 ## Consuming the data
 
 - **gRPC** (`opindexer.v1.Stream`, [stream.proto](crates/stream/proto/opindexer/v1/stream.proto)):

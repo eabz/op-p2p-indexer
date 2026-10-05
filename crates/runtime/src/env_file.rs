@@ -6,7 +6,7 @@
 //! parsed by `dotenvy`; a variable already set in the process environment wins over the file.
 //! Values are never logged nor put in an error: the file holds secrets (R2 keys, API keys).
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::PathBuf;
 
@@ -32,7 +32,7 @@ const DEFAULT: &str = ".env";
 /// Returns an error naming the file if a named file does not exist or cannot be read, and the
 /// file and line if a line is not `NAME=value`.
 pub fn load(args: impl IntoIterator<Item = OsString>) -> eyre::Result<Option<PathBuf>> {
-    let named = path_arg(args)
+    let named = flag_value(FLAG, args)
         .or_else(|| std::env::var_os(VAR))
         .map(PathBuf::from);
     let explicit = named.is_some();
@@ -55,42 +55,43 @@ pub fn load(args: impl IntoIterator<Item = OsString>) -> eyre::Result<Option<Pat
     }
 }
 
-/// The path after `--env-file`, or in `--env-file=<path>`.
-fn path_arg(args: impl IntoIterator<Item = OsString>) -> Option<OsString> {
+/// The value of `flag` in `args`: the argument after `<flag>`, or the rest of `<flag>=<value>`.
+pub fn flag_value(flag: &str, args: impl IntoIterator<Item = OsString>) -> Option<OsString> {
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
-        if arg == FLAG {
+        if arg == flag {
             return args.next();
         }
-        let inline = arg
-            .to_str()
-            .and_then(|arg| arg.strip_prefix(FLAG)?.strip_prefix('='));
-        if let Some(path) = inline {
-            return Some(path.into());
+        if let Some(value) = inline(&arg, flag) {
+            return Some(value.into());
         }
     }
     None
 }
 
-/// The arguments the binary itself reads: `args` without the env file's flag and its value
-/// (`--env-file <path>` or `--env-file=<path>`), up to any `--`.
-pub fn other_args(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
-    let mut others = Vec::new();
+/// `args` without `flag` and its value (`<flag> <value>` or `<flag>=<value>`).
+pub fn without_flag(flag: &str, args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+    let mut kept = Vec::new();
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
-        if arg == "--" {
-            break;
-        }
-        if arg == FLAG {
+        if arg == flag {
             args.next();
-        } else if !arg.to_str().is_some_and(|arg| {
-            arg.strip_prefix(FLAG)
-                .is_some_and(|rest| rest.starts_with('='))
-        }) {
-            others.push(arg);
+        } else if inline(&arg, flag).is_none() {
+            kept.push(arg);
         }
     }
-    others
+    kept
+}
+
+/// The arguments the binary itself reads: `args` up to any `--`, without the env file's flag
+/// and its value.
+pub fn other_args(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+    without_flag(FLAG, args.into_iter().take_while(|arg| arg != "--"))
+}
+
+/// The value in `arg` if it is `<flag>=<value>`.
+fn inline<'a>(arg: &'a OsStr, flag: &str) -> Option<&'a str> {
+    arg.to_str()?.strip_prefix(flag)?.strip_prefix('=')
 }
 
 /// The 1-based number of the line of `text` where `line` starts: `dotenvy` reports the line's

@@ -1,13 +1,49 @@
 //! Shared process setup independent of node and storage services.
 
-use std::io::{self, Write as _};
-use std::path::Path;
+use std::fmt;
+use std::io::{self, IsTerminal as _, Write as _};
+use std::path::{Path, PathBuf};
 
 use eyre::WrapErr;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::time::ChronoUtc;
 
 pub mod env_file;
+pub mod service;
+
+/// What a node binary does once [`startup`] returns.
+#[derive(Debug)]
+#[must_use]
+pub enum Startup {
+    /// Run in the foreground, with the `.env` file loaded from here, if one was.
+    Run {
+        /// Where the `.env` file was.
+        env_file: Option<PathBuf>,
+    },
+    /// The command line asked for something done already (`--version`, a service command):
+    /// exit.
+    Exit,
+}
+
+/// The start of `indexer`, `server` and `balancer`, before any thread or runtime: answers
+/// `--version` (before the `.env` file, which may not load), loads the `.env` file
+/// ([`env_file::load`]), then runs a service command if the command line names one
+/// ([`service`]).
+///
+/// # Errors
+///
+/// Returns an error if the `.env` file cannot be loaded or the service command fails.
+pub fn startup(binary: &str, version: &str) -> eyre::Result<Startup> {
+    if version_requested(binary, version) {
+        return Ok(Startup::Exit);
+    }
+    // Before any thread starts: loading sets environment variables.
+    let env_file = env_file::load(std::env::args_os().skip(1))?;
+    if service::command(binary, env_file.as_deref())? {
+        return Ok(Startup::Exit);
+    }
+    Ok(Startup::Run { env_file })
+}
 
 /// Prints `<binary> <version>` and returns `true` if the command line asks for the version
 /// (`--version` or `-V`, among [`env_file::other_args`]): the binary then exits at once, before
@@ -17,16 +53,23 @@ pub fn version_requested(binary: &str, version: &str) -> bool {
         .iter()
         .any(|arg| arg == "--version" || arg == "-V");
     if asked {
-        // The answer is the only output; a closed stdout has nothing to show it on.
-        drop(writeln!(io::stdout(), "{binary} {version}"));
+        say(format_args!("{binary} {version}"));
     }
     asked
+}
+
+/// A line for the operator on stdout: a command's answer. A closed stdout has nowhere to show
+/// it.
+pub(crate) fn say(line: fmt::Arguments<'_>) {
+    drop(writeln!(io::stdout(), "{line}"));
 }
 
 /// Initializes logging and reports the environment file without its contents.
 pub fn init_tracing(env_file: Option<&Path>) {
     tracing_subscriber::fmt()
         .with_timer(ChronoUtc::new("%H:%M:%S%.3f".to_owned()))
+        // Colours for a terminal only: a log file (`start`, systemd) gets plain text.
+        .with_ansi(io::stdout().is_terminal())
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )

@@ -13,17 +13,18 @@ use std::path::PathBuf;
 use eyre::WrapErr;
 use op_indexer_balancer::Balancer;
 use op_indexer_chunks::{ChunkSigner, ChunkStore, Manifest};
+use op_indexer_runtime::Startup;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::config::BalancerSettings;
 
 fn main() -> eyre::Result<()> {
-    if op_indexer_runtime::version_requested(env!("CARGO_BIN_NAME"), env!("CARGO_PKG_VERSION")) {
+    let Startup::Run { env_file } =
+        op_indexer_runtime::startup(env!("CARGO_BIN_NAME"), env!("CARGO_PKG_VERSION"))?
+    else {
         return Ok(());
-    }
-    // Before the runtime starts any thread: loading sets environment variables.
-    let env_file = op_indexer_runtime::env_file::load(std::env::args_os().skip(1))?;
+    };
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
