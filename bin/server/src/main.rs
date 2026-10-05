@@ -27,7 +27,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::time::ChronoUtc;
 
-use crate::config::ServerConfig;
+use crate::config::{Chunks, ServerConfig};
 
 /// Log timestamp: UTC time of day with milliseconds, e.g. `13:04:12.345`.
 const LOG_TIME_FORMAT: &str = "%H:%M:%S%.3f";
@@ -78,8 +78,11 @@ async fn run(env_file: Option<PathBuf>) -> eyre::Result<()> {
     );
     let tail = FjallArchive::open(&config.data_dir().join(TAIL_DIR), storage.chain)
         .wrap_err("failed to open the tail")?;
-    let store = ChunkStore::r2(&server.r2, chain, server.read)
-        .wrap_err("failed to set up the R2 chunk store")?;
+    let store = match &server.chunks {
+        Chunks::R2(r2) => ChunkStore::r2(r2, chain, server.read),
+        Chunks::Local { dir, prefix } => ChunkStore::local(dir, prefix, chain, server.read),
+    }
+    .wrap_err("failed to set up the chunk store")?;
     let source = R2Chunks::open(store, config.data_dir().join(INDEX_DIR))
         .await
         .wrap_err("failed to read the R2 manifest")?;

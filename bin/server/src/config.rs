@@ -2,6 +2,7 @@
 //! export mode and the registration with a balancer.
 
 use std::env;
+use std::path::PathBuf;
 
 use eyre::eyre;
 use op_indexer_balancer::register::{Registration, is_valid_address};
@@ -14,13 +15,23 @@ const DEFAULT_EXPORTER_ID: &str = "server";
 /// What the server needs beyond the node's configuration.
 #[derive(Debug)]
 pub(crate) struct ServerConfig {
-    /// The bucket. Only the exporter's key may write.
-    pub(crate) r2: R2Config,
+    /// Where the chunks are.
+    pub(crate) chunks: Chunks,
     pub(crate) read: ReadOptions,
     /// With `--export` or `OP_INDEXER_EXPORT=true`: the exporter's name in the manifest.
     pub(crate) export: Option<String>,
     /// With `OP_INDEXER_BALANCER_URL`: how this server registers with the balancer.
     pub(crate) balancer: Option<Registration>,
+}
+
+/// Where the sealed chunks are read from.
+#[derive(Debug)]
+pub(crate) enum Chunks {
+    /// The bucket. Only the exporter's key may write.
+    R2(R2Config),
+    /// A local directory, as `import export` writes one for tests and the bench, with the
+    /// key prefix inside it.
+    Local { dir: PathBuf, prefix: String },
 }
 
 impl ServerConfig {
@@ -39,6 +50,9 @@ impl ServerConfig {
     ///   `archive`).
     /// - `OP_INDEXER_R2_ENDPOINT`: the S3 endpoint (default
     ///   `https://<account id>.r2.cloudflarestorage.com`).
+    /// - `OP_INDEXER_CHUNKS_DIR`: read the chunks from this local directory instead of R2,
+    ///   under `OP_INDEXER_R2_PREFIX` (for local runs and the bench); the R2 variables are
+    ///   then not needed.
     /// - `OP_INDEXER_EXPORT_ID`: the exporter's name in the manifest (default `server`).
     /// - `OP_INDEXER_BALANCER_URL`: the balancer's gRPC URL (e.g.
     ///   `http://balancer.internal:50060`); set, the server registers there and reports its
@@ -80,14 +94,21 @@ impl ServerConfig {
                 }
             }
         }
-        let r2 = R2Config {
-            account_id: required("OP_INDEXER_R2_ACCOUNT_ID")?,
-            bucket: var("OP_INDEXER_R2_BUCKET")
-                .unwrap_or_else(|| format!("{}-snapshot", chain.name)),
-            prefix: var("OP_INDEXER_R2_PREFIX").unwrap_or_else(|| "archive".to_owned()),
-            access_key_id: required("OP_INDEXER_R2_ACCESS_KEY_ID")?,
-            secret_access_key: required("OP_INDEXER_R2_SECRET_ACCESS_KEY")?,
-            endpoint: var("OP_INDEXER_R2_ENDPOINT"),
+        let prefix = var("OP_INDEXER_R2_PREFIX").unwrap_or_else(|| "archive".to_owned());
+        let chunks = match var("OP_INDEXER_CHUNKS_DIR") {
+            Some(dir) => Chunks::Local {
+                dir: PathBuf::from(dir),
+                prefix,
+            },
+            None => Chunks::R2(R2Config {
+                account_id: required("OP_INDEXER_R2_ACCOUNT_ID")?,
+                bucket: var("OP_INDEXER_R2_BUCKET")
+                    .unwrap_or_else(|| format!("{}-snapshot", chain.name)),
+                prefix,
+                access_key_id: required("OP_INDEXER_R2_ACCESS_KEY_ID")?,
+                secret_access_key: required("OP_INDEXER_R2_SECRET_ACCESS_KEY")?,
+                endpoint: var("OP_INDEXER_R2_ENDPOINT"),
+            }),
         };
         let balancer = var("OP_INDEXER_BALANCER_URL")
             .map(|balancer| {
@@ -102,7 +123,7 @@ impl ServerConfig {
             .transpose()?;
         Ok(Self {
             balancer,
-            r2,
+            chunks,
             read: ReadOptions::default(),
             export: export.then(|| {
                 var("OP_INDEXER_EXPORT_ID").unwrap_or_else(|| DEFAULT_EXPORTER_ID.to_owned())
