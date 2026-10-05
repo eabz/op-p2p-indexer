@@ -8,7 +8,7 @@
 //! Nothing here is verified.
 
 use super::Forks;
-use crate::rows::{BlockRow, Rows, TransactionRow};
+use crate::rows::{BlockRow, L1Info, Rows, TransactionRow};
 
 /// What lacks a field: the header or a transaction type.
 pub(crate) type Row = &'static str;
@@ -50,10 +50,17 @@ pub(crate) fn missing(forks: &Forks, rows: &Rows, mut found: impl FnMut(Missing,
             );
         });
     }
+    // Whether the block of the transactions being read starts an epoch: only then are
+    // deposits after the L1-attributes one users', which mint (an upgrade's mints nothing).
+    let mut epoch_start = false;
     for tx in &rows.transactions {
+        if tx.transaction_index == 0 {
+            epoch_start = tx.kind == Some(op_alloy_consensus::DEPOSIT_TX_TYPE_ID)
+                && L1Info::of(&tx.input).is_some_and(|info| info.sequence == 0);
+        }
         let block = rows.block(tx.block_number);
         let canyon = block.is_some_and(|block| block.timestamp.to::<u64>() >= forks.canyon);
-        transaction(tx, canyon, |row, field| {
+        transaction(tx, canyon, epoch_start, |row, field| {
             found(Missing { row, field }, tx.block_number);
         });
     }
@@ -96,8 +103,13 @@ fn header(forks: &Forks, block: &BlockRow, mut found: impl FnMut(&'static str)) 
 
 /// Calls `found` with the transaction type of `tx` and each field its row lacks, as
 /// `transaction::encode` and `receipt::rebuild` read them. `canyon` is whether its block is at
-/// or after Canyon.
-fn transaction(tx: &TransactionRow, canyon: bool, mut found: impl FnMut(Row, &'static str)) {
+/// or after Canyon, `epoch_start` whether it starts an epoch.
+fn transaction(
+    tx: &TransactionRow,
+    canyon: bool,
+    epoch_start: bool,
+    mut found: impl FnMut(Row, &'static str),
+) {
     let r = ("r", tx.r.is_none());
     let s = ("s", tx.s.is_none());
     let typed_v = ("v", tx.y_parity.is_none() && tx.v.is_none());
@@ -164,8 +176,9 @@ fn transaction(tx: &TransactionRow, canyon: bool, mut found: impl FnMut(Row, &'s
             "deposit",
             &[
                 ("source_hash", tx.source_hash.is_none()),
-                // An upgrade deposit's, which mints nothing, is listed too.
-                ("mint", tx.lacks_mint()),
+                // In an epoch's first block: an upgrade deposit there, which mints nothing, is
+                // listed too.
+                ("mint", epoch_start && tx.lacks_mint()),
                 from,
                 ("deposit_nonce", canyon && tx.deposit_nonce.is_none()),
                 (

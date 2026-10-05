@@ -1283,11 +1283,10 @@ dependencies = [
  "op-indexer-balancer",
  "op-indexer-chainspec",
  "op-indexer-chunks",
- "op-indexer-node",
+ "op-indexer-runtime",
  "tokio",
  "tokio-util",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -3689,10 +3688,9 @@ version = "0.1.6"
 dependencies = [
  "eyre",
  "op-indexer-node",
+ "op-indexer-runtime",
  "op-indexer-storage",
  "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -5197,6 +5195,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "op-indexer-api"
+version = "0.1.6"
+dependencies = [
+ "alloy-primitives",
+ "arrow-flight",
+ "arrow-schema",
+ "subtle",
+ "tonic",
+]
+
+[[package]]
 name = "op-indexer-balancer"
 version = "0.1.6"
 dependencies = [
@@ -5204,9 +5213,9 @@ dependencies = [
  "arrow-flight",
  "fastrand",
  "futures-util",
+ "op-indexer-api",
  "op-indexer-chainspec",
  "op-indexer-chunks",
- "op-indexer-stream",
  "prost",
  "protox",
  "thiserror 2.0.21",
@@ -5285,7 +5294,6 @@ dependencies = [
  "alloy-rlp",
  "bytes",
  "clap",
- "dotenvy",
  "eyre",
  "fastrand",
  "flate2",
@@ -5295,6 +5303,7 @@ dependencies = [
  "op-indexer-chainspec",
  "op-indexer-chunks",
  "op-indexer-primitives",
+ "op-indexer-runtime",
  "reqwest 0.12.28",
  "rustix",
  "serde",
@@ -5303,7 +5312,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "tracing-subscriber",
  "zstd",
 ]
 
@@ -5344,7 +5352,6 @@ name = "op-indexer-node"
 version = "0.1.6"
 dependencies = [
  "alloy-primitives",
- "dotenvy",
  "eyre",
  "op-indexer-chainspec",
  "op-indexer-el",
@@ -5352,6 +5359,7 @@ dependencies = [
  "op-indexer-p2p",
  "op-indexer-pipeline",
  "op-indexer-primitives",
+ "op-indexer-runtime",
  "op-indexer-storage",
  "op-indexer-stream",
  "tokio",
@@ -5415,6 +5423,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "op-indexer-runtime"
+version = "0.1.6"
+dependencies = [
+ "dotenvy",
+ "eyre",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "op-indexer-server"
 version = "0.1.6"
 dependencies = [
@@ -5442,6 +5461,7 @@ dependencies = [
  "alloy-rlp",
  "fastrand",
  "fjall",
+ "futures-util",
  "op-alloy-consensus",
  "op-indexer-primitives",
  "snap",
@@ -5465,11 +5485,11 @@ dependencies = [
  "arrow-schema",
  "bytes",
  "op-alloy-consensus",
+ "op-indexer-api",
  "op-indexer-primitives",
  "op-indexer-storage",
  "prost",
  "protox",
- "subtle",
  "thiserror 2.0.21",
  "tokio",
  "tokio-stream",
@@ -7427,12 +7447,11 @@ dependencies = [
  "op-indexer-chainspec",
  "op-indexer-chunks",
  "op-indexer-node",
+ "op-indexer-runtime",
  "op-indexer-server",
  "op-indexer-storage",
  "tokio",
  "tokio-util",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

@@ -14,7 +14,6 @@
 //!
 //! [`StreamServer`] is the component; it only reads the stores.
 
-mod auth;
 mod convert;
 mod flight;
 mod follower;
@@ -34,11 +33,11 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::info;
 
-pub use crate::auth::ApiKeys;
 use crate::flight::Flight;
 use crate::follower::{Follower, Live};
 use crate::service::Service;
 use crate::source::Source;
+pub use op_indexer_api::ApiKeys;
 
 /// How long open connections and tasks get to end after shutdown begins.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
@@ -70,7 +69,7 @@ pub mod proto {
 /// Flight tickets and descriptors, as the servers read them: for a client of several servers
 /// (the balancer) to hand out tickets any server serves.
 pub mod ticket {
-    pub use crate::flight::{Cap, MAX_FLIGHT_BLOCKS, Query, Table};
+    pub use op_indexer_api::ticket::{Cap, MAX_FLIGHT_BLOCKS, Query, Table};
 }
 
 /// Where the server listens and its limits.

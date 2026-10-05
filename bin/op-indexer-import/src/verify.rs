@@ -46,7 +46,7 @@ pub(crate) use self::fields::{Missing, holes, missing};
 pub(crate) use self::lists::encode_access_list;
 use crate::cli::VerifyArgs;
 use crate::rows::RowsError;
-use crate::state::{Chunk, MIN_SPACE_BYTES, Plan, State, covered};
+use crate::state::{Chunk, MIN_SPACE_BYTES, Plan, State, contiguous_through, covered};
 
 /// Compressed size of the downloaded chunks `verify` (and `fill`) reads at once, whatever the
 /// number of threads; one chunk is always allowed. A chunk takes about twenty times its
@@ -319,7 +319,8 @@ fn prepare_state(
     start: u64,
 ) -> std::io::Result<(Vec<ChunkEntry>, Option<u64>)> {
     let mut sealed = state.read_sealed()?;
-    let through = sealed.last().map(|entry| entry.last);
+    // Not past a gap: the chunks there are not sealed.
+    let through = contiguous_through(&sealed);
     for chunk in plan.chunks().filter(|chunk| covered(through, *chunk)) {
         state.remove_raw(chunk)?;
     }

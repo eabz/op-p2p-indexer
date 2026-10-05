@@ -10,6 +10,8 @@ publish = false
 
 [workspace.dependencies]
 # Internal crates.
+op-indexer-api = { path = "crates/api" }
+op-indexer-runtime = { path = "crates/runtime" }
 op-indexer-balancer = { path = "crates/balancer" }
 op-indexer-chainspec = { path = "crates/chainspec" }
 op-indexer-chunks = { path = "crates/chunks" }

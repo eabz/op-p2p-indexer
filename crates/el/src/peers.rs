@@ -74,6 +74,10 @@ use crate::warn_limit::WarnLimit;
 const KEEP_IDLE: usize = 2;
 /// Shortest time between two warnings about dropped peer reports.
 const DROP_WARN_INTERVAL: Duration = Duration::from_mins(1);
+/// While a range sync round runs, outbound sessions are dialed for up to this many times
+/// `max_sessions`: a sync spreads its requests over every session, and gives them back when the
+/// round ends (unused sessions are released again).
+const SYNC_SESSIONS_FACTOR: usize = 2;
 /// How long an outbound session may go without a request of ours before it is released.
 const IDLE_RELEASE: Duration = Duration::from_mins(10);
 /// A kept session used within this long counts as busy.
@@ -132,6 +136,10 @@ pub enum Report {
     /// The indexer says it holds blocks before Bedrock but answers "not held" for them again
     /// and again: drop it for a long while, so another indexer can take the slot.
     NotHolding(PeerId),
+    /// Whether a range sync round is running: while it is, the peer set dials for
+    /// twice its usual outbound sessions and releases none for being
+    /// unused. Sent again now and then while a round runs, since a report may be dropped.
+    Syncing(bool),
 }
 
 /// The peer set. [`PeerSet::run`] is its task.
@@ -156,6 +164,8 @@ pub(crate) struct PeerSet {
     /// Sessions kept in each direction (`PeerConfig::max_sessions`); one more is dialed for an
     /// op-p2p-indexer on a network they share.
     max_sessions: usize,
+    /// Whether a range sync round runs (`Report::Syncing`).
+    syncing: bool,
     /// The dial for the indexer slot, while it is in [`Self::dialing`].
     slot_dial: Option<PeerId>,
     /// Outbound sessions dialed for (the indexer slot aside): `max_sessions`, or [`KEEP_IDLE`]
@@ -288,6 +298,7 @@ impl PeerSet {
             tasks: JoinSet::new(),
             next_generation: 0,
             max_sessions: config.max_sessions,
+            syncing: false,
             outbound_target: config.max_sessions,
             busy_ticks: 0,
             slot_dial: None,
@@ -429,7 +440,12 @@ impl PeerSet {
         let in_flight = MAX_DIALS_IN_FLIGHT.saturating_sub(self.dialing.len());
         let (sessions, dialing, ctx) = (&self.sessions, &self.dialing, &self.ctx);
         let in_use = |peer: &PeerId| sessions.contains_key(peer) || dialing.contains(peer);
-        let for_anyone = self.outbound_target.saturating_sub(outbound).min(in_flight);
+        let target = if self.syncing {
+            self.max_sessions.saturating_mul(SYNC_SESSIONS_FACTOR)
+        } else {
+            self.outbound_target
+        };
+        let for_anyone = target.saturating_sub(outbound).min(in_flight);
         let mut due = self.schedule.take_due(for_anyone, in_use, |_| true);
         // One slot beyond the ordinary ones is kept for an indexer, only one discovery saw
         // carrying the flag in this run: a peer calling itself one takes that slot at most.
@@ -599,6 +615,10 @@ impl PeerSet {
     fn reported(&mut self, report: Report) {
         let (peer, reason, tell, wait) = match report {
             Report::Served(peer) => return self.save(peer),
+            Report::Syncing(syncing) => {
+                self.syncing = syncing;
+                return;
+            }
             Report::BadData(peer) => {
                 self.schedule.ban(peer);
                 let tell = DisconnectReason::ProtocolBreach;
@@ -663,6 +683,10 @@ impl PeerSet {
     /// so no other peer is dialed in their place; it goes back to `max_sessions` once every
     /// kept session has been busy (used within [`BUSY`]) for [`BUSY_TICKS`] ticks in a row.
     fn release_idle(&mut self) {
+        // A range sync round uses every session it can get.
+        if self.syncing {
+            return;
+        }
         let mut ours: Vec<&SessionHandle> = self
             .sessions
             .values()

@@ -4,8 +4,17 @@
 //! the chunk's temporary file as it arrives and as it travelled, in the service's content
 //! encoding, so memory stays small whatever a chunk holds and nothing is compressed here.
 //! The file gets its final name only once every block of the chunk has arrived (a chunk may
-//! take several requests: an answer may cover less than was asked). Nothing is parsed and
-//! nothing is verified: the request window is spent on the transfer.
+//! take several requests: an answer may cover less than was asked) and its rows are checked
+//! for the fields their forks have ([`fill::lacking`], what the fill's scan lists). The
+//! service's servers do not all answer alike: on Base some leave whole columns out of an answer
+//! (`mix_hash`, deposits' `source_hash`, `mint`, `deposit_nonce`) that the same query asked
+//! again has. A chunk whose rows lack a field is asked for again, up to [`COMPLETE_ANSWERS`]
+//! times, and the most complete answer is kept; the fill takes what it still lacks. Nothing
+//! is verified here.
+//!
+//! `--refetch-incomplete` also reads every chunk on disk not sealed yet, with its fill, and
+//! asks again for those whose rows still lack a field or cannot be read: a new answer
+//! replaces the chunk (and its fill, which belonged to the old one) only if it lacks less.
 //!
 //! A chunk that fails for a reason that may pass (the service busy or limiting, a broken
 //! connection) is fetched again from its start a few times, with capped, jittered backoff.
@@ -13,26 +22,29 @@
 //! requests in flight finish and are written, and the step ends with a summary of what is
 //! missing. It never spins.
 
+use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use eyre::WrapErr;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::{JoinError, JoinSet};
 use tokio::time::{MissedTickBehavior, interval, sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::backoff::Backoff;
+use crate::fill;
 use crate::progress::{self, Rate};
 use crate::source::{Encoding, HyperSync, Meters, SourceError};
 use crate::state::{
-    Chunk, LOW_SPACE_BYTES, MIN_SPACE_BYTES, Plan, State, covered, remove_if_exists, write_atomic,
+    Chunk, LOW_SPACE_BYTES, MIN_SPACE_BYTES, Plan, State, covered, remove_if_exists,
 };
+use crate::verify::Forks;
 
 /// Pieces of an answer waiting to be written, per chunk. A piece is what the HTTP client
 /// hands over at once, tens of kilobytes; with the decoder that finds the cursor a request
@@ -43,6 +55,13 @@ const FILES_PER_REQUEST: u64 = 2;
 /// Open files the process needs besides: the standard streams, the lock, the directories
 /// being listed, the L1 lookup's connections.
 const FILES_BESIDES: u64 = 64;
+/// Answers asked for a chunk while each lacks a field; then the most complete is kept.
+const COMPLETE_ANSWERS: u32 = 8;
+/// Answers in a row no more complete than the best, after which the best is kept: a field no
+/// server has for the chunk (an upgrade deposit's mint, which it has none of).
+const UNIMPROVED_ANSWERS: u32 = 3;
+/// Wait before asking again for a chunk whose answer lacked a field.
+const INCOMPLETE_WAIT: Duration = Duration::from_millis(250);
 
 /// Why a chunk was not downloaded.
 #[derive(Debug, thiserror::Error)]
@@ -51,6 +70,8 @@ enum DownloadError {
     Source(#[from] SourceError),
     #[error("the service answered blocks {from}..{to} without advancing")]
     NoProgress { from: u64, to: u64 },
+    #[error("none of the {answers} answers for blocks {from}..{to} could be read as rows")]
+    Unreadable { from: u64, to: u64, answers: u32 },
     #[error("failed to write the chunk: {0}")]
     Io(#[from] io::Error),
     #[error("write task failed: {0}")]
@@ -116,13 +137,61 @@ impl DownloadError {
                     false
                 }
             }
-            Self::NoProgress { .. } | Self::Task(_) => false,
+            Self::NoProgress { .. } | Self::Unreadable { .. } | Self::Task(_) => false,
+        }
+    }
+}
+
+/// A chunk to download.
+#[derive(Debug, Clone, Copy)]
+struct Job {
+    chunk: Chunk,
+    /// For a chunk on disk asked for again: how many fields its rows lack (`u64::MAX` if they
+    /// cannot be read); an answer replaces it only if it lacks fewer.
+    replaces: Option<u64>,
+}
+
+/// Counts the fields an answer's rows lack, a few answers at a time: the reading is CPU-bound.
+#[derive(Debug, Clone)]
+struct Checker {
+    forks: Forks,
+    permits: Arc<Semaphore>,
+}
+
+impl Checker {
+    fn new(plan: &Plan, threads: usize) -> Self {
+        Self {
+            forks: Forks::new(plan.chain),
+            permits: Arc::new(Semaphore::new(threads)),
+        }
+    }
+
+    /// How many fields the rows of the answer at `path` lack; `u64::MAX` if they cannot be
+    /// read (an answer cut short or garbled is the least complete there is).
+    async fn lacking(&self, path: &Path) -> u64 {
+        let Ok(_permit) = self.permits.acquire().await else {
+            return u64::MAX;
+        };
+        let (forks, path) = (self.forks, path.to_owned());
+        let counted = tokio::task::spawn_blocking(move || fill::lacking(&forks, &path, None)).await;
+        match counted {
+            Ok(Ok((lacking, _))) => lacking,
+            Ok(Err(err)) => {
+                debug!(%err, "an answer that cannot be read");
+                u64::MAX
+            }
+            Err(err) => {
+                debug!(%err, "the check of an answer failed");
+                u64::MAX
+            }
         }
     }
 }
 
 /// Downloads the missing chunks of `plan` from `source`, `requests` at a time, until all are
-/// on disk, `cancel` fires, a chunk fails for good, or the disk is nearly full.
+/// on disk, `cancel` fires, a chunk fails for good, or the disk is nearly full; with
+/// `refetch`, also the chunks on disk whose rows, with their fill, lack a field. Answers are
+/// checked on `threads` threads.
 ///
 /// # Errors
 ///
@@ -133,6 +202,8 @@ pub(crate) async fn run(
     state: &State,
     plan: &Plan,
     requests: usize,
+    threads: usize,
+    refetch: bool,
     cancel: &CancellationToken,
 ) -> eyre::Result<()> {
     let missing = {
@@ -146,15 +217,23 @@ pub(crate) async fn run(
                     // A fill belongs to the download it was fetched for: one left from an
                     // earlier download of the chunk goes before the new one is written.
                     remove_if_exists(&state.fill_path(chunk))?;
-                    missing.push(chunk);
+                    missing.push(Job {
+                        chunk,
+                        replaces: None,
+                    });
                 }
             }
             io::Result::Ok(missing)
         })
         .await??
     };
+    let checker = Checker::new(plan, threads);
+    let mut jobs = missing;
+    if refetch {
+        jobs.extend(incomplete(state, plan, &checker, threads, cancel).await?);
+    }
     let meters = Arc::new(Meters::default());
-    let mut done = Progress::new(&missing, plan.chain.bedrock_block, Arc::clone(&meters));
+    let mut done = Progress::new(&jobs, plan.chain.bedrock_block, Arc::clone(&meters));
     info!(
         chunks = done.total_chunks,
         blocks = done.total_blocks,
@@ -162,7 +241,7 @@ pub(crate) async fn run(
         "download starting"
     );
 
-    let mut queue = missing.into_iter();
+    let mut queue = jobs.into_iter();
     let mut tasks = JoinSet::new();
     let mut tick = interval(progress::INTERVAL);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -172,11 +251,14 @@ pub(crate) async fn run(
     loop {
         while stopped.is_none()
             && tasks.len() < requests
-            && let Some(chunk) = queue.next()
+            && let Some(job) = queue.next()
         {
-            let (source, path) = (source.clone(), state.raw_path(chunk));
+            let (source, checker, state) = (source.clone(), checker.clone(), state.clone());
             let meters = Arc::clone(&meters);
-            tasks.spawn(async move { (chunk, fetch_chunk(&source, &meters, chunk, path).await) });
+            tasks.spawn(async move {
+                let fetched = fetch_chunk(&source, &meters, &checker, &state, job).await;
+                (job, fetched)
+            });
         }
         tokio::select! {
             biased;
@@ -185,8 +267,8 @@ pub(crate) async fn run(
                 break;
             }
             finished = tasks.join_next() => match finished {
-                Some(Ok((chunk, Ok(written)))) => done.chunk_done(chunk, written),
-                Some(Ok((chunk, Err(err)))) => {
+                Some(Ok((job, Ok(fetched)))) => done.chunk_done(job, fetched),
+                Some(Ok((Job { chunk, .. }, Err(err)))) => {
                     warn!(from = chunk.from, to = chunk.to, %err, "chunk failed");
                     stopped.get_or_insert_with(|| {
                         format!("blocks {}..{}: {err}", chunk.from, chunk.to)
@@ -226,6 +308,109 @@ pub(crate) async fn run(
             done.total_chunks
         )),
     }
+}
+
+/// The chunks on disk not sealed yet whose rows, with their fill, lack a field or cannot be
+/// read, to ask for again; read on `threads` threads, with a progress line now and then.
+async fn incomplete(
+    state: &State,
+    plan: &Plan,
+    checker: &Checker,
+    threads: usize,
+    cancel: &CancellationToken,
+) -> eyre::Result<Vec<Job>> {
+    let chunks = {
+        let (state, plan) = (state.clone(), *plan);
+        tokio::task::spawn_blocking(move || -> io::Result<Vec<Chunk>> {
+            let sealed = state.sealed_through()?;
+            let mut chunks = Vec::new();
+            for chunk in plan.chunks().filter(|chunk| !covered(sealed, *chunk)) {
+                if state.raw_path(chunk).try_exists()? {
+                    chunks.push(chunk);
+                }
+            }
+            Ok(chunks)
+        })
+        .await??
+    };
+    let total = chunks.len();
+    info!(
+        chunks = total,
+        "reading the chunks on disk for fields their rows lack"
+    );
+    let read = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let scan = {
+        let (state, forks) = (state.clone(), checker.forks);
+        let (read, stop) = (Arc::clone(&read), Arc::clone(&stop));
+        tokio::task::spawn_blocking(move || {
+            let next = AtomicUsize::new(0);
+            let found = Mutex::new(Vec::new());
+            std::thread::scope(|scope| {
+                for _ in 0..threads {
+                    scope.spawn(|| {
+                        while !stop.load(Ordering::Relaxed)
+                            && let Some(&chunk) = chunks.get(next.fetch_add(1, Ordering::Relaxed))
+                        {
+                            let raw = state.raw_path(chunk);
+                            let fill = state.fill_path(chunk);
+                            let replaces = match fill::lacking(&forks, &raw, Some(&fill)) {
+                                Ok((_, 0)) => None,
+                                // What the download alone lacks, which a new one must beat.
+                                Ok((alone, _)) => Some(alone),
+                                Err(err) => {
+                                    warn!(
+                                        from = chunk.from,
+                                        to = chunk.to,
+                                        %err,
+                                        "a chunk on disk cannot be read: downloading it again"
+                                    );
+                                    Some(u64::MAX)
+                                }
+                            };
+                            if let Some(replaces) = replaces
+                                && let Ok(mut found) = found.lock()
+                            {
+                                found.push(Job {
+                                    chunk,
+                                    replaces: Some(replaces),
+                                });
+                            }
+                            read.fetch_add(1, Ordering::Relaxed);
+                        }
+                    });
+                }
+            });
+            let mut found = found.into_inner().unwrap_or_default();
+            found.sort_unstable_by_key(|job| job.chunk.from);
+            found
+        })
+    };
+    tokio::pin!(scan);
+    let mut tick = interval(progress::INTERVAL);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let found = loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled(), if !stop.load(Ordering::Relaxed) => {
+                stop.store(true, Ordering::Relaxed);
+            }
+            found = &mut scan => break found?,
+            _ = tick.tick() => {
+                info!(chunks = read.load(Ordering::Relaxed), of = total, "reading the chunks on disk");
+            }
+        }
+    };
+    eyre::ensure!(
+        !cancel.is_cancelled(),
+        "stopped while reading the chunks on disk: run `download` again"
+    );
+    info!(
+        chunks = total,
+        incomplete = found.len(),
+        "chunks on disk read: those lacking a field are asked for again"
+    );
+    Ok(found)
 }
 
 /// The blocks of one era of the chain, before the Bedrock block or from it on: they differ
@@ -285,14 +470,21 @@ struct Progress {
     wire_rate: Rate,
     /// Microseconds of decoding, so its recent share of a core can be told.
     decode_rate: Rate,
+    /// Chunks asked for more than once for an answer lacking a field, and those kept lacking
+    /// one (the fill takes the rest).
+    retried: usize,
+    incomplete: usize,
+    /// Chunks on disk asked for again whose answer replaced them, and those kept as they were.
+    replaced: usize,
+    unreplaced: usize,
 }
 
 impl Progress {
-    fn new(missing: &[Chunk], bedrock_block: u64, meters: Arc<Meters>) -> Self {
+    fn new(jobs: &[Job], bedrock_block: u64, meters: Arc<Meters>) -> Self {
         let mut progress = Self {
             started: Instant::now(),
-            total_chunks: missing.len(),
-            total_blocks: missing.iter().map(|chunk| chunk.blocks()).sum(),
+            total_chunks: jobs.len(),
+            total_blocks: jobs.iter().map(|job| job.chunk.blocks()).sum(),
             chunks: 0,
             bedrock_block,
             eras: [Era::new(), Era::new()],
@@ -300,10 +492,14 @@ impl Progress {
             blocks_rate: Rate::new(),
             wire_rate: Rate::new(),
             decode_rate: Rate::new(),
+            retried: 0,
+            incomplete: 0,
+            replaced: 0,
+            unreplaced: 0,
         };
-        for chunk in missing {
-            let era = progress.era(*chunk);
-            era.left_blocks = era.left_blocks.saturating_add(chunk.blocks());
+        for job in jobs {
+            let era = progress.era(job.chunk);
+            era.left_blocks = era.left_blocks.saturating_add(job.chunk.blocks());
         }
         progress
     }
@@ -318,12 +514,35 @@ impl Progress {
         }
     }
 
-    const fn chunk_done(&mut self, chunk: Chunk, disk_bytes: u64) {
+    fn chunk_done(&mut self, job: Job, fetched: Fetched) {
+        let chunk = job.chunk;
+        let kept = fetched.bytes > 0;
         self.chunks = self.chunks.saturating_add(1);
+        self.retried = self
+            .retried
+            .saturating_add(usize::from(fetched.answers > 1));
+        self.incomplete = self
+            .incomplete
+            .saturating_add(usize::from(kept && fetched.lacking > 0));
+        if job.replaces.is_some() {
+            if kept {
+                self.replaced = self.replaced.saturating_add(1);
+            } else {
+                self.unreplaced = self.unreplaced.saturating_add(1);
+            }
+        }
+        if kept && fetched.lacking > 0 {
+            debug!(
+                from = chunk.from,
+                to = chunk.to,
+                lacking = fetched.lacking,
+                "chunk kept lacking fields"
+            );
+        }
         let era = self.era(chunk);
         era.left_blocks = era.left_blocks.saturating_sub(chunk.blocks());
         era.blocks = era.blocks.saturating_add(chunk.blocks());
-        era.bytes = era.bytes.saturating_add(disk_bytes);
+        era.bytes = era.bytes.saturating_add(fetched.bytes);
     }
 
     fn blocks(&self) -> u64 {
@@ -382,23 +601,96 @@ impl Progress {
             disk_bytes_per_block = self.disk_bytes().checked_div(self.blocks()),
             blocks_per_sec = self.blocks() / secs,
             secs,
+            retried_chunks = self.retried,
+            incomplete_chunks = self.incomplete,
+            replaced_chunks = self.replaced,
+            unreplaced_chunks = self.unreplaced,
             "download ended"
         );
         missing
     }
 }
 
-/// Fetches one chunk into the file at `path`, starting over when an attempt fails for a
-/// reason that may pass. Returns the size of the file written.
+/// What fetching one chunk gave.
+#[derive(Debug, Clone, Copy)]
+struct Fetched {
+    /// Size of the answer kept; zero if none was.
+    bytes: u64,
+    /// Fields the chunk's rows lack, as kept.
+    lacking: u64,
+    /// Answers asked for.
+    answers: u32,
+}
+
+/// Fetches `job`'s chunk, asking again while its answer lacks a field (up to
+/// [`COMPLETE_ANSWERS`], or [`UNIMPROVED_ANSWERS`] in a row no better). The chunk's file
+/// always holds the most complete answer so far: an answer replaces it, and its fill, which
+/// belonged to the one before, only if it lacks fewer fields.
 async fn fetch_chunk(
     source: &HyperSync,
     meters: &Meters,
+    checker: &Checker,
+    state: &State,
+    job: Job,
+) -> Result<Fetched, DownloadError> {
+    let path = state.raw_path(job.chunk);
+    // A killed run's is removed when the directory is opened.
+    let answer = path.with_extension("answer.tmp");
+    let mut fetched = Fetched {
+        bytes: 0,
+        lacking: job.replaces.unwrap_or(u64::MAX),
+        answers: 0,
+    };
+    let mut unimproved = 0_u32;
+    while fetched.answers < COMPLETE_ANSWERS && unimproved < UNIMPROVED_ANSWERS {
+        if fetched.answers > 0 {
+            sleep(INCOMPLETE_WAIT).await;
+        }
+        let bytes = fetch_answer(source, meters, job.chunk, &answer).await?;
+        fetched.answers = fetched.answers.saturating_add(1);
+        let lacking = checker.lacking(&answer).await;
+        // An answer that cannot be read (`u64::MAX`) is never kept.
+        if lacking < fetched.lacking {
+            let (answer, path, fill) = (answer.clone(), path.clone(), state.fill_path(job.chunk));
+            tokio::task::spawn_blocking(move || {
+                // The fill first: a crash between leaves the old answer without one, which
+                // the fill makes again.
+                remove_if_exists(&fill)?;
+                fs::rename(&answer, &path)
+            })
+            .await??;
+            (fetched.bytes, fetched.lacking) = (bytes, lacking);
+            unimproved = 0;
+            if lacking == 0 {
+                break;
+            }
+        } else {
+            tokio::fs::remove_file(&answer).await?;
+            unimproved = unimproved.saturating_add(1);
+        }
+    }
+    // A new chunk with no answer that could be read is not on disk: the run says so.
+    if job.replaces.is_none() && fetched.bytes == 0 {
+        return Err(DownloadError::Unreadable {
+            from: job.chunk.from,
+            to: job.chunk.to,
+            answers: fetched.answers,
+        });
+    }
+    Ok(fetched)
+}
+
+/// Fetches one answer for `chunk` into the file at `path`, starting over when an attempt
+/// fails for a reason that may pass. Returns the size of the file written.
+async fn fetch_answer(
+    source: &HyperSync,
+    meters: &Meters,
     chunk: Chunk,
-    path: PathBuf,
+    path: &Path,
 ) -> Result<u64, DownloadError> {
     let mut backoff = Backoff::new();
     loop {
-        match attempt_chunk(source, meters, chunk, &path).await {
+        match attempt_chunk(source, meters, chunk, path).await {
             Err(err) if err.may_pass() => {
                 let attempt = backoff.attempt();
                 let Some(wait) = backoff.next() else {
@@ -417,9 +709,9 @@ async fn fetch_chunk(
     }
 }
 
-/// One attempt at a chunk: every answer is passed to a writer as it arrives, and the file is
-/// given its final name only if all of them arrived. The file starts with one byte naming
-/// the content encoding, which every answer of the chunk must then have.
+/// One attempt at a chunk: every answer is passed to a writer as it arrives, and the file at
+/// `path` is kept only if all of them arrived. The file starts with one byte naming the
+/// content encoding, which every answer of the chunk must then have.
 async fn attempt_chunk(
     source: &HyperSync,
     meters: &Meters,
@@ -479,15 +771,15 @@ async fn attempt_chunk(
     }
 }
 
-/// Writes the pieces of a chunk to its file as they arrive. The file gets its final name only
-/// if `complete` is signalled after the last piece. Returns the file's size. Blocking.
+/// Writes the pieces of a chunk to the file at `path` as they arrive, synced, and keeps it
+/// only if `complete` is signalled after the last piece. Returns the file's size. Blocking.
 fn write_chunk(
     path: &Path,
     mut pieces: mpsc::Receiver<Bytes>,
     complete: oneshot::Receiver<()>,
 ) -> io::Result<u64> {
     let mut written = 0_u64;
-    write_atomic(path, |file| {
+    let result = File::create(path).and_then(|file| {
         let mut out = BufWriter::new(file);
         while let Some(piece) = pieces.blocking_recv() {
             out.write_all(&piece)?;
@@ -496,7 +788,14 @@ fn write_chunk(
         complete.blocking_recv().map_err(|_abandoned| {
             io::Error::new(io::ErrorKind::Interrupted, "the chunk was not completed")
         })?;
-        out.flush()
-    })?;
+        out.into_inner()
+            .map_err(io::IntoInnerError::into_error)?
+            .sync_all()
+    });
+    if let Err(err) = result {
+        // Best effort: a leftover is removed when the directory is next opened.
+        let _removed = fs::remove_file(path);
+        return Err(err);
+    }
     Ok(written)
 }

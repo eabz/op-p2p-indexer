@@ -1,16 +1,17 @@
 # Stream spec (`crates/stream`)
 
-Status: **built, not run**. It compiles and passes the lints; no consumer has subscribed yet,
-and the unsafe store's events have not been read on a live node. Decision:
-[roadmap.md](roadmap.md), 2026-10-04, "The node is a source of data, streamed out".
+Status: **implemented**, including Arrow Flight and optional API-key authentication.
+See [roadmap.md](roadmap.md) for current validation status. The original design decision is
+in [decisions.md](decisions.md), 2026-10-04, "The node is a source of data, streamed out".
 
 The `stream` crate serves the chain to consumers over gRPC: history from the block archive,
 then the live chain from the unsafe store, each block with its status, and reorgs and status
 changes as their own messages. It only reads: the archive, the unsafe store, and the unsafe
-store's event stream. It depends on `primitives` and `storage` only.
+store's event stream. It reads through `primitives` and `storage`; `api` holds shared authentication, tickets and schemas.
 
-**There is no authentication and no TLS.** Anyone who can reach the port can subscribe. The
-binary listens on `127.0.0.1` by default (section 5).
+**API keys are optional; TLS is not built in.** When keys are configured, gRPC and Flight
+require `authorization: Bearer <key>`. With no keys configured, access is unauthenticated.
+The binary listens on `127.0.0.1` by default (section 5).
 
 ## 1. Service
 
@@ -148,18 +149,20 @@ execution network disabled no receipts come, and `Heads.receipts` says so.
 
 | Variable | Default | What |
 |---|---|---|
-| `OP_INDEXER_STREAM_LISTEN_ADDR` | `127.0.0.1:50051` | gRPC listen address: local only, since there is no authentication. |
+| `OP_INDEXER_STREAM_LISTEN_ADDR` | `127.0.0.1:50051` | Shared gRPC/Flight listen address; local by default. |
 | `OP_INDEXER_STREAM_MAX_SUBSCRIPTIONS` | `64` | Concurrent subscriptions (at most `Semaphore::MAX_PERMITS`; more is lowered to it). |
 | `OP_INDEXER_STREAM_MAX_FLIGHTS` | `8` | Concurrent Arrow Flight `DoGet` streams (section 6), with the same ceiling. |
+| `OP_INDEXER_STREAM_API_KEYS` | unset | Comma-separated bearer keys; unset disables authentication. |
 
-Set it to `0.0.0.0:50051` to expose the stream, knowingly: there is no authentication.
+Use API keys or a suitable proxy when exposing the listener beyond localhost.
 
 ## 6. Arrow Flight: bulk history
 
 Bulk history for data pipelines and analytics (DuckDB, Polars, Spark, warehouses), as columnar
 record batches over Arrow Flight. It is served by the same server, on the same port, as a
 second gRPC service (`crates/stream/src/flight.rs`). The live tail with reorgs stays on the
-subscription; Flight serves ranges. Same rules: no authentication, no TLS.
+subscription; Flight serves ranges. The same API-key configuration applies to both services;
+TLS termination remains external.
 
 **Crates.** `arrow-flight` 60 (Apache, Apache-2.0), with no default features: no Flight SQL,
 no TLS, no CLI. It uses tonic 0.14 and prost 0.14, the stream's, so the binary holds one tonic.
@@ -288,9 +291,10 @@ chain id column: one node serves one chain. A block without receipts adds no row
 | `topic0` … `topic3` | `FSB(32)?` |
 | `data` | `Binary` |
 
-**Not run.** No Flight client has read from a node yet.
+**Validation:** local Flight benchmarks are recorded in [serving.md](serving.md); production
+fleet validation remains in [roadmap.md](roadmap.md).
 
 ## 7. Not built
 
-Log filters by address and topic, authentication and TLS, compression, and for Flight:
+Log filters by address and topic, built-in TLS, compression, and for Flight:
 `DoPut`, `DoExchange`, Flight SQL, and total row counts in `FlightInfo`.

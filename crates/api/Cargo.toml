@@ -1,0 +1,17 @@
+[package]
+name = "op-indexer-api"
+description = "Shared authentication and Flight ticket contract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+alloy-primitives.workspace = true
+arrow-flight.workspace = true
+arrow-schema.workspace = true
+subtle.workspace = true
+tonic.workspace = true
+
+[lints]
+workspace = true

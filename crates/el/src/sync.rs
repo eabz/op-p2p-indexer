@@ -8,9 +8,15 @@
 //! ```
 //!
 //! - **Walk** (`headers`). The only trusted input is the anchor: the hash of the last block
-//!   of the range. Headers are fetched in pages going down from it and each must be the block
-//!   its child names as parent. Every [`SEGMENT_BLOCKS`]-th hash is kept as a checkpoint and
-//!   reported, so the binary can save it: a restart continues from the lowest one.
+//!   of the range. A *skeleton* is fetched first, one page at a time: the hash of every
+//!   1,024th block going down, a thousand of them per request (`GetBlockHeaders` with a skip).
+//!   Those are claims. The 1,024-block gaps below each are then fetched in parallel on every
+//!   session, each as a hash chain down from its claimed top, and *linked* from the top down:
+//!   a gap is accepted only once its top is the hash the gap above it names as parent (the
+//!   anchor for the first), so the trust still runs from the anchor down; a gap fetched from a
+//!   wrong claim is fetched again from the trusted hash. Every [`SEGMENT_BLOCKS`]-th hash is
+//!   kept as a checkpoint and reported as it is linked, so the binary can save it: a restart
+//!   continues from the lowest one.
 //! - **Fetch** (`segment`). Once the checkpoints reach the first block, the segments between
 //!   them are fetched in ascending order, a few at a time on different sessions, and handed on
 //!   strictly in order.
@@ -28,8 +34,9 @@
 //!
 //! Does not open sessions or choose peers to dial (`peers`), and does not store anything: the
 //! pipeline stores the batches and the binary saves the checkpoints. It uses the sessions the
-//! receipts fetcher uses, with one request at a time on each; the session routes answers by
-//! request id, so a request for a new block's receipts is not queued behind it.
+//! receipts fetcher uses, with a few requests at a time on each (`schedule`); the session
+//! routes answers by request id, so a request for a new block's receipts is not queued behind
+//! them. Faster peers are given work first.
 //!
 //! The headers of the range are downloaded twice, once by the walk and once per segment: the
 //! walk runs from the top and the fetch from the bottom, and holding the walk's headers until
@@ -64,9 +71,16 @@ use crate::session::{RequestError, SessionHandle};
 /// Blocks between two checkpoints: what one session fetches as a unit and the size of a batch
 /// handed to the pipeline. A segment is held in memory until it is handed on.
 const SEGMENT_BLOCKS: u64 = 256;
-/// Segments fetched or waiting to be handed on at once. Bounds memory, and how far the fetch
-/// runs ahead of a pipeline that stores slowly.
-const MAX_SEGMENTS_AHEAD: usize = 8;
+/// Segments fetched or waiting to be handed on at once: enough for every session to keep a
+/// few requests in flight. Bounds how far the fetch runs ahead of a pipeline that stores
+/// slowly; [`MAX_READY_BYTES`] bounds the memory.
+const MAX_SEGMENTS_AHEAD: usize = 32;
+/// Bytes of verified segments waiting to be handed on, past which no segment is started: a
+/// dozen OP Mainnet segments (about 19 MB each), hundreds of Unichain ones.
+const MAX_READY_BYTES: usize = 256 << 20;
+/// Gaps of the walk fetched or waiting to be linked at once, below the lowest verified block:
+/// 256 of 1,024 blocks. Each kept gap holds a handful of hashes.
+const MAX_GAPS_AHEAD: u64 = 256;
 /// How often progress is logged, and how often the sessions are looked at again when nothing
 /// else happens (a peer's announced range can change without a session opening or ending).
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
@@ -159,7 +173,10 @@ pub(crate) async fn run(
         let Some(mut plan) = plan else { break };
         let ended = std::mem::replace(&mut plan.ended, oneshot::channel().0);
         let syncer = Syncer::new(chain, peers.clone(), plan, blocks.clone(), verified.clone());
-        let Some(end) = syncer.run(&cancel).await? else {
+        peers.report(Report::Syncing(true));
+        let ended_as = syncer.run(&cancel).await;
+        peers.report(Report::Syncing(false));
+        let Some(end) = ended_as? else {
             break;
         };
         // The planner may have stopped waiting: nothing to tell.
@@ -187,8 +204,18 @@ struct Syncer {
     /// Whether the checkpoints reach down to the first segment. Never unset: the walk is done
     /// once, however far the fetch has got since.
     walked: bool,
-    /// Whether a page of the walk is being fetched.
-    walking: bool,
+    /// Claimed hashes of every 1,024th block below where the walk started, from the skeleton.
+    skeleton: BTreeMap<BlockNumber, B256>,
+    /// Where the next page of the skeleton starts; `None` once it reaches the first block.
+    skeleton_from: Option<BlockRef>,
+    /// Whether a page of the skeleton is being fetched.
+    skeleton_busy: bool,
+    /// Gaps of the walk fetched and not yet linked, by top.
+    gaps: BTreeMap<BlockNumber, Gap>,
+    /// Gaps being fetched, by top.
+    gaps_busy: HashSet<BlockNumber>,
+    /// Bytes of the segments in `ready`.
+    ready_bytes: usize,
     /// First block not yet assigned to a segment.
     next_assign: BlockNumber,
     /// First block not yet handed on.
@@ -218,6 +245,17 @@ struct Syncer {
     given_up: Option<RoundEnd>,
 }
 
+/// A gap of the walk, fetched as a hash chain down from a claimed top.
+#[derive(Debug)]
+struct Gap {
+    /// The top's hash it was fetched from: the gap is linked only if it is the trusted one.
+    top_hash: B256,
+    /// Its checkpoints, highest first (see `headers::walk`).
+    checkpoints: Vec<BlockRef>,
+    /// The parent of its lowest block, when it reaches the first block of the range.
+    below: Option<BlockRef>,
+}
+
 /// Consecutive blocks ending at a checkpoint.
 #[derive(Debug, Clone, Copy)]
 struct Segment {
@@ -228,8 +266,10 @@ struct Segment {
 /// Something for one session to fetch.
 #[derive(Debug, Clone, Copy)]
 enum Job {
-    /// A page of the walk, down from this block.
-    Walk(BlockRef),
+    /// A page of the skeleton, down from this block.
+    Skeleton(BlockRef),
+    /// A gap of the walk, down from this block.
+    Gap(BlockRef),
     Segment(Segment),
 }
 
@@ -238,13 +278,17 @@ enum Job {
 struct Done {
     peer: PeerId,
     result: JobResult,
+    /// How long the job took, for the peer's speed.
+    took: Duration,
 }
 
 #[derive(Debug)]
 enum JobResult {
-    /// A page of the walk from this block, with the checkpoints it verified and, once it
+    /// A page of the skeleton from this block: the claimed hashes below it.
+    Skeleton(BlockRef, Result<Vec<BlockRef>, Failure>),
+    /// A gap of the walk from this block, with the checkpoints it verified and, once it
     /// reaches the first block, that block's parent.
-    Walk(BlockRef, Result<(Vec<BlockRef>, Option<BlockRef>), Failure>),
+    Gap(BlockRef, Result<(Vec<BlockRef>, Option<BlockRef>), Failure>),
     Segment(Segment, Result<Vec<EncodedBlock>, Failure>),
 }
 
@@ -324,7 +368,12 @@ impl Syncer {
             saved,
             checkpoints,
             walked: false,
-            walking: false,
+            skeleton: BTreeMap::new(),
+            skeleton_from: None,
+            skeleton_busy: false,
+            gaps: BTreeMap::new(),
+            gaps_busy: HashSet::new(),
+            ready_bytes: 0,
             next_assign: first,
             next_emit: first,
             waiting: BTreeMap::new(),
@@ -340,6 +389,7 @@ impl Syncer {
             given_up: None,
         };
         syncer.walked = syncer.walk_from().is_none();
+        syncer.skeleton_from = syncer.walk_from();
         // Checkpoints below the anchor were verified from it: a peer served it. A range short
         // enough to need no walk has none, and learns it from its first verified segment.
         syncer.anchor_served = syncer.checkpoints.len() > 1;
@@ -395,7 +445,11 @@ impl Syncer {
                         None => std::future::pending().await,
                     }
                 } => {}
-                _ = progress.tick() => self.log_progress(),
+                _ = progress.tick() => {
+                    self.log_progress();
+                    // A report may have been dropped: the peer set hears it again.
+                    self.peers.report(Report::Syncing(true));
+                }
             }
             if self.is_complete() {
                 info!(
@@ -512,7 +566,13 @@ impl Syncer {
     fn dispatch(&mut self) {
         let sessions = self.peers.sessions();
         let now = Instant::now();
-        for session in sessions.iter() {
+        // The fastest peers first, so they get the work when there is little.
+        let mut order: Vec<(f64, &SessionHandle)> = sessions
+            .iter()
+            .map(|session| (self.schedule.rate(&session.status().peer_id), session))
+            .collect();
+        order.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+        for (_, session) in order {
             let peer = session.status().peer_id;
             if !self.schedule.is_free(peer, now) {
                 continue;
@@ -523,16 +583,22 @@ impl Syncer {
             self.schedule.started(peer);
             let (session, first, canyon_time) = (session.clone(), self.first, self.canyon_time);
             let job = async move {
+                let started = Instant::now();
                 let result = match job {
-                    Job::Walk(start) => {
-                        JobResult::Walk(start, headers::walk(&session, start, first).await)
+                    Job::Skeleton(from) => {
+                        JobResult::Skeleton(from, headers::skeleton(&session, from, first).await)
                     }
+                    Job::Gap(top) => JobResult::Gap(top, headers::walk(&session, top, first).await),
                     Job::Segment(segment) => JobResult::Segment(
                         segment,
                         segment::fetch(&session, segment, canyon_time).await,
                     ),
                 };
-                Done { peer, result }
+                Done {
+                    peer,
+                    result,
+                    took: started.elapsed(),
+                }
             };
             self.jobs.spawn(job.in_current_span());
         }
@@ -544,17 +610,41 @@ impl Syncer {
     /// peer holds, or nothing to do right now.
     fn next_job(&mut self, session: &SessionHandle) -> Option<Job> {
         let holds = |first: BlockNumber, last: BlockNumber| self.serves(session, first, last);
-        if let Some(start) = self.walk_from() {
-            // One page at a time: each starts where the one before ended.
-            let page_first = start
-                .number
-                .saturating_sub(HEADERS_PER_REQUEST - 1)
-                .max(self.first);
-            if self.walking || !holds(page_first, start.number) {
-                return None;
+        if let Some(lowest) = self.walk_from() {
+            // The skeleton first, one page at a time: each starts where the one before ended.
+            if !self.skeleton_busy
+                && let Some(from) = self.skeleton_from
+                && holds(
+                    from.number
+                        .saturating_sub(HEADERS_PER_REQUEST)
+                        .max(self.first),
+                    from.number,
+                )
+            {
+                self.skeleton_busy = true;
+                return Some(Job::Skeleton(from));
             }
-            self.walking = true;
-            return Some(Job::Walk(start));
+            // Then a gap: the one below the lowest verified block, from its trusted hash, or one
+            // further down from its claimed top, within reach of the linking.
+            let reach = lowest
+                .number
+                .saturating_sub(MAX_GAPS_AHEAD.saturating_mul(HEADERS_PER_REQUEST));
+            let claimed = self
+                .skeleton
+                .range(reach..lowest.number)
+                .rev()
+                .map(|(number, hash)| BlockRef {
+                    number: *number,
+                    hash: *hash,
+                });
+            let top = std::iter::once(lowest).chain(claimed).find(|top| {
+                let gap_first = self.gap_first(top.number);
+                !self.gaps.contains_key(&top.number)
+                    && !self.gaps_busy.contains(&top.number)
+                    && holds(gap_first, top.number)
+            })?;
+            self.gaps_busy.insert(top.number);
+            return Some(Job::Gap(top));
         }
         let waiting = self
             .waiting
@@ -565,7 +655,7 @@ impl Syncer {
             self.waiting.remove(&segment.first);
             return Some(Job::Segment(segment));
         }
-        if self.outstanding >= MAX_SEGMENTS_AHEAD {
+        if self.outstanding >= MAX_SEGMENTS_AHEAD || self.ready_bytes >= MAX_READY_BYTES {
             return None;
         }
         let (number, hash) = self.checkpoints.range(self.next_assign..).next()?;
@@ -612,30 +702,27 @@ impl Syncer {
     /// Handles the end of one job. Returns `false` when the sync has to stop: the node is
     /// shutting down or nothing takes its output.
     async fn finished(&mut self, done: Done, cancel: &CancellationToken) -> Result<bool, ElError> {
-        let Done { peer, result } = done;
+        let Done { peer, result, took } = done;
         let (first, last, failure) = match result {
-            JobResult::Walk(start, Ok((checkpoints, below))) => {
-                self.walking = false;
-                self.anchor_served = true;
-                if below.is_some_and(|below| !self.linked(below)) {
-                    return Ok(true);
-                }
-                self.succeeded(peer);
-                debug!(%peer, from = start.number, checkpoints = checkpoints.len(), "headers verified");
-                for checkpoint in &checkpoints {
-                    self.checkpoints.insert(checkpoint.number, checkpoint.hash);
-                }
-                if self.walk_from().is_none() {
-                    self.walked = true;
-                    info!(
-                        segments = self.checkpoints.len(),
-                        "header chain verified down to the first block; fetching blocks"
-                    );
-                }
-                return Ok(send(&self.saved, checkpoints, "checkpoints", cancel).await);
+            JobResult::Skeleton(from, Ok(claims)) => {
+                self.skeleton_fetched(peer, from, &claims, took);
+                return Ok(true);
+            }
+            JobResult::Gap(top, Ok((checkpoints, below))) => {
+                self.gap_fetched(
+                    peer,
+                    top,
+                    Gap {
+                        top_hash: top.hash,
+                        checkpoints,
+                        below,
+                    },
+                    took,
+                );
+                return self.link(cancel).await;
             }
             JobResult::Segment(segment, Ok(blocks)) => {
-                self.succeeded(peer);
+                self.succeeded(peer, blocks.len(), took);
                 self.anchor_served = true;
                 // The lowest segment's first block names the block the range extends: checked
                 // here too, for a range with no walk.
@@ -652,18 +739,22 @@ impl Syncer {
                         return Ok(true);
                     }
                 }
+                self.ready_bytes = self.ready_bytes.saturating_add(batch_bytes(&blocks));
                 self.ready.insert(segment.first, (segment, blocks));
                 return Ok(self.hand_on(cancel).await);
             }
-            JobResult::Walk(start, Err(failure)) => {
-                self.walking = false;
-                if start == self.anchor
-                    && !self.anchor_served
-                    && matches!(failure, Failure::NotHeld)
+            JobResult::Skeleton(from, Err(failure)) => {
+                self.skeleton_busy = false;
+                (from.number, from.number, failure)
+            }
+            JobResult::Gap(top, Err(failure)) => {
+                self.gaps_busy.remove(&top.number);
+                if top == self.anchor && !self.anchor_served && matches!(failure, Failure::NotHeld)
                 {
                     self.anchor_refused.insert(peer);
                 }
-                (start.number, start.number, failure)
+                let gap_first = self.gap_first(top.number);
+                (gap_first, top.number, failure)
             }
             JobResult::Segment(segment, Err(failure)) => {
                 if segment.top == self.anchor
@@ -705,16 +796,93 @@ impl Syncer {
         }
     }
 
-    fn succeeded(&mut self, peer: PeerId) {
+    /// Records a job of `blocks` blocks that verified in `took`.
+    fn succeeded(&mut self, peer: PeerId, blocks: usize, took: Duration) {
         self.indexer_misses.remove(&peer);
+        self.schedule.measured(peer, blocks, took);
         // A success is never reported to the peer set.
         let _report = self.schedule.finished(peer, None);
+    }
+
+    /// The first block of the gap below `top`: a page of the walk, not below the first block.
+    fn gap_first(&self, top: BlockNumber) -> BlockNumber {
+        top.saturating_sub(HEADERS_PER_REQUEST - 1).max(self.first)
+    }
+
+    /// Records a page of the skeleton: its claims, and where the next page starts.
+    fn skeleton_fetched(
+        &mut self,
+        peer: PeerId,
+        from: BlockRef,
+        claims: &[BlockRef],
+        took: Duration,
+    ) {
+        self.skeleton_busy = false;
+        self.succeeded(peer, claims.len(), took);
+        debug!(%peer, from = from.number, claims = claims.len(), "skeleton fetched");
+        // Below the last claim the next page starts; past the first block, none.
+        self.skeleton_from = claims
+            .last()
+            .copied()
+            .filter(|last| last.number.saturating_sub(self.first) >= HEADERS_PER_REQUEST);
+        self.skeleton
+            .extend(claims.iter().map(|claim| (claim.number, claim.hash)));
+    }
+
+    /// Keeps a fetched gap for [`Self::link`].
+    fn gap_fetched(&mut self, peer: PeerId, top: BlockRef, gap: Gap, took: Duration) {
+        self.gaps_busy.remove(&top.number);
+        if top == self.anchor {
+            self.anchor_served = true;
+        }
+        let blocks = usize::try_from(HEADERS_PER_REQUEST).unwrap_or(usize::MAX);
+        self.succeeded(peer, blocks, took);
+        debug!(%peer, from = top.number, checkpoints = gap.checkpoints.len(), "headers verified");
+        self.gaps.insert(top.number, gap);
+    }
+
+    /// Links the fetched gaps from the top down: each is accepted once its top is the lowest
+    /// verified hash, and its checkpoints become verified in turn. A gap fetched from a wrong
+    /// claim is dropped, and that gap is fetched again from the trusted hash. Returns `false`
+    /// when the sync has to stop.
+    async fn link(&mut self, cancel: &CancellationToken) -> Result<bool, ElError> {
+        while let Some(lowest) = self.walk_from() {
+            let Some(gap) = self.gaps.remove(&lowest.number) else {
+                break;
+            };
+            if gap.top_hash != lowest.hash {
+                debug!(
+                    number = lowest.number,
+                    "skeleton claim does not link; fetching the gap again from the verified hash"
+                );
+                self.skeleton.insert(lowest.number, lowest.hash);
+                break;
+            }
+            if gap.below.is_some_and(|below| !self.linked(below)) {
+                return Ok(true);
+            }
+            for checkpoint in &gap.checkpoints {
+                self.checkpoints.insert(checkpoint.number, checkpoint.hash);
+            }
+            if self.walk_from().is_none() {
+                self.walked = true;
+                info!(
+                    segments = self.checkpoints.len(),
+                    "header chain verified down to the first block; fetching blocks"
+                );
+            }
+            if !send(&self.saved, gap.checkpoints, "checkpoints", cancel).await {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Hands on every verified segment that is next in order. Returns `false` when the sync
     /// has to stop.
     async fn hand_on(&mut self, cancel: &CancellationToken) -> bool {
         while let Some((segment, blocks)) = self.ready.remove(&self.next_emit) {
+            self.ready_bytes = self.ready_bytes.saturating_sub(batch_bytes(&blocks));
             if !send(&self.blocks, blocks, "blocks", cancel).await {
                 return false;
             }
@@ -728,10 +896,7 @@ impl Syncer {
     fn log_progress(&self) {
         if let Some(lowest) = self.walk_from() {
             // Sessions whose peer says it holds the next page of the walk.
-            let page_first = lowest
-                .number
-                .saturating_sub(HEADERS_PER_REQUEST - 1)
-                .max(self.first);
+            let page_first = self.gap_first(lowest.number);
             let sessions = self.peers.sessions();
             let usable = sessions
                 .iter()
@@ -778,6 +943,20 @@ impl Syncer {
             );
         }
     }
+}
+
+/// The bytes of a batch of blocks: headers, bodies and receipts.
+fn batch_bytes(blocks: &[EncodedBlock]) -> usize {
+    blocks
+        .iter()
+        .map(|block| {
+            block
+                .header
+                .len()
+                .saturating_add(block.body.len())
+                .saturating_add(block.receipts.as_ref().map_or(0, |receipts| receipts.len()))
+        })
+        .fold(0, usize::saturating_add)
 }
 
 /// Sends `value` on a channel of the sync's output, waiting for room. Returns `false` if the

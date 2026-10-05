@@ -63,13 +63,30 @@ again; a completed chunk is never redone.
 - A response may cover less than the range asked for; the chunk is complete only when every
   block of it has arrived.
 - **Done chunks.** A chunk is done when its file is in `raw/`, or when the records of sealed
-  chunks (`sealed/`, section 3.2) cover it whole: `verify` deleted its file once it was sealed
-  and uploaded. Only the other chunks are fetched.
+  chunks (`sealed/`, section 3.2) cover it whole, from the first record without a gap:
+  `verify` deleted its file once it was sealed and uploaded. Only the other chunks are fetched,
+  so a deleted or missing file is fetched again unless sealed records cover it; the fill's
+  scan reads only the chunks with a file that no record covers, so its count is the plan's
+  less those.
+- **Every answer is checked before it is kept.** The service's servers do not all answer
+  alike: on Base the same query asked five times for 2,084,000..2,084,100 came back once
+  without any block's `mix_hash` and any deposit's `source_hash`, and a sample across the
+  chain found answers without deposits' `mint` and `deposit_nonce` too. So once a chunk's
+  answer is on disk under a temporary name, its rows are read and checked for every field
+  their forks have, as the fill's scan does (`fill::lacking`; on as many threads as there are
+  cores, about 650 MB of JSON a second each). An answer lacking a field is asked for again, up
+  to 8 times, stopping after 3 in a row no more complete than the best; the most complete is
+  kept, and the fill takes what it still lacks. The summary counts `retried_chunks` and
+  `incomplete_chunks`.
+- **`--refetch-incomplete`** first reads every chunk on disk not sealed yet, with its fill,
+  and asks again for those whose rows still lack a field or cannot be read (a damaged file).
+  A new answer replaces the chunk only if it lacks fewer fields; the chunk's fill, which
+  belonged to the old answer, is dropped with it (`replaced_chunks`, `unreplaced_chunks`).
 - **Stored as it travels.** The response body is written to the chunk's file exactly as
   received, in the content encoding the service chose (zstd is asked for first, then gzip),
   after one byte naming that encoding. Nothing is decompressed to be compressed again. The
-  only work per byte is one streaming decode, into nothing, to read the cursor
-  (`next_block`) at the end of the body. Memory is about a megabyte per request in flight,
+  work per byte is one streaming decode, into nothing, to read the cursor (`next_block`) at
+  the end of the body, and the check of the chunk's rows once it is complete (below). Memory is about a megabyte per request in flight,
   whatever a chunk holds.
 - **Fields requested**: what the header, the transactions and the receipts with their logs
   are rebuilt from. Not requested, because `verify` computes them and the header hash proves

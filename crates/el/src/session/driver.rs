@@ -205,7 +205,24 @@ impl SessionHandle {
     ///
     /// As [`Self::receipts`].
     pub async fn headers(&self, start: B256, limit: u64) -> Result<Vec<Bytes>, RequestError> {
-        let body = self.request(Request::Headers { start, limit }).await?;
+        self.headers_skipping(start, limit, 0).await
+    }
+
+    /// Requests up to `limit` headers going down from `start` with `skip` blocks left out
+    /// between two (every `skip + 1`-th block), as [`Self::headers`] otherwise.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::headers`].
+    pub async fn headers_skipping(
+        &self,
+        start: B256,
+        limit: u64,
+        skip: u32,
+    ) -> Result<Vec<Bytes>, RequestError> {
+        let body = self
+            .request(Request::Headers { start, limit, skip })
+            .await?;
         items(&body, usize::try_from(limit).unwrap_or(usize::MAX))
     }
 

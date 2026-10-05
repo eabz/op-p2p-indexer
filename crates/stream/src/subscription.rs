@@ -34,7 +34,7 @@ use crate::convert::{Payload, Prepared, heads_message};
 use crate::follower::{CHAIN_WINDOW, ChainEvent, Live};
 use crate::proto;
 use crate::sink::{Ended, Sink};
-use crate::source::{ReadError, Source, push_bounded, read_status};
+use crate::source::{History, ReadError, Source, push_bounded, read_status};
 
 /// How often, while reading, the blocks sent without receipts are looked up again.
 const RECEIPTS_RECHECK: Duration = Duration::from_secs(5);
@@ -110,8 +110,8 @@ pub(crate) struct Subscription<U, A> {
     /// Whether `next` is in a gap range sync is filling: only the archive's tip is watched
     /// until it reaches `next`.
     in_gap: bool,
-    /// The archive's last block, as far as the reads have seen.
-    archive_tip: Option<BlockNumber>,
+    /// This subscription's archive position and read-ahead.
+    history: History,
     /// When the blocks sent without receipts were last looked up.
     receipts_checked: Instant,
 }
@@ -140,7 +140,7 @@ impl<U: UnsafeStore, A: ArchiveStore> Subscription<U, A> {
             next: 0,
             any_first: false,
             in_gap: false,
-            archive_tip: None,
+            history: History::default(),
             receipts_checked: Instant::now(),
         }
     }
@@ -212,6 +212,7 @@ impl<U: UnsafeStore, A: ArchiveStore> Subscription<U, A> {
                     self.send_receipts(block).await?;
                 }
             }
+            self.history = History::default();
             return Ok(Some(Mode::Follow(cursor)));
         }
         self.recheck_receipts().await?;
@@ -228,7 +229,7 @@ impl<U: UnsafeStore, A: ArchiveStore> Subscription<U, A> {
         }
         let blocks = self
             .source
-            .blocks_from(self.next, &mut self.archive_tip)
+            .blocks_from(self.next, &mut self.history)
             .await?;
         if blocks.is_empty() {
             // Above the follower's last block, nothing is there yet; below it, maybe never.

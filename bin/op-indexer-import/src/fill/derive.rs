@@ -50,16 +50,13 @@ use op_alloy_consensus::{
 use op_indexer_chainspec::{ChainSpec, Hardfork};
 
 use self::user::UserDeposit;
+use crate::rows::L1Info;
 use crate::rpc::RpcHeader;
 use crate::source::{DepositLog, HyperSync, L1Header, SourceError};
 
 /// L1 blocks read per request, at least: about 33 hours of L1, so of L2 (about 60,000 Base
 /// blocks) per span.
 const L1_SPAN: u64 = 10_000;
-
-/// Selector of the Bedrock form of the L1-attributes deposit (`setL1BlockValues`, ABI words);
-/// the forms from Ecotone on are packed.
-const BEDROCK_SELECTOR: [u8; 4] = [0x01, 0x5d, 0x8e, 0xb9];
 
 /// The upgrade transactions of a fork's first block, by their intents, in their order
 /// (op-node's): the forks whose blocks the rebuild knows.
@@ -84,37 +81,6 @@ const UPGRADES: &[(Hardfork, &[&str])] = &[
         ],
     ),
 ];
-
-/// What a block's L1-attributes deposit says of its L1 origin.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct L1Info {
-    /// The L1 origin's number and hash.
-    pub(super) number: u64,
-    pub(super) hash: B256,
-    /// The block's place in its epoch: 0 for the epoch's first, where its user deposits are.
-    pub(super) sequence: u64,
-}
-
-impl L1Info {
-    /// Reads the deposit's calldata: the origin's number at bytes 28..36 and hash at 100..132,
-    /// in the Bedrock form and the packed forms alike, and the sequence number at 156..164 in
-    /// the Bedrock form, 12..20 in the packed ones. `None` if it is too short.
-    pub(super) fn of(input: &[u8]) -> Option<Self> {
-        let word = |at: std::ops::Range<usize>| -> Option<u64> {
-            Some(u64::from_be_bytes(input.get(at)?.try_into().ok()?))
-        };
-        let sequence = if input.get(..4) == Some(&BEDROCK_SELECTOR[..]) {
-            word(156..164)?
-        } else {
-            word(12..20)?
-        };
-        Some(Self {
-            number: word(28..36)?,
-            hash: B256::from_slice(input.get(100..132)?),
-            sequence,
-        })
-    }
-}
 
 /// What the rebuild reads of one block's rows.
 #[derive(Debug, Clone)]

@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use alloy_primitives::BlockNumber;
-use op_indexer_stream::ticket::Cap;
+use op_indexer_api::ticket::Cap;
 
 use crate::register::{PeerReport, ServedReport, SlotReport};
 

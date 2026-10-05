@@ -264,13 +264,16 @@ impl State {
         Ok(entries)
     }
 
-    /// The last block the recorded sealed chunks cover; `None` if there is none. Blocking.
+    /// The last block the recorded sealed chunks cover without a gap from the first; `None`
+    /// if there is none. `verify` records them in block order, so a gap is not of its making:
+    /// the chunks past it are not taken as sealed, and are downloaded and checked again rather
+    /// than skipped. Blocking.
     ///
     /// # Errors
     ///
     /// As [`Self::read_sealed`].
     pub(crate) fn sealed_through(&self) -> io::Result<Option<u64>> {
-        Ok(self.read_sealed()?.last().map(|entry| entry.last))
+        Ok(contiguous_through(&self.read_sealed()?))
     }
 
     /// Records that the sealed chunk `entry` is uploaded, durably. Blocking.
@@ -315,6 +318,19 @@ impl State {
         self.raw
             .join(format!("{:012}-{:012}.fill.json", chunk.from, chunk.to))
     }
+}
+
+/// The last block `entries` (in block order) cover without a gap from the first.
+pub(crate) fn contiguous_through(entries: &[ChunkEntry]) -> Option<u64> {
+    let (first, rest) = entries.split_first()?;
+    let mut through = first.last;
+    for entry in rest {
+        if entry.first != through.saturating_add(1) {
+            break;
+        }
+        through = entry.last;
+    }
+    Some(through)
 }
 
 /// Whether sealed chunks recorded through block `sealed` cover `chunk` whole.

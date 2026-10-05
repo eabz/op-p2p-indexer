@@ -28,9 +28,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use op_indexer_api::ApiKeys;
 use op_indexer_chainspec::ChainSpec;
 use op_indexer_chunks::{ChunkEntry, ChunkStore, Manifest};
-use op_indexer_stream::ApiKeys;
 use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
