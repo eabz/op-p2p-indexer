@@ -1,5 +1,6 @@
 //! Shared process setup independent of node and storage services.
 
+use std::io::{self, Write as _};
 use std::path::Path;
 
 use eyre::WrapErr;
@@ -7,6 +8,20 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::time::ChronoUtc;
 
 pub mod env_file;
+
+/// Prints `<binary> <version>` and returns `true` if the command line asks for the version
+/// (`--version` or `-V`, among [`env_file::other_args`]): the binary then exits at once, before
+/// it loads the `.env` file or starts anything.
+pub fn version_requested(binary: &str, version: &str) -> bool {
+    let asked = env_file::other_args(std::env::args_os().skip(1))
+        .iter()
+        .any(|arg| arg == "--version" || arg == "-V");
+    if asked {
+        // The answer is the only output; a closed stdout has nothing to show it on.
+        drop(writeln!(io::stdout(), "{binary} {version}"));
+    }
+    asked
+}
 
 /// Initializes logging and reports the environment file without its contents.
 pub fn init_tracing(env_file: Option<&Path>) {

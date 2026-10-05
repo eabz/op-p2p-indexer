@@ -11,6 +11,9 @@ use op_indexer_node::Config;
 use op_indexer_storage::archive_store::FjallArchive;
 
 fn main() -> eyre::Result<()> {
+    if op_indexer_runtime::version_requested(env!("CARGO_BIN_NAME"), env!("CARGO_PKG_VERSION")) {
+        return Ok(());
+    }
     // Before the runtime starts any thread: loading sets environment variables.
     let env_file = op_indexer_runtime::env_file::load(std::env::args_os().skip(1))?;
     tokio::runtime::Builder::new_multi_thread()

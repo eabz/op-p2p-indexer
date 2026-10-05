@@ -72,6 +72,27 @@ fn path_arg(args: impl IntoIterator<Item = OsString>) -> Option<OsString> {
     None
 }
 
+/// The arguments the binary itself reads: `args` without the env file's flag and its value
+/// (`--env-file <path>` or `--env-file=<path>`), up to any `--`.
+pub fn other_args(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+    let mut others = Vec::new();
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            break;
+        }
+        if arg == FLAG {
+            args.next();
+        } else if !arg.to_str().is_some_and(|arg| {
+            arg.strip_prefix(FLAG)
+                .is_some_and(|rest| rest.starts_with('='))
+        }) {
+            others.push(arg);
+        }
+    }
+    others
+}
+
 /// The 1-based number of the line of `text` where `line` starts: `dotenvy` reports the line's
 /// text but not its number.
 fn line_number(text: &str, line: &str) -> Option<usize> {

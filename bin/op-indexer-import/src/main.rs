@@ -59,6 +59,10 @@ const DEFAULT_CHUNK_BLOCKS: u64 = 1000;
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> eyre::Result<()> {
+    // Before the `.env` file, which may not load: clap's `--version` answers only after it.
+    if op_indexer_runtime::version_requested(env!("CARGO_BIN_NAME"), env!("CARGO_PKG_VERSION")) {
+        return Ok(());
+    }
     // First: loading sets environment variables, which is sound only before the runtime starts
     // any thread, and the command line falls back to them.
     let env_file = env_file::load(std::env::args_os().skip(1))?;
