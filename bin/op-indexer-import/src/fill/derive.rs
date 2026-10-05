@@ -33,20 +33,23 @@
 //! (Fjord's). Nothing here is trusted: the header hash proves every rebuilt block, and `fill`
 //! checks a chunk's before writing them.
 
+mod user;
+
 use std::collections::BTreeMap;
 use std::fmt;
 
 use alloy_consensus::EMPTY_ROOT_HASH;
 use alloy_eips::BlockNumHash;
 use alloy_eips::eip1559::{BaseFeeParams, calc_next_block_base_fee};
-use alloy_primitives::{B256, Bytes, U64};
+use alloy_primitives::{Address, B256, Bytes, U64, U128, U256};
 use op_alloy_consensus::{
     L1InfoDepositSource, UpgradeDepositSource, UserDepositSource, decode_holocene_extra_data,
 };
 use op_indexer_chainspec::{ChainSpec, Hardfork};
 
 use crate::rpc::RpcHeader;
-use crate::source::{HyperSync, L1Header, SourceError};
+use self::user::UserDeposit;
+use crate::source::{DepositLog, HyperSync, L1Header, SourceError};
 
 /// L1 blocks read per request, at least: about 33 hours of L1, so of L2 (about 60,000 Base
 /// blocks) per span.
@@ -235,34 +238,44 @@ fn base_fee(chain: &ChainSpec, parent: &Parent, timestamp: u64) -> Option<u64> {
 
 /// A deposit as rebuilt: its source hash, what that is from, and for a user deposit the mint
 /// its L1 log gives.
-type Rebuilt Deposit = (B256, Derivation, Option<U128>);
+type DepositOf = (B256, Derivation, Option<U128>);
 
-/// The source hashes of a block's deposits, in their order, with what each is from: its
-/// L1-attributes deposit, the portal's logs in its L1 origin (if the epoch starts here) and
-/// the fork it is the first block of; `None` if the deposits are not those.
-fn sources(chain: &ChainSpec, row: &HeaderRow, l1: &L1Data) -> Option<Vec<(B256, Derivation)>> {
-    let info = row.l1_info?;
-    let deposits = usize::try_from(row.deposits).ok()?;
-    let mut hashes = Vec::with_capacity(deposits);
-    hashes.push((
+/// Each of a block's deposits as rebuilt, in their order: its L1-attributes deposit, the
+/// portal's logs in its L1 origin (if the epoch starts here; each checked against its row)
+/// and the upgrades of the fork it is the first block of. Else the field that cannot be
+/// rebuilt, or the user deposit's that is not its log's.
+fn deposits(chain: &ChainSpec, row: &HeaderRow, l1: &L1Data) -> Result<Vec<DepositOf>, &'static str> {
+    const UNKNOWN: &str = "source_hash";
+    let info = row.l1_info.ok_or(UNKNOWN)?;
+    let mut rebuilt = Vec::with_capacity(row.deposits.len());
+    rebuilt.push((
         L1InfoDepositSource::new(info.hash, info.sequence).source_hash(),
         Derivation::L1Info {
             origin: info.number,
             sequence: info.sequence,
         },
+        None,
     ));
-    if info.sequence == 0 && deposits > 1 {
-        hashes.extend(l1.logs(info)?.iter().map(|&log_index| {
-            (
-                UserDepositSource::new(info.hash, log_index).source_hash(),
+    if info.sequence == 0 && row.deposits.len() > 1 {
+        for log in l1.logs(info).ok_or(UNKNOWN)? {
+            let deposit = UserDeposit::of(log).ok_or("user deposit (its L1 log does not decode)")?;
+            // More logs than deposits leaves the count to fail below.
+            if let Some(row) = row.deposits.get(rebuilt.len())
+                && let Some(field) = deposit.differs(row)
+            {
+                return Err(field);
+            }
+            rebuilt.push((
+                UserDepositSource::new(info.hash, log.log_index).source_hash(),
                 Derivation::User {
                     origin: info.number,
-                    log_index,
+                    log_index: log.log_index,
                 },
-            )
-        }));
+                Some(deposit.mint),
+            ));
+        }
     }
-    let upgrades = deposits.checked_sub(hashes.len())?;
+    let upgrades = row.deposits.len().checked_sub(rebuilt.len()).ok_or(UNKNOWN)?;
     if upgrades > 0 {
         // The fork whose first block this is.
         let starts = |fork: Hardfork| {
@@ -270,26 +283,30 @@ fn sources(chain: &ChainSpec, row: &HeaderRow, l1: &L1Data) -> Option<Vec<(B256,
                 row.timestamp >= time && row.timestamp < time.saturating_add(chain.block_time_secs)
             })
         };
-        let (_, intents) = UPGRADES.iter().find(|(fork, _)| starts(*fork))?;
+        let (_, intents) = UPGRADES
+            .iter()
+            .find(|(fork, _)| starts(*fork))
+            .ok_or(UNKNOWN)?;
         if intents.len() != upgrades {
-            return None;
+            return Err(UNKNOWN);
         }
-        hashes.extend(intents.iter().map(|&intent| {
+        rebuilt.extend(intents.iter().map(|&intent| {
             (
                 UpgradeDepositSource::new(intent.to_owned()).source_hash(),
                 Derivation::Upgrade(intent),
+                None,
             )
         }));
     }
-    Some(hashes)
+    Ok(rebuilt)
 }
 
 /// What a span of L1 gave: headers and the portal's deposit logs, by L1 block number.
 #[derive(Debug, Default)]
 pub(super) struct L1Data {
     headers: BTreeMap<u64, L1Header>,
-    /// Each block's deposit log indexes, ascending; a block without any is absent.
-    logs: BTreeMap<u64, Vec<u64>>,
+    /// Each block's deposit logs, by index; a block without any is absent.
+    logs: BTreeMap<u64, Vec<DepositLog>>,
     /// Read from here on.
     from: u64,
     /// Read up to here, excluded.
@@ -322,7 +339,7 @@ impl L1Data {
             self.logs
                 .entry(log.block_number)
                 .or_default()
-                .push(log.log_index);
+                .push(log);
         }
         (self.from, self.to) = (first, to);
         Ok(())
@@ -337,18 +354,20 @@ impl L1Data {
 
     /// The deposit log indexes of the L1 origin `info` names, if it was read (its header has
     /// its hash): none is an empty list.
-    fn logs(&self, info: L1Info) -> Option<&[u64]> {
+    fn logs(&self, info: L1Info) -> Option<&[DepositLog]> {
         self.header(info)?;
         Some(self.logs.get(&info.number).map_or(&[], Vec::as_slice))
     }
 }
 
-/// A deposit's source hash, rebuilt.
+/// What was rebuilt of a deposit its row lacks: the source hash, the mint, or both.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Source {
     pub(super) number: u64,
     pub(super) index: u64,
-    pub(super) hash: B256,
+    pub(super) hash: Option<B256>,
+    pub(super) mint: Option<U128>,
+    /// The source hash's derivation, for the error if the block does not hash.
     from: Derivation,
 }
 
@@ -418,17 +437,20 @@ pub(super) fn describe(number: u64, headers: &[RpcHeader], sources: &[Source]) -
                 .filter_map(|(field, value)| Some(format!("{field} {}", (*value)?))),
         );
     }
-    fields.extend(
-        sources
-            .iter()
-            .filter(|source| source.number == number)
-            .map(|source| {
-                format!(
-                    "transaction {}'s source_hash {} ({})",
-                    source.index, source.hash, source.from
-                )
-            }),
-    );
+    for source in sources.iter().filter(|source| source.number == number) {
+        if let Some(hash) = source.hash {
+            fields.push(format!(
+                "transaction {}'s source_hash {hash} ({})",
+                source.index, source.from
+            ));
+        }
+        if let Some(mint) = source.mint {
+            fields.push(format!(
+                "transaction {}'s mint {mint} (from {})",
+                source.index, source.from
+            ));
+        }
+    }
     if fields.is_empty() {
         return format!("nothing was rebuilt for block {number}");
     }
@@ -488,19 +510,26 @@ pub(super) fn rebuild(
             }
         }
         let mut sources = Vec::new();
-        if !row.lacking_sources.is_empty() {
-            match self::sources(chain, row, l1) {
-                Some(hashes) => sources.extend(row.lacking_sources.iter().filter_map(|&index| {
-                    let (hash, from) = *hashes.get(usize::try_from(index).ok()?)?;
-                    Some(Source {
-                        number: row.number,
-                        index,
-                        hash,
-                        from,
-                    })
-                })),
-                None => {
-                    left.get_or_insert("source_hash");
+        if row.lacks_deposit_fields() {
+            match self::deposits(chain, row, l1) {
+                Ok(deposits) => {
+                    for (deposit, &(hash, from, mint)) in row.deposits.iter().zip(&deposits) {
+                        let source = Source {
+                            number: row.number,
+                            index: deposit.index,
+                            hash: (!deposit.has_source).then_some(hash),
+                            mint: mint.filter(|_| deposit.mint.is_none()),
+                            from,
+                        };
+                        if source.hash.is_some() || source.mint.is_some() {
+                            sources.push(source);
+                        }
+                    }
+                    // A deposit with neither left lacking a mint is not a user deposit's: it
+                    // mints nothing, which `verify` reads as zero.
+                }
+                Err(field) => {
+                    left.get_or_insert(field);
                 }
             }
         }
@@ -515,7 +544,7 @@ pub(super) fn rebuild(
             base_fee,
             extra_data: row.extra_data.clone(),
         });
-        if row.lacks.is_empty() && row.lacking_sources.is_empty() {
+        if row.lacks.is_empty() && !row.lacks_deposit_fields() {
             continue;
         }
         let block = BlockNumHash::new(row.number, row.hash);
