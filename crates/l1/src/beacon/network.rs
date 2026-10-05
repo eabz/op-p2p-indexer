@@ -3,10 +3,10 @@
 //! gossip.
 //!
 //! ```text
-//! discovery (eth2 fork digest) ─▶ dial ─▶ identify (lists the light-client protocols?)
+//! discovery (eth2 fork digest) ─▶ dial ─▶ identify (which light-client protocols it lists)
 //!   ─▶ Status sent, peer usable
-//! NetworkHandle::request ─▶ the peer that failed least and was asked longest ago,
-//!   or the next one that connects
+//! NetworkHandle::request ─▶ of the peers that list its protocol, the one that failed least
+//!   and was asked longest ago, or the next one that connects
 //! gossip (finality and optimistic updates) ─▶ Gossip
 //! ```
 //!
@@ -28,7 +28,7 @@ mod behaviour;
 mod handle;
 mod peers;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -233,11 +233,16 @@ impl Network {
     /// Sends a request to the peer that failed least and, among those, was asked longest
     /// ago. Without a peer the request waits for the next one that connects.
     fn send(&mut self, waiting: Waiting) {
-        let bootstrap = matches!(waiting.request, Request::Bootstrap(_));
-        let Some(peer) = self.peers.pick(bootstrap) else {
-            // Every place may be taken by peers that lack the bootstrap: one of them is
-            // closed so another node is dialed. It stays known.
-            if let Some(peer) = self.peers.in_the_way() {
+        let (asked, payload) = match waiting.request {
+            Request::Bootstrap(root) => (Asked::Bootstrap, root.to_vec()),
+            Request::UpdatesByRange { period } => (Asked::Updates, rpc::updates_by_range(period)),
+            Request::FinalityUpdate => (Asked::Finality, Vec::new()),
+            Request::OptimisticUpdate => (Asked::Optimistic, Vec::new()),
+        };
+        let Some(peer) = self.peers.pick(asked) else {
+            // Every place may be taken by peers that do not serve this: one of them is closed
+            // so another node is dialed. It stays known.
+            if let Some(peer) = self.peers.in_the_way(asked) {
                 self.peers.lost(peer);
                 let _closed = self.swarm.disconnect_peer_id(peer);
             }
@@ -248,18 +253,6 @@ impl Network {
                 let _sent = waiting.reply.send(Err(RequestError::NoPeer));
             }
             return;
-        };
-        let (asked, payload) = match waiting.request {
-            Request::Bootstrap(root) => (Asked::Bootstrap, root.to_vec()),
-            Request::UpdatesByRange {
-                start_period,
-                count,
-            } => {
-                let count = count.min(rpc::MAX_UPDATES);
-                (Asked::Updates, rpc::updates_by_range(start_period, count))
-            }
-            Request::FinalityUpdate => (Asked::Finality, Vec::new()),
-            Request::OptimisticUpdate => (Asked::Optimistic, Vec::new()),
         };
         debug!(%peer, ?asked, "light-client request sent");
         let behaviour = self.swarm.behaviour_mut().requests(asked);
@@ -354,11 +347,17 @@ impl Network {
         if self.peers.is_connected(&peer) {
             return;
         }
-        let serves = info
-            .protocols
-            .iter()
-            .any(|name| name.as_ref() == rpc::BOOTSTRAP);
-        if !serves || self.peers.is_avoided(&peer) {
+        // The light-client protocols it does not list are not asked of it.
+        let lacks: HashSet<Asked> = Asked::ALL
+            .into_iter()
+            .filter(|asked| {
+                !info
+                    .protocols
+                    .iter()
+                    .any(|name| name.as_ref() == asked.protocol())
+            })
+            .collect();
+        if lacks.len() == Asked::ALL.len() || self.peers.is_avoided(&peer) {
             self.drop_peer(peer, "it does not serve light-client data");
             return;
         }
@@ -368,7 +367,8 @@ impl Network {
             return;
         }
         debug!(%peer, agent = info.agent_version, "beacon peer connected");
-        self.peers.connected(peer, info.agent_version.clone(), addr);
+        self.peers
+            .connected(peer, info.agent_version.clone(), addr, lacks);
         let status = self.status_ssz();
         self.swarm
             .behaviour_mut()
@@ -473,16 +473,24 @@ impl Network {
                 Err(RequestError::Malformed(peer))
             }
             Err(OutboundFailure::Timeout) => Err(RequestError::Unanswered(peer)),
+            // It does not serve this after all: asked of another peer, not held against it.
+            Err(OutboundFailure::UnsupportedProtocols) => {
+                debug!(%peer, ?asked, "beacon peer does not serve this request");
+                self.peers.lacks(&peer, asked);
+                let Some(pending) = self.resend(pending) else {
+                    return;
+                };
+                return send_reply(pending, Err(RequestError::NoPeer));
+            }
             Err(error) => {
                 // The connection went away, which says nothing about what the peer holds:
                 // the request goes to another peer, as if it had not been sent.
                 debug!(%peer, ?asked, %error, "light-client request lost with its connection");
                 self.peers.lost(peer);
-                if pending.since.elapsed() < REQUEST_TIMEOUT {
-                    self.send(pending);
+                let Some(pending) = self.resend(pending) else {
                     return;
-                }
-                Err(RequestError::Unanswered(peer))
+                };
+                return send_reply(pending, Err(RequestError::Unanswered(peer)));
             }
         };
         match &result {
@@ -491,12 +499,23 @@ impl Network {
             // An answer without data: it does not hold what was asked, or serves nothing
             // though it lists the protocol.
             Ok(_) | Err(RequestError::Refused(..)) => {
-                self.failed(peer, asked == Asked::Bootstrap);
+                if asked == Asked::Bootstrap {
+                    self.peers.lacks(&peer, asked);
+                }
+                self.failed(peer);
             }
-            Err(_) => self.failed(peer, false),
+            Err(_) => self.failed(peer),
         }
-        // The light client stopped waiting: nothing to do.
-        let _sent = pending.reply.send(result);
+        send_reply(pending, result);
+    }
+
+    /// Sends `pending` again, to another peer, while it has time left; else hands it back.
+    fn resend(&mut self, pending: Waiting) -> Option<Waiting> {
+        if pending.since.elapsed() >= REQUEST_TIMEOUT {
+            return Some(pending);
+        }
+        self.send(pending);
+        None
     }
 
     /// Hands a gossip message to the light client, whose verdict decides whether it is
@@ -533,8 +552,8 @@ impl Network {
 
     /// Counts a request the peer did not answer with data; drops the peer after a few in a
     /// row.
-    fn failed(&mut self, peer: PeerId, lacks_bootstrap: bool) {
-        if self.peers.failed(&peer, lacks_bootstrap) {
+    fn failed(&mut self, peer: PeerId) {
+        if self.peers.failed(&peer) {
             self.drop_peer(peer, "it serves no light-client data");
         }
     }
@@ -546,6 +565,12 @@ impl Network {
         // Not connected any more: nothing to close.
         let _closed = self.swarm.disconnect_peer_id(peer);
     }
+}
+
+/// Gives the light client its answer.
+fn send_reply(pending: Waiting, result: Result<Response, RequestError>) {
+    // The light client stopped waiting: nothing to do.
+    let _sent = pending.reply.send(result);
 }
 
 /// The successful chunks of an answer, or the error code it starts with.

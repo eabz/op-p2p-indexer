@@ -17,9 +17,9 @@ pub(super) const COMMAND_CAPACITY: usize = 16;
 pub(in crate::beacon) enum Request {
     /// The bootstrap of the block with this root.
     Bootstrap(B256),
-    /// One update per sync-committee period, `count` of them from `start_period`; at most
-    /// `rpc::MAX_UPDATES` are asked for.
-    UpdatesByRange { start_period: u64, count: u64 },
+    /// The update of one sync-committee period (`LightClientUpdatesByRange` with a count of
+    /// one, see `rpc::updates_by_range`).
+    UpdatesByRange { period: u64 },
     /// The newest finality update.
     FinalityUpdate,
     /// The newest optimistic update.

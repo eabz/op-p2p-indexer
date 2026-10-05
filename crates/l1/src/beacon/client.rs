@@ -6,8 +6,9 @@
 //! 1. no store yet: ask for the bootstrap of the checkpoint ([`Bootstrap`]), and when enough
 //!    peers say they do not hold it, of the fallback;
 //! 2. the next sync committee is not known, or the clock is more than one period ahead of
-//!    the store: ask for `LightClientUpdatesByRange` from the store's period (one update per
-//!    period, each proving the committee that signs the next);
+//!    the store: ask for the `LightClientUpdatesByRange` update of the last period whose
+//!    committee is known, which proves the committee that signs the next; one period per
+//!    request, the next asked at once while the store is behind;
 //! 3. a finality or optimistic update arrived over gossip: take it;
 //! 4. when gossip has brought nothing new for a while: ask for the optimistic update every
 //!    slot, and once an epoch for the finality update.
@@ -299,10 +300,9 @@ impl Client {
         };
         let now = Instant::now();
         let now_slot = self.spec.now_slot();
-        let (period, clock_period) = (store.period(), now_slot / SLOTS_PER_PERIOD);
         // With the next committee known, updates signed in the next period verify and the
         // store rotates by itself when one of them finalizes a block there.
-        let stuck = clock_period > store.last_known_period();
+        let stuck = self.behind(store);
         if (stuck || !store.knows_next_committee()) && now >= self.next_committee_attempt {
             let retry = if stuck {
                 CATCH_UP_RETRY
@@ -310,10 +310,10 @@ impl Client {
                 COMMITTEE_RETRY
             };
             self.next_committee_attempt = now + retry;
-            // The network asks for no more than a peer may send at once.
+            // The update of that period is signed by its committee and carries the next one;
+            // applied, it rotates the store into it when it finalizes there.
             let request = Request::UpdatesByRange {
-                start_period: period,
-                count: clock_period.saturating_sub(period).saturating_add(1),
+                period: store.last_known_period(),
             };
             return Ok(Some((Kind::Update, request)));
         }
@@ -327,6 +327,12 @@ impl Client {
         }
         self.finality_epoch = epoch;
         Ok(Some((Kind::Finality, Request::FinalityUpdate)))
+    }
+
+    /// Whether the clock is past the last period whose committee `store` knows: updates
+    /// signed now cannot be verified until the catch-up brings the next committees.
+    fn behind(&self, store: &Store) -> bool {
+        self.spec.now_slot() / SLOTS_PER_PERIOD > store.last_known_period()
     }
 
     /// The data of an answer under a fork digest this build reads, with who sent it; `None`
@@ -413,6 +419,10 @@ impl Client {
                 root,
                 slot,
             }));
+        }
+        // Still behind the clock after a step of the catch-up: the next period at once.
+        if kind == Kind::Update && self.behind(&store) {
+            self.next_committee_attempt = Instant::now();
         }
         self.store = Some(store);
         for block in [accepted.finalized, accepted.head].into_iter().flatten() {
