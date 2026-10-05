@@ -90,7 +90,7 @@ def read_job(clients, job, call, retries):
                 return record(index, location, failovers, rows, nbytes,
                               ttfb if ttfb is not None else seconds, seconds)
             except Exception as err:  # noqa: BLE001: a job's failure is reported, not raised
-                error = "{}: {}".format(type(err).__name__, str(err).splitlines()[0])
+                error = describe(err)
                 if not retryable(err):
                     return record(index, location, failovers, error=error)
                 failovers += 1
@@ -98,9 +98,20 @@ def read_job(clients, job, call, retries):
     return record(index, locations[-1] if locations else "-", failovers, error=error)
 
 
+def describe(err):
+    """`Type: first line of the message`, whatever the message (it may be empty)."""
+    lines = str(err).strip().splitlines()
+    return "{}: {}".format(type(err).__name__, lines[0] if lines else repr(err))
+
+
 def worker(jobs, results, threads, key, compression, retries):
-    """One process: `threads` threads taking jobs until each gets a stop marker."""
+    """One process: `threads` threads taking jobs until each gets a stop marker.
+
+    Each job is announced ("started", index, pid) before it is read and reported ("done",
+    record) after, whatever happens in it, so the parent knows which jobs a process that dies
+    took with it."""
     call = options(key, compression)
+    pid = os.getpid()
 
     def run():
         clients = {}
@@ -108,7 +119,13 @@ def worker(jobs, results, threads, key, compression, retries):
             job = jobs.get()
             if job is None:
                 return
-            results.put(read_job(clients, job, call, retries))
+            index = job[0]
+            results.put(("started", index, pid))
+            try:
+                result = read_job(clients, job, call, retries)
+            except BaseException as err:  # noqa: BLE001: reported as the job's failure
+                result = record(index, "-", 0, error=describe(err))
+            results.put(("done", result))
 
     pool = [threading.Thread(target=run, daemon=True) for _ in range(threads)]
     for thread in pool:
@@ -133,6 +150,15 @@ def percentile(values, share):
     if not ordered:
         return 0.0
     return ordered[min(len(ordered) - 1, int(share * len(ordered)))]
+
+
+def ended(exitcode):
+    """A process's exit code in words: a negative one is the signal that ended it."""
+    if exitcode is None:
+        return "still running"
+    if exitcode < 0:
+        return "killed by signal {}".format(-exitcode)
+    return "exit code {}".format(exitcode)
 
 
 def mb(nbytes):
@@ -197,26 +223,56 @@ def main():
     for process in processes:
         process.start()
 
-    done = []
+    by_index = {}
+    in_flight = {}  # job index -> pid of the process reading it
+    reported = set()  # pids whose end was reported
     last_line = started
-    while len(done) < len(jobs):
+    while len(by_index) < len(jobs):
         try:
-            done.append(results.get(timeout=1.0))
+            message = results.get(timeout=1.0)
         except queue.Empty:
+            # Nothing for a second: whatever a dead process sent has been read, so the jobs it
+            # still held are lost with it.
+            for process in processes:
+                if process.is_alive() or process.pid in reported:
+                    continue
+                reported.add(process.pid)
+                lost = [index for index, pid in in_flight.items() if pid == process.pid]
+                if process.exitcode != 0 or lost:
+                    print("worker process {} ended ({}), {} jobs lost with it".format(
+                        process.pid, ended(process.exitcode), len(lost)), file=sys.stderr)
+                for index in lost:
+                    del in_flight[index]
+                    by_index[index] = record(
+                        index, "-", 0,
+                        error="its worker process ended ({}) during the job".format(
+                            ended(process.exitcode)))
             if not any(process.is_alive() for process in processes):
-                print("every worker process ended early", file=sys.stderr)
                 break
+        else:
+            if message[0] == "started":
+                in_flight[message[1]] = message[2]
+            else:
+                result = message[1]
+                in_flight.pop(result["index"], None)
+                by_index[result["index"]] = result
         now = time.monotonic()
         if now - last_line >= args.progress:
             last_line = now
             elapsed = now - started
-            nbytes, rows, retries = totals(done)
+            nbytes, rows, retries = totals(by_index.values())
             print(
                 "{:7.1f}s  {}/{} jobs  {:8.1f} MB/s  {:10.0f} rows/s  {} retries".format(
-                    elapsed, len(done), len(jobs), mb(nbytes) / elapsed, rows / elapsed, retries,
+                    elapsed, len(by_index), len(jobs), mb(nbytes) / elapsed, rows / elapsed,
+                    retries,
                 ),
                 flush=True,
             )
+    # Every planned job has a result: a job no process reported is a failure too.
+    for index, _ticket, _locations in jobs:
+        if index not in by_index:
+            by_index[index] = record(index, "-", 0, error="not run: every worker process ended")
+    done = [by_index[index] for index, _ticket, _locations in jobs]
     elapsed = time.monotonic() - started
     for process in processes:
         process.join(timeout=5)
@@ -226,7 +282,8 @@ def main():
     nbytes, rows, _ = totals(ok)
     ttfbs = [result["ttfb"] for result in ok if result["ttfb"] is not None]
     print()
-    print("jobs       {} done, {} failed, {} retries".format(len(ok), len(errors), totals(done)[2]))
+    print("jobs       {} planned: {} done, {} failed, {} retries".format(
+        len(jobs), len(ok), len(errors), totals(done)[2]))
     print("time       {:.1f} s".format(elapsed))
     print("read       {:.1f} MB, {} rows".format(mb(nbytes), rows))
     print("rate       {:.1f} MB/s, {:.0f} rows/s".format(mb(nbytes) / elapsed, rows / elapsed))
