@@ -102,6 +102,7 @@ pub struct LightClient {
     config: BeaconConfig,
     trusted: mpsc::Sender<TrustedL1Block>,
     finalized: watch::Sender<Option<BeaconCheckpoint>>,
+    peer_count: watch::Sender<usize>,
 }
 
 impl LightClient {
@@ -113,7 +114,7 @@ impl LightClient {
     /// those finalized blocks is published on `finalized`, for the node to save and pass
     /// back as [`BeaconConfig::saved`] after a restart: about once an epoch.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         config: BeaconConfig,
         trusted: mpsc::Sender<TrustedL1Block>,
         finalized: watch::Sender<Option<BeaconCheckpoint>>,
@@ -122,7 +123,14 @@ impl LightClient {
             config,
             trusted,
             finalized,
+            peer_count: watch::Sender::new(0),
         }
+    }
+
+    /// The number of beacon peers connected, kept current while the light client runs.
+    #[must_use]
+    pub fn peer_count(&self) -> watch::Receiver<usize> {
+        self.peer_count.subscribe()
     }
 
     /// Runs the light client until `cancel` fires or the receiver of trusted blocks is
@@ -137,6 +145,7 @@ impl LightClient {
             config,
             trusted,
             finalized,
+            peer_count,
         } = self;
         let spec = &MAINNET;
         let epoch = spec.now_slot() / SLOTS_PER_EPOCH;
@@ -162,8 +171,13 @@ impl LightClient {
             head_root: spec.genesis_block_root,
             head_slot: 0,
         };
-        let (network, handle, gossip) =
-            network::new(config.listen_addr, config.bootnodes, digest, status)?;
+        let (network, handle, gossip) = network::new(
+            config.listen_addr,
+            config.bootnodes,
+            digest,
+            status,
+            peer_count,
+        )?;
         let client = Client::new(spec, bootstraps, handle, gossip, trusted, finalized);
         // Either part ending stops the other.
         let stop = cancel.child_token();

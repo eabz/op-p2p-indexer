@@ -44,7 +44,7 @@ pub use config::ElConfig;
 pub use discovery::enode_discovery_addr;
 pub use error::ElError;
 pub use network::{ETH_RECORD_KEY, NetworkSpec, OPEL_RECORD_KEY, PeerConfig, PeerNetwork};
-pub use peers::{Peers, Report};
+pub use peers::{Peers, Report, SessionCounts};
 pub use reth_network_peers::PeerId;
 pub use serve::BlockProvider;
 pub use session::{BlockRange, RequestError, SessionHandle};

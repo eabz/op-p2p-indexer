@@ -10,9 +10,12 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Instant;
 
 use alloy_primitives::BlockNumber;
 use op_indexer_stream::ticket::Cap;
+
+use crate::register::PeerReport;
 
 /// Picks so far, so ties between equally loaded servers go round-robin across requests.
 static TURN: AtomicUsize = AtomicUsize::new(0);
@@ -31,9 +34,20 @@ pub(crate) struct Server {
     pub(crate) contiguous_through: Option<BlockNumber>,
     pub(crate) requests_in_flight: u32,
     pub(crate) bytes_per_second: u64,
+    pub(crate) peers: PeerReport,
+    /// Since when it has reported no consensus peer or no execution session, by the
+    /// heartbeats; `None` while it has both. Kept by the [`Table`].
+    pub(crate) peerless_since: Option<Instant>,
 }
 
 impl Server {
+    /// Whether it reports no consensus peer or no execution session: gossip, or receipts and
+    /// gap fill, cannot go on.
+    const fn is_peerless(&self) -> bool {
+        matches!(self.peers.consensus_peers, Some(0))
+            || matches!(self.peers.execution_sessions, Some(0))
+    }
+
     /// The last block it serves under `cap`: its head under the cap, but no further than it
     /// holds every block (a server without range sync has a gap above the sealed chunks).
     pub(crate) fn reach(&self, cap: Cap) -> Option<BlockNumber> {
@@ -56,15 +70,19 @@ pub(crate) struct Table {
 
 impl Table {
     /// Adds `server` for registration `call`, replacing an older registration of its id.
-    pub(crate) fn insert(&self, id: &str, call: u64, server: Server) {
+    pub(crate) fn insert(&self, id: &str, call: u64, mut server: Server) {
+        server.peerless_since = server.is_peerless().then(Instant::now);
         self.lock().insert(id.to_owned(), (call, server));
     }
 
     /// Records a heartbeat of registration `call`. `false` if a newer registration of the
     /// id replaced it, which then ends.
-    pub(crate) fn update(&self, id: &str, call: u64, server: Server) -> bool {
+    pub(crate) fn update(&self, id: &str, call: u64, mut server: Server) -> bool {
         match self.lock().get_mut(id) {
             Some(entry) if entry.0 == call => {
+                server.peerless_since = server
+                    .is_peerless()
+                    .then(|| entry.1.peerless_since.unwrap_or_else(Instant::now));
                 entry.1 = server;
                 true
             }

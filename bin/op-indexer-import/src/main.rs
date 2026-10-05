@@ -258,8 +258,19 @@ async fn download(
         .rpc_endpoint
         .as_deref()
         .or_else(|| rpc::default_endpoint(plan.chain.chain_id));
-    let rpc = rpc_endpoint.map(Rpc::new).transpose()?;
-    fill::run(state, &plan, rpc.as_ref(), threads(None), cancel).await?;
+    let batch = usize::try_from(args.rpc_batch).wrap_err("--rpc-batch is too large")?;
+    let rpc = rpc_endpoint.map(|url| Rpc::new(url, batch)).transpose()?;
+    let rpc_requests =
+        usize::try_from(args.rpc_requests).wrap_err("--rpc-requests is too large")?;
+    fill::run(
+        state,
+        &plan,
+        rpc.as_ref(),
+        rpc_requests,
+        threads(None),
+        cancel,
+    )
+    .await?;
     Ok(plan)
 }
 

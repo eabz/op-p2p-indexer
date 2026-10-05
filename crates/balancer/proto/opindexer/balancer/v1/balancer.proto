@@ -52,6 +52,16 @@ message Heartbeat {
   // second.
   uint32 requests_in_flight = 9;
   uint64 bytes_per_second = 10;
+  // Its peers, for the balancer's status log: consensus gossip peers connected (what unsafe
+  // blocks arrive from); sessions with the chain's execution peers (receipts, gap fill, range
+  // sync), in all and dialed by the peers, unset without the execution network; sessions with
+  // L1 execution peers and the beacon light client's peers, unset without the L1 side. Unset
+  // all, from a server built before they were sent.
+  optional uint32 consensus_peers = 12;
+  optional uint32 execution_sessions = 13;
+  optional uint32 execution_inbound = 14;
+  optional uint32 l1_sessions = 15;
+  optional uint32 beacon_peers = 16;
 }
 
 // The balancer took the registration.

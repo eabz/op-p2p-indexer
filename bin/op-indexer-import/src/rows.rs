@@ -179,10 +179,18 @@ impl Rows {
 
     /// The block numbered `number`, if the chunk has it.
     pub(crate) fn block(&self, number: u64) -> Option<&BlockRow> {
-        let at = self
-            .blocks
-            .binary_search_by_key(&number, |block| block.number);
-        at.ok().and_then(|at| self.blocks.get(at))
+        self.block_at(number).and_then(|at| self.blocks.get(at))
+    }
+
+    /// The header row of block `number`, to fill in.
+    pub(crate) fn block_mut(&mut self, number: u64) -> Option<&mut BlockRow> {
+        self.block_at(number).and_then(|at| self.blocks.get_mut(at))
+    }
+
+    fn block_at(&self, number: u64) -> Option<usize> {
+        self.blocks
+            .binary_search_by_key(&number, |block| block.number)
+            .ok()
     }
 }
 

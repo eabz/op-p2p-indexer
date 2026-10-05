@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use libp2p::{Multiaddr, PeerId};
+use tokio::sync::watch;
 use tokio::time::Instant;
 
 use super::behaviour::Asked;
@@ -73,9 +74,24 @@ pub(super) struct Peers {
     avoided: HashSet<PeerId>,
     /// Requests sent so far.
     asked: u64,
+    /// How many peers are connected, published on every change.
+    count: watch::Sender<usize>,
 }
 
 impl Peers {
+    /// Empty tables that publish the number of connected peers on `count`.
+    pub(super) fn new(count: watch::Sender<usize>) -> Self {
+        Self {
+            count,
+            ..Self::default()
+        }
+    }
+
+    /// Publishes the number of connected peers, after it changed.
+    fn publish(&self) {
+        self.count.send_replace(self.len());
+    }
+
     /// How many peers are connected.
     pub(super) fn len(&self) -> usize {
         self.connected.len()
@@ -190,6 +206,7 @@ impl Peers {
             asked_at: 0,
         };
         self.connected.insert(peer, state);
+        self.publish();
     }
 
     /// Picks the peer to send `asked` to: of those that do not lack it, the one that failed
@@ -224,6 +241,7 @@ impl Peers {
         let Some(state) = self.connected.remove(&peer) else {
             return false;
         };
+        self.publish();
         if let Some(addr) = state.addr
             && (self.known.len() < MAX_KNOWN || self.known.contains_key(&peer))
         {
@@ -268,7 +286,9 @@ impl Peers {
             self.avoided.clear();
         }
         self.avoided.insert(peer);
-        self.connected.remove(&peer);
+        if self.connected.remove(&peer).is_some() {
+            self.publish();
+        }
         self.known.remove(&peer);
     }
 }

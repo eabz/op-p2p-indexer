@@ -28,7 +28,7 @@ use std::net::SocketAddr;
 
 use alloy_primitives::{B256, BlockNumber};
 use op_indexer_chainspec::ChainSpec;
-use op_indexer_el::{ElError, PeerConfig, PeerNetwork};
+use op_indexer_el::{ElError, PeerConfig, PeerNetwork, Peers};
 use op_indexer_primitives::{ExecutionPeer, L1Games};
 use tokio::sync::{mpsc, watch as watch_channel};
 use tokio_util::sync::CancellationToken;
@@ -88,6 +88,8 @@ pub enum L1Error {
 pub struct L1Network {
     network: PeerNetwork,
     watcher: Watcher,
+    /// The sessions with L1 execution peers, for [`Self::peers`].
+    peers: Peers,
 }
 
 impl L1Network {
@@ -133,8 +135,24 @@ impl L1Network {
             head_rx,
             served,
         )?;
-        let watcher = Watcher::new(config.chain, Fetcher::new(peers), trusted, head, games);
-        Ok(Self { network, watcher })
+        let watcher = Watcher::new(
+            config.chain,
+            Fetcher::new(peers.clone()),
+            trusted,
+            head,
+            games,
+        );
+        Ok(Self {
+            network,
+            watcher,
+            peers,
+        })
+    }
+
+    /// The sessions with L1 execution peers, kept current while the L1 side runs.
+    #[must_use]
+    pub fn peers(&self) -> Peers {
+        self.peers.clone()
     }
 
     /// Runs the L1 side until `cancel` fires or the source of trusted blocks ends.
@@ -144,7 +162,11 @@ impl L1Network {
     /// Returns [`L1Error`] if the network cannot bind its sockets or one of its tasks fails,
     /// or the watcher panics.
     pub async fn run(self, cancel: CancellationToken) -> Result<(), L1Error> {
-        let Self { network, watcher } = self;
+        let Self {
+            network,
+            watcher,
+            peers: _,
+        } = self;
         // Either part ending stops the other.
         let stop = cancel.child_token();
         let watching = tokio::spawn(watcher.run(stop.clone()));

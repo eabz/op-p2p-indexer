@@ -93,6 +93,23 @@ pub struct Report {
     pub requests_in_flight: u32,
     /// Bytes it sends to clients per second.
     pub bytes_per_second: u64,
+    /// Its peers: `Heartbeat.consensus_peers` and the fields after it in the proto.
+    pub peers: PeerReport,
+}
+
+/// The peers a server reports; each count is `None` when its network does not run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PeerReport {
+    /// Consensus gossip peers connected.
+    pub consensus_peers: Option<u32>,
+    /// Sessions with the chain's execution peers.
+    pub execution_sessions: Option<u32>,
+    /// Of those, the sessions the peers dialed.
+    pub execution_inbound: Option<u32>,
+    /// Sessions with L1 execution peers.
+    pub l1_sessions: Option<u32>,
+    /// The beacon light client's peers.
+    pub beacon_peers: Option<u32>,
 }
 
 /// Why registration cannot start.
@@ -253,6 +270,14 @@ fn heartbeat(template: Heartbeat, report: Report) -> Heartbeat {
         contiguous_through,
         requests_in_flight,
         bytes_per_second,
+        peers:
+            PeerReport {
+                consensus_peers,
+                execution_sessions,
+                execution_inbound,
+                l1_sessions,
+                beacon_peers,
+            },
     } = report;
     Heartbeat {
         healthy,
@@ -263,6 +288,11 @@ fn heartbeat(template: Heartbeat, report: Report) -> Heartbeat {
         contiguous_through,
         requests_in_flight,
         bytes_per_second,
+        consensus_peers,
+        execution_sessions,
+        execution_inbound,
+        l1_sessions,
+        beacon_peers,
         ..template
     }
 }

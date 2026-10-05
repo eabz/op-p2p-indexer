@@ -23,7 +23,7 @@ use tracing::{debug, info, warn};
 
 use crate::proto::balancer_server;
 use crate::proto::{Heartbeat, LocateRequest, LocateResponse, Registered};
-use crate::register::{HEARTBEAT_INTERVAL, is_valid_address};
+use crate::register::{HEARTBEAT_INTERVAL, PeerReport, is_valid_address};
 use crate::table::{Server, Table};
 
 /// A server is down once no heartbeat came for this long: three missed (6.3).
@@ -189,6 +189,11 @@ fn checked(chain: &ChainSpec, heartbeat: Heartbeat) -> Result<(String, Server), 
         contiguous_through,
         requests_in_flight,
         bytes_per_second,
+        consensus_peers,
+        execution_sessions,
+        execution_inbound,
+        l1_sessions,
+        beacon_peers,
     } = heartbeat;
     if chain_id != chain.chain_id {
         return Err(Status::failed_precondition(other_chain(chain, chain_id)));
@@ -210,6 +215,14 @@ fn checked(chain: &ChainSpec, heartbeat: Heartbeat) -> Result<(String, Server), 
         contiguous_through,
         requests_in_flight,
         bytes_per_second,
+        peers: PeerReport {
+            consensus_peers,
+            execution_sessions,
+            execution_inbound,
+            l1_sessions,
+            beacon_peers,
+        },
+        peerless_since: None,
     };
     Ok((id, server))
 }

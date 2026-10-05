@@ -1,8 +1,9 @@
 //! The chain's JSON-RPC endpoint, read-only: what the archive service leaves out of some rows
-//! (see `fill`). Whole blocks with `eth_getBlockByNumber` and full transactions (public
-//! endpoints do not all allow the per-transaction methods; Unichain's does not) and their
-//! receipts with `eth_getBlockReceipts` (else `eth_getTransactionReceipt` per transaction),
-//! several calls per request as one JSON-RPC batch.
+//! (see `fill`). Headers with `eth_getBlockByNumber` without transactions; whole blocks with
+//! it and full transactions (public endpoints do not all allow the per-transaction methods;
+//! Unichain's does not) and their receipts with `eth_getBlockReceipts` (else
+//! `eth_getTransactionReceipt` per transaction); several calls per request as one JSON-RPC
+//! batch, of a size the operator sets ([`Rpc::new`]).
 //!
 //! Nothing read here is trusted: it goes into the rebuilt block, and the block's header hash
 //! proves it or `verify` fails. The answer's block hash is compared with the one the service
@@ -24,8 +25,6 @@ use tracing::{debug, warn};
 
 use crate::backoff::Backoff;
 
-/// Calls in one request, as one batch: Unichain's public endpoint refuses more than 10.
-pub(crate) const BATCH_CALLS: usize = 10;
 /// Limit for one request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// Limit for connecting to the endpoint.
@@ -37,6 +36,7 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(600);
 pub(crate) const fn default_endpoint(chain_id: u64) -> Option<&'static str> {
     match chain_id {
         130 => Some("https://mainnet.unichain.org"),
+        8453 => Some("https://mainnet.base.org"),
         _ => None,
     }
 }
@@ -48,6 +48,29 @@ pub(crate) struct Wanted {
     /// The block's hash in the download, which the endpoint's must equal.
     pub(crate) hash: B256,
     pub(crate) indexes: Vec<u64>,
+}
+
+/// The header fields of a block the service may leave out, in the RPC's form; each absent
+/// where the block's fork has none.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RpcHeader {
+    pub(crate) number: U64,
+    /// Checked against the download's when fetched; not kept in the fill.
+    #[serde(default, skip_serializing)]
+    hash: B256,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) mix_hash: Option<B256>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) base_fee_per_gas: Option<U64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) withdrawals_root: Option<B256>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) blob_gas_used: Option<U64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) excess_blob_gas: Option<U64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) parent_beacon_block_root: Option<B256>,
 }
 
 /// A whole block's transactions and receipts, in the RPC's form: the parts the rebuild reads.
@@ -160,15 +183,18 @@ impl RpcError {
 pub(crate) struct Rpc {
     client: Client,
     url: String,
+    /// Calls in one request; at least two (a whole block takes two).
+    batch_calls: usize,
 }
 
 impl Rpc {
-    /// Builds the client for `url`.
+    /// Builds the client for `url`, sending `batch` calls per request (Unichain's public
+    /// endpoint refuses more than 10).
     ///
     /// # Errors
     ///
     /// Returns an error if the HTTP client cannot be built.
-    pub(crate) fn new(url: &str) -> eyre::Result<Self> {
+    pub(crate) fn new(url: &str, batch: usize) -> eyre::Result<Self> {
         let client = Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .connect_timeout(CONNECT_TIMEOUT)
@@ -176,6 +202,7 @@ impl Rpc {
         Ok(Self {
             client,
             url: url.to_owned(),
+            batch_calls: batch.max(2),
         })
     }
 
@@ -184,8 +211,48 @@ impl Rpc {
         &self.url
     }
 
+    /// Calls in one request.
+    pub(crate) const fn batch_calls(&self) -> usize {
+        self.batch_calls
+    }
+
+    /// The headers of `blocks`, in their order, read with one batch request: at most
+    /// [`Self::batch_calls`] blocks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RpcError`] once the attempts are spent or the error cannot pass.
+    pub(crate) async fn headers(
+        &self,
+        blocks: &[BlockNumHash],
+    ) -> Result<Vec<RpcHeader>, RpcError> {
+        let calls: Vec<_> = blocks
+            .iter()
+            .map(|block| {
+                (
+                    "eth_getBlockByNumber",
+                    json!([format!("{:#x}", block.number), false]),
+                )
+            })
+            .collect();
+        let mut headers = Vec::with_capacity(blocks.len());
+        for (wanted, answer) in blocks.iter().zip(self.batch(&calls).await?) {
+            let header =
+                parse::<Option<RpcHeader>>(answer?)?.ok_or(RpcError::NoBlock(wanted.number))?;
+            if header.hash != wanted.hash {
+                return Err(RpcError::OtherBlock {
+                    number: wanted.number,
+                    expected: wanted.hash,
+                    got: header.hash,
+                });
+            }
+            headers.push(header);
+        }
+        Ok(headers)
+    }
+
     /// The authorization lists `blocks` want, in their order (block by block, index by index),
-    /// read with one batch request: at most [`BATCH_CALLS`] blocks.
+    /// read with one batch request: at most [`Self::batch_calls`] blocks.
     ///
     /// # Errors
     ///
@@ -216,8 +283,8 @@ impl Rpc {
         Ok(lists)
     }
 
-    /// The transactions and receipts of the blocks `holes`, in their order, read with one batch request
-    /// (two calls a block: at most half of [`BATCH_CALLS`] blocks). A block whose receipts
+    /// The transactions and receipts of the blocks `holes`, in their order, read with one batch
+    /// request (two calls a block: at most half of [`Self::batch_calls`] blocks). A block whose receipts
     /// the endpoint will not give at once is read again receipt by receipt.
     ///
     /// # Errors
@@ -263,10 +330,10 @@ impl Rpc {
         Ok(filled)
     }
 
-    /// The receipts of `transactions`, by hash, [`BATCH_CALLS`] per request.
+    /// The receipts of `transactions`, by hash, [`Self::batch_calls`] per request.
     async fn receipts(&self, transactions: &[RpcTransaction]) -> Result<Vec<RpcReceipt>, RpcError> {
         let mut receipts = Vec::new();
-        for part in transactions.chunks(BATCH_CALLS) {
+        for part in transactions.chunks(self.batch_calls) {
             let calls: Vec<_> = part
                 .iter()
                 .map(|tx| ("eth_getTransactionReceipt", json!([tx.hash])))

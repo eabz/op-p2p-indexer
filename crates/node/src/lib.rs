@@ -15,6 +15,7 @@
 
 mod config;
 pub mod env_file;
+mod peers;
 mod provider;
 
 use std::future::Future;
@@ -44,6 +45,8 @@ use tracing::{debug, info, warn};
 
 pub use crate::config::Config;
 use crate::config::{ElSettings, L1Settings, NODE_DIR};
+pub use crate::peers::PeerCounts;
+use crate::peers::PeerSources;
 use crate::provider::{NodeProvider, RangeEnd};
 
 /// Unsafe blocks waiting for the pipeline. Blocks arrive every 2 s on OP Mainnet and every
@@ -118,6 +121,8 @@ pub struct NodeView {
     unsafe_store: MemoryStore,
     /// Where [`Self::contiguous_through`]'s last search ended.
     range_end: RangeEnd,
+    /// Where [`Self::peers`] reads from.
+    peers: PeerSources,
 }
 
 impl NodeView {
@@ -127,7 +132,15 @@ impl NodeView {
             load,
             unsafe_store,
             range_end: RangeEnd::default(),
+            peers: PeerSources::default(),
         }
+    }
+
+    /// How many peers each of the node's networks has now. Cheap: read from what the
+    /// networks publish as they run.
+    #[must_use]
+    pub fn peers(&self) -> PeerCounts {
+        self.peers.counts()
     }
 
     /// The highest block N such that the node holds every block from `archive`'s first
@@ -379,11 +392,12 @@ async fn run_components<A: Archive>(
     execution: Option<ExecutionNetwork<NodeProvider<A>>>,
     l1: Option<(L1Network, LightClient)>,
     (pipeline, stream): (Pipeline<MemoryStore, A>, StreamServer<MemoryStore, A>),
-    (mut followers, tasks, view): (JoinSet<&'static str>, Vec<(&'static str, Task)>, NodeView),
+    (mut followers, tasks, mut view): (JoinSet<&'static str>, Vec<(&'static str, Task)>, NodeView),
     saves: Vec<JoinHandle<()>>,
 ) -> eyre::Result<()> {
     let cancel = CancellationToken::new();
     let networks_cancel = cancel.child_token();
+    view.peers = PeerSources::new(&network, execution.as_ref(), l1.as_ref());
     // The binary's own tasks, stopped with the networks.
     let mut extra = JoinSet::new();
     for (name, task) in tasks {

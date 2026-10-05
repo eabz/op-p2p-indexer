@@ -95,7 +95,8 @@ again; a completed chunk is never redone.
 
 ### 3.1a What the service leaves out, from the chain's RPC
 
-Two gaps are known, both on Unichain; OP Mainnet's whole chain verified without either.
+Three gaps are known: two on Unichain, one on Base; OP Mainnet's whole chain verified without
+any.
 
 - **Authorization lists.** HyperSync sends EIP-7702 transactions (type 4) without their
   `authorization_list`; every other field is there. Found at block 16,068,511: its type-4
@@ -108,6 +109,16 @@ Two gaps are known, both on Unichain; OP Mainnet's whole chain verified without 
   is the chunk's end). The chain has 8 transactions in 55,142,810. Every block after the
   Bedrock block has at least the L1-attributes deposit, so a block from there on without
   transaction rows is a hole: the whole block is fetched.
+- **Header fields (Base).** HyperSync's Base rows lack header fields in large stretches before
+  block 13.5 M. Of 52 chunks sampled across 0 to 52.19 M (2026-10-05), every block in the chunks
+  at 0, 1.04 M, 2.09 M, 3.13 M, 6.26 M, 10.4 M and 11.5 M lacks `mix_hash` and
+  `base_fee_per_gas`, 12.52 M lacks `mix_hash` only, and the chunks at 4.17 M, 5.22 M, 7.31 M,
+  8.35 M, 9.39 M and from 13.57 M on are complete: millions of blocks, patchy. Neither field can
+  be rebuilt (`mix_hash` is the L1 origin's randomness). For a block whose header row lacks any
+  field of its forks, the header is fetched (`eth_getBlockByNumber` without transactions) and
+  its fork's header fields are kept; whether the later forks' fields (`withdrawals_root`, the
+  blob gas fields, the parent beacon block root) are missing there too shows in the scan's
+  report, per field.
 
 - **Checked after every download.** Once the chunks are on disk, `download` reads every chunk
   not sealed yet (one per core at a time, within 256 MiB of downloaded bytes in flight, the
@@ -127,24 +138,39 @@ Two gaps are known, both on Unichain; OP Mainnet's whole chain verified without 
 - **Left out** means: a type-4 row with no `authorization_list`, no bytes, or a list of zero
   entries (the service writes an empty list as a count of zero, as it does `access_list`), and
   no fill. The scan and `verify` use the same rule (`TransactionRow::lacks_authorization_list`).
-- **Fetched**: `eth_getBlockByNumber` with full transactions for each block that needs it
-  (Unichain's public endpoint does not allow `eth_getTransactionByBlockNumberAndIndex`), and
-  for a hole its receipts too, with `eth_getBlockReceipts` (else `eth_getTransactionReceipt`
-  per transaction, for an endpoint without it), up to 10 calls per request as one JSON-RPC
-  batch (the endpoint refuses larger batches, with one error for the whole batch, which is
-  reported as a refusal with its message), four chunks' requests at a time. A request is
+- **Fetched as the scan goes**: what a chunk lacks is fetched as soon as the chunk is read,
+  while the next ones are read. `eth_getBlockByNumber` without transactions for a header,
+  with full transactions for a list (Unichain's public endpoint does not allow
+  `eth_getTransactionByBlockNumberAndIndex`), and for a hole its receipts too, with
+  `eth_getBlockReceipts` (else `eth_getTransactionReceipt` per transaction, for an endpoint
+  without it). `--rpc-batch` calls per request as one JSON-RPC batch
+  (`OP_INDEXER_IMPORT_RPC_BATCH`, default 10: Unichain's public endpoint refuses larger
+  batches, with one error for the whole batch, which is reported as a refusal with its
+  message), `--rpc-requests` chunks' requests at a time (`OP_INDEXER_IMPORT_RPC_REQUESTS`,
+  default 4). The defaults suit a public endpoint; a provider of your own may take more of
+  both. Progress is logged every 10 seconds: chunks read, blocks fetched and found, blocks per
+  second, the time left for the blocks found so far. A request is
   retried up to six times with `download`'s capped, jittered backoff on a busy endpoint (408,
   5xx), a broken connection or a malformed answer; on a rate limit (429) it waits what
   `Retry-After` asks (up to 10 minutes), else 15 s doubling to 2 minutes, minutes in all.
-  Ctrl-C drops the requests in flight at once. A refused call, a block the endpoint does not have, or a block hash that is not
-  the downloaded one (an endpoint of another chain) fails at once, naming the endpoint.
+  Ctrl-C drops the requests in flight at once. A refused call, a block the endpoint does not
+  have, or a block hash that is not the downloaded one (an endpoint of another chain) fails at
+  once, naming the endpoint.
+- **Resumable**: a chunk's fill is written once its requests are all answered, and the scan
+  reads the fill with the rows, so a chunk whose fill holds what it lacks fetches nothing on
+  the next run. A run stopped part way loses at most the chunks being fetched. Each run reads
+  every chunk not sealed yet again (decompress and parse), which on Base's 2.57 TB takes a
+  while; the fetching goes on meanwhile.
 - **Kept apart.** What is fetched goes to the chunk's fill, `raw/<from>-<to>.fill.json`,
   written atomically and durably, in the RPC's JSON form (a list per transaction; a hole's
-  transactions and receipts with their logs); the downloaded chunk stays as received. A
+  transactions and receipts with their logs; a header's fork fields, without its hash: about
+  150 bytes a block before Canyon, 400 after Ecotone); the downloaded chunk stays as
+  received. A
   chunk downloaded again loses its old fill first. `verify` reads no RPC: it puts the fill
   into the rows before rebuilding, a list into its transaction, a hole's transactions and
   logs as rows like the service's (the receipt's fields with the transaction's, the access
-  list in the service's layout). A type-4 row with no list, or a block after Bedrock with no
+  list in the service's layout), a header field into the header row where the row lacks it
+  (what the service sent is kept). A type-4 row with no list, or a block after Bedrock with no
   transactions, and no fill, fails `verify` with a message to run `download`, not the generic
   hash mismatch. A fill is deleted with its downloaded chunk once that chunk is sealed.
 - **Trust unchanged.** What is filled goes into the rebuilt block; the transactions and
@@ -152,15 +178,20 @@ Two gaps are known, both on Unichain; OP Mainnet's whole chain verified without 
   which `verify` recovers from the signatures and checks like every other. A wrong fill fails `verify` like a wrong row (checked: one
   changed signature byte gives a header hash mismatch).
 - **Endpoint**: `--rpc-endpoint` (`OP_INDEXER_IMPORT_RPC_ENDPOINT`), by default
-  `https://mainnet.unichain.org` for Unichain and none for OP Mainnet, whose rows need none so
-  far, nor for Base, which should be given one (`https://mainnet.base.org`, section 10);
-  without one, `download` stops with a message when something is missing.
-- **Counted**: `authorization_lists_to_fetch`, `holes_to_fetch` and `rpc_filled_transactions`
-  in `download`'s summary, `rpc_filled_transactions` (lists filled and hole transactions
-  added) in `verify`'s; each hole is also a `block`/`transactions` line of the missing-field
-  report.
+  `https://mainnet.unichain.org` for Unichain, `https://mainnet.base.org` for Base, and none
+  for OP Mainnet, whose rows need none so far; without one, `download` stops with a message
+  when something is missing.
+- **Counted**: `blocks_to_fetch`, `blocks_fetched`, `rpc_filled_transactions` and
+  `rpc_filled_headers` in `download`'s summary, and one warning per missing field with its
+  count and first block (counted before that run's fills); `rpc_filled_transactions` (lists
+  filled and hole transactions added) in `verify`'s; each hole is also a
+  `block`/`transactions` line of the missing-field report.
 - Not done: asking HyperSync again for a hole's chunk before using the RPC; the RPC answer is
-  proven the same way.
+  proven the same way. And, if the endpoint is too slow for Base's millions of headers, the
+  header fields could be derived instead of fetched: `mix_hash` and the parent beacon block
+  root from the L1 origin's header (from L1's HyperSync), the base fee from EIP-1559 with the
+  chain's parameters, the withdrawals root and the blob gas fields as their constants; the
+  header hash would prove them the same way. Not built.
 
 Checked on 2026-10-04, offline but for the endpoint: a chunk of block 16,068,511 built from
 the endpoint's block and receipts in HyperSync's row format, without `authorization_list`.
@@ -175,6 +206,14 @@ and access list, coming from the endpoint) verified too. The receipt-by-receipt 
 not run: Unichain's endpoint has `eth_getBlockReceipts`. Not checked against HyperSync's own
 Unichain answers. (These checks ran with the build of the time, whose `verify` wrote a
 verified copy instead of sealing.)
+
+Header fields, checked on 2026-10-05: a chunk of OP Mainnet (blocks 140,000,063 to
+140,000,162) with `mix_hash` and `base_fee_per_gas` taken out of all 100 header rows.
+`download` (every chunk present: no request to HyperSync) went straight to the scan, reported
+both fields missing 100 times, and fetched the 100 headers from `https://mainnet.optimism.io`
+in 2.8 s (10 calls a request, 2 requests at a time: about 35 blocks a second); the fill is
+41 KB. A second `download` fetched nothing. `verify` rebuilt every header to its hash, sealed
+the chunk and accepted it at its anchor. Not run against Base's own rows or endpoint.
 
 ### 3.2 `verify`: check, seal and upload
 
@@ -317,8 +356,9 @@ machine: `cargo build --release -p op-indexer-import` produces one file to copy.
   endpoints (`OP_INDEXER_IMPORT_ENDPOINT`, `OP_INDEXER_IMPORT_L1_ENDPOINT`,
   `OP_INDEXER_IMPORT_RPC_ENDPOINT`), the range (`OP_INDEXER_IMPORT_FIRST_BLOCK`,
   `_LAST_BLOCK`, `_ANCHOR_HASH`, `_LEGACY_ONLY`), the chunk size
-  (`OP_INDEXER_IMPORT_CHUNK_BLOCKS`), requests in flight (`OP_INDEXER_IMPORT_REQUESTS`), and
-  for `verify`: `--to-dir`, the bucket and its keys (`OP_INDEXER_R2_ACCOUNT_ID`,
+  (`OP_INDEXER_IMPORT_CHUNK_BLOCKS`), requests in flight (`OP_INDEXER_IMPORT_REQUESTS`), the
+  RPC's batch size and requests in flight (`OP_INDEXER_IMPORT_RPC_BATCH`,
+  `OP_INDEXER_IMPORT_RPC_REQUESTS`; section 3.1a), and for `verify`: `--to-dir`, the bucket and its keys (`OP_INDEXER_R2_ACCOUNT_ID`,
   `OP_INDEXER_R2_BUCKET`, `OP_INDEXER_R2_PREFIX`, `OP_INDEXER_R2_ACCESS_KEY_ID`,
   `OP_INDEXER_R2_SECRET_ACCESS_KEY`, `OP_INDEXER_R2_ENDPOINT`; section 3.2), its threads
   (`--threads`, `OP_INDEXER_IMPORT_VERIFY_THREADS`, one per CPU) and its uploads (`--uploads`,
@@ -577,11 +617,12 @@ What differs (`docs/base.md`):
   621), created with `createWithInitData`, whose extra data starts with the L2 block number and
   whose root claim is that block's output root, read through the chain spec's claim formats
   like the other types.
-- **Give an RPC endpoint.** There is none by default. EIP-7702 transactions exist on Base
-  since Isthmus, and HyperSync leaves their authorization lists out (as on Unichain, section
-  3.1a), so expect `download` to need one for the missing fields; without it, `download` lists
-  what is missing and stops, asking for `--rpc-endpoint`. Not yet checked against HyperSync's
-  own Base answers. Two public ones work: `https://mainnet.base.org` (Base's own; it has no `eth_getBlockReceipts`, so a hole's
+- **Header fields from the RPC.** HyperSync's Base rows lack `mix_hash` and the base fee in
+  large stretches before block 13.5 M (section 3.1a), so `download` fetches millions of
+  headers. The endpoint defaults to `https://mainnet.base.org`; at the defaults
+  (`--rpc-batch 10 --rpc-requests 4`) a public endpoint gives tens to a hundred-odd blocks a
+  second, so hours to days for millions; a provider of your own with larger batches and more
+  requests is much faster. Two public ones work: `https://mainnet.base.org` (Base's own; it has no `eth_getBlockReceipts`, so a hole's
   receipts are read one by one, and it limits the rate with an error in the answer, which is
   waited out like HTTP 429) and `https://base.drpc.org` (has it).
 - **Size.** The archive was estimated at 2 to 3.5 TB (`docs/base.md` section 6). The download

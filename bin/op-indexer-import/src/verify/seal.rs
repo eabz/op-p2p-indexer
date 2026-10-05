@@ -516,7 +516,7 @@ fn failed(err: &ChunkError, raw: &Path) -> eyre::Report {
     let hint = match err {
         // A row left without a field says itself what to run.
         ChunkError::Block {
-            check: Check::Unfilled { .. } | Check::Hole,
+            check: Check::Unfilled { .. } | Check::Hole | Check::MissingMixHash,
             ..
         } => "",
         // A field the rows carry wrong, or one the rebuild defaulted: what the chain's RPC

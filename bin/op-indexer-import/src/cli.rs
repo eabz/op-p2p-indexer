@@ -152,11 +152,29 @@ pub(crate) struct DownloadArgs {
     #[arg(long, env = "OP_INDEXER_IMPORT_ENDPOINT")]
     pub(crate) endpoint: Option<String>,
     /// JSON-RPC endpoint of the chain, read-only, for what the archive service leaves out of
-    /// some rows (Unichain's EIP-7702 authorization lists); what it gives is proven by the
-    /// header hash like the rest [default: by chain, `https://mainnet.unichain.org` for
-    /// Unichain (130); none for OP Mainnet, whose rows need none so far].
+    /// some rows (Unichain's EIP-7702 authorization lists, Base's early header fields); what it
+    /// gives is proven by the header hash like the rest [default: by chain,
+    /// `https://mainnet.unichain.org` for Unichain (130), `https://mainnet.base.org` for Base
+    /// (8453); none for OP Mainnet, whose rows need none so far].
     #[arg(long, env = "OP_INDEXER_IMPORT_RPC_ENDPOINT")]
     pub(crate) rpc_endpoint: Option<String>,
+    /// Calls per request to `--rpc-endpoint`, as one JSON-RPC batch. Public endpoints cap it
+    /// (Unichain's at 10); a provider of your own may take more.
+    #[arg(
+        long,
+        env = "OP_INDEXER_IMPORT_RPC_BATCH",
+        default_value_t = 10,
+        value_parser = clap::value_parser!(u64).range(2..=1000)
+    )]
+    pub(crate) rpc_batch: u64,
+    /// Requests to `--rpc-endpoint` in flight at once: kept low for a public endpoint.
+    #[arg(
+        long,
+        env = "OP_INDEXER_IMPORT_RPC_REQUESTS",
+        default_value_t = 4,
+        value_parser = clap::value_parser!(u64).range(1..=256)
+    )]
+    pub(crate) rpc_requests: u64,
     /// `HyperSync` endpoint of the L1 chain the dispute games are on, for the lookup of the
     /// range's last block. Uses the same API token.
     #[arg(

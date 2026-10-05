@@ -16,9 +16,9 @@ mod config;
 use std::path::PathBuf;
 
 use eyre::WrapErr;
-use op_indexer_balancer::register::{HEARTBEAT_INTERVAL, Report};
+use op_indexer_balancer::register::{HEARTBEAT_INTERVAL, PeerReport, Report};
 use op_indexer_chunks::ChunkStore;
-use op_indexer_node::{Config, NodeView, Task};
+use op_indexer_node::{Config, NodeView, PeerCounts, Task};
 use op_indexer_server::{ChunkSource, Exporter, R2Archive, R2Chunks};
 use op_indexer_storage::ArchiveStore;
 use op_indexer_storage::archive_store::FjallArchive;
@@ -124,8 +124,9 @@ async fn run(env_file: Option<PathBuf>) -> eyre::Result<()> {
 }
 
 /// Keeps the report the balancer gets current until `cancel` fires: the node's head, the
-/// committed store's L1 heads and last sealed block, how far it holds every block, and the
-/// stream's load, read once per heartbeat. A store that cannot be read makes the server report itself unhealthy.
+/// committed store's L1 heads and last sealed block, how far it holds every block, the
+/// stream's load and the networks' peers, read once per heartbeat. A store that cannot be
+/// read makes the server report itself unhealthy.
 async fn report<S: ChunkSource>(
     archive: &R2Archive<S>,
     view: &NodeView,
@@ -157,6 +158,19 @@ async fn report<S: ChunkSource>(
             requests_in_flight: view.load.in_flight(),
             // Not counted yet: the stream does not track the bytes it sends.
             bytes_per_second: 0,
+            peers: peer_report(view.peers()),
         });
+    }
+}
+
+/// The node's peer counts as the heartbeat carries them.
+fn peer_report(peers: PeerCounts) -> PeerReport {
+    let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+    PeerReport {
+        consensus_peers: Some(count(peers.consensus)),
+        execution_sessions: peers.execution.map(|sessions| count(sessions.total)),
+        execution_inbound: peers.execution.map(|sessions| count(sessions.inbound)),
+        l1_sessions: peers.l1_execution.map(count),
+        beacon_peers: peers.beacon.map(count),
     }
 }

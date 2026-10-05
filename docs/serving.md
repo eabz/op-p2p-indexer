@@ -474,7 +474,13 @@ heartbeat:
   before) up to the first still waiting for receipts, extended through its unsafe chain's
   canonical blocks that link to them and have theirs, each search continuing from the last;
   never below the last sealed block;
-- load: requests in flight (subscriptions, Flight streams, lookups) and bytes sent per second.
+- load: requests in flight (subscriptions, Flight streams, lookups) and bytes sent per second;
+- peers: consensus gossip peers connected (what unsafe blocks arrive from); sessions with the
+  chain's execution peers, in all and inbound (receipts, gap fill, range sync), unset without
+  the execution network; sessions with L1 execution peers and the beacon light client's
+  peers, unset without the L1 side. Read from what the node's networks publish as they run
+  (`NodeView::peers`), nothing polled. For the status log only (6.3): routing does not use
+  them.
 
 The table holds no chunk ranges (corrected by the user, 2026-10-04): every server is stateless
 and reads the same bucket, so every server serves every sealed chunk. The balancer reads the
@@ -483,7 +489,7 @@ manifest itself, once per refresh (every 30 s), only for the chunk boundaries.
 ### 6.2 Registration
 
 A server opens a `Register` stream to the balancer and sends a heartbeat every 5 s with its
-health, heads, contiguity and load. Three missed heartbeats (15 s) mark it down and remove it.
+health, heads, contiguity, load and peers. Three missed heartbeats (15 s) mark it down and remove it.
 
 ### 6.3 Health and failover
 
@@ -494,6 +500,11 @@ health, heads, contiguity and load. Three missed heartbeats (15 s) mark it down 
   behind, or has a gap above the sealed chunks, gets none there, but still serves sealed
   chunks. A server that reports no `contiguous_through` gets no work above them.
 - Failover is on the client side: every answer names more than one server when there are.
+- Every 30 s the balancer logs one `server status` line per server: its heads,
+  `contiguous_through` and how far that is behind the newest head any server has, requests in
+  flight, and its peers. It is a warning when the server is unhealthy, more than 64 blocks
+  behind, or has had no consensus peer or no execution session for more than a minute: gossip,
+  or receipts and gap fill, have stalled. `no server registered` is a warning too.
 
 ### 6.4 Flight: per-chunk jobs
 

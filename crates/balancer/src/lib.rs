@@ -47,6 +47,9 @@ const STATUS_INTERVAL: Duration = Duration::from_secs(30);
 /// Blocks a server may hold behind the newest head before its status is a warning: about
 /// a minute of blocks at 1 to 2 s each.
 const BEHIND_WARN: u64 = 64;
+/// How long a server may have no consensus peer or no execution session before its status is
+/// a warning: gossip, or receipts and gap fill, have stalled by then.
+const NO_PEERS_WARN: Duration = Duration::from_mins(1);
 /// How long open calls and tasks get to end after shutdown begins.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// How often an idle connection is pinged, and how long the answer may take: on the
@@ -206,8 +209,9 @@ impl Balancer {
 }
 
 /// Logs every [`STATUS_INTERVAL`] one line per registered server: its heads, how far it
-/// holds every block, and how far that is behind the newest head any server has. A server
-/// unhealthy or more than [`BEHIND_WARN`] blocks behind is logged as a warning.
+/// holds every block, how far that is behind the newest head any server has, and its peers.
+/// A server unhealthy, more than [`BEHIND_WARN`] blocks behind, or with no consensus peer or
+/// no execution session for more than [`NO_PEERS_WARN`] is logged as a warning.
 async fn report_servers(table: Table, cancel: CancellationToken) {
     let mut ticks = tokio::time::interval(STATUS_INTERVAL);
     ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -231,6 +235,10 @@ async fn report_servers(table: Table, cancel: CancellationToken) {
                 .zip(server.contiguous_through)
                 .map(|(tip, through)| tip.saturating_sub(through));
             let lagging = behind.is_none_or(|behind| behind > BEHIND_WARN);
+            let peers = server.peers;
+            let stalled = server
+                .peerless_since
+                .is_some_and(|since| since.elapsed() > NO_PEERS_WARN);
             macro_rules! status {
                 ($level:ident) => {
                     $level!(
@@ -243,11 +251,16 @@ async fn report_servers(table: Table, cancel: CancellationToken) {
                         contiguous_through = ?server.contiguous_through,
                         behind = ?behind,
                         in_flight = server.requests_in_flight,
+                        consensus_peers = ?peers.consensus_peers,
+                        execution_sessions = ?peers.execution_sessions,
+                        execution_inbound = ?peers.execution_inbound,
+                        l1_sessions = ?peers.l1_sessions,
+                        beacon_peers = ?peers.beacon_peers,
                         "server status"
                     )
                 };
             }
-            if !server.healthy || lagging {
+            if !server.healthy || lagging || stalled {
                 status!(warn);
             } else {
                 status!(info);

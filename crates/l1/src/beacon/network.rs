@@ -41,7 +41,7 @@ use libp2p::request_response::{self, OutboundFailure, OutboundRequestId};
 use libp2p::swarm::SwarmEvent;
 use libp2p::swarm::dial_opts::DialOpts;
 use libp2p::{Multiaddr, PeerId, Swarm, SwarmBuilder, identify, identity, noise, tcp, yamux};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
@@ -113,7 +113,8 @@ impl std::fmt::Debug for Network {
 /// listener; [`Network::run`] binds discovery's UDP socket.
 ///
 /// The node gets a new identity at each start. `digest` is the fork digest peers must be on;
-/// `status` is what the node reports about itself in `Status` for the whole run.
+/// `status` is what the node reports about itself in `Status` for the whole run. The number
+/// of connected peers is published on `peer_count`.
 ///
 /// # Errors
 ///
@@ -125,6 +126,7 @@ pub(super) fn new(
     bootnodes: Vec<String>,
     digest: ForkDigest,
     status: StatusData,
+    peer_count: watch::Sender<usize>,
 ) -> Result<(Network, NetworkHandle, mpsc::Receiver<Gossip>), BeaconError> {
     let (gossipsub, finality_topic, optimistic_topic) = behaviour::gossip(digest)?;
     let mut swarm = SwarmBuilder::with_existing_identity(identity::Keypair::generate_secp256k1())
@@ -155,7 +157,7 @@ pub(super) fn new(
         gossip,
         finality_topic,
         optimistic_topic,
-        peers: Peers::default(),
+        peers: Peers::new(peer_count),
         pending: HashMap::new(),
         waiting: VecDeque::new(),
     };

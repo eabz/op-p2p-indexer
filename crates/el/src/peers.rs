@@ -107,6 +107,15 @@ pub struct Peers {
     dropped: Arc<WarnLimit>,
 }
 
+/// The sessions a peer set has open ([`Peers::session_counts`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionCounts {
+    /// Sessions the peers dialed.
+    pub inbound: usize,
+    /// Every session, dialed by us or by them.
+    pub total: usize,
+}
+
 /// What a requester tells the peer set about a peer.
 #[derive(Debug, Clone, Copy)]
 pub enum Report {
@@ -197,6 +206,19 @@ impl Peers {
     #[must_use]
     pub fn sessions(&self) -> Arc<[SessionHandle]> {
         Arc::clone(&self.sessions.borrow())
+    }
+
+    /// How many sessions are open now, and how many of them the peers dialed.
+    #[must_use]
+    pub fn session_counts(&self) -> SessionCounts {
+        let sessions = self.sessions.borrow();
+        SessionCounts {
+            inbound: sessions
+                .iter()
+                .filter(|session| session.status().direction == Direction::Inbound)
+                .count(),
+            total: sessions.len(),
+        }
     }
 
     /// The newest block peers say they hold: the median of the three highest `latest` that

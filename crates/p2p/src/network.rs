@@ -87,6 +87,8 @@ pub struct Network {
     blocks: mpsc::Sender<UnsafeBlock>,
     safe_head: watch::Receiver<BlockNumber>,
     payloads: Arc<dyn PayloadSource>,
+    /// Connected peers subscribed to the block topics, published by the swarm task.
+    peer_count: watch::Sender<usize>,
 }
 
 /// The swarm's protocols: connection limits enforced for every connection, gossipsub, ping
@@ -186,7 +188,15 @@ impl Network {
             blocks,
             safe_head,
             payloads,
+            peer_count: watch::Sender::new(0),
         }
+    }
+
+    /// The number of connected peers subscribed to the block topics, kept current while the
+    /// node runs: what the node gossips with.
+    #[must_use]
+    pub fn peer_count(&self) -> watch::Receiver<usize> {
+        self.peer_count.subscribe()
     }
 
     /// Runs the node until `cancel` fires or the block consumer drops its receiver.
@@ -203,6 +213,7 @@ impl Network {
             blocks,
             safe_head,
             payloads,
+            peer_count,
         } = self;
         let chain = config.chain;
 
@@ -217,25 +228,18 @@ impl Network {
         info!(peer_id = %swarm.local_peer_id(), chain_id = chain.chain_id, "p2p node starting");
 
         let (discovered_tx, mut discovered_rx) = mpsc::channel(DISCOVERED_PEERS_CAPACITY);
-        let (peer_count_tx, peer_count_rx) = watch::channel(0);
         let mut discovery_task = JoinSet::new();
         discovery_task.spawn(discovery.run(
             config.bootnodes,
             discovered_tx,
-            peer_count_rx,
+            peer_count.subscribe(),
             cancel.child_token(),
         ));
 
         let validator = BlockValidator::new(chain);
         let server = crate::sync::Server::new(chain, payloads);
         let mut state = State::new(
-            topics,
-            validator,
-            blocks,
-            store,
-            peer_count_tx,
-            safe_head,
-            server,
+            topics, validator, blocks, store, peer_count, safe_head, server,
         );
 
         state.dial_known_peers(&mut swarm).await;

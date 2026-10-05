@@ -1,31 +1,36 @@
 //! What the archive service leaves out of some rows, fetched from the chain's JSON-RPC
-//! ([`Rpc`]) by `download` and kept next to the chunk, so `verify` stays offline.
+//! ([`Rpc`]) by `download` and kept next to the chunk, so `verify` reads no RPC.
 //!
-//! Known so far, on Unichain (OP Mainnet's whole chain needed nothing):
+//! Known so far:
 //!
-//! - EIP-7702 transactions without their authorization list. The list is not optional, so such
-//!   a row cannot be rebuilt from the download alone.
+//! - EIP-7702 transactions without their authorization list (Unichain). The list is not
+//!   optional, so such a row cannot be rebuilt from the download alone.
 //! - Holes: blocks whose header row is there but none of their transaction and log rows (ten in
-//!   a row at 55,142,810). Every block after the Bedrock block has at least the L1-attributes
-//!   deposit, so a block without transactions is one the service left out; the whole block's
-//!   transactions and receipts are fetched.
+//!   a row at 55,142,810 on Unichain). Every block after the Bedrock block has at least the
+//!   L1-attributes deposit, so a block without transactions is one the service left out; the
+//!   whole block's transactions and receipts are fetched.
+//! - Header fields: Base's rows lack `mix_hash` and `base_fee_per_gas` in large stretches before
+//!   block 13.5 M (and may lack a later fork's fields there too). For a block whose header row
+//!   lacks any field its forks have, the header is fetched (`eth_getBlockByNumber` without
+//!   transactions) and its fields kept.
 //!
 //! After the chunks are downloaded, every chunk not sealed yet is read, several at once
-//! within `verify`'s memory bound ([`IN_FLIGHT_BYTES`]), and
-//! checked for every field its rows lack ([`crate::verify::missing`]): all of them are logged
-//! in one summary, so they can be dealt with together rather than one `verify` failure at a
-//! time. What is missing is fetched, several calls per request ([`BATCH_CALLS`]), a few
-//! requests at a time, and written to the chunk's fill (`<from>-<to>.fill.json` in `raw/`,
-//! written atomically and durably), in the RPC's form. The downloaded chunk itself is kept as
-//! received. `verify` merges the fill into the rows: a list into its transaction, a hole's
-//! transactions and logs as rows of their own. A row or block still left out fails there with
-//! a message to run `download`.
+//! within `verify`'s memory bound ([`IN_FLIGHT_BYTES`]), and checked for every field its rows
+//! lack ([`crate::verify::missing`]): all of them are logged in one summary at the end. What a
+//! chunk lacks is fetched as soon as the chunk is read, several calls per request (`--rpc-batch`),
+//! `--rpc-requests` requests at a time, while the next chunks are read, and written to the
+//! chunk's fill (`<from>-<to>.fill.json` in `raw/`, written atomically and durably), in the RPC's
+//! form. The downloaded chunk itself is kept as received. A chunk whose fill already holds what
+//! it lacks needs nothing, so a run stopped part way resumes where it was. `verify` merges the
+//! fill into the rows: a list into its transaction, a hole's transactions and logs as rows of
+//! their own, a header field into the header row where it lacks it. A row or block still left
+//! out fails there with a message to run `download`.
 //!
 //! The trust is unchanged: what the fill holds goes into the rebuilt block, and the block's
-//! header hash proves it. A hole's senders are the RPC's `from`, which `load` recovers and
+//! header hash proves it. A hole's senders are the RPC's `from`, which `verify` recovers and
 //! checks like every other.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -41,12 +46,9 @@ use tracing::{info, warn};
 
 use crate::progress::{self, Rate};
 use crate::rows::{self, LogRow, Rows, TransactionRow};
-use crate::rpc::{BATCH_CALLS, FilledBlock, Rpc, Wanted};
+use crate::rpc::{FilledBlock, Rpc, RpcHeader, Wanted};
 use crate::state::{Chunk, Plan, State, covered, read_json, write_json};
 use crate::verify::{Forks, IN_FLIGHT_BYTES, Missing, encode_access_list, holes, missing};
-
-/// Requests to the RPC endpoint in flight at once: it is a public endpoint, used politely.
-const RPC_REQUESTS: usize = 4;
 
 /// What a chunk's rows lack, fetched from the chain's RPC.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -57,6 +59,9 @@ pub(crate) struct Fill {
     /// Blocks whose transactions and logs the service left out.
     #[serde(default)]
     blocks: Vec<FilledBlock>,
+    /// Header fields of blocks whose header row lacks some.
+    #[serde(default)]
+    headers: Vec<RpcHeader>,
 }
 
 /// One transaction's authorization list, in the RPC's form.
@@ -70,6 +75,19 @@ struct FilledTransaction {
 /// Puts what `fill` holds into the rows it is for. Returns how many transaction rows it
 /// filled or added.
 pub(crate) fn apply(rows: &mut Rows, fill: Fill) -> u64 {
+    for header in fill.headers {
+        // Only into a field the row lacks: what the service sent is kept.
+        if let Some(row) = rows.block_mut(header.number.to()) {
+            row.mix_hash = row.mix_hash.or(header.mix_hash);
+            row.base_fee_per_gas = row.base_fee_per_gas.or(header.base_fee_per_gas);
+            row.withdrawals_root = row.withdrawals_root.or(header.withdrawals_root);
+            row.blob_gas_used = row.blob_gas_used.or(header.blob_gas_used);
+            row.excess_blob_gas = row.excess_blob_gas.or(header.excess_blob_gas);
+            row.parent_beacon_block_root = row
+                .parent_beacon_block_root
+                .or(header.parent_beacon_block_root);
+        }
+    }
     let mut filled = 0_u64;
     let mut added = false;
     for block in fill.blocks {
@@ -175,11 +193,21 @@ struct Fetch {
     wanted: Vec<Wanted>,
     /// The blocks to fetch whole.
     holes: Vec<BlockNumHash>,
+    /// The blocks whose header fields to fetch.
+    headers: Vec<BlockNumHash>,
 }
 
 impl Fetch {
     fn is_empty(&self) -> bool {
-        self.wanted.is_empty() && self.holes.is_empty()
+        self.blocks() == 0
+    }
+
+    /// Block reads from the RPC: a block may need two (its list and its header).
+    fn blocks(&self) -> usize {
+        self.wanted
+            .len()
+            .saturating_add(self.holes.len())
+            .saturating_add(self.headers.len())
     }
 }
 
@@ -190,19 +218,20 @@ fn tally(tally: &mut Tally, field: Missing, count: u64, first: u64) {
     entry.1 = entry.1.min(first);
 }
 
-/// Lists every field the rows of the downloaded chunks not sealed yet lack, logs them, and
-/// fetches what can be fetched (authorization lists, holes) from `rpc` into the chunks' fills.
-/// Up to `threads`
-/// chunks are read at once, within [`IN_FLIGHT_BYTES`] of downloaded bytes.
+/// Lists every field the rows of the downloaded chunks not sealed yet lack, and fetches what
+/// can be fetched (authorization lists, holes, header fields) from `rpc` into the chunks'
+/// fills, `requests` requests at a time, while the next chunks are read: up to `threads` at
+/// once, within [`IN_FLIGHT_BYTES`] of downloaded bytes. Logs what is missing at the end.
 ///
 /// # Errors
 ///
-/// Returns an error if a chunk cannot be read, lists are missing and there is no endpoint, a
-/// request fails for good, or a fill cannot be written.
+/// Returns an error if a chunk cannot be read, something is to fetch and there is no
+/// endpoint, a request fails for good, a fill cannot be written, or `cancel` fires.
 pub(crate) async fn run(
     state: &State,
     plan: &Plan,
     rpc: Option<&Rpc>,
+    requests: usize,
     threads: usize,
     cancel: &CancellationToken,
 ) -> eyre::Result<()> {
@@ -210,107 +239,228 @@ pub(crate) async fn run(
         let (state, plan) = (state.clone(), *plan);
         tokio::task::spawn_blocking(move || to_scan(&state, &plan)).await??
     };
-    let started = Instant::now();
     info!(
         chunks = chunks.len(),
-        threads, "checking the downloaded rows for missing fields"
+        threads,
+        endpoint = rpc.map(Rpc::url),
+        rpc_batch = rpc.map(Rpc::batch_calls),
+        rpc_requests = requests,
+        "checking the downloaded rows for missing fields, and fetching them"
     );
     let forks = Forks::new(plan.chain);
-    let total = chunks.len();
+    // Chunks read and waiting for their fetch: enough to keep every request busy, few enough
+    // that reading, much faster, does not hold the range's needs in memory.
+    let backlog = requests.saturating_mul(4);
+    let mut work = Work::new(chunks.len(), rpc.is_some());
     let mut queue = chunks.into_iter().peekable();
-    let mut tasks = JoinSet::new();
+    let (mut scans, mut fetches) = (JoinSet::new(), JoinSet::new());
     let mut tick = interval(progress::INTERVAL);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut rate = Rate::new();
-    let mut scanned = 0_usize;
     let mut in_flight_bytes = 0_u64;
-    let mut lacking = Tally::new();
-    let mut to_fetch: Vec<(Chunk, Fetch)> = Vec::new();
+    let mut aborted = false;
     loop {
-        while !cancel.is_cancelled()
-            && tasks.len() < threads
+        let go_on = work.failure.is_none() && !cancel.is_cancelled();
+        while go_on
+            && scans.len() < threads
+            && work.to_fetch.len() < backlog
             && let Some((chunk, bytes)) = queue.next_if(|(_, bytes)| {
-                tasks.is_empty() || in_flight_bytes.saturating_add(*bytes) <= IN_FLIGHT_BYTES
+                scans.is_empty() || in_flight_bytes.saturating_add(*bytes) <= IN_FLIGHT_BYTES
             })
         {
             in_flight_bytes = in_flight_bytes.saturating_add(bytes);
             let (raw, fill) = (state.raw_path(chunk), state.fill_path(chunk));
-            tasks.spawn_blocking(move || (chunk, bytes, scan(&forks, &raw, &fill)));
+            scans.spawn_blocking(move || (chunk, bytes, scan(&forks, &raw, &fill)));
+        }
+        if let Some(rpc) = rpc {
+            while go_on
+                && fetches.len() < requests
+                && let Some((chunk, fetch)) = work.to_fetch.pop_front()
+            {
+                let (rpc, path) = (rpc.clone(), state.fill_path(chunk));
+                fetches.spawn(async move { (chunk, fill_chunk(&rpc, &fetch, path).await) });
+            }
+        }
+        let scanning = (go_on && queue.peek().is_some()) || !scans.is_empty();
+        let fetching = !fetches.is_empty() || (go_on && rpc.is_some() && !work.to_fetch.is_empty());
+        if !scanning && !fetching {
+            break;
         }
         tokio::select! {
-            finished = tasks.join_next() => match finished {
-                Some(Ok((chunk, bytes, found))) => {
-                    in_flight_bytes = in_flight_bytes.saturating_sub(bytes);
-                    let found = found.wrap_err_with(|| {
-                        format!("blocks {}..{}: failed to read the chunk", chunk.from, chunk.to)
-                    })?;
-                    scanned = scanned.saturating_add(1);
-                    for (field, (count, first)) in found.missing {
-                        tally(&mut lacking, field, count, first);
-                    }
-                    if !found.fetch.is_empty() {
-                        to_fetch.push((chunk, found.fetch));
-                    }
+            biased;
+            // The requests in flight are dropped below, backoffs included; a fill being
+            // written is atomic. The chunks being read finish. Then fetches before reads:
+            // the endpoint is the bottleneck, and a finished fetch frees its place.
+            () = cancel.cancelled(), if !aborted && !fetches.is_empty() => {
+                fetches.abort_all();
+                aborted = true;
+            }
+            Some(done) = fetches.join_next(), if !fetches.is_empty() => match done {
+                Ok((_, Ok(filled))) => work.fetched(filled),
+                Ok((chunk, Err(err))) => {
+                    work.failure.get_or_insert_with(|| {
+                        format!("blocks {}..{}: {err:#}", chunk.from, chunk.to)
+                    });
                 }
-                Some(Err(err)) => return Err(err).wrap_err("a check task failed"),
-                None => break,
+                // Aborted on cancel: nothing to report.
+                Err(err) if err.is_cancelled() => {}
+                Err(err) => {
+                    work.failure.get_or_insert_with(|| format!("a fetch task failed: {err}"));
+                }
             },
-            _ = tick.tick() => {
-                let per_sec = rate.per_sec(u64::try_from(scanned).unwrap_or(u64::MAX));
-                let left = u64::try_from(total.saturating_sub(scanned)).unwrap_or(u64::MAX);
-                info!(
-                    chunks = scanned,
-                    of = total,
-                    chunks_per_sec = per_sec,
-                    secs_left = left.checked_div(per_sec),
-                    "checking"
-                );
+            Some(scanned) = scans.join_next(), if !scans.is_empty() => {
+                let (chunk, bytes, found) = scanned.wrap_err("a check task failed")?;
+                in_flight_bytes = in_flight_bytes.saturating_sub(bytes);
+                let found = found.wrap_err_with(|| {
+                    format!("blocks {}..{}: failed to read the chunk", chunk.from, chunk.to)
+                })?;
+                work.scanned(chunk, found);
+            }
+            _ = tick.tick() => work.log(fetches.len()),
+        }
+    }
+    work.finish(rpc, plan, cancel)
+}
+
+/// What a run of [`run`] found and fetched so far.
+#[derive(Debug)]
+struct Work {
+    started: Instant,
+    chunks: usize,
+    scanned: usize,
+    lacking: Tally,
+    /// Chunks read with something to fetch, in the order they were read; only counted when
+    /// there is no endpoint to fetch from.
+    to_fetch: VecDeque<(Chunk, Fetch)>,
+    keep: bool,
+    /// Block reads from the RPC that scans found, and those done so far.
+    queued_blocks: u64,
+    fetched_blocks: u64,
+    /// Transaction rows the fetched fills added or filled, and headers filled.
+    filled_transactions: u64,
+    filled_headers: u64,
+    scan_rate: Rate,
+    fetch_rate: Rate,
+    /// The first fetch that failed for good.
+    failure: Option<String>,
+}
+
+impl Work {
+    fn new(chunks: usize, keep: bool) -> Self {
+        Self {
+            started: Instant::now(),
+            chunks,
+            scanned: 0,
+            lacking: Tally::new(),
+            to_fetch: VecDeque::new(),
+            keep,
+            queued_blocks: 0,
+            fetched_blocks: 0,
+            filled_transactions: 0,
+            filled_headers: 0,
+            scan_rate: Rate::new(),
+            fetch_rate: Rate::new(),
+            failure: None,
+        }
+    }
+
+    fn scanned(&mut self, chunk: Chunk, found: Scanned) {
+        self.scanned = self.scanned.saturating_add(1);
+        for (field, (count, first)) in found.missing {
+            tally(&mut self.lacking, field, count, first);
+        }
+        if !found.fetch.is_empty() {
+            let blocks = u64::try_from(found.fetch.blocks()).unwrap_or(u64::MAX);
+            self.queued_blocks = self.queued_blocks.saturating_add(blocks);
+            if self.keep {
+                self.to_fetch.push_back((chunk, found.fetch));
             }
         }
     }
-    eyre::ensure!(
-        !cancel.is_cancelled(),
-        "stopped while checking the downloaded rows: run `download` again"
-    );
-    let lists: usize = to_fetch
-        .iter()
-        .flat_map(|(_, fetch)| &fetch.wanted)
-        .map(|block| block.indexes.len())
-        .sum();
-    let holes: usize = to_fetch.iter().map(|(_, fetch)| fetch.holes.len()).sum();
-    report(scanned, started, &lacking, lists, holes);
-    if to_fetch.is_empty() {
-        return Ok(());
-    }
-    let rpc = rpc.ok_or_else(|| {
-        eyre::eyre!(
-            "the archive service left out {lists} EIP-7702 authorization lists and {holes} \
-             blocks' transactions, and no RPC endpoint is known for chain {}: give one with \
-             --rpc-endpoint",
-            plan.chain.chain_id
-        )
-    })?;
-    fetch(state, rpc, to_fetch, cancel).await
-}
 
-/// Logs what the scan found: one line, then one warning per field missing.
-fn report(chunks: usize, started: Instant, lacking: &Tally, lists: usize, holes: usize) {
-    info!(
-        chunks,
-        secs = started.elapsed().as_secs(),
-        fields_missing = lacking.len(),
-        authorization_lists_to_fetch = lists,
-        holes_to_fetch = holes,
-        "downloaded rows checked"
-    );
-    for (field, (count, first_block)) in lacking {
-        warn!(
-            row = field.row,
-            field = field.field,
-            count,
-            first_block,
-            "downloaded rows lack this field"
+    fn fetched(&mut self, fetched: Fetched) {
+        self.fetched_blocks = self.fetched_blocks.saturating_add(fetched.blocks);
+        self.filled_transactions = self
+            .filled_transactions
+            .saturating_add(fetched.transactions);
+        self.filled_headers = self.filled_headers.saturating_add(fetched.headers);
+    }
+
+    /// Logs one progress line: chunks read, and blocks fetched with their speed over the last
+    /// minute and the time left for those found so far (more may be found).
+    fn log(&mut self, requests_in_flight: usize) {
+        let blocks_per_sec = self.fetch_rate.per_sec(self.fetched_blocks);
+        info!(
+            chunks = self.scanned,
+            of = self.chunks,
+            chunks_per_sec = self
+                .scan_rate
+                .per_sec(u64::try_from(self.scanned).unwrap_or(u64::MAX)),
+            blocks_fetched = self.fetched_blocks,
+            blocks_found = self.queued_blocks,
+            blocks_per_sec,
+            secs_left = self
+                .queued_blocks
+                .saturating_sub(self.fetched_blocks)
+                .checked_div(blocks_per_sec),
+            requests_in_flight,
+            "checking and fetching"
         );
+    }
+
+    /// Reports the run, and says what went wrong, if anything: a fetch that failed, a stop, or
+    /// something to fetch and no endpoint.
+    fn finish(
+        self,
+        rpc: Option<&Rpc>,
+        plan: &Plan,
+        cancel: &CancellationToken,
+    ) -> eyre::Result<()> {
+        self.report();
+        if let Some(failure) = self.failure {
+            eyre::bail!(
+                "fetching from {} failed: {failure}; run `download` again, or give another \
+                 endpoint with --rpc-endpoint",
+                rpc.map_or("the RPC endpoint", Rpc::url)
+            );
+        }
+        eyre::ensure!(
+            !cancel.is_cancelled(),
+            "stopped while checking the downloaded rows: run `download` again, which goes on \
+             where it stopped"
+        );
+        if rpc.is_none() && self.queued_blocks > 0 {
+            eyre::bail!(
+                "the archive service left out what {} block reads need (authorization lists, \
+                 transactions, header fields), and no RPC endpoint is known for chain {}: give \
+                 one with --rpc-endpoint",
+                self.queued_blocks,
+                plan.chain.chain_id
+            );
+        }
+        Ok(())
+    }
+
+    /// Logs what the run found and fetched: one line, then one warning per field missing.
+    fn report(&self) {
+        info!(
+            chunks = self.scanned,
+            secs = self.started.elapsed().as_secs(),
+            fields_missing = self.lacking.len(),
+            blocks_to_fetch = self.queued_blocks,
+            blocks_fetched = self.fetched_blocks,
+            rpc_filled_transactions = self.filled_transactions,
+            rpc_filled_headers = self.filled_headers,
+            "downloaded rows checked"
+        );
+        for (field, (count, first_block)) in &self.lacking {
+            warn!(
+                row = field.row,
+                field = field.field,
+                count,
+                first_block,
+                "downloaded rows lack this field (counted before this run's fills)"
+            );
+        }
     }
 }
 
@@ -336,10 +486,22 @@ fn scan(forks: &Forks, raw: &Path, fill: &Path) -> eyre::Result<Scanned> {
         apply(&mut rows, fill);
     }
     let mut scanned = Scanned::default();
+    // Header fields come block by block, in block order.
+    let mut headers: Vec<u64> = Vec::new();
     missing(forks, &rows, |field, block| {
         tally(&mut scanned.missing, field, 1, block);
+        if field.row == "header" && headers.last() != Some(&block) {
+            headers.push(block);
+        }
     });
     scanned.fetch.holes = holes(forks, &rows)
+        .map(|block| BlockNumHash::new(block.number, block.hash))
+        .collect();
+    // A hole's block is fetched whole, its header fields with it: but those go to the header
+    // row only through `headers`, so a hole lacking them is read for both.
+    scanned.fetch.headers = headers
+        .into_iter()
+        .filter_map(|number| rows.block(number))
         .map(|block| BlockNumHash::new(block.number, block.hash))
         .collect();
     let mut lists: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
@@ -366,78 +528,21 @@ fn scan(forks: &Forks, raw: &Path, fill: &Path) -> eyre::Result<Scanned> {
     Ok(scanned)
 }
 
-/// Fetches what `to_fetch` lists, the chunks [`RPC_REQUESTS`] at a time (a chunk's calls
-/// [`BATCH_CALLS`] per request), and adds it to each chunk's fill.
-async fn fetch(
-    state: &State,
-    rpc: &Rpc,
-    to_fetch: Vec<(Chunk, Fetch)>,
-    cancel: &CancellationToken,
-) -> eyre::Result<()> {
-    let started = Instant::now();
-    info!(
-        chunks = to_fetch.len(),
-        endpoint = rpc.url(),
-        requests = RPC_REQUESTS,
-        "fetching what the archive service left out"
-    );
-    let mut queue = to_fetch.into_iter();
-    let mut tasks = JoinSet::new();
-    let mut filled = 0_u64;
-    let mut failure = None;
-    loop {
-        while failure.is_none()
-            && !cancel.is_cancelled()
-            && tasks.len() < RPC_REQUESTS
-            && let Some((chunk, blocks)) = queue.next()
-        {
-            let (rpc, path) = (rpc.clone(), state.fill_path(chunk));
-            tasks.spawn(async move { (chunk, fill_chunk(&rpc, &blocks, path).await) });
-        }
-        tokio::select! {
-            biased;
-            // The requests in flight are dropped below, backoffs included; a fill being
-            // written is atomic.
-            () = cancel.cancelled() => break,
-            finished = tasks.join_next() => match finished {
-                Some(Ok((_, Ok(count)))) => filled = filled.saturating_add(count),
-                Some(Ok((chunk, Err(err)))) => {
-                    failure.get_or_insert_with(|| {
-                        format!("blocks {}..{}: {err:#}", chunk.from, chunk.to)
-                    });
-                }
-                Some(Err(err)) => {
-                    failure.get_or_insert_with(|| format!("a fetch task failed: {err}"));
-                }
-                None => break,
-            },
-        }
-    }
-    tasks.shutdown().await;
-    info!(
-        rpc_filled_transactions = filled,
-        secs = started.elapsed().as_secs(),
-        "fetched what the archive service left out"
-    );
-    if let Some(failure) = failure {
-        eyre::bail!(
-            "fetching from {} failed: {failure}; run `download` again, or give another endpoint \
-             with --rpc-endpoint",
-            rpc.url()
-        );
-    }
-    eyre::ensure!(
-        !cancel.is_cancelled(),
-        "stopped while fetching from the RPC endpoint: run `download` again"
-    );
-    Ok(())
+/// What fetching one chunk's fill added.
+#[derive(Debug, Clone, Copy)]
+struct Fetched {
+    /// Blocks read from the RPC.
+    blocks: u64,
+    /// Transaction rows it fills or adds.
+    transactions: u64,
+    /// Headers it fills.
+    headers: u64,
 }
 
-/// Fetches what one chunk lacks and writes its fill with it added to what it held. Returns how
-/// many transactions it filled or added.
-async fn fill_chunk(rpc: &Rpc, fetch: &Fetch, path: PathBuf) -> eyre::Result<u64> {
+/// Fetches what one chunk lacks and writes its fill with it added to what it held.
+async fn fill_chunk(rpc: &Rpc, fetch: &Fetch, path: PathBuf) -> eyre::Result<Fetched> {
     let mut lists = Vec::new();
-    for batch in fetch.wanted.chunks(BATCH_CALLS) {
+    for batch in fetch.wanted.chunks(rpc.batch_calls()) {
         let fetched = rpc.authorization_lists(batch).await?;
         let wanted = batch.iter().flat_map(|block| {
             block
@@ -457,17 +562,30 @@ async fn fill_chunk(rpc: &Rpc, fetch: &Fetch, path: PathBuf) -> eyre::Result<u64
     }
     let mut blocks = Vec::new();
     // Two calls a block: the block and its receipts.
-    for batch in fetch.holes.chunks(BATCH_CALLS / 2) {
+    for batch in fetch.holes.chunks(rpc.batch_calls() / 2) {
         blocks.extend(rpc.whole_blocks(batch).await?);
     }
+    let mut headers = Vec::with_capacity(fetch.headers.len());
+    for batch in fetch.headers.chunks(rpc.batch_calls()) {
+        headers.extend(rpc.headers(batch).await?);
+    }
     let added: usize = blocks.iter().map(|block| block.transactions.len()).sum();
-    let count = u64::try_from(lists.len().saturating_add(added)).unwrap_or(u64::MAX);
+    let fetched = Fetched {
+        blocks: u64::try_from(fetch.blocks()).unwrap_or(u64::MAX),
+        transactions: u64::try_from(lists.len().saturating_add(added)).unwrap_or(u64::MAX),
+        headers: u64::try_from(headers.len()).unwrap_or(u64::MAX),
+    };
     tokio::task::spawn_blocking(move || {
         let mut fill = read_json::<Fill>(&path)?.unwrap_or_default();
         fill.transactions.extend(lists);
         fill.blocks.extend(blocks);
+        // A header fetched again (one the endpoint gave without a field asked for) replaces
+        // the one kept, so the fill does not grow run after run.
+        fill.headers
+            .retain(|kept| headers.iter().all(|new| new.number != kept.number));
+        fill.headers.extend(headers);
         write_json(&path, &fill)
     })
     .await??;
-    Ok(count)
+    Ok(fetched)
 }
