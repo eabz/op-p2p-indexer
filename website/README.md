@@ -22,6 +22,8 @@ The quick start currently builds from source. When an installer is released and 
 
 ## Publish
 
-`.openai/hosting.json` identifies the existing private Site and its static output directory. Use the Sites publishing workflow with this identity; do not register a replacement Site. Prepare a separate temporary checkout containing `website/` when publishing, so the Sites workflow operates independently of this repository's Git metadata. Keep changes here as the source of truth.
+GitHub Pages serves `website/dist/` at https://eabz.github.io/op-p2p-indexer/.
+
+The workflow in `.github/workflows/pages.yml` deploys automatically when website files change on `main`. It can also be run manually from GitHub Actions. Repository Settings → Pages must use **GitHub Actions** as the publishing source. Only the static files are uploaded; no build step, hosting credentials or external hosting service is required.
 
 Before publishing, run `node --check website/dist/app.js` from the repository root and check chain selection, pipeline stages, pause/play, protocol tabs, copy commands and the mobile layout.
