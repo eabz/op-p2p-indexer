@@ -548,11 +548,16 @@ pub(crate) struct L1Header {
 const DEPOSIT_EVENT: B256 =
     alloy_primitives::b256!("0xb3813568d9991fc951961fcb4c784893574240a28925604d09fc577c55bb7c32");
 
-/// A user deposit on L1: its block and its log's index in the block.
-#[derive(Debug, Clone, Copy, Deserialize)]
+/// A user deposit on L1, its portal's `TransactionDeposited` log: its block, its index in the
+/// block, the deposit's sender and recipient (topics 1 and 2) and its ABI-encoded opaque data.
+#[derive(Debug, Clone, Deserialize)]
 pub(crate) struct DepositLog {
     pub(crate) block_number: u64,
     pub(crate) log_index: u64,
+    pub(crate) topic1: Option<B256>,
+    pub(crate) topic2: Option<B256>,
+    #[serde(default)]
+    pub(crate) data: alloy_primitives::Bytes,
 }
 
 /// What a span of L1 gives the L2 header fields and deposits the archive service left out.
@@ -591,7 +596,7 @@ impl HyperSync {
                 "logs": [{ "address": [portal], "topics": [[DEPOSIT_EVENT]] }],
                 "field_selection": {
                     "block": ["number", "hash", "mix_hash", "parent_beacon_block_root"],
-                    "log": ["block_number", "log_index"],
+                    "log": ["block_number", "log_index", "topic1", "topic2", "data"],
                 },
             });
             let answer = self

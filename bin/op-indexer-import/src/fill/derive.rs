@@ -126,21 +126,46 @@ pub(super) struct HeaderRow {
     pub(super) lacks: Vec<&'static str>,
     /// Its L1-attributes deposit, read if a field it lacks comes from there.
     pub(super) l1_info: Option<L1Info>,
-    /// Its deposits (the first transactions, from the L1-attributes one), and those whose row
-    /// lacks the source hash, by index.
-    pub(super) deposits: u64,
-    pub(super) lacking_sources: Vec<u64>,
+    /// Its deposits: the first transactions, from the L1-attributes one.
+    pub(super) deposits: Vec<DepositRow>,
+}
+
+/// What the rebuild reads of a deposit's row.
+#[derive(Debug, Clone)]
+pub(super) struct DepositRow {
+    pub(super) index: u64,
+    pub(super) has_source: bool,
+    pub(super) from: Option<Address>,
+    pub(super) to: Option<Address>,
+    pub(super) mint: Option<U128>,
+    pub(super) value: U256,
+    pub(super) gas: u64,
+    pub(super) input: Bytes,
+}
+
+impl DepositRow {
+    /// Whether its row lacks a field the rebuild fills: the source hash, or the mint of a
+    /// deposit after the first (the L1-attributes one mints nothing; a user deposit's mint
+    /// comes with its L1 log).
+    pub(super) fn lacks(&self) -> bool {
+        !self.has_source || (self.index > 0 && self.mint.is_none())
+    }
 }
 
 impl HeaderRow {
+    /// Whether a deposit's row lacks a field the rebuild fills.
+    pub(super) fn lacks_deposit_fields(&self) -> bool {
+        self.deposits.iter().any(DepositRow::lacks)
+    }
+
     /// Whether the rebuild of its fields reads its L1 origin: a header field from there, or
-    /// the source hashes of user deposits.
+    /// what the logs of user deposits give.
     fn reads_l1(&self) -> bool {
         self.lacks
             .iter()
             .any(|field| matches!(*field, "mix_hash" | "parent_beacon_block_root"))
-            || (!self.lacking_sources.is_empty()
-                && self.deposits > 1
+            || (self.lacks_deposit_fields()
+                && self.deposits.len() > 1
                 && self.l1_info.is_some_and(|info| info.sequence == 0))
     }
 }
@@ -207,6 +232,10 @@ fn base_fee(chain: &ChainSpec, parent: &Parent, timestamp: u64) -> Option<u64> {
         params,
     ))
 }
+
+/// A deposit as rebuilt: its source hash, what that is from, and for a user deposit the mint
+/// its L1 log gives.
+type Rebuilt Deposit = (B256, Derivation, Option<U128>);
 
 /// The source hashes of a block's deposits, in their order, with what each is from: its
 /// L1-attributes deposit, the portal's logs in its L1 origin (if the epoch starts here) and
