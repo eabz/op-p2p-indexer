@@ -1,6 +1,6 @@
 # Roadmap
 
-What is left, in order. Status 2026-10-05 (v0.1.8): every program is built and has run live.
+What is left, in order. Status 2026-10-05: every program is built and has run live.
 What runs today is in [architecture.md](architecture.md), and how it got here is in
 [decisions.md](decisions.md).
 
@@ -19,6 +19,20 @@ What runs today is in [architecture.md](architecture.md), and how it got here is
   times in 5, so incomplete ranges are being fetched again (`download --refetch-incomplete`,
   [import §3.1](import.md#31-download)).
 - **Exporter**: running on the Unichain fleet; not yet seen sealing a chunk.
+
+## Installation work on the current branch
+
+- Implemented: shared TOML configuration, environment migration, per-chain and per-role
+  state paths, interactive and unattended setup, collision-aware port assignment, and named
+  systemd services with chain start/stop targets.
+- Implemented: checksum-verified installation and atomic binary replacement from published
+  releases; updates preserve configuration and state, and restart only selected services.
+- Validated locally: all four binaries, configuration precedence and migration, installer
+  preservation/collision checks, and scoped service lifecycle generation. Rust checks pass.
+- Release gate: Ubuntu CI (including generated systemd units) must pass before merging and publishing. The one-liner requires a published
+  release containing the new setup helper and TOML-capable binaries.
+- Pending operational validation: install on a fresh Ubuntu fleet host, migrate its existing
+  environment configuration, and confirm graceful restart and boot startup with real state.
 
 ## What's left, in order
 

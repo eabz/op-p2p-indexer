@@ -11,7 +11,7 @@ use op_indexer_chunks::{R2Config, ReadOptions};
 use op_indexer_node::sizing;
 use op_indexer_runtime::env_var as var;
 use op_indexer_runtime::machine::Machine;
-use op_indexer_runtime::{deprecated, env_file};
+use op_indexer_runtime::{config, deprecated};
 
 /// The exporter's name in the manifest when the server has none: no `OP_INDEXER_SERVER_ID`
 /// and no host name.
@@ -49,7 +49,7 @@ pub(crate) enum Chunks {
 impl ServerConfig {
     /// Reads the configuration:
     ///
-    /// - `--env-file <path>` (command line): read by the env-file loader before this.
+    /// - Shared TOML configuration and legacy environment files are loaded before this.
     /// - `OP_INDEXER_EXPORT`: `true` to also run the exporter (default `false`); `--export` on
     ///   the command line does the same. Exactly one server per deployment, the one with the
     ///   bucket's write key.
@@ -97,23 +97,13 @@ impl ServerConfig {
             .transpose()
             .map_err(|_err| eyre!("OP_INDEXER_EXPORT must be true or false"))?
             .unwrap_or(false);
-        let mut args = env::args().skip(1);
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--export" => export = true,
-                // Read before anything else, by the env-file loader.
-                flag if flag == env_file::FLAG => {
-                    args.next();
-                }
-                other
-                    if other
-                        .strip_prefix(env_file::FLAG)
-                        .is_some_and(|rest| rest.starts_with('=')) => {}
-                other => {
-                    return Err(eyre!(
-                        "unknown argument {other}; the arguments are --export and --env-file"
-                    ));
-                }
+        for arg in config::other_args(env::args_os().skip(1)) {
+            if arg == "--export" {
+                export = true;
+            } else {
+                return Err(eyre!(
+                    "unknown server argument; use --export, --config, --chain or --check-config"
+                ));
             }
         }
         let prefix = var("OP_INDEXER_R2_PREFIX").unwrap_or_else(|| "archive".to_owned());
@@ -122,7 +112,7 @@ impl ServerConfig {
                 dir: PathBuf::from(dir),
                 prefix,
             },
-            None => Chunks::R2(R2Config::from_env(chain)?),
+            None => Chunks::R2(R2Config::from_lookup(chain, var)?),
         };
         let id = var("OP_INDEXER_SERVER_ID").or_else(|| Machine::get().hostname.clone());
         let export_id = deprecated(

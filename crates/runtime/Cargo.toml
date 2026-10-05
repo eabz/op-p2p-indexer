@@ -1,6 +1,6 @@
 [package]
 name = "op-indexer-runtime"
-description = "Shared binary startup: environment files, logging and shutdown signals"
+description = "Shared binary startup: TOML configuration, logging and shutdown signals"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 dotenvy.workspace = true
+toml.workspace = true
 eyre.workspace = true
 # The host name (`uname`) of `machine`.
 rustix = { workspace = true, features = ["system"] }
