@@ -12,8 +12,10 @@
 //! Writing ([`ChunkRecord`], [`ChunkWriter`], [`ChunkStore::put_chunk`], [`Manifest::append`],
 //! [`IndexBuilder`]) is shared by the importer's conversion and the server's exporter. Reading
 //! ([`ChunkStore::stream`], [`ChunkStore::block`], [`ChunkStore::lookup_hash`]) checks what it
-//! reads (D5: the chunk's root and each segment's sha256, header hashes and parent links; no
-//! root is recomputed) and keeps no block data: only the manifest and indexes the caller holds.
+//! reads (D5: the index against the manifest and each segment's sha256 against the index; the
+//! records are taken as sealed, every block having been verified before, and no root is
+//! recomputed) and keeps no block data: only the manifest and indexes the caller holds.
+//! [`decode_chunk`] also checks every header hash and parent link.
 //!
 //! [`ChunkSigner`] signs GET URLs of whole chunks a client downloads straight from the bucket,
 //! and [`decode_chunk`] checks and decodes one so downloaded.

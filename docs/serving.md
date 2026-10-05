@@ -167,8 +167,21 @@ any of them is discarded and refetched once, then reported:
    The chain of chunks ends at a block the server verified itself (its own committed head,
    through the `l1` crate), so one chunk cannot be swapped without breaking the hashes back to
    a block L1 committed. This is the importer's anchor argument, applied continuously;
-3. **header hashes and parent links**: every header hashes to its record's hash and names the
-   previous block as its parent.
+3. **header hashes and parent links**, for a reader that does not trust the index (`import
+   fetch`): every header hashes to its record's hash and names the previous block as its
+   parent. A server reading its own deployment's chunks does not hash every header again
+   (2026-10-05): checks 1 and 2 already tie each segment's bytes to the manifest, and every
+   block was verified before it was sealed. What a read checks is the segment's sha256 against
+   the index, zstd's frame checksum, and that the records decode.
+
+A read decodes only what its reader needs (`ReadParts`): the receipts are left out for the
+headers and transactions of Flight, and their blooms (a keccak per log address and topic,
+most of what a read costs) for the receipts and logs of Flight and the decoded payload of
+gRPC, which carries no receipt blooms; the raw payload and the follower read whole blocks.
+Measured locally (2,000 OP blocks, CPU per GB of block data read): whole 4.1 s (about 245
+MB/s a core), without blooms 1.85 s (about 540 MB/s), without receipts 0.94 s (about 1,060
+MB/s). Raw headers and bodies are slices of the decompressed segment, sent as they are; raw
+receipts need their blooms rebuilt, which the chunk does not store.
 
 Transactions and receipts roots are not recomputed on fetch: the header hash binds them, and
 they were recomputed when the chunk was sealed (`verify`, or the node's promotion check).
@@ -370,10 +383,9 @@ Flight and promotion are unchanged:
 - **A single block by number**: one ranged GET of the chunk's footer (its index, located by
   the manifest), then one ranged GET of the block's segment. Two GETs, about 1 MiB read.
 - **By hash**: the index (D9), then the same as by number.
-- **Check on fetch** (D5) runs per segment and per chunk as the bytes stream: the object's
-  sha256 over the whole GET, the header hash and parent links per block. A single-segment read
-  checks the segment's zstd checksum and the block's header hash; the object sha256 needs the
-  whole chunk, so a chunk-wide check is not possible there.
+- **Check on fetch** (D5) runs per segment as the bytes stream: its sha256 against the index,
+  which is the manifest's, and zstd's checksum (section 1.5); headers are not hashed again,
+  except the one block a single-block read returns.
 - **Failures**: an R2 error or a failed check retries once on the same server; then the
   request fails with `UNAVAILABLE`, and the client goes to the next location the balancer
   gave it (6.3).
@@ -477,6 +489,7 @@ the allocator's slack and the parts below that are not counted exactly.
 | Exporter (one server per deployment) | the chunk being sealed (at most 256 MiB compressed) and one read of 64 MiB | `crates/chunks` (`CHUNK_BYTES`), `crates/server/src/export.rs` |
 | fjall tail and the unsafe chain's journal | caches of 64 and 8 MiB, memtables of at most 7 × 16 and 8 MiB | `crates/storage` |
 | Peer reads from R2 | `MAX_PEER_READS` reads in flight, each one answer | `crates/server/src/budget.rs` |
+| Chunk indexes read lately | 256 parsed indexes, about 64 KiB each (a hash per block): some 20 MiB | `crates/chunks/src/store.rs` (`MAX_CACHED_INDEXES`) |
 
 Before the build cap a `DoGet` built two reads at once with no limit across streams: 16
 streams could hold about 3.2 GiB of builds, which with the rest (2 GiB of unsafe chain, 1 GiB
@@ -484,6 +497,40 @@ of read budget) is how the L1 and exporter server of the v0.1.7 bench reached 5.
 A build now takes a place among the server's builds before it starts and keeps it until its
 messages are sent; a stream without a free place sends what it has built first, so streams
 never wait on each other's places.
+
+### 5.8 Flight throughput: where a server's CPU goes (2026-10-05)
+
+The v0.1.8 bench levelled off at about 35 MB/s of `blocks` per 4-vCPU server, whatever the
+number of `DoGet`s. Locally (10 cores, the 2,000-block OP Mainnet chunk from a local directory,
+pyarrow clients on the same machine) the server is CPU-bound in the same way: one `blocks`
+stream used 2.1 cores for 21 MB/s, and four or more streams saturated the server at about 70
+MB/s, about 9 MB/s per core, which is the bench's per-server figure on 4 cores. Neither the
+HTTP/2 settings nor a lock serialised it (the server's windows govern what clients send it; the
+client's receive window paces a download, and gRPC clients size it to the link).
+
+Sampled on-CPU time of a server under 8 `DoGet`s of `blocks`: the sha256 of each segment read
+about half, zstd's decompression a quarter, the copies `zstd::decode_all` makes through a small
+buffer and a growing output an eighth, the frame's XXH64 checksum 6%; Arrow building and IPC
+encoding a few per cent. Changes:
+
+- sha2 0.11, which uses the CPU's SHA instructions on x86-64 (SHA-NI) and aarch64 alike; 0.10
+  ran its software rounds on aarch64 (and runs them on any x86 without SHA-NI either way).
+- Segments and indexes decompress straight into a buffer sized from the frame (eight times its
+  compressed size), with one context per thread, and the frame's checksum is not checked again
+  once the sha256 of its compressed bytes has passed.
+
+`blocks`, local, before and after: one stream 21 → 50 MB/s; the server 70 → 148 MB/s at the
+same CPU (2.1 times less CPU per byte). `transactions`: about 2.1 GB/s before and after (the
+local clients' limit), at 15% less server CPU. On x86 servers with SHA-NI the sha256 part is
+already fast, so the gain there is the decompression's.
+
+Time to the first batch of a `DoGet`, 0.5 to 0.6 s in the bench, is two R2 round trips in a
+row: the chunk's index, then its first range. A stream that starts at a chunk's first block
+(every per-chunk Flight job) now reads the chunk's head (`range_bytes` from byte 0, where the
+first segment starts) while the index arrives, and the 256 indexes read last are kept: with
+150 ms added to every GET, the first batch came after 0.31 s before and 0.16 s after, and a
+whole-chunk `DoGet` stream rose from 2.7 to 4.0 MB/s. Jobs are a chunk each, so their speed is
+mostly their time to the first batch.
 
 ## 6. The balancer
 
@@ -735,10 +782,12 @@ the raw download (6.8) hands them out anyway; the manifest and index stay privat
 **Running it.** `scripts/bench.py` reads a range of one table through the balancer, as a
 Flight client would: it asks the balancer to plan the range (`GetFlightInfo`), then runs the
 jobs across `--processes` processes with `--threads` threads each, so one Python process is
-not the limit. A job fails over to its next location on `UNAVAILABLE` or `RESOURCE_EXHAUSTED`
-(and back to the first, up to `--retries` rounds). It prints progress, then jobs done and
-failed, MB/s and rows/s (Arrow bytes received, decoded), retries, time to first batch (median
-and p95), and per server its jobs and MB/s. It needs pyarrow and an API key in `KEY`:
+not the limit. A job fails over to its next location at once on `UNAVAILABLE`; on
+`RESOURCE_EXHAUSTED` (a server at its `DoGet` limit) it backs off first, 200 ms doubling to
+5 s with jitter, and it keeps trying its locations in turn for `--retry-for` seconds (default
+120). It prints progress, then jobs planned, done and failed, MB/s and rows/s (Arrow bytes
+received, decoded), retries and the time spent backing off, time to first batch (median and
+p95), and per server its jobs and MB/s. It needs pyarrow and an API key in `KEY`:
 
 ```bash
 KEY=<api key> scripts/bench.py --balancer grpc://<balancer>:50060 --table logs --from 120000000 --to 120100000 --processes 4 --threads 8 --compression zstd

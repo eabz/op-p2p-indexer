@@ -95,6 +95,11 @@ impl History {
             ..Self::default()
         }
     }
+
+    /// Forgets the position and the read-ahead, keeping the parts read.
+    pub(crate) fn reset(&mut self) {
+        *self = Self::of(self.parts);
+    }
 }
 
 impl std::fmt::Debug for History {
@@ -285,21 +290,23 @@ impl<U: UnsafeStore, A: ArchiveStore> Source<U, A> {
         Ok(Some(self.canonical(from).await?.into_iter().collect()))
     }
 
-    /// The archive's blocks from `number`, within `limits`.
+    /// The archive's block `number`, of the `parts` the reader needs (a store may give more).
     async fn archived(
         &self,
         number: BlockNumber,
-        limits: ReadLimits,
-    ) -> Result<Vec<Prepared>, ReadError> {
+        parts: ReadParts,
+    ) -> Result<Option<Prepared>, ReadError> {
         let archived = self
-            .call(Store::Archive, "archive blocks", || {
-                self.archive.blocks(number, limits)
+            .call(Store::Archive, "archive block", || {
+                let mut range = self.archive.read_range(number, ONE_BLOCK, parts);
+                async move { Ok(range.next().await.transpose()?.unwrap_or_default()) }
             })
             .await?;
-        archived
+        Ok(archived
             .into_iter()
-            .map(|block| Ok(Prepared::new(StoredBlock::Archived(block))?))
-            .collect()
+            .next()
+            .map(|block| Prepared::new(StoredBlock::Archived(block)))
+            .transpose()?)
     }
 
     /// The unsafe store's canonical block at `number`.
@@ -314,20 +321,26 @@ impl<U: UnsafeStore, A: ArchiveStore> Source<U, A> {
             .transpose()?)
     }
 
-    /// The canonical block at `number`: the unsafe store's, else the archive's.
+    /// The canonical block at `number`: the unsafe store's, else the archive's, of the
+    /// `parts` the reader needs (a store may give more).
     pub(crate) async fn block_at(
         &self,
         number: BlockNumber,
+        parts: ReadParts,
     ) -> Result<Option<Prepared>, ReadError> {
         if let Some(block) = self.canonical(number).await? {
             return Ok(Some(block));
         }
-        Ok(self.archived(number, ONE_BLOCK).await?.into_iter().next())
+        self.archived(number, parts).await
     }
 
-    /// The canonical block with this hash: the unsafe store's or the archive's. A side block
-    /// is `None`.
-    pub(crate) async fn block_by_hash(&self, hash: B256) -> Result<Option<Prepared>, ReadError> {
+    /// The canonical block with this hash: the unsafe store's or the archive's, of the
+    /// `parts` the reader needs. A side block is `None`.
+    pub(crate) async fn block_by_hash(
+        &self,
+        hash: B256,
+        parts: ReadParts,
+    ) -> Result<Option<Prepared>, ReadError> {
         let block = self
             .call(Store::Unsafe, "unsafe block", || {
                 self.unsafe_store.block(hash)
@@ -348,7 +361,7 @@ impl<U: UnsafeStore, A: ArchiveStore> Source<U, A> {
         let Some(number) = number else {
             return Ok(None);
         };
-        Ok(self.archived(number, ONE_BLOCK).await?.into_iter().next())
+        self.archived(number, parts).await
     }
 
     /// `at` (a block sent as canonical) with its receipts, if a store holds them now: the
@@ -371,10 +384,9 @@ impl<U: UnsafeStore, A: ArchiveStore> Source<U, A> {
         at: BlockRef,
     ) -> Result<Option<Prepared>, ReadError> {
         Ok(self
-            .archived(at.number, ONE_BLOCK)
+            .archived(at.number, ReadParts::Whole)
             .await?
-            .into_iter()
-            .find(|block| block.at == at && block.has_receipts()))
+            .filter(|block| block.at == at && block.has_receipts()))
     }
 
     /// What the stores hold. The unsafe store is read first: a block pruned from it was

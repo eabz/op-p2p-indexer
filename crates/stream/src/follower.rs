@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use alloy_primitives::BlockNumber;
-use op_indexer_primitives::{BlockRef, L1Heads, UnsafeEvent};
+use op_indexer_primitives::{BlockRef, L1Heads, ReadParts, UnsafeEvent};
 use op_indexer_storage::{ArchiveStore, EventId, Store, UnsafeStore};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -413,7 +413,7 @@ impl<U: UnsafeStore, A: ArchiveStore> Follower<U, A> {
                 // it from the stores. After a reorg that removed every block remembered: from
                 // the first removed height on, so nothing is skipped.
                 let first = state.resume_at.unwrap_or(head.number).min(head.number);
-                let Some(block) = self.source.block_at(first).await? else {
+                let Some(block) = self.source.block_at(first, ReadParts::Whole).await? else {
                     debug!(
                         number = first,
                         "the stream's follower waits for a block it lacks"
@@ -428,7 +428,7 @@ impl<U: UnsafeStore, A: ArchiveStore> Follower<U, A> {
                 return Ok(());
             }
             let next = last.number.saturating_add(1);
-            let Some(block) = self.source.block_at(next).await? else {
+            let Some(block) = self.source.block_at(next, ReadParts::Whole).await? else {
                 debug!(
                     number = next,
                     "the unsafe chain has a gap; the stream waits at it"

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use alloy_primitives::B256;
+use alloy_primitives::{B256, keccak256};
 use bytes::Bytes;
 use futures_util::{Stream, TryStreamExt as _};
 use object_store::http::HttpBuilder;
@@ -24,6 +24,7 @@ use object_store::{
 };
 use op_indexer_chainspec::ChainSpec;
 use op_indexer_primitives::{ArchivedBlock, ReadParts};
+use quick_cache::sync::Cache;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tracing::debug;
@@ -145,6 +146,9 @@ struct Inner {
     /// The chain the manifest must be of.
     chain_id: u64,
     genesis_hash: B256,
+    /// Indexes of chunks opened lately, checked, by root: a chunk read again is read without
+    /// its index's GET.
+    indexes: Cache<B256, Arc<ChunkIndex>>,
 }
 
 impl fmt::Debug for ChunkStore {
@@ -262,6 +266,7 @@ impl ChunkStore {
                 options,
                 chain_id: chain.chain_id,
                 genesis_hash: chain.genesis_hash,
+                indexes: Cache::new(MAX_CACHED_INDEXES),
             }),
         }
     }
@@ -413,17 +418,25 @@ impl ChunkStore {
         Ok(self.list(CHUNKS_DIR, None).await?.into_iter().collect())
     }
 
-    /// Reads a chunk's index: one ranged GET of its tail, checked against `entry`.
+    /// Reads a chunk's index: one ranged GET of its tail, checked against `entry`, unless it
+    /// is among the 256 read last (`MAX_CACHED_INDEXES`; a chunk is immutable, its key names its
+    /// root).
     ///
     /// # Errors
     ///
     /// Returns [`ChunksError::Store`] if the store fails, and [`ChunksError::Integrity`] or
     /// [`ChunksError::Malformed`] if the index is not the manifest's.
-    pub async fn index(&self, entry: &ChunkEntry) -> Result<ChunkIndex, ChunksError> {
-        let tail = self
-            .get_range(&entry.key(), entry.footer_offset..entry.size)
-            .await?;
-        ChunkIndex::parse(entry, &tail)
+    pub async fn index(&self, entry: &ChunkEntry) -> Result<Arc<ChunkIndex>, ChunksError> {
+        // Readers of the same chunk at once share one read.
+        self.inner
+            .indexes
+            .get_or_insert_async(&entry.sha256, async {
+                let tail = self
+                    .get_range(&entry.key(), entry.footer_offset..entry.size)
+                    .await?;
+                Ok(Arc::new(ChunkIndex::parse(entry, &tail)?))
+            })
+            .await
     }
 
     /// Reads one block of a chunk: one ranged GET of its segment, checked and decoded.
@@ -446,7 +459,6 @@ impl ChunkStore {
             return Ok(None);
         };
         let bytes = self.get_range(&entry.key(), segment.range()).await?;
-        let parent = index.parent_of(entry, segment.first);
         let blocks = tokio::task::spawn_blocking({
             let entry = *entry;
             move || {
@@ -454,14 +466,25 @@ impl ChunkStore {
                     &entry,
                     &segment,
                     &bytes,
-                    parent,
+                    None,
                     number..number.saturating_add(1),
                     ReadParts::Whole,
                 )
             }
         })
         .await??;
-        Ok(blocks.into_iter().next())
+        // The one block returned is checked against its hash: cheap, and what the importer's
+        // anchor check reads.
+        let block = blocks.into_iter().next();
+        if let Some(block) = &block
+            && keccak256(&block.encoded.header) != block.encoded.hash
+        {
+            return Err(ChunksError::Integrity {
+                key: entry.key(),
+                check: "a header does not hash to its hash",
+            });
+        }
+        Ok(block)
     }
 
     /// Streams the blocks of a chunk from `from` (its first block if `from` is before it),
@@ -497,7 +520,17 @@ impl ChunkStore {
         tx: &mpsc::Sender<Result<Vec<ArchivedBlock>, ChunksError>>,
     ) -> Result<(), ChunksError> {
         let from = from.max(entry.first);
-        let index = Arc::new(self.index(&entry).await?);
+        // From the chunk's first block (a per-chunk job), its head is read while the index
+        // arrives: the first segment starts at the chunk's first byte, so the first GET needs
+        // no index, and the first blocks come one round trip sooner. Accepted waste: the head
+        // runs past the first range's last whole segment, and the next range reads those
+        // bytes again (under a range's bytes, in a chunk of tens of MB); a first segment
+        // longer than the head is read whole and the head is dropped.
+        let mut head = (from == entry.first).then(|| {
+            let end = reads.range_bytes.min(entry.footer_offset);
+            (end, self.get_span(entry, 0..end))
+        });
+        let index = self.index(&entry).await?;
         let Some(start) = index.segment_of(from) else {
             return Ok(());
         };
@@ -530,7 +563,13 @@ impl ChunkStore {
                 let Some(segments) = ranges.next() else {
                     break;
                 };
-                let get = self.get_segments(entry, &index, segments.clone());
+                // The head read ahead serves the first range if it covers it (a first segment
+                // longer than a range is read whole instead); it is one of the base GETs.
+                let span = span(&index, segments.clone());
+                let get = match head.take() {
+                    Some((end, read)) if span.start == 0 && span.end <= end => read,
+                    _ => self.get_span(entry, span),
+                };
                 getting.push_back((get, segments, lent));
             }
             // A range decoded is handed on once the next is decoding too, or nothing is left.
@@ -555,18 +594,12 @@ impl ChunkStore {
         }
     }
 
-    /// Starts the GET of `segments` of a chunk, on its own task.
-    fn get_segments(
+    /// Starts the GET of bytes `span` of a chunk, on its own task.
+    fn get_span(
         &self,
         entry: ChunkEntry,
-        index: &ChunkIndex,
-        segments: Range<usize>,
+        span: Range<u64>,
     ) -> Aborting<Result<Bytes, ChunksError>> {
-        let parts = index.segments.get(segments).unwrap_or_default();
-        let span = match (parts.first(), parts.last()) {
-            (Some(first), Some(last)) => first.offset..last.range().end,
-            _ => 0..0,
-        };
         let store = self.clone();
         Aborting(tokio::spawn(async move {
             if span.is_empty() {
@@ -576,6 +609,19 @@ impl ChunkStore {
         }))
     }
 }
+
+/// The bytes `segments` of a chunk take, from the first one's offset.
+fn span(index: &ChunkIndex, segments: Range<usize>) -> Range<u64> {
+    let parts = index.segments.get(segments).unwrap_or_default();
+    match (parts.first(), parts.last()) {
+        (Some(first), Some(last)) => first.offset..last.range().end,
+        _ => 0..0,
+    }
+}
+
+/// Chunk indexes a store keeps after reading them: a few hundred chunks, the ones streams and
+/// lookups reopen, at about 64 KiB each (a hash per block), some 20 MiB.
+const MAX_CACHED_INDEXES: usize = 256;
 
 /// Ranges of a stream decoded at once at most.
 const DECODED_AHEAD: usize = 2;
@@ -628,12 +674,11 @@ fn decode_range(
             key: entry.key(),
             reason: "a GET returned fewer bytes than its range",
         })?;
-        let parent = index.parent_of(entry, segment.first);
         blocks.extend(decode_segment(
             entry,
             segment,
             part,
-            parent,
+            None,
             from..u64::MAX,
             parts,
         )?);

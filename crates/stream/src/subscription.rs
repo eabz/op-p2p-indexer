@@ -140,7 +140,7 @@ impl<U: UnsafeStore, A: ArchiveStore> Subscription<U, A> {
             next: 0,
             any_first: false,
             in_gap: false,
-            history: History::default(),
+            history: History::of(payload.parts()),
             receipts_checked: Instant::now(),
         }
     }
@@ -212,7 +212,7 @@ impl<U: UnsafeStore, A: ArchiveStore> Subscription<U, A> {
                     self.send_receipts(block).await?;
                 }
             }
-            self.history = History::default();
+            self.history.reset();
             return Ok(Some(Mode::Follow(cursor)));
         }
         self.recheck_receipts().await?;

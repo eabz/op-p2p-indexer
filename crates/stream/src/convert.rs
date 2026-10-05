@@ -15,8 +15,8 @@ use alloy_primitives::{Address, B256, U256};
 use bytes::Bytes;
 use op_alloy_consensus::{OpReceiptEnvelope, OpTxEnvelope};
 use op_indexer_primitives::{
-    ArchivedBlock, BlockRef, BlockSource, DecodedBlock, EncodedBlock, L1Heads, decode_block,
-    encode_receipts, encode_transaction, split_body,
+    ArchivedBlock, BlockRef, BlockSource, DecodedBlock, EncodedBlock, L1Heads, ReadParts,
+    decode_block, encode_receipts, encode_transaction, split_body,
 };
 use op_indexer_storage::InvalidBlockReason;
 
@@ -27,6 +27,17 @@ use crate::proto;
 pub(crate) enum Payload {
     Decoded,
     Raw,
+}
+
+impl Payload {
+    /// What of each block the payload sends: the raw one the receipts with their blooms (their
+    /// consensus encoding), the decoded one their fields, without blooms.
+    pub(crate) const fn parts(self) -> ReadParts {
+        match self {
+            Self::Raw => ReadParts::Whole,
+            Self::Decoded => ReadParts::WithoutBlooms,
+        }
+    }
 }
 
 impl From<proto::Payload> for Payload {

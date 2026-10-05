@@ -116,12 +116,12 @@ where
         let payload = Payload::from(request.payload());
         let block = match request.block {
             Some(proto::get_block_request::Block::Number(number)) => {
-                self.source.block_at(number).await
+                self.source.block_at(number, payload.parts()).await
             }
             Some(proto::get_block_request::Block::Hash(hash)) => {
                 let hash = B256::try_from(hash.as_ref())
                     .map_err(|_length| Status::invalid_argument("a hash is 32 bytes"))?;
-                self.source.block_by_hash(hash).await
+                self.source.block_by_hash(hash, payload.parts()).await
             }
             None => return Err(Status::invalid_argument("give `number` or `hash`")),
         }

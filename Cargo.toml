@@ -86,9 +86,13 @@ tree_hash_derive = "0.12"
 ssz_types = { version = "0.14", default-features = false }
 # BLS12-381 signatures of the sync committee (already in the tree through alloy's KZG).
 blst = { version = "0.3", default-features = false }
-# Gossip payloads and archived blocks are snappy block-compressed; gossip message IDs are
-# SHA-256 (0.10, as op-alloy).
-sha2 = "0.10"
+# Gossip payloads and archived blocks are snappy block-compressed; gossip message IDs, beacon
+# merkle steps and every sealed chunk segment read are SHA-256. 0.11 (already in the tree
+# through discv5): it picks the CPU's SHA instructions at run time on x86-64 (SHA-NI) and
+# aarch64 alike, where 0.10 needs its `asm` feature (a C build) for them on aarch64. In
+# software, the segment checks were half the CPU of a Flight read. 0.10 stays in the tree
+# through op-alloy.
+sha2 = "0.11"
 # Constant-time comparison of API keys (the stream).
 subtle = { version = "2.6", default-features = false }
 snap = "1.1"
@@ -144,11 +148,16 @@ clap = { version = "4", default-features = false, features = ["std", "derive", "
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 # Decoding of gzip answers when the service does not send zstd (already in the tree).
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
-# Free space of the state directory's filesystem and the open-files limit (already in the
-# tree; std has no call for either).
+# Free space of the state directory's filesystem and the open-files limit, and the host name
+# and memory the binaries size their settings from (`crates/runtime`, feature `system`; already
+# in the tree; std has no call for any of them).
 rustix = { version = "1", default-features = false, features = ["std", "fs", "process"] }
+# The chunk indexes a server read last (`crates/chunks`); already in the tree through fjall.
+quick_cache = { version = "0.6", default-features = false }
 # Compression of the downloaded and verified chunks on disk (already in the tree).
-zstd = { version = "0.13", default-features = false }
+# `experimental`: libzstd's advanced decompression parameters, for skipping a sealed segment's
+# frame checksum once its sha256 has passed (`crates/chunks`); no other crate.
+zstd = { version = "0.13", default-features = false, features = ["experimental"] }
 # Object storage (Cloudflare R2, through its S3 API) for sealed block chunks, in `crates/chunks`
 # only: Apache Arrow's maintained client, with pooled keep-alive connections over reqwest and
 # ranged GETs; `aws` is the S3 backend (no Azure or GCP), `fs` a local directory with the

@@ -27,7 +27,10 @@ use op_alloy_consensus::{OpReceipt, OpReceiptEnvelope};
 use op_indexer_chainspec::ChainSpec;
 use op_indexer_primitives::{ArchivedBlock, EncodedBlock, ReadParts, encode_receipts};
 use sha2::{Digest, Sha256};
+use std::cell::RefCell;
 use std::io::Write as _;
+
+use zstd::zstd_safe::{DCtx, DParameter, InBuffer, OutBuffer, ResetDirective};
 
 use crate::ChunksError;
 use crate::manifest::ChunkEntry;
@@ -367,8 +370,7 @@ impl ChunkIndex {
                 check: "its index does not hash to the manifest's root",
             });
         }
-        let index =
-            zstd::decode_all(frame).map_err(|_zstd| malformed("its index does not decompress"))?;
+        let index = decompress(frame).ok_or_else(|| malformed("its index does not decompress"))?;
         let mut reader = Reader::new(&index);
         let header = (|| {
             Some((
@@ -434,17 +436,6 @@ impl ChunkIndex {
         Some(self.first.saturating_add(u64::try_from(position).ok()?))
     }
 
-    /// The hash the block `number` must name as its parent: the hash before it, or `first`'s
-    /// parent from `entry`.
-    pub(crate) fn parent_of(&self, entry: &ChunkEntry, number: u64) -> B256 {
-        number
-            .checked_sub(self.first)
-            .and_then(|offset| offset.checked_sub(1))
-            .and_then(|position| self.hashes.get(usize::try_from(position).ok()?))
-            .copied()
-            .unwrap_or(entry.first_parent)
-    }
-
     /// The chunk's blocks, `(hash, number)`, in block order.
     pub fn blocks(&self) -> impl Iterator<Item = (B256, u64)> + '_ {
         (self.first..)
@@ -460,16 +451,19 @@ impl ChunkIndex {
     }
 }
 
-/// Decodes one segment, checking it first: its bytes against the index's sha256, then each
-/// block's header against its hash and its parent link to the block before (`parent`, the
-/// last block's hash before the segment, or the chunk's first parent). Every block is checked;
-/// only those numbered in `wanted` are built (their receipts' blooms rebuilt), the rest are
-/// skipped.
+/// Decodes one segment, checking its bytes against the index's sha256 first. With `links`
+/// (the last block's hash before the segment, or the chunk's first parent) it also checks
+/// each block's header against its hash and its parent link to the block before: what a reader
+/// that does not trust the index needs (`import fetch`). Without, the records are taken as
+/// sealed: the index is the manifest's (its sha256, [`ChunkIndex::parse`]), the segment the
+/// index's, and every block was verified before it was sealed, so a server reading its own
+/// chunks does not hash every header again. Only blocks numbered in `wanted` are built, with
+/// the `parts` asked for; the rest are skipped.
 pub(crate) fn decode_segment(
     entry: &ChunkEntry,
     segment: &Segment,
     bytes: &[u8],
-    mut parent: B256,
+    mut links: Option<B256>,
     wanted: std::ops::Range<u64>,
     parts: ReadParts,
 ) -> Result<Vec<ArchivedBlock>, ChunksError> {
@@ -486,22 +480,24 @@ pub(crate) fn decode_segment(
     }
     // One buffer for the segment: the blocks built from it are slices of it, not copies.
     let records = bytes::Bytes::from(
-        zstd::decode_all(bytes).map_err(|_zstd| malformed("a segment does not decompress"))?,
+        decompress(bytes).ok_or_else(|| malformed("a segment does not decompress"))?,
     );
     let mut reader = Reader::new(&records);
     let mut blocks = Vec::new();
     let numbers = segment.first..segment.first.saturating_add(u64::from(segment.blocks));
     for number in numbers {
         let record = Record::read(&mut reader).ok_or_else(|| malformed("a record is cut short"))?;
-        if keccak256(record.header) != record.hash {
-            return Err(integrity("a header does not hash to its hash"));
+        if let Some(parent) = &mut links {
+            if keccak256(record.header) != record.hash {
+                return Err(integrity("a header does not hash to its hash"));
+            }
+            if parent_hash(record.header) != Some(*parent) {
+                return Err(integrity(
+                    "a block does not name the previous block as its parent",
+                ));
+            }
+            *parent = record.hash;
         }
-        if parent_hash(record.header) != Some(parent) {
-            return Err(integrity(
-                "a block does not name the previous block as its parent",
-            ));
-        }
-        parent = record.hash;
         if wanted.contains(&number) {
             blocks.push(
                 record
@@ -583,6 +579,52 @@ impl<'a> Record<'a> {
                 .collect(),
         })
     }
+}
+
+/// Decompressed bytes reserved per compressed byte before a frame is decompressed: blocks
+/// compress up to about sevenfold, so most frames decompress without the buffer growing.
+const EXPANSION: usize = 8;
+
+/// Decompresses one frame of a chunk (a segment or the index) whose sha256 the caller has
+/// checked. `None` if it is not one whole zstd frame.
+///
+/// The frame's own checksum (XXH64 of what it decompresses to) is not checked: the sha256
+/// over its compressed bytes already is, and is the stronger check. Decompresses straight
+/// into the buffer it returns, with one decompression context per thread, where
+/// `zstd::decode_all` copies through a small buffer and grows its output from empty: the
+/// two were a third of a Flight read's CPU.
+fn decompress(frame: &[u8]) -> Option<Vec<u8>> {
+    thread_local! {
+        static CONTEXT: RefCell<DCtx<'static>> = RefCell::new({
+            let mut context = DCtx::create();
+            // Without it the frame's checksum is checked too: slower, not wrong.
+            let _ignored = context.set_parameter(DParameter::ForceIgnoreChecksum(true));
+            context
+        });
+    }
+    CONTEXT.with_borrow_mut(|context| {
+        context.reset(ResetDirective::SessionOnly).ok()?;
+        let mut out = Vec::with_capacity(frame.len().saturating_mul(EXPANSION));
+        let mut input = InBuffer::around(frame);
+        loop {
+            if out.len() == out.capacity() {
+                out.reserve(out.capacity().max(1 << 16));
+            }
+            let len = out.len();
+            let left = {
+                let mut output = OutBuffer::around_pos(&mut out, len);
+                context.decompress_stream(&mut output, &mut input).ok()?
+            };
+            if left == 0 {
+                // The frame ended: nothing may follow it.
+                return (input.pos() == frame.len()).then_some(out);
+            }
+            // Every byte read and room left over: the frame is cut short.
+            if input.pos() == frame.len() && out.len() < out.capacity() {
+                return None;
+            }
+        }
+    })
 }
 
 /// The sha256 of `bytes`.

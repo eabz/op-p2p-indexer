@@ -97,7 +97,7 @@ pub fn decode_chunk(entry: &ChunkEntry, bytes: &[u8]) -> Result<Vec<ArchivedBloc
             entry,
             segment,
             part,
-            parent,
+            Some(parent),
             segment.first..u64::MAX,
             ReadParts::Whole,
         )?;
