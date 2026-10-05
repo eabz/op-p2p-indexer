@@ -45,6 +45,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use alloy_primitives::BlockNumber;
 use op_indexer_primitives::ExecutionPeer;
 use reth_eth_wire_types::DisconnectReason;
 use reth_network_peers::PeerId;
@@ -196,6 +197,26 @@ impl Peers {
     #[must_use]
     pub fn sessions(&self) -> Arc<[SessionHandle]> {
         Arc::clone(&self.sessions.borrow())
+    }
+
+    /// The newest block peers say they hold: the median of the three highest `latest` that
+    /// askable sessions advertise (the lower of two, the one of one), so one peer announcing
+    /// too high cannot set it. `None` without such a session. Peers announce their range at
+    /// the handshake and then only every few minutes (reth: every 384 s, once their head has
+    /// moved 32 blocks), so this trails their real head.
+    #[must_use]
+    pub fn advertised_latest(&self) -> Option<BlockNumber> {
+        let mut latest: Vec<BlockNumber> = self
+            .sessions
+            .borrow()
+            .iter()
+            .filter(|session| session.is_askable())
+            .map(|session| session.range().latest)
+            .filter(|latest| *latest > 0)
+            .collect();
+        latest.sort_unstable_by(|a, b| b.cmp(a));
+        latest.truncate(3);
+        latest.get(latest.len() / 2).copied()
     }
 
     /// Waits until a session opens or ends. Returns `false` once the peer set has stopped.

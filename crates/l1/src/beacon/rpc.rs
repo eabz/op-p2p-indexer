@@ -52,8 +52,6 @@ pub(super) const SUCCESS: u8 = 0;
 pub(super) const MAX_LIGHT_CLIENT_BYTES: usize = 64 * 1024;
 /// Largest SSZ of the small messages (status, ping, metadata, goodbye, an error text).
 pub(super) const MAX_SMALL_BYTES: usize = 1024;
-/// Most updates asked for in one `LightClientUpdatesByRange`: one per period, about a week.
-pub(super) const MAX_UPDATES: u64 = 8;
 /// `CUSTODY_REQUIREMENT`: the fewest custody groups a node may report from Fulu on.
 const CUSTODY_REQUIREMENT: u64 = 4;
 /// Bytes a varint length may take.
@@ -87,10 +85,8 @@ pub(super) struct Codec {
     request_payload: bool,
     /// Whether successful response chunks carry a fork digest.
     context: bool,
-    /// Largest SSZ of a response chunk.
+    /// Largest SSZ of a response chunk; every response is one chunk.
     max_chunk_bytes: usize,
-    /// Most chunks in a response.
-    max_chunks: usize,
 }
 
 impl Codec {
@@ -108,18 +104,13 @@ impl Codec {
             } else {
                 MAX_SMALL_BYTES
             },
-            max_chunks: if protocol == UPDATES_BY_RANGE {
-                usize::try_from(MAX_UPDATES).unwrap_or(1)
-            } else {
-                1
-            },
         }
     }
 
     /// Bytes a whole response may take on the wire.
     fn max_response_bytes(&self) -> u64 {
         let chunk = snap::raw::max_compress_len(self.max_chunk_bytes).saturating_add(64);
-        u64::try_from(chunk.saturating_mul(self.max_chunks)).unwrap_or(u64::MAX)
+        u64::try_from(chunk).unwrap_or(u64::MAX)
     }
 }
 
@@ -154,7 +145,7 @@ impl request_response::Codec for Codec {
         let mut rest = wire.as_slice();
         let mut chunks = Vec::new();
         while let Some((&code, after)) = rest.split_first() {
-            if chunks.len() >= self.max_chunks {
+            if !chunks.is_empty() {
                 return Err(invalid("more response chunks than asked for"));
             }
             rest = after;
@@ -304,9 +295,12 @@ pub(super) fn metadata(fulu: bool) -> Vec<u8> {
     ssz
 }
 
-/// The SSZ of a `LightClientUpdatesByRange` request.
-pub(super) fn updates_by_range(start_period: u64, count: u64) -> Vec<u8> {
-    let mut ssz = start_period.to_le_bytes().to_vec();
-    ssz.extend_from_slice(&count.to_le_bytes());
+/// The SSZ of a `LightClientUpdatesByRange` request for the update of `period` alone.
+///
+/// One update per request, though the specification allows 128: Lighthouse never serves a
+/// request for more (`docs/l1.md` §8, "One period per `LightClientUpdatesByRange`").
+pub(super) fn updates_by_range(period: u64) -> Vec<u8> {
+    let mut ssz = period.to_le_bytes().to_vec();
+    ssz.extend_from_slice(&1_u64.to_le_bytes());
     ssz
 }

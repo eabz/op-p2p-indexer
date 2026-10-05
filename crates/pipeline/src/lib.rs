@@ -25,6 +25,7 @@
 
 mod commit;
 mod error;
+mod fill;
 mod ingest;
 mod promote;
 mod range;
@@ -35,7 +36,7 @@ mod retry;
 use std::fmt;
 
 use alloy_primitives::BlockNumber;
-use op_indexer_primitives::{BlockRef, EncodedBlock, L1Games, L1Heads, UnsafeBlock};
+use op_indexer_primitives::{BlockRef, EncodedBlock, FillRequest, L1Games, L1Heads, UnsafeBlock};
 use op_indexer_storage::{ArchiveStore, UnsafeStore};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
@@ -57,6 +58,8 @@ pub struct Pipeline<U, A> {
     receipts: Option<ReceiptsChannels>,
     range: Option<mpsc::Receiver<Vec<EncodedBlock>>>,
     head: Option<watch::Sender<Option<BlockRef>>>,
+    /// Where missed spans are asked for, and the blocks fetched for them.
+    fills: Option<(mpsc::Sender<FillRequest>, mpsc::Receiver<Vec<EncodedBlock>>)>,
     /// The dispute games, the chain's Isthmus time, and where the heads they give go.
     games: Option<(watch::Receiver<L1Games>, u64, watch::Sender<L1Heads>)>,
 }
@@ -69,6 +72,7 @@ enum Task {
     Receipts,
     Range,
     Commit,
+    Fill,
 }
 
 impl Task {
@@ -79,6 +83,7 @@ impl Task {
             Self::Receipts => "receipts",
             Self::Range => "range",
             Self::Commit => "commit",
+            Self::Fill => "fill",
         }
     }
 }
@@ -121,6 +126,7 @@ where
             receipts,
             range: None,
             head: None,
+            fills: None,
             games: None,
         }
     }
@@ -148,6 +154,20 @@ where
         isthmus_time: u64,
     ) -> Self {
         self.games = Some((games, isthmus_time, heads));
+        self
+    }
+
+    /// Fills what gossip missed: when the unsafe head moves past heights it does not hold, the
+    /// span (within 1,024 blocks of the head) is asked for on `requests`, and the blocks
+    /// received on `filled` (each batch consecutive, ascending, verified by the fetcher) are
+    /// stored in the unsafe store, closing the gap.
+    #[must_use]
+    pub fn with_fills(
+        mut self,
+        requests: mpsc::Sender<FillRequest>,
+        filled: mpsc::Receiver<Vec<EncodedBlock>>,
+    ) -> Self {
+        self.fills = Some((requests, filled));
         self
     }
 
@@ -193,13 +213,19 @@ where
             .receipts
             .as_ref()
             .map(|channels| channels.requests.clone());
+        let (fill_requests, filled) = self.fills.unzip();
         let ingest = ingest::run(
             self.unsafe_store.clone(),
             self.blocks,
             requests,
             self.head,
+            fill_requests,
             stop.clone(),
         );
+        if let Some(filled) = filled {
+            let fill = fill::run(self.unsafe_store.clone(), filled, stop.clone());
+            tasks.spawn(async move { (Task::Fill, fill.await) });
+        }
         tasks.spawn(async move { (Task::Ingest, ingest.await) });
         if let Some((games, isthmus_time, heads)) = self.games {
             let commit = commit::run(
@@ -229,8 +255,8 @@ where
             match joined {
                 // Ingest ends when the network does; the others have nothing left to follow.
                 Ok((Task::Ingest, Ok(()))) => stop.cancel(),
-                // The receipts task ends when the fetcher has stopped; ingest carries on.
-                Ok((Task::Receipts, Ok(()))) => {}
+                // The receipts and fill tasks end when the fetcher has stopped; ingest carries on.
+                Ok((Task::Receipts | Task::Fill, Ok(()))) => {}
                 // Promotion, the commit and the range task follow inputs that close only when
                 // the node stops: ending earlier leaves the archive silently behind.
                 Ok((task @ (Task::Promote | Task::Range | Task::Commit), Ok(()))) => {

@@ -9,6 +9,12 @@ use op_indexer_balancer::register::{Registration, is_valid_address};
 use op_indexer_chainspec::ChainSpec;
 use op_indexer_chunks::{R2Config, ReadOptions};
 use op_indexer_node::env_file;
+/// Bytes of one ranged chunk read: about a segment (1 MiB compressed).
+const RANGE_BYTES: u64 = 1 << 20;
+/// Ranged reads of one chunk stream in flight at once.
+const RANGES_IN_FLIGHT: usize = 2;
+/// Default memory for consumers' reads of sealed history, in MiB.
+const DEFAULT_READ_BUDGET_MB: u64 = 1024;
 /// The exporter's name in the manifest when none is configured.
 const DEFAULT_EXPORTER_ID: &str = "server";
 
@@ -18,6 +24,8 @@ pub(crate) struct ServerConfig {
     /// Where the chunks are.
     pub(crate) chunks: Chunks,
     pub(crate) read: ReadOptions,
+    /// Bytes consumers' reads of sealed history may hold in all.
+    pub(crate) read_budget: u64,
     /// With `--export` or `OP_INDEXER_EXPORT=true`: the exporter's name in the manifest.
     pub(crate) export: Option<String>,
     /// With `OP_INDEXER_BALANCER_URL`: how this server registers with the balancer.
@@ -29,7 +37,7 @@ pub(crate) struct ServerConfig {
 pub(crate) enum Chunks {
     /// The bucket. Only the exporter's key may write.
     R2(R2Config),
-    /// A local directory, as `import export` writes one for tests and the bench, with the
+    /// A local directory, as `import verify` writes one for tests and the bench, with the
     /// key prefix inside it.
     Local { dir: PathBuf, prefix: String },
 }
@@ -50,6 +58,9 @@ impl ServerConfig {
     ///   `archive`).
     /// - `OP_INDEXER_R2_ENDPOINT`: the S3 endpoint (default
     ///   `https://<account id>.r2.cloudflarestorage.com`).
+    /// - `OP_INDEXER_SERVER_READ_BUDGET_MB`: memory, in MiB, that streams and Flight reads of
+    ///   sealed history may hold in all, whatever the number of readers: decoded blocks read
+    ///   ahead and chunk streams open (default 1024). Past it readers wait.
     /// - `OP_INDEXER_CHUNKS_DIR`: read the chunks from this local directory instead of R2,
     ///   under `OP_INDEXER_R2_PREFIX` (for local runs and the bench); the R2 variables are
     ///   then not needed.
@@ -124,7 +135,19 @@ impl ServerConfig {
         Ok(Self {
             balancer,
             chunks,
-            read: ReadOptions::default(),
+            // A segment or so per ranged read, two at once: what one open chunk stream holds
+            // stays small (see `op_indexer_server`'s read budget).
+            read: ReadOptions {
+                range_bytes: RANGE_BYTES,
+                ranges_in_flight: RANGES_IN_FLIGHT,
+                ..ReadOptions::default()
+            },
+            read_budget: var("OP_INDEXER_SERVER_READ_BUDGET_MB")
+                .map(|mib| mib.parse::<u64>())
+                .transpose()
+                .map_err(|_err| eyre!("OP_INDEXER_SERVER_READ_BUDGET_MB must be a number of MiB"))?
+                .unwrap_or(DEFAULT_READ_BUDGET_MB)
+                .saturating_mul(1 << 20),
             export: export.then(|| {
                 var("OP_INDEXER_EXPORT_ID").unwrap_or_else(|| DEFAULT_EXPORTER_ID.to_owned())
             }),

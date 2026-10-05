@@ -15,9 +15,11 @@
 //!   what to ask for.
 //!
 //! The one trusted input is the checkpoint: the root of a finalized beacon block, given in
-//! configuration. Everything after it is verified. Nothing is persisted: a restart
-//! bootstraps again, which takes well under a minute, so the checkpoint has to stay recent
-//! enough for peers to hold its bootstrap. Uses no RPC. See `docs/l1.md`.
+//! configuration. Everything after it is verified. The newest finalized block verified is
+//! published ([`BeaconCheckpoint`]) for the node to save, and a restart bootstraps from the
+//! saved one (well under a minute), so the configured checkpoint only has to be recent on the
+//! first start. A saved block adds no trust: it was verified from a configured checkpoint.
+//! Uses no RPC. See `docs/l1.md`.
 
 mod client;
 mod discovery;
@@ -31,12 +33,13 @@ use std::net::SocketAddr;
 
 use alloy_primitives::B256;
 use libp2p::{Multiaddr, noise};
-use tokio::sync::mpsc;
+use op_indexer_primitives::BeaconCheckpoint;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::TrustedL1Block;
-use crate::beacon::client::Client;
+use crate::beacon::client::{Bootstrap, Client};
 use crate::beacon::rpc::StatusData;
 use crate::beacon::spec::{MAINNET, SLOTS_PER_EPOCH};
 
@@ -44,8 +47,13 @@ use crate::beacon::spec::{MAINNET, SLOTS_PER_EPOCH};
 #[derive(Debug, Clone)]
 pub struct BeaconConfig {
     /// Root of a finalized beacon block the operator trusts: the light client starts from
-    /// it. It must be recent: peers serve the bootstrap of a checkpoint for a limited time.
+    /// it on the first start, or when it is newer than [`Self::saved`]. It must be recent
+    /// then: peers serve the bootstrap of a checkpoint for a limited time.
     pub checkpoint: B256,
+    /// The newest finalized block a previous run verified, if the node saved one: started
+    /// from when it descends from [`Self::checkpoint`], else used as the fallback
+    /// (`docs/l1.md` §8, "Restart").
+    pub saved: Option<BeaconCheckpoint>,
     /// Listen address, used for both discovery (UDP) and libp2p (TCP). It must differ from
     /// the other networks' addresses.
     pub listen_addr: SocketAddr,
@@ -70,8 +78,9 @@ pub enum BeaconError {
     /// The TCP listen address could not be bound.
     #[error("failed to listen for beacon peers on {0}")]
     Listen(Multiaddr, #[source] libp2p::TransportError<std::io::Error>),
-    /// Peers do not hold the bootstrap of the configured checkpoint: it is too old, or not
-    /// the root of a finalized block. The operator has to configure a newer one.
+    /// Peers hold the bootstrap of neither the configured checkpoint nor the saved one: both
+    /// are too old, or not the root of a finalized block. The operator has to configure a
+    /// newer one.
     #[error(
         "{peers} beacon peers do not hold the light-client bootstrap of checkpoint \
          {checkpoint}: configure the root of a more recent finalized beacon block"
@@ -92,6 +101,7 @@ pub enum BeaconError {
 pub struct LightClient {
     config: BeaconConfig,
     trusted: mpsc::Sender<TrustedL1Block>,
+    finalized: watch::Sender<Option<BeaconCheckpoint>>,
 }
 
 impl LightClient {
@@ -99,10 +109,20 @@ impl LightClient {
     ///
     /// Each L1 execution block it verifies is sent on `trusted`: the checkpoint's own block
     /// first, then every newer finalized block (`finalized: true`) and every newer head as
-    /// the sync committee attested it (`finalized: false`).
+    /// the sync committee attested it (`finalized: false`). The beacon block of each of
+    /// those finalized blocks is published on `finalized`, for the node to save and pass
+    /// back as [`BeaconConfig::saved`] after a restart: about once an epoch.
     #[must_use]
-    pub const fn new(config: BeaconConfig, trusted: mpsc::Sender<TrustedL1Block>) -> Self {
-        Self { config, trusted }
+    pub const fn new(
+        config: BeaconConfig,
+        trusted: mpsc::Sender<TrustedL1Block>,
+        finalized: watch::Sender<Option<BeaconCheckpoint>>,
+    ) -> Self {
+        Self {
+            config,
+            trusted,
+            finalized,
+        }
     }
 
     /// Runs the light client until `cancel` fires or the receiver of trusted blocks is
@@ -110,16 +130,24 @@ impl LightClient {
     ///
     /// # Errors
     ///
-    /// Returns [`BeaconError`] if a socket cannot be bound, or peers do not hold the
-    /// bootstrap of the configured checkpoint.
+    /// Returns [`BeaconError`] if a socket cannot be bound, or peers hold the bootstrap of
+    /// neither the saved nor the configured checkpoint.
     pub async fn run(self, cancel: CancellationToken) -> Result<(), BeaconError> {
-        let Self { config, trusted } = self;
+        let Self {
+            config,
+            trusted,
+            finalized,
+        } = self;
         let spec = &MAINNET;
         let epoch = spec.now_slot() / SLOTS_PER_EPOCH;
         let digest = spec.fork_digest(epoch);
 
+        let bootstraps = bootstraps(config.checkpoint, config.saved);
         info!(
-            checkpoint = %config.checkpoint,
+            checkpoint = %bootstraps.0.root,
+            saved = bootstraps.0.root != config.checkpoint,
+            saved_slot = config.saved.map(|saved| saved.slot),
+            fallback = ?bootstraps.1.map(|fallback| fallback.root),
             fork_digest = %alloy_primitives::hex::encode(digest),
             listen = %config.listen_addr,
             "beacon light client starting"
@@ -136,7 +164,7 @@ impl LightClient {
         };
         let (network, handle, gossip) =
             network::new(config.listen_addr, config.bootnodes, digest, status)?;
-        let client = Client::new(spec, config.checkpoint, handle, gossip, trusted);
+        let client = Client::new(spec, bootstraps, handle, gossip, trusted, finalized);
         // Either part ending stops the other.
         let stop = cancel.child_token();
         let (networking, result) = tokio::join!(
@@ -153,5 +181,21 @@ impl LightClient {
         );
         networking?;
         result
+    }
+}
+
+/// The root to bootstrap from, and the one to try if peers do not hold it, as
+/// [`BeaconConfig::saved`] says.
+fn bootstraps(configured: B256, saved: Option<BeaconCheckpoint>) -> (Bootstrap, Option<Bootstrap>) {
+    let from_configured = Bootstrap {
+        root: configured,
+        origin: configured,
+    };
+    match saved.filter(|saved| saved.root != configured) {
+        None => (from_configured, None),
+        // Verified from the configured checkpoint, so newer than it.
+        Some(saved) if saved.origin == configured => (saved.into(), Some(from_configured)),
+        // Verified from another: the operator configured a new checkpoint since.
+        Some(saved) => (from_configured, Some(saved.into())),
     }
 }

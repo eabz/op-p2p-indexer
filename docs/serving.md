@@ -1,12 +1,13 @@
 # Serving at scale: chunks, `server` and `balancer`
 
-Status: **built, except the balancer.** The storage core (`crates/chunks`, sections 1, 2 and
-2.4) and the converter (`import export`, section 3) are built and checked end to end against a
-local directory. The stateless `server` (`crates/server`, `bin/server`: history from R2 with no
-cache, section 5; the exporter, `server --export`, section 4) is built and not yet run against
-R2 (5.5). The `balancer` is in progress; the bench comes next. Decision: [roadmap.md](roadmap.md),
-2026-10-04, "Four binaries". Decisions are marked **D**; the user's answers of 2026-10-04 settled
-the open questions (they are recorded in the decisions). Measurements are from 2026-10-04.
+Status: **built.** The storage core (`crates/chunks`, sections 1, 2 and 2.4) and the converter
+(`import verify`, section 3, which replaced `import export`) are built and checked end to end
+against a local directory. The stateless `server` (`crates/server`, `bin/server`: history from
+R2 with no cache, section 5; the exporter, `server --export`, section 4) is built and not yet
+run against R2 (5.5). The `balancer` (section 6) is built and checked locally (6.7); the bench
+comes next. Decision: [roadmap.md](roadmap.md), 2026-10-04, "Four binaries". Decisions are
+marked **D**; the user's answers of 2026-10-04 settled the open questions (they are recorded in
+the decisions). Measurements are from 2026-10-04.
 
 Four binaries (`op-indexer` is renamed `indexer`; the importer keeps its `import` command):
 
@@ -14,7 +15,7 @@ Four binaries (`op-indexer` is renamed `indexer`; the importer keeps its `import
 |---|---|---|
 | `indexer` | Today's node: one user, every service in one process | fjall archive, unsafe chain in memory + fjall journal |
 | `server` | A full node (p2p layers, its own unsafe chain, serving peers, gRPC and Flight) that holds no history: it reads sealed chunks from R2 on demand and streams them; one server per deployment also exports (section 4) | a small fjall tail of unsealed committed blocks, unsafe chain in memory + fjall journal; no chunk cache |
-| `importer` (`import`) | Today's importer, plus the one-time converter of `verified/` to chunks (section 3) | state directory, R2 (write, during the conversion) |
+| `importer` (`import`) | Downloads a chain from an external archive; `verify` checks every block and uploads it as sealed chunks (section 3) | state directory, R2 (write) |
 | `balancer` | The single entry point: keeps the servers' health and load, splits each request into per-chunk jobs and spreads them over the servers; no block data passes through it | an in-memory table |
 
 R2 holds only sealed, immutable history. Live and recent data never go through R2: every
@@ -255,6 +256,14 @@ number, except for the block a range sync starts from.
 
 ## 3. The converter: `verified/` to chunks (one-time)
 
+**Superseded (2026-10-05, the user's decision).** `import export` and the verified copy are
+gone: `import verify` checks each downloaded chunk, seals the blocks into the same D4 chunks
+and uploads them, deleting the downloaded chunks as it goes, and lists them in the manifest
+only once the last block matches the anchor. Base's 2.57 TB of downloaded chunks did not fit
+twice on its disk. See `docs/import.md`, section 3.2. The rest of this section is the design
+as it was built for `export`; its chunk format, cuts, upload and index are what `verify` does
+now.
+
 **D10.** An `import` subcommand, `import export --state-dir <dir>`, not a separate tool, which
 replaces `import load` (removed, 2026-10-04). It runs once per existing `verified/` folder (OP Mainnet's and Unichain's on the user's
 server). It needs exactly what `importer` already has:
@@ -406,8 +415,14 @@ Unchanged code over `R2Archive`:
     sealed only once finalized, so blocks served from R2 report `FINALIZED` in `GetBlock`,
     subscriptions and Flight caps even with the L1 side off.
   - Read-ahead (5.2): a consumer's `blocks` calls are served by a feed that streams chunk after
-    chunk ahead of it, at most 64 MiB per reader and 512 MiB in all, dropped after a minute
-    unread; no disk, no cache.
+    chunk ahead of it, at most 16 MiB per reader, dropped after 10 s unread; no disk, no cache.
+    The read budget (`OP_INDEXER_SERVER_READ_BUDGET_MB`, default 1024) bounds them all,
+    whatever the number of readers: half for decoded blocks read ahead, half for the chunk
+    streams open at once (about 32 MiB each, with the server's reads of about a segment, two
+    in flight). Measured on a one-chunk local export (2,000 OP Mainnet blocks), peak RSS for
+    1/8/16/32/64 concurrent Flight `DoGet`s of the whole chunk: 100/420/717/790/878 MB at the
+    default, about 300 MB at 64 with a 256 MiB budget; before, 430 MB/2.6/3.4/5.8 GB for
+    1/8/16/32.
   - Peers (5.3): a read that needs R2 takes one of 4 places and counts against 512 MiB a
     minute; without one the peer gets the empty answer.
   - `Exporter` (section 4): adds a block to the chunk being written once it is finalized and
@@ -447,6 +462,18 @@ heartbeat:
 - id, chain, and the `host:port` of its gRPC and Flight listener;
 - health: an unhealthy server gets no work;
 - heads: unsafe, safe, finalized, and the last sealed block it has read from the manifest;
+- contiguity (`contiguous_through`): the highest block N such that it holds every block from
+  the chain's first through N, each with its receipts. A server holds the sealed chunks (R2),
+  its own tail (committed blocks above them; filled by range sync, `OP_INDEXER_EL_SYNC=true`)
+  and its own unsafe chain (gossip since it started). Without range sync there is a gap
+  between the last sealed block and the first block it gossiped: its head is above the gap
+  but it cannot serve it (seen on the bench, 2026-10-04: one server answered `NOT_FOUND` for
+  a block the other served). The server computes it at each heartbeat, cheaply, as the range
+  it advertises to execution peers (`NodeView::contiguous_through`, `NodeProvider::range`):
+  its committed store's blocks (contiguous by construction: every append links to the one
+  before) up to the first still waiting for receipts, extended through its unsafe chain's
+  canonical blocks that link to them and have theirs, each search continuing from the last;
+  never below the last sealed block;
 - load: requests in flight (subscriptions, Flight streams, lookups) and bytes sent per second.
 
 The table holds no chunk ranges (corrected by the user, 2026-10-04): every server is stateless
@@ -456,14 +483,16 @@ manifest itself, once per refresh (every 30 s), only for the chunk boundaries.
 ### 6.2 Registration
 
 A server opens a `Register` stream to the balancer and sends a heartbeat every 5 s with its
-health, heads and load. Three missed heartbeats (15 s) mark it down and remove it.
+health, heads, contiguity and load. Three missed heartbeats (15 s) mark it down and remove it.
 
 ### 6.3 Health and failover
 
 - A server is down after 3 missed heartbeats, and out of the table as soon as its `Register`
   call ends.
-- Work at the tip goes only to a server whose head covers it (6.4, 6.5): a server that falls
-  behind gets none until it catches up, but still serves sealed chunks.
+- Work above the sealed chunks goes only to a server that holds every block through it: its
+  head covers the work and so does its `contiguous_through` (6.4, 6.5). A server that falls
+  behind, or has a gap above the sealed chunks, gets none there, but still serves sealed
+  chunks. A server that reports no `contiguous_through` gets no work above them.
 - Failover is on the client side: every answer names more than one server when there are.
 
 ### 6.4 Flight: per-chunk jobs
@@ -472,8 +501,8 @@ health, heads and load. Three missed heartbeats (15 s) mark it down and remove i
 into per-chunk jobs, so one big range runs in parallel over the servers:
 - One `FlightEndpoint` per chunk the range touches, its ticket clipped to the chunk
   (`table:first:last:cap`, the stream's existing ticket); every healthy server can take it.
-- The part above the last sealed chunk becomes jobs only a server whose head (under the
-  ticket's cap) reaches the job's last block can take.
+- The part above the last sealed chunk becomes jobs only a server can take whose head (under
+  the ticket's cap) and `contiguous_through` both reach the job's last block.
 - Every job is also cut to the servers' `DoGet` limit (100,000 blocks).
 - Each job goes to the least loaded server that can take it, and its `location` lists up to
   three, least loaded first. The load counts the jobs already given out for the same range, so
@@ -486,7 +515,8 @@ into per-chunk jobs, so one big range runs in parallel over the servers:
 ### 6.5 Locate
 
 **D17.** `Locate(chain, from_block) → [server endpoints]` for gRPC subscriptions: the healthy
-servers whose head reaches the block before `from_block`, least loaded first. The client
+servers whose `contiguous_through` reaches the block before `from_block` (they hold every
+block up to it), least loaded first. The client
 subscribes to the first and, on failure, resubscribes from its last block at the next.
 Subscriptions already resume by number.
 
@@ -531,11 +561,14 @@ environment and are never logged. TLS is not part of this design.
   and registers again after a backoff of 1 s doubling to 30 s with jitter; it never stops the
   server. A server's address must be exactly `host:port` (`register::is_valid_address`).
 - **Picking** (6.4, 6.5): by requests in flight plus the jobs given out for the same request,
-  then bytes per second, ties round-robin. The heads are the heartbeats'; no separate
-  `GetHeads` probe.
+  then bytes per second, ties round-robin. Above the sealed chunks a server serves up to its
+  reach, min(head under the cap, `contiguous_through`) (`table::Server::reach`): Flight jobs
+  by the ticket's cap, `Locate` by the unsafe head. The heads and `contiguous_through` are the
+  heartbeats'; no separate `GetHeads` probe.
 - **Flight** (D16): the other Flight calls are `UNIMPLEMENTED` (no `GetSchema`: the schema is
-  in each `FlightInfo`). A range is clipped by the best head of its cap among the servers, and
-  may not start below the first sealed chunk (`OUT_OF_RANGE`). `ordered` is set.
+  in each `FlightInfo`). A range is clipped by the best reach among the servers (the head of
+  its cap, but no further than the server's `contiguous_through`), and may not start below the
+  first sealed chunk (`OUT_OF_RANGE`). `ordered` is set.
 - **Keys** (D18): `Locate` and Flight take a user key from `OP_INDEXER_STREAM_API_KEYS`, the
   servers' own list; `Register` takes a server key from `OP_INDEXER_BALANCER_SERVER_KEYS`,
   which is required. Checked per call (`op_indexer_stream::ApiKeys::verify`), never logged.
@@ -556,11 +589,11 @@ environment and are never logged. TLS is not part of this design.
 Setup:
 - 2 or 3 `server`s (no cache), one of them with `--export`;
 - one `balancer`;
-- a bucket filled by `import export` from OP Mainnet's `verified/`.
+- a bucket filled by `import verify` from OP Mainnet's downloaded chunks.
 
 Measure:
-- **Converter**: blocks/s and MB/s from `verified/` to R2; total time and objects; R2 Class A
-  operations.
+- **Converter** (`import verify`): blocks/s and MB/s from the downloaded chunks to R2; total
+  time and objects; R2 Class A operations.
 - **R2 from a droplet**:
   - time to first byte, and its spread;
   - streaming throughput per server, with 1, 4 and 16 GETs in flight;
@@ -599,7 +632,8 @@ Measure:
   - the chunk index and footer, `R2Archive` with its streaming read-ahead, and the hash index
     shards (D9);
   - the R2 client (an S3-compatible crate, chosen when built) and the manifest;
-  - `import export` (the converter) and `server --export` (the exporter);
+  - `import verify` (checks and uploads; it replaced `import export`) and `server --export`
+    (the exporter);
   - the `server` and `balancer` binaries, the registration protocol and the API keys.
 - **Settled by the bench, not decided here**: the chunk size target (D4), whether R2 honours
   conditional PUT (D8), level 1 against level 3 on real servers (D3).

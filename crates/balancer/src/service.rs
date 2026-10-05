@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use op_indexer_chainspec::ChainSpec;
 use op_indexer_stream::ApiKeys;
+use op_indexer_stream::ticket::Cap;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt as _};
@@ -94,22 +95,22 @@ impl balancer_server::Balancer for Service {
         if chain_id != self.chain.chain_id {
             return Err(Status::invalid_argument(other_chain(self.chain, chain_id)));
         }
-        // A subscription reads history up to the server's head, then follows it: any healthy
-        // server whose head reaches the block before `from_block` serves it.
+        // A subscription reads history up to the server's head, then follows it: a healthy
+        // server that holds every block before `from_block` serves it.
         let endpoints: Vec<String> = self
             .table
             .picker()
             .pick(usize::MAX, |server| {
                 server
-                    .unsafe_head
-                    .is_some_and(|head| head.saturating_add(1) >= from_block)
+                    .reach(Cap::Any)
+                    .is_some_and(|last| last.saturating_add(1) >= from_block)
             })
             .into_iter()
             .map(|address| format!("http://{address}"))
             .collect();
         if endpoints.is_empty() {
             return Err(Status::unavailable(format!(
-                "no healthy server has reached block {from_block}"
+                "no healthy server holds every block before {from_block}"
             )));
         }
         Ok(Response::new(LocateResponse { endpoints }))
@@ -185,6 +186,7 @@ fn checked(chain: &ChainSpec, heartbeat: Heartbeat) -> Result<(String, Server), 
         safe_head,
         finalized_head,
         last_sealed: _,
+        contiguous_through,
         requests_in_flight,
         bytes_per_second,
     } = heartbeat;
@@ -205,6 +207,7 @@ fn checked(chain: &ChainSpec, heartbeat: Heartbeat) -> Result<(String, Server), 
         unsafe_head,
         safe_head,
         finalized_head,
+        contiguous_through,
         requests_in_flight,
         bytes_per_second,
     };

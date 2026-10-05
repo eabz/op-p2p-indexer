@@ -21,7 +21,7 @@ many users means running several servers behind one balancer.
 |---|---|---|---|
 | **`indexer`** | The full node for a single user: every service in one process. Takes part in the p2p networks, follows L1, keeps history and serves it over gRPC and Arrow Flight | Its own local block archive (fjall) | built |
 | **`server`** | A full node for serving at scale: the same p2p participation and live data, but stateless for history: it keeps no archive and reads sealed, immutable block chunks from Cloudflare R2 on demand, with no cache. One server per deployment runs with `--export` (or `OP_INDEXER_EXPORT=true`) and is the single exporter, which seals finalized blocks into new chunks | R2 (sealed chunks), a small local tail of unsealed blocks | built; not yet run against R2 |
-| **`importer`** | Fills history once from an external archive (Envio HyperSync), verifying every block, and exports it as sealed chunks to R2 | Its state directory | built (`import`) |
+| **`importer`** | Fills history once from an external archive (Envio HyperSync): `download`, then `verify`, which checks every block and uploads it as sealed chunks to R2, deleting each downloaded chunk once uploaded | Its state directory | built (`import`) |
 | **`balancer`** | The single entry point for users: keeps the table of which chunk ranges each server holds and points every request at the right server. No data passes through it | The chunk table | in progress |
 
 R2 holds the sealed history the servers read. Live data always comes from the p2p networks,
@@ -109,7 +109,8 @@ Details, schemas and limits: [stream.md](docs/stream.md).
 ## Status
 
 The importer has downloaded and verified the full OP Mainnet chain (157.7 M blocks) and
-Unichain, and exports the verified history to R2 as sealed chunks ([import.md](docs/import.md)).
+Unichain; `verify` checks every block and uploads the history to R2 as sealed chunks, with
+no local copy ([import.md](docs/import.md)).
 The `server` is built but has not run against R2 yet; the `balancer` is in progress
 ([serving.md](docs/serving.md)). Base support is built but has not run yet. The node's gossip
 ingest and receipt fetching have run against live peers. Serving

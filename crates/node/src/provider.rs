@@ -53,8 +53,12 @@ pub(crate) struct NodeProvider<A> {
     /// The end of the advertised range found last, from which the next search continues: the
     /// range is read again on every new head, and the run below a block that is still
     /// canonical has not changed (a reorg would have replaced it) nor lost its receipts.
-    range_end: Arc<Mutex<Option<BlockRef>>>,
+    range_end: RangeEnd,
 }
+
+/// The end of the advertised range found last ([`NodeProvider::range`]), shared by the
+/// providers that search it.
+pub(crate) type RangeEnd = Arc<Mutex<Option<BlockRef>>>;
 
 /// The items of one answer, and where it must end.
 struct Answer {
@@ -66,10 +70,19 @@ struct Answer {
 
 impl<A: Archive> NodeProvider<A> {
     pub(crate) fn new(archive: A, unsafe_store: MemoryStore) -> Self {
+        Self::sharing_range(archive, unsafe_store, RangeEnd::default())
+    }
+
+    /// A provider whose range search continues from `range_end`, which others share.
+    pub(crate) const fn sharing_range(
+        archive: A,
+        unsafe_store: MemoryStore,
+        range_end: RangeEnd,
+    ) -> Self {
         Self {
             archive,
             unsafe_store,
-            range_end: Arc::default(),
+            range_end,
         }
     }
 

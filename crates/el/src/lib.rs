@@ -32,7 +32,9 @@ mod warn_limit;
 mod wire;
 
 use alloy_primitives::B256;
-use op_indexer_primitives::{BlockRef, ExecutionPeer, ReceiptsRequest, VerifiedReceipts};
+use op_indexer_primitives::{
+    BlockRef, EncodedBlock, ExecutionPeer, FillRequest, ReceiptsRequest, VerifiedReceipts,
+};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -63,6 +65,8 @@ pub struct ExecutionNetwork<P> {
     verified: mpsc::Sender<VerifiedReceipts>,
     /// A range of blocks to fetch from peers; `None` unless one was asked for.
     sync: Option<RangeSync>,
+    /// Spans gossip missed, and where their blocks go; `None` unless asked for.
+    fills: Option<(mpsc::Receiver<FillRequest>, mpsc::Sender<Vec<EncodedBlock>>)>,
     /// The network's name, on every line its tasks log.
     label: &'static str,
 }
@@ -112,8 +116,28 @@ impl<P: BlockProvider> ExecutionNetwork<P> {
             requests,
             verified,
             sync: None,
+            fills: None,
             label,
         })
+    }
+
+    /// Fetches what gossip missed: each span asked for on `requests` (see [`FillRequest`]) is
+    /// fetched from peers and verified by the hash chain down from its top, and its blocks
+    /// are sent on `filled`, a few dozen at a time, ascending.
+    #[must_use]
+    pub fn with_fills(
+        mut self,
+        requests: mpsc::Receiver<FillRequest>,
+        filled: mpsc::Sender<Vec<EncodedBlock>>,
+    ) -> Self {
+        self.fills = Some((requests, filled));
+        self
+    }
+
+    /// The open sessions, as requesters see them: for what peers advertise.
+    #[must_use]
+    pub fn peers(&self) -> Peers {
+        self.peers.clone()
     }
 
     /// Adds a range of blocks to fetch from peers and verify, next to the receipts of new
@@ -139,6 +163,7 @@ impl<P: BlockProvider> ExecutionNetwork<P> {
             requests,
             verified,
             sync,
+            fills,
             label,
         } = self;
         // The peer network names itself; these tasks are named here.
@@ -158,6 +183,12 @@ impl<P: BlockProvider> ExecutionNetwork<P> {
             let (peers, stop) = (peers.clone(), stop.clone());
             let chain = config.chain;
             let run = async move { sync::run(chain, peers, sync, stop).await };
+            tasks.spawn(run.instrument(span.clone()));
+        }
+        if let Some((requests, filled)) = fills {
+            let (peers, stop) = (peers.clone(), stop.clone());
+            let canyon_time = config.chain.canyon_time();
+            let run = sync::run_fills(canyon_time, peers, requests, filled, stop);
             tasks.spawn(run.instrument(span.clone()));
         }
         let fetcher = Fetcher::new(config.chain, peers, requests, verified);

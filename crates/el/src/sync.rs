@@ -35,9 +35,12 @@
 //! walk runs from the top and the fetch from the bottom, and holding the walk's headers until
 //! the fetch reaches them would mean keeping the whole chain's.
 
+mod fill;
 mod headers;
 mod schedule;
 mod segment;
+
+pub(crate) use fill::run as run_fills;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
@@ -73,6 +76,9 @@ const STARVED_INTERVAL: Duration = Duration::from_mins(1);
 /// every peer that says it holds the anchor's height has: a block no peer serves (one a reorg
 /// left behind, mostly) would otherwise keep the round open for ever.
 const ANCHOR_REFUSALS: usize = 3;
+/// How long a round waits with no open session whose peer says it holds the anchor before it
+/// gives the anchor up, so the next round can anchor where peers are.
+const ANCHOR_UNSERVED: Duration = Duration::from_mins(2);
 /// "Not held" answers in a row for blocks before Bedrock after which an indexer is dropped:
 /// it advertises them and does not serve them, and holds the indexer slot.
 const MAX_INDEXER_MISSES: u32 = 3;
@@ -200,6 +206,9 @@ struct Syncer {
     anchor_served: bool,
     /// Peers that said they do not hold the anchor, while none has served it.
     anchor_refused: HashSet<PeerId>,
+    /// Since when no open session's peer says it holds the anchor; `None` while one does, or
+    /// once it was served.
+    anchor_unserved_since: Option<Instant>,
     /// "Not held" answers in a row for blocks before Bedrock, per indexer.
     indexer_misses: HashMap<PeerId, u32>,
     /// The block the first block must name as parent; `None` for any.
@@ -325,6 +334,7 @@ impl Syncer {
             starved_warned: None,
             anchor_served: false,
             anchor_refused: HashSet::new(),
+            anchor_unserved_since: None,
             indexer_misses: HashMap::new(),
             extends,
             given_up: None,
@@ -407,11 +417,36 @@ impl Syncer {
                 );
                 break Some(RoundEnd::AnchorUnavailable);
             }
+            if self.anchor_unserved() {
+                warn!(
+                    anchor = self.anchor.number,
+                    advertised = ?self.peers.advertised_latest(),
+                    "range sync gives up its anchor: no peer has said it holds it for 2 minutes"
+                );
+                break Some(RoundEnd::AnchorUnavailable);
+            }
             self.dispatch();
         };
         // In-flight jobs have nowhere to deliver.
         self.jobs.shutdown().await;
         Ok(complete)
+    }
+
+    /// Whether no open session's peer has said it holds the anchor for [`ANCHOR_UNSERVED`].
+    fn anchor_unserved(&mut self) -> bool {
+        let number = self.anchor.number;
+        let served = self.anchor_served
+            || self
+                .peers
+                .sessions()
+                .iter()
+                .any(|session| self.serves(session, number, number));
+        if served {
+            self.anchor_unserved_since = None;
+            return false;
+        }
+        let since = *self.anchor_unserved_since.get_or_insert_with(Instant::now);
+        since.elapsed() >= ANCHOR_UNSERVED
     }
 
     /// Whether the anchor is to be given up: [`ANCHOR_REFUSALS`] peers said they do not hold
@@ -707,11 +742,30 @@ impl Syncer {
                 (0, false) => "range sync: waiting for a peer that holds these headers",
                 _ => "range sync: verifying the header chain",
             };
+            // The oldest block any askable peer still holds: a gap starting below it cannot be
+            // filled from these peers (they prune).
+            let held_from = sessions
+                .iter()
+                .filter(|session| session.is_askable())
+                .map(|session| session.range().earliest)
+                .min();
+            if usable == 0 && held_from.is_some_and(|earliest| page_first < earliest) {
+                warn!(
+                    verified_down_to = lowest.number,
+                    first = self.first,
+                    peers_hold_from = ?held_from,
+                    sessions = sessions.len(),
+                    "range sync: no peer holds blocks this old (their history starts later); \
+                     waiting for a peer that does, such as an archive node or an op-p2p-indexer"
+                );
+                return;
+            }
             info!(
                 verified_down_to = lowest.number,
                 first = self.first,
                 peers = usable,
                 sessions = sessions.len(),
+                advertised = ?self.peers.advertised_latest(),
                 "{waiting}"
             );
         } else {

@@ -1,21 +1,22 @@
 //! The state directory: the plan of the import, and where each chunk's files are.
 //!
 //! ```text
-//! <state>/plan.json                   the range, its anchor and the chunk size
-//! <state>/verified.json               written by `verify` once the whole range is accepted
-//! <state>/raw/<from>-<to>.raw         downloaded chunk: the service's answers as they travelled
-//! <state>/raw/<from>-<to>.fill.json   fields the service left out, from the chain's RPC (`fill`)
-//! <state>/verified/<from>-<to>.blk    verified chunk: consensus encodings, see `chunk`
-//! <state>/lock                        held by the one process working on the directory
+//! <state>/plan.json                     the range, its anchor and the chunk size
+//! <state>/raw/<from>-<to>.raw           downloaded chunk: the service's answers as they travelled
+//! <state>/raw/<from>-<to>.fill.json     fields the service left out, from the chain's RPC (`fill`)
+//! <state>/sealed/<first>-<last>.json    a sealed chunk `verify` uploaded: its manifest entry
+//! <state>/index-build/                  the hash index being built (`verify`)
+//! <state>/lock                          held by the one process working on the directory
 //! ```
 //!
+//! `verify` deletes a downloaded chunk once sealed chunks it recorded cover it whole, so
+//! `download` treats a chunk covered by the records as done. A `verified/` directory left by
+//! an earlier build is not read any more and can be deleted, as can an `export-index/`.
 //! `download` writes the plan on its first run; every later run of any step reads it, so the
 //! range and the chunk size cannot change under files already written. A file that exists is
 //! complete: files are written under a temporary name (`*.tmp`) and renamed; temporary files
 //! left by a killed run are removed when the directory is opened. Holds no credentials. Does
 //! not know what the chunk files contain.
-//!
-//! What the block archive holds is not recorded here: `load` asks the archive.
 
 use std::fmt;
 use std::fs::{self, File, TryLockError};
@@ -25,6 +26,7 @@ use std::sync::Arc;
 
 use alloy_primitives::B256;
 use op_indexer_chainspec::ChainSpec;
+use op_indexer_chunks::ChunkEntry;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -127,33 +129,12 @@ struct PlanFile {
     chunk_blocks: u64,
 }
 
-/// `verified.json`: the range `verify` accepted. It exists only while every chunk of the plan
-/// is verified, each chunk continues the one before, and the last block matched the anchor.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct VerifiedRange {
-    pub(crate) first: u64,
-    pub(crate) last: u64,
-    /// Hash of the last block.
-    pub(crate) last_hash: B256,
-    /// What the last block was checked against.
-    pub(crate) anchor: Anchor,
-    /// When `verify` accepted the range, in seconds since the Unix epoch.
-    pub(crate) verified_at_secs: u64,
-}
-
-impl VerifiedRange {
-    /// Whether this is the range of `plan`, checked against the plan's anchor.
-    pub(crate) fn covers(&self, plan: &Plan) -> bool {
-        (self.first, self.last, self.anchor) == (plan.first, plan.last, plan.anchor)
-    }
-}
-
 /// Paths inside the state directory.
 #[derive(Debug, Clone)]
 pub(crate) struct State {
     root: PathBuf,
     raw: PathBuf,
-    verified: PathBuf,
+    sealed: PathBuf,
     /// Held so that only one process works on the directory.
     _lock: Arc<File>,
 }
@@ -182,13 +163,13 @@ impl State {
         let state = Self {
             root: root.to_owned(),
             raw: root.join("raw"),
-            verified: root.join("verified"),
+            sealed: root.join("sealed"),
             _lock: Arc::new(lock),
         };
         fs::create_dir_all(&state.raw)?;
-        fs::create_dir_all(&state.verified)?;
+        fs::create_dir_all(&state.sealed)?;
         // Temporary files of a run that was killed mid-write; nobody else writes here now.
-        for directory in [root, &state.raw, &state.verified] {
+        for directory in [root, &state.raw, &state.sealed] {
             for entry in fs::read_dir(directory)? {
                 let path = entry?.path();
                 if path.extension().is_some_and(|extension| extension == "tmp") {
@@ -262,35 +243,54 @@ impl State {
         Ok(fs::read_dir(&self.raw)?.next().is_some())
     }
 
-    /// Reads the range `verify` accepted; `None` if it has not accepted one. Blocking.
+    /// The sealed chunks `verify` recorded as uploaded, in block order. Blocking.
     ///
     /// # Errors
     ///
-    /// Returns `InvalidData` if the file is damaged, and the I/O error of reading it.
-    pub(crate) fn read_verified(&self) -> io::Result<Option<VerifiedRange>> {
-        read_json(&self.root.join("verified.json"))
+    /// Returns `InvalidData` if a record is damaged, and the I/O error of reading them.
+    pub(crate) fn read_sealed(&self) -> io::Result<Vec<ChunkEntry>> {
+        let mut entries = Vec::new();
+        for file in fs::read_dir(&self.sealed)? {
+            let path = file?.path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+                && let Some(entry) = read_json::<ChunkEntry>(&path)?
+            {
+                entries.push(entry);
+            }
+        }
+        entries.sort_unstable_by_key(|entry| entry.first);
+        Ok(entries)
     }
 
-    /// Records that `verify` accepted `range`. Blocking.
+    /// The last block the recorded sealed chunks cover; `None` if there is none. Blocking.
     ///
     /// # Errors
     ///
-    /// Returns the I/O error of writing the file.
-    pub(crate) fn write_verified(&self, range: &VerifiedRange) -> io::Result<()> {
-        // The record covers the verified chunks, so their renames are made durable first: one
-        // sync for the whole directory, not one per chunk (a lost rename only loses a chunk
-        // that is then verified again).
-        sync_dir(&self.verified)?;
-        write_json(&self.root.join("verified.json"), range)
+    /// As [`Self::read_sealed`].
+    pub(crate) fn sealed_through(&self) -> io::Result<Option<u64>> {
+        Ok(self.read_sealed()?.last().map(|entry| entry.last))
     }
 
-    /// Removes the record of the accepted range, if there is one. Blocking.
+    /// Records that the sealed chunk `entry` is uploaded, durably. Blocking.
     ///
     /// # Errors
     ///
-    /// Returns the I/O error of removing the file.
-    pub(crate) fn clear_verified(&self) -> io::Result<()> {
-        remove_if_exists(&self.root.join("verified.json"))
+    /// Returns the I/O error of writing the record.
+    pub(crate) fn write_sealed(&self, entry: &ChunkEntry) -> io::Result<()> {
+        let name = format!("{:012}-{:012}.json", entry.first, entry.last);
+        write_json(&self.sealed.join(name), entry)
+    }
+
+    /// Removes a downloaded chunk and its fill, which a recorded sealed chunk covers. Blocking.
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error, unless a file was not there.
+    pub(crate) fn remove_raw(&self, chunk: Chunk) -> io::Result<()> {
+        remove_if_exists(&self.raw_path(chunk))?;
+        remove_if_exists(&self.fill_path(chunk))
     }
 
     /// Free space on the directory's filesystem, in bytes; `None` where the system has no call
@@ -315,12 +315,11 @@ impl State {
         self.raw
             .join(format!("{:012}-{:012}.fill.json", chunk.from, chunk.to))
     }
+}
 
-    /// File of the verified chunk.
-    pub(crate) fn verified_path(&self, chunk: Chunk) -> PathBuf {
-        self.verified
-            .join(format!("{:012}-{:012}.blk", chunk.from, chunk.to))
-    }
+/// Whether sealed chunks recorded through block `sealed` cover `chunk` whole.
+pub(crate) fn covered(sealed: Option<u64>, chunk: Chunk) -> bool {
+    sealed.is_some_and(|sealed| chunk.to <= sealed.saturating_add(1))
 }
 
 /// Writes a file so that it exists only when complete: `write` fills a temporary file next to

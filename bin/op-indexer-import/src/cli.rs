@@ -16,22 +16,22 @@ use tracing::warn;
 /// The former name of `OP_INDEXER_IMPORT_API_TOKEN`, still read.
 const DEPRECATED_API_TOKEN_VAR: &str = "ENVIO_API_TOKEN";
 
-/// Downloads a chain's blocks from an external archive, verifies every block, and exports
+/// Downloads a chain's blocks from an external archive, verifies every block, and uploads
 /// them as sealed chunks to object storage (Cloudflare R2), where servers read history from.
 ///
-/// Run `download`, then `verify`, then `export`, or `run` for all three. Every step keeps its
-/// progress (the state directory, and the manifest in the bucket) and can be stopped and
-/// started again: nothing completed is redone.
+/// Run `download`, then `verify`, or `run` for both. Every step keeps its progress (the state
+/// directory, and the manifest in the bucket) and can be stopped and started again: nothing
+/// completed is redone.
 ///
 /// `download` decides the range on its first run and records it in the state directory;
-/// `verify` and `export` read it from there. By default the range is OP Mainnet from block 0 to
+/// `verify` reads it from there. By default the range is OP Mainnet from block 0 to
 /// the last block known to be committed to L1: the block of the newest dispute game. Blocks
 /// come from Envio `HyperSync`.
 #[derive(Debug, Parser)]
 #[command(name = "import", version, arg = crate::env_file::arg())]
 pub(crate) struct Cli {
-    /// Directory for the plan and the downloaded and verified chunks. Use the same one for
-    /// every step.
+    /// Directory for the plan, the downloaded chunks and the record of the sealed ones. Use
+    /// the same one for every step.
     #[arg(
         long,
         global = true,
@@ -51,22 +51,21 @@ pub(crate) enum Command {
     /// full. Then lists every field the downloaded rows lack, and fetches the ones it can from
     /// the chain's RPC endpoint (`--rpc-endpoint`).
     Download(DownloadArgs),
-    /// Check every downloaded chunk offline: header hashes and parent links up to the anchor,
-    /// transactions roots and receipts roots. Senders are checked by `export`.
-    Verify(VerifyCommand),
-    /// Convert the verified range into sealed chunks, their manifest and the hash index, and
-    /// upload them to object storage (R2). Recovers every transaction's sender from its
-    /// signature and checks it against the verified chunk first; stops at the first that
-    /// differs. Resumable from the manifest. Needs the whole range accepted by `verify`.
-    Export(ExportArgs),
-    /// `download`, `verify`, then `export`, stopping at the first step that cannot finish.
+    /// Check every downloaded chunk (header hashes, parent links, transactions and receipts
+    /// roots, every sender recovered from its signature), seal the blocks into chunks and
+    /// upload them to object storage (R2), deleting each downloaded chunk once the sealed
+    /// chunks covering it are uploaded. The chunks are listed in the manifest, with the hash
+    /// index, only once the last block matches the anchor. Stops at the first block that fails
+    /// a check, naming it. Resumable.
+    Verify(VerifyArgs),
+    /// `download`, then `verify`, stopping at the first step that cannot finish.
     Run(Box<RunArgs>),
 }
 
-/// Settings of `export`: where the chunks go. The R2 keys are read from the environment (a
-/// flag shows in the process list), never logged or written to disk.
+/// Settings of `verify`: threads, and where the chunks go. The R2 keys are read from the
+/// environment (a flag shows in the process list), never logged or written to disk.
 #[derive(Debug, Clone, Args)]
-pub(crate) struct ExportArgs {
+pub(crate) struct VerifyArgs {
     /// Write to this local directory instead of R2, in the layout the bucket would hold
     /// (`<dir>/<prefix>/…`; for a test or the bench without credentials).
     #[arg(long)]
@@ -91,13 +90,18 @@ pub(crate) struct ExportArgs {
     /// Another endpoint than the account's (an S3-compatible store).
     #[arg(long, env = "OP_INDEXER_R2_ENDPOINT")]
     pub(crate) r2_endpoint: Option<String>,
-    /// Verified chunks prepared at once (read, senders recovered, receipts encoded; default:
-    /// one per CPU).
-    #[arg(long, env = "OP_INDEXER_IMPORT_EXPORT_THREADS")]
+    /// Downloaded chunks verified at once (rebuilt, checked, senders recovered; default: one
+    /// per CPU).
+    #[arg(long, env = "OP_INDEXER_IMPORT_VERIFY_THREADS")]
     pub(crate) threads: Option<usize>,
-    /// Chunks uploaded at once.
-    #[arg(long, env = "OP_INDEXER_IMPORT_EXPORT_UPLOADS", default_value_t = 4)]
-    pub(crate) uploads: usize,
+    /// Sealed chunks uploaded at once.
+    #[arg(
+        long,
+        env = "OP_INDEXER_IMPORT_VERIFY_UPLOADS",
+        default_value_t = 4,
+        value_parser = clap::value_parser!(u64).range(1..=64)
+    )]
+    pub(crate) uploads: u64,
 }
 
 /// Settings of `download`. The range flags are read on the first run only, when the plan is
@@ -192,27 +196,6 @@ impl DownloadArgs {
     }
 }
 
-/// Settings of `verify`.
-#[derive(Debug, Clone, Args)]
-pub(crate) struct VerifyArgs {
-    /// Chunks verified at once (default: one per CPU).
-    #[arg(long, env = "OP_INDEXER_IMPORT_VERIFY_THREADS")]
-    pub(crate) verify_threads: Option<usize>,
-}
-
-/// Settings of the `verify` step on its own.
-#[derive(Debug, Clone, Args)]
-pub(crate) struct VerifyCommand {
-    #[command(flatten)]
-    pub(crate) verify: VerifyArgs,
-    /// Verify only the chunks from this block on, and do not link or accept the range: a
-    /// quick check of one part of the chain. The chunks it verifies are kept; `verify`
-    /// without this flag must still run before `export`. Not taken by `run`, whose `export`
-    /// needs the whole range accepted.
-    #[arg(long, env = "OP_INDEXER_IMPORT_VERIFY_FROM_BLOCK")]
-    pub(crate) from_block: Option<u64>,
-}
-
 /// Settings of `run`: those of every step.
 #[derive(Debug, Clone, Args)]
 pub(crate) struct RunArgs {
@@ -220,8 +203,6 @@ pub(crate) struct RunArgs {
     pub(crate) download: DownloadArgs,
     #[command(flatten)]
     pub(crate) verify: VerifyArgs,
-    #[command(flatten)]
-    pub(crate) export: ExportArgs,
 }
 
 /// A credential given on the command line: the archive service's API token. `Debug` never

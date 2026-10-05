@@ -26,13 +26,16 @@ use std::time::Duration;
 use alloy_primitives::BlockNumber;
 use eyre::WrapErr;
 use op_indexer_chainspec::ChainSpec;
-use op_indexer_el::{ExecutionNetwork, RangeSync, RoundEnd, SyncPlan};
+use op_indexer_el::{BlockProvider as _, ExecutionNetwork, Peers, RangeSync, RoundEnd, SyncPlan};
 use op_indexer_l1::{BeaconConfig, L1Config, L1Network, LightClient};
 use op_indexer_p2p::{Network, NodeStore, PayloadSource, StoreError};
 use op_indexer_pipeline::{Pipeline, ReceiptsChannels};
-use op_indexer_primitives::{BlockRef, EncodedBlock, ExecutionPeer, L1Games, L1Heads, SyncRange};
+use op_indexer_primitives::{
+    BeaconCheckpoint, BlockRef, EncodedBlock, ExecutionPeer, FillRequest, L1Games, L1Heads,
+    SyncRange,
+};
 use op_indexer_storage::unsafe_store::MemoryStore;
-use op_indexer_storage::{ArchiveStore, StorageConfig, UnsafeStore};
+use op_indexer_storage::{ArchiveStore, StorageConfig, StorageError, UnsafeStore};
 use op_indexer_stream::{Load, StreamServer};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
@@ -41,7 +44,7 @@ use tracing::{debug, info, warn};
 
 pub use crate::config::Config;
 use crate::config::{ElSettings, L1Settings, NODE_DIR};
-use crate::provider::NodeProvider;
+use crate::provider::{NodeProvider, RangeEnd};
 
 /// Unsafe blocks waiting for the pipeline. Blocks arrive every 2 s on OP Mainnet and every
 /// second on Unichain; this absorbs a store that is unreachable for about 8 or 4 minutes
@@ -84,6 +87,11 @@ const ANCHOR_DEPTH: u64 = 64;
 /// How often the archive is asked whether a round of the range sync has reached its end, and
 /// whether it holds the safe block of the L1 heads promotion waits for.
 const SYNC_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Missed gossip spans waiting for the execution network: a gap is rare and one at a time is
+/// enough; one that does not fit is left to range sync.
+const FILL_REQUEST_CAPACITY: usize = 8;
+/// Segments of a missed span fetched and waiting for the pipeline (64 blocks each).
+const FILLED_CAPACITY: usize = 4;
 /// Verified checkpoints of a range sync waiting to be saved; the sync waits when it is full.
 const SYNC_CHECKPOINT_CAPACITY: usize = 16;
 
@@ -106,6 +114,44 @@ pub struct NodeView {
     pub head: watch::Receiver<Option<BlockRef>>,
     /// How busy the stream server is.
     pub load: Load,
+    /// The unsafe chain, for [`Self::contiguous_through`].
+    unsafe_store: MemoryStore,
+    /// Where [`Self::contiguous_through`]'s last search ended.
+    range_end: RangeEnd,
+}
+
+impl NodeView {
+    fn new(head: watch::Receiver<Option<BlockRef>>, load: Load, unsafe_store: MemoryStore) -> Self {
+        Self {
+            head,
+            load,
+            unsafe_store,
+            range_end: RangeEnd::default(),
+        }
+    }
+
+    /// The highest block N such that the node holds every block from `archive`'s first
+    /// through N, each with its receipts: the range it advertises to execution peers,
+    /// `archive`'s blocks up to the first still waiting for its receipts, extended through the
+    /// unsafe chain's canonical blocks that link to them and have theirs. `None` while there
+    /// is no such block.
+    ///
+    /// Cheap: each call continues the search from where the last one ended.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if `archive` cannot be read.
+    pub async fn contiguous_through<A: Archive>(
+        &self,
+        archive: &A,
+    ) -> Result<Option<BlockNumber>, StorageError> {
+        let provider = NodeProvider::sharing_range(
+            archive.clone(),
+            self.unsafe_store.clone(),
+            Arc::clone(&self.range_end),
+        );
+        Ok(provider.range().await?.map(|(_, end)| end.number))
+    }
 }
 
 /// What every committed store the node runs on must be.
@@ -172,13 +218,13 @@ pub async fn run<A: Archive>(
             execution_network(el, sync, &store, &stores, head_rx, &mut followers)
         })
         .transpose()?;
-    let (execution, receipts, range, mut saves) = execution.map_or_else(
-        || (None, None, None, Vec::new()),
+    let (execution, receipts, inputs, mut saves) = execution.map_or_else(
+        || (None, None, PipelineInputs::default(), Vec::new()),
         |parts| {
             (
                 Some(parts.network),
                 Some(parts.receipts),
-                parts.range,
+                parts.inputs,
                 parts.saves,
             )
         },
@@ -195,10 +241,7 @@ pub async fn run<A: Archive>(
         stores.unsafe_store.clone(),
         stores.archive.clone(),
     );
-    let view = NodeView {
-        head: view_head,
-        load: stream.load(),
-    };
+    let view = NodeView::new(view_head, stream.load(), stores.unsafe_store.clone());
     let pipeline = Pipeline::new(
         stores.unsafe_store,
         stores.archive,
@@ -209,10 +252,7 @@ pub async fn run<A: Archive>(
         receipts,
     )
     .with_head(head_tx);
-    let pipeline = match range {
-        Some(range) => pipeline.with_range(range),
-        None => pipeline,
-    };
+    let pipeline = inputs.extend(pipeline);
     let gate = gate_archive.map(|archive| (archive, safe_number_rx.clone()));
     let forward = forward_l1_heads(l1_source_rx, l1_heads_tx, gate);
     follow(&mut followers, "L1 heads forwarder", forward);
@@ -223,6 +263,7 @@ pub async fn run<A: Archive>(
         Some(settings) => {
             let l1 = l1_side(settings, config.network.chain, &store)?;
             saves.push(l1.served);
+            saves.push(l1.checkpoints);
             let isthmus_time = config.network.chain.isthmus_time();
             let pipeline = pipeline.with_l1_games(l1.games, l1_source_tx, isthmus_time);
             (Some((l1.network, l1.light_client)), pipeline, None)
@@ -270,6 +311,8 @@ struct L1Side {
     games: watch::Receiver<L1Games>,
     /// Saves the L1 peers that served us.
     served: JoinHandle<()>,
+    /// Saves the light client's newest finalized beacon block.
+    checkpoints: JoinHandle<()>,
 }
 
 /// Builds the L1 side: a beacon light client that follows Ethereum's finality from the
@@ -299,25 +342,32 @@ fn l1_side(
     };
     let network = L1Network::new(config, key, trusted_rx, games_tx, served_tx)
         .wrap_err("failed to create the L1 network")?;
+    let (finalized_tx, finalized_rx) = watch::channel(None);
     let light_client = LightClient::new(
         BeaconConfig {
             checkpoint: settings.checkpoint,
+            saved: store
+                .l1_checkpoint()
+                .wrap_err("failed to load the saved beacon checkpoint")?,
             listen_addr: settings.beacon_listen_addr,
             // Beacon nodes share the discovery network of the chain's bootnodes.
             bootnodes: chain.consensus_bootnodes().map(str::to_owned).collect(),
         },
         trusted_tx,
+        finalized_tx,
     );
     let served = tokio::spawn(save_peers(
         Arc::clone(store),
         served_rx,
         NodeStore::save_l1_peer,
     ));
+    let checkpoints = tokio::spawn(save_l1_checkpoints(Arc::clone(store), finalized_rx));
     Ok(L1Side {
         network,
         light_client,
         games,
         served,
+        checkpoints,
     })
 }
 
@@ -469,10 +519,37 @@ struct Execution<A: Archive> {
     network: ExecutionNetwork<NodeProvider<A>>,
     /// The pipeline's ends of the receipts channels.
     receipts: ReceiptsChannels,
-    /// The batches of the range sync, for the pipeline, when a range is configured.
-    range: Option<mpsc::Receiver<Vec<EncodedBlock>>>,
+    /// What it feeds the pipeline besides receipts.
+    inputs: PipelineInputs,
     /// Tasks that save what the network reports to the node store.
     saves: Vec<JoinHandle<()>>,
+}
+
+/// What the execution network feeds the pipeline besides receipts.
+#[derive(Default)]
+struct PipelineInputs {
+    /// The batches of the range sync, when a range is configured.
+    range: Option<mpsc::Receiver<Vec<EncodedBlock>>>,
+    /// Where missed gossip spans are asked for, and the blocks fetched for them.
+    fills: Option<(mpsc::Sender<FillRequest>, mpsc::Receiver<Vec<EncodedBlock>>)>,
+}
+
+impl PipelineInputs {
+    /// `pipeline` with these inputs.
+    fn extend<U, A>(self, pipeline: Pipeline<U, A>) -> Pipeline<U, A>
+    where
+        U: UnsafeStore + Clone + Send + Sync + 'static,
+        A: ArchiveStore + Clone + Send + Sync + 'static,
+    {
+        let pipeline = match self.range {
+            Some(range) => pipeline.with_range(range),
+            None => pipeline,
+        };
+        match self.fills {
+            Some((requests, filled)) => pipeline.with_fills(requests, filled),
+            None => pipeline,
+        }
+    }
 }
 
 /// Builds the execution network from its settings and what the node store has saved for it.
@@ -519,7 +596,7 @@ fn execution_network<A: Archive>(
             let (plans_tx, plans_rx) = mpsc::channel(1);
             let (blocks_tx, batches) = mpsc::channel(SYNC_BATCH_CAPACITY);
             let (checkpoints_tx, checkpoints_rx) = mpsc::channel(SYNC_CHECKPOINT_CAPACITY);
-            let plan = plan_sync(Arc::clone(store), inputs, plans_tx);
+            let plan = plan_sync(Arc::clone(store), inputs, network.peers(), plans_tx);
             follow(followers, "range sync planner", plan);
             saves.push(tokio::spawn(save_sync_checkpoints(
                 Arc::clone(store),
@@ -534,13 +611,20 @@ fn execution_network<A: Archive>(
         }
         None => (network, None),
     };
+    // Spans gossip missed: the pipeline asks, the network fetches.
+    let (fill_requests_tx, fill_requests_rx) = mpsc::channel(FILL_REQUEST_CAPACITY);
+    let (filled_tx, filled_rx) = mpsc::channel(FILLED_CAPACITY);
+    let network = network.with_fills(fill_requests_rx, filled_tx);
     Ok(Execution {
         network,
         receipts: ReceiptsChannels {
             requests: requests_tx,
             verified: verified_rx,
         },
-        range,
+        inputs: PipelineInputs {
+            range,
+            fills: Some((fill_requests_tx, filled_rx)),
+        },
         saves,
     })
 }
@@ -591,6 +675,7 @@ struct Rest {
 async fn plan_sync<A: Archive>(
     store: Arc<NodeStore>,
     mut inputs: SyncInputs<A>,
+    peers: Peers,
     plans: mpsc::Sender<SyncPlan>,
 ) {
     let mut resume = {
@@ -612,7 +697,7 @@ async fn plan_sync<A: Archive>(
         let anchor = match resumed {
             Some(anchor) => anchor,
             None => {
-                match next_anchor(&mut inputs, from, rest.as_ref(), &plans).await {
+                match next_anchor(&mut inputs, &peers, from, rest.as_ref(), &plans).await {
                     Some(Some(anchor)) => anchor,
                     // Something moved, or a wait ended: look again.
                     Some(None) => continue,
@@ -675,10 +760,14 @@ async fn plan_sync<A: Archive>(
 /// the safe head, or below the committed safe block, and is anchored on the safe head only:
 /// everything the sync writes is then committed on L1, so no reorg can leave it behind.
 /// Without it a round is needed while the archive is that far below the gossiped head, and is
-/// anchored on the block [`ANCHOR_DEPTH`] below it: an unsafe reorg deeper than that would
-/// leave the archive on a dead branch, which only rebuilding the archive repairs.
+/// anchored on the gossiped block [`ANCHOR_DEPTH`] below it, or lower, at the newest block
+/// peers say they hold ([`Peers::advertised_latest`]): peers announce their range only every
+/// few minutes, so an anchor at the head would wait on a height none of them has announced.
+/// An unsafe reorg deeper than the anchor would leave the archive on a dead branch, which only
+/// rebuilding the archive repairs.
 async fn next_anchor<A: Archive>(
     inputs: &mut SyncInputs<A>,
+    peers: &Peers,
     from: BlockNumber,
     rest: Option<&Rest>,
     plans: &mpsc::Sender<SyncPlan>,
@@ -698,7 +787,10 @@ async fn next_anchor<A: Archive>(
         safe.filter(|safe| safe.number >= from && (far(safe.number) || behind_committed))
     } else {
         match head.filter(|head| far(head.number)) {
-            Some(head) => below_head(&inputs.unsafe_store, head).await,
+            Some(head) => {
+                let advertised = peers.advertised_latest();
+                anchor_below(&inputs.unsafe_store, head, advertised, from).await
+            }
             None => None,
         }
     };
@@ -722,17 +814,27 @@ async fn next_anchor<A: Archive>(
     Some(None)
 }
 
-/// The gossiped block [`ANCHOR_DEPTH`] below `head`, if the unsafe store holds the chain that
-/// far down (it does not right after a start: then the next head is tried).
-async fn below_head(unsafe_store: &MemoryStore, head: BlockRef) -> Option<BlockRef> {
-    let stop_at = head.number.checked_sub(ANCHOR_DEPTH.saturating_add(1))?;
-    match unsafe_store.ancestry(head, stop_at).await {
-        Ok(blocks) => blocks.first().map(|block| BlockRef {
-            number: block.block.header.number,
+/// The gossiped canonical block [`ANCHOR_DEPTH`] below `head`, or lower at `advertised`, the
+/// newest block peers say they hold; `None` without a peer saying so, below `from`, or if the
+/// unsafe store does not hold the chain that far down (right after a start: then the next head
+/// is tried).
+async fn anchor_below(
+    unsafe_store: &MemoryStore,
+    head: BlockRef,
+    advertised: Option<BlockNumber>,
+    from: BlockNumber,
+) -> Option<BlockRef> {
+    let height = head.number.checked_sub(ANCHOR_DEPTH)?.min(advertised?);
+    if height < from {
+        return None;
+    }
+    match unsafe_store.canonical(height).await {
+        Ok(block) => block.map(|block| BlockRef {
+            number: height,
             hash: block.hash,
         }),
         Err(err) => {
-            debug!(%err, head = head.number, "no range sync anchor below this head yet");
+            debug!(%err, height, "no range sync anchor at this height yet");
             None
         }
     }
@@ -896,6 +998,25 @@ async fn save_peers(
             Ok(Ok(())) => {}
             Ok(Err(err)) => warn!(%err, "failed to save execution peer"),
             Err(err) => warn!(%err, "execution peer save task failed"),
+        }
+    }
+}
+
+/// Saves each newer finalized beacon block the light client verifies, so a restart
+/// bootstraps from it. Ends when the light client drops its sender.
+async fn save_l1_checkpoints(
+    store: Arc<NodeStore>,
+    mut finalized: watch::Receiver<Option<BeaconCheckpoint>>,
+) {
+    while finalized.changed().await.is_ok() {
+        let Some(checkpoint) = *finalized.borrow_and_update() else {
+            continue;
+        };
+        let store = Arc::clone(&store);
+        match tokio::task::spawn_blocking(move || store.save_l1_checkpoint(&checkpoint)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => warn!(%err, "failed to save the beacon checkpoint"),
+            Err(err) => warn!(%err, "beacon checkpoint save task failed"),
         }
     }
 }

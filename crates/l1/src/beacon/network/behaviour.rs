@@ -52,6 +52,25 @@ pub(super) enum Asked {
     Optimistic,
 }
 
+impl Asked {
+    pub(super) const ALL: [Self; 4] = [
+        Self::Bootstrap,
+        Self::Updates,
+        Self::Finality,
+        Self::Optimistic,
+    ];
+
+    /// The protocol name the request goes out on.
+    pub(super) const fn protocol(self) -> &'static str {
+        match self {
+            Self::Bootstrap => rpc::BOOTSTRAP,
+            Self::Updates => rpc::UPDATES_BY_RANGE,
+            Self::Finality => rpc::FINALITY_UPDATE,
+            Self::Optimistic => rpc::OPTIMISTIC_UPDATE,
+        }
+    }
+}
+
 /// The swarm's protocols. Each request/response protocol is a behaviour of its own: a
 /// behaviour sends a request on the first protocol the peer supports, so they cannot share
 /// one.

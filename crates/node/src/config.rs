@@ -155,10 +155,12 @@ impl Config {
     ///   block and promotes on a match. Needs `OP_INDEXER_L1_CHECKPOINT`, and the range sync
     ///   (`OP_INDEXER_EL_SYNC=true`, so the execution network too): promotion records only
     ///   what the archive holds, and range sync fills the gaps gossip leaves. If no peer serves
-    ///   the checkpoint any more the node stops and asks for a newer one.
+    ///   the checkpoint (nor the saved one) any more the node stops and asks for a newer one.
     /// - `OP_INDEXER_L1_CHECKPOINT`: root of a recent finalized beacon block, from a source
     ///   you trust: the one value the L1 side takes on trust, everything after it is
-    ///   verified.
+    ///   verified. Used on the first start, or when it is newer than the saved one: the node
+    ///   saves the newest finalized block the light client verified from it, and later starts
+    ///   bootstrap from that (it adds no trust), so the configured root may grow old.
     /// - `OP_INDEXER_L1_LISTEN_ADDR`: L1 execution p2p listen socket, TCP and UDP (default
     ///   `0.0.0.0:30304`; it must differ from `OP_INDEXER_EL_LISTEN_ADDR`).
     /// - `OP_INDEXER_L1_BEACON_LISTEN_ADDR`: listen socket of the beacon light client, TCP

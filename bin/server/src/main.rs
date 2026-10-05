@@ -86,7 +86,7 @@ async fn run(env_file: Option<PathBuf>) -> eyre::Result<()> {
     let source = R2Chunks::open(store, config.data_dir().join(INDEX_DIR))
         .await
         .wrap_err("failed to read the R2 manifest")?;
-    let archive = R2Archive::open(chain, source, tail)
+    let archive = R2Archive::open(chain, source, tail, server.read_budget)
         .await
         .wrap_err("failed to open the R2 archive")?;
 
@@ -124,8 +124,8 @@ async fn run(env_file: Option<PathBuf>) -> eyre::Result<()> {
 }
 
 /// Keeps the report the balancer gets current until `cancel` fires: the node's head, the
-/// committed store's L1 heads and last sealed block, and the stream's load, read once per
-/// heartbeat. A store that cannot be read makes the server report itself unhealthy.
+/// committed store's L1 heads and last sealed block, how far it holds every block, and the
+/// stream's load, read once per heartbeat. A store that cannot be read makes the server report itself unhealthy.
 async fn report<S: ChunkSource>(
     archive: &R2Archive<S>,
     view: &NodeView,
@@ -141,14 +141,19 @@ async fn report<S: ChunkSource>(
             _ = tick.tick() => {}
         }
         let heads = archive.heads().await;
-        let healthy = heads.is_ok();
+        let contiguous = view.contiguous_through(archive).await;
+        let healthy = heads.is_ok() && contiguous.is_ok();
         let heads = heads.unwrap_or_default();
+        let contiguous = contiguous.unwrap_or_default();
+        let last_sealed = archive.last_sealed();
         sender.send_replace(Report {
             healthy,
             unsafe_head: view.head.borrow().map(|head| head.number),
             safe_head: heads.safe.map(|safe| safe.number),
             finalized_head: heads.finalized.map(|finalized| finalized.number),
-            last_sealed: archive.last_sealed(),
+            last_sealed,
+            // The tail can trail the manifest a moment, before it drops what was sealed.
+            contiguous_through: contiguous.max(last_sealed),
             requests_in_flight: view.load.in_flight(),
             // Not counted yet: the stream does not track the bytes it sends.
             bytes_per_second: 0,

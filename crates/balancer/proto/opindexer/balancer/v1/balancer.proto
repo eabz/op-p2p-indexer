@@ -20,8 +20,8 @@ service Balancer {
   // - DEADLINE_EXCEEDED after missed heartbeats;
   // - UNAVAILABLE when it shuts down.
   rpc Register(stream Heartbeat) returns (stream Registered);
-  // The servers to subscribe at, for a gRPC subscription from `from_block`: the servers
-  // caught up with the chain, least loaded first. Subscribe at the first; on failure,
+  // The servers to subscribe at, for a gRPC subscription from `from_block`: those that hold
+  // every block before it (`Heartbeat.contiguous_through`), least loaded first. Subscribe at the first; on failure,
   // subscribe again at the next, from the last block received. UNAVAILABLE if none is.
   rpc Locate(LocateRequest) returns (LocateResponse);
 }
@@ -42,6 +42,12 @@ message Heartbeat {
   optional uint64 safe_head = 6;
   optional uint64 finalized_head = 7;
   optional uint64 last_sealed = 8;
+  // The highest block N such that it holds every block from the chain's first through N:
+  // the sealed chunks, its own tail and its unsafe chain with no hole between them (each block
+  // with its receipts). A server that does not range sync holds nothing between the last
+  // sealed block and the first block it gossiped; it is given no work in that gap. Unset, it
+  // is given no work above the sealed chunks.
+  optional uint64 contiguous_through = 11;
   // Load: requests in flight (subscriptions, Flight streams, lookups) and bytes it sends per
   // second.
   uint32 requests_in_flight = 9;
@@ -54,8 +60,8 @@ message Registered {}
 message LocateRequest {
   // The L2 chain id; it must be the balancer's.
   uint64 chain_id = 1;
-  // The first block the subscription asks for. Every server holds every sealed chunk and
-  // its own tail, so all of them serve it.
+  // The first block the subscription asks for. Every server holds every sealed chunk, but
+  // above them only what it reports in `Heartbeat.contiguous_through`.
   uint64 from_block = 2;
 }
 

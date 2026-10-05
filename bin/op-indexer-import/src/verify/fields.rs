@@ -66,7 +66,10 @@ fn header(forks: &Forks, block: &BlockRow, mut found: impl FnMut(&'static str)) 
     let canyon = timestamp >= forks.canyon;
     let ecotone = timestamp >= forks.ecotone;
     let fields = [
-        ("mix_hash", bedrock && block.mix_hash.is_none()),
+        (
+            "mix_hash",
+            block.number > forks.bedrock_block && block.mix_hash.is_none(),
+        ),
         (
             "base_fee_per_gas",
             bedrock && block.base_fee_per_gas.is_none(),

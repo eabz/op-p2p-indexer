@@ -10,6 +10,7 @@ use std::time::Duration;
 use libp2p::{Multiaddr, PeerId};
 use tokio::time::Instant;
 
+use super::behaviour::Asked;
 use crate::beacon::discovery::Candidate;
 
 /// Peers serving light-client data to stay connected to.
@@ -34,7 +35,7 @@ const REDIAL_AFTER: Duration = Duration::from_secs(120);
 /// Dials in a row that may fail to make a known peer a peer again before it is forgotten.
 const MAX_REDIALS: u32 = 5;
 
-/// A connected peer that lists the light-client protocols.
+/// A connected peer that lists light-client protocols.
 #[derive(Debug)]
 struct Peer {
     agent: String,
@@ -42,8 +43,9 @@ struct Peer {
     addr: Option<Multiaddr>,
     /// Requests in a row it left unanswered or answered without data.
     failures: u32,
-    /// Whether it answered a bootstrap request without data.
-    lacks_bootstrap: bool,
+    /// What it is not asked: the protocols it does not list or refused, and the bootstrap
+    /// once it answered one without data.
+    lacks: HashSet<Asked>,
     /// When it was asked last, as a count of requests; 0 if never.
     asked_at: u64,
 }
@@ -171,41 +173,48 @@ impl Peers {
         self.dialing.remove(peer).map(|(_, addr)| addr)
     }
 
-    /// Records a new peer; `addr` is where it was dialed, if we dialed.
-    pub(super) fn connected(&mut self, peer: PeerId, agent: String, addr: Option<Multiaddr>) {
+    /// Records a new peer; `addr` is where it was dialed, if we dialed; `lacks` what it is
+    /// not to be asked.
+    pub(super) fn connected(
+        &mut self,
+        peer: PeerId,
+        agent: String,
+        addr: Option<Multiaddr>,
+        lacks: HashSet<Asked>,
+    ) {
         let state = Peer {
             agent,
             addr,
             failures: 0,
-            lacks_bootstrap: false,
+            lacks,
             asked_at: 0,
         };
         self.connected.insert(peer, state);
     }
 
-    /// Picks the peer to send a request to: the one that failed least and, among those, was
-    /// asked longest ago. A bootstrap is not asked of a peer that answered one without data.
-    pub(super) fn pick(&mut self, bootstrap: bool) -> Option<PeerId> {
+    /// Picks the peer to send `asked` to: of those that do not lack it, the one that failed
+    /// least and, among those, was asked longest ago.
+    pub(super) fn pick(&mut self, asked: Asked) -> Option<PeerId> {
         let (peer, state) = self
             .connected
             .iter_mut()
-            .filter(|(_, state)| !(bootstrap && state.lacks_bootstrap))
+            .filter(|(_, state)| !state.lacks.contains(&asked))
             .min_by_key(|(_, state)| (state.failures, state.asked_at))?;
         self.asked = self.asked.saturating_add(1);
         state.asked_at = self.asked;
         Some(*peer)
     }
 
-    /// A peer to close so that another node is dialed: one that lacks the bootstrap, when
-    /// every place is taken.
-    pub(super) fn in_the_way(&self) -> Option<PeerId> {
+    /// A peer to close so that another node is dialed: one that lacks `asked`, when every
+    /// place is taken.
+    pub(super) fn in_the_way(&self, asked: Asked) -> Option<PeerId> {
         if self.connected.len() < TARGET_PEERS {
             return None;
         }
         let mut lacking = self
             .connected
             .iter()
-            .filter(|(_, state)| state.lacks_bootstrap);
+            .filter(|(_, state)| state.lacks.contains(&asked));
         lacking.next().map(|(peer, _)| *peer)
     }
 
@@ -236,16 +245,21 @@ impl Peers {
         }
     }
 
-    /// Counts a request the peer did not answer with data; `lacks_bootstrap` if it answered
-    /// a bootstrap request so. Returns whether it failed [`MAX_FAILURES`] times in a row and
-    /// is to be dropped.
-    pub(super) fn failed(&mut self, peer: &PeerId, lacks_bootstrap: bool) -> bool {
+    /// Counts a request the peer did not answer with data. Returns whether it failed
+    /// [`MAX_FAILURES`] times in a row and is to be dropped.
+    pub(super) fn failed(&mut self, peer: &PeerId) -> bool {
         let Some(state) = self.connected.get_mut(peer) else {
             return false;
         };
-        state.lacks_bootstrap |= lacks_bootstrap;
         state.failures = state.failures.saturating_add(1);
         state.failures >= MAX_FAILURES
+    }
+
+    /// Records that a peer does not serve `asked`, which it is not asked again.
+    pub(super) fn lacks(&mut self, peer: &PeerId, asked: Asked) {
+        if let Some(state) = self.connected.get_mut(peer) {
+            state.lacks.insert(asked);
+        }
     }
 
     /// Forgets a peer and remembers not to dial it again.

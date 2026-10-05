@@ -95,7 +95,8 @@ impl Sealed {
 
 impl<S: ChunkSource> R2Archive<S> {
     /// Opens the store over `source` and `tail`: reads the first sealed block's hash, checks
-    /// that the chunks link, and drops from `tail` what they already cover.
+    /// that the chunks link, and drops from `tail` what they already cover. Consumers' reads of
+    /// sealed history hold at most `read_budget` bytes in all (see `feed`).
     ///
     /// # Errors
     ///
@@ -105,6 +106,7 @@ impl<S: ChunkSource> R2Archive<S> {
         chain: &'static ChainSpec,
         source: S,
         tail: FjallArchive,
+        read_budget: u64,
     ) -> Result<Self, ServerError> {
         let chunks = source.chunks();
         check_links(&chunks, None)?;
@@ -127,7 +129,7 @@ impl<S: ChunkSource> R2Archive<S> {
             tail,
             first,
             budget: PeerBudget::new(),
-            feeds: Feeds::new(),
+            feeds: Feeds::new(read_budget),
         };
         let sealed = archive.sealed();
         info!(

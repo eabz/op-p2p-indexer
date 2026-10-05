@@ -3,18 +3,21 @@
 //!
 //! One thing is done at a time, in this order of need:
 //!
-//! 1. no store yet: ask for the bootstrap of the configured checkpoint;
+//! 1. no store yet: ask for the bootstrap of the checkpoint ([`Bootstrap`]), and when enough
+//!    peers say they do not hold it, of the fallback;
 //! 2. the next sync committee is not known, or the clock is more than one period ahead of
-//!    the store: ask for `LightClientUpdatesByRange` from the store's period (one update per
-//!    period, each proving the committee that signs the next);
+//!    the store: ask for the `LightClientUpdatesByRange` update of the last period whose
+//!    committee is known, which proves the committee that signs the next; one period per
+//!    request, the next asked at once while the store is behind;
 //! 3. a finality or optimistic update arrived over gossip: take it;
 //! 4. when gossip has brought nothing new for a while: ask for the optimistic update every
 //!    slot, and once an epoch for the finality update.
 //!
 //! Each answer and gossip message is verified off the runtime (`verify`) against a copy of
-//! the store, which replaces the store when it verifies. A peer whose data fails
-//! verification is reported to the network, which drops it. Data is accepted under any fork
-//! digest whose containers this build reads.
+//! the store, which replaces the store when it verifies. Each newer finalized block is
+//! published ([`BeaconCheckpoint`]), for the node to save and bootstrap from after a
+//! restart. A peer whose data fails verification is reported to the network, which drops it.
+//! Data is accepted under any fork digest whose containers this build reads.
 //!
 //! Does not touch the swarm, pick peers or frame messages: see `network`.
 
@@ -25,7 +28,8 @@ use std::time::Duration;
 
 use alloy_primitives::{B256, Bytes};
 use libp2p::PeerId;
-use tokio::sync::mpsc;
+use op_indexer_primitives::BeaconCheckpoint;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -49,7 +53,7 @@ const COMMITTEE_RETRY: Duration = Duration::from_secs(600);
 /// The same while the store cannot follow without it: the clock is past the last period
 /// whose committee is known.
 const CATCH_UP_RETRY: Duration = Duration::from_secs(20);
-/// Peers that must say they do not hold the checkpoint's bootstrap before the checkpoint is
+/// Peers that must say they do not hold a checkpoint's bootstrap before the checkpoint is
 /// given up as too old.
 const BOOTSTRAP_REFUSALS: usize = 12;
 /// The response code of a peer that does not hold what was asked: `ResourceUnavailable`
@@ -77,16 +81,40 @@ async fn answered(
     }
 }
 
+/// A root to bootstrap from: a finalized beacon block, the configured checkpoint or one the
+/// light client verified from it before a restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Bootstrap {
+    pub(super) root: B256,
+    /// The configured checkpoint `root` was verified from (`root` itself when it is that one).
+    pub(super) origin: B256,
+}
+
+impl From<BeaconCheckpoint> for Bootstrap {
+    fn from(saved: BeaconCheckpoint) -> Self {
+        Self {
+            root: saved.root,
+            origin: saved.origin,
+        }
+    }
+}
+
 /// The light client's state machine.
 #[derive(Debug)]
 pub(super) struct Client {
     spec: &'static BeaconSpec,
-    checkpoint: B256,
+    /// The configured checkpoint, named when no bootstrap can be had.
+    configured: B256,
+    /// The root asked for until a store exists, and the one to try when peers refuse it.
+    bootstrap: Bootstrap,
+    fallback: Option<Bootstrap>,
     network: NetworkHandle,
     gossip: mpsc::Receiver<Gossip>,
     trusted: mpsc::Sender<TrustedL1Block>,
+    /// The newest finalized block verified, for the node to save.
+    finalized: watch::Sender<Option<BeaconCheckpoint>>,
     store: Option<Store>,
-    /// Peers that said they do not hold the checkpoint's bootstrap.
+    /// Peers that said they do not hold the bootstrap of [`Self::bootstrap`].
     refused: HashSet<PeerId>,
     next_poll: Instant,
     next_committee_attempt: Instant,
@@ -101,20 +129,26 @@ pub(super) struct Client {
 }
 
 impl Client {
+    /// A client that bootstraps from `bootstrap`, verified from the configured checkpoint (its
+    /// `origin`), then from `fallback` if peers do not hold the first.
     pub(super) fn new(
         spec: &'static BeaconSpec,
-        checkpoint: B256,
+        (bootstrap, fallback): (Bootstrap, Option<Bootstrap>),
         network: NetworkHandle,
         gossip: mpsc::Receiver<Gossip>,
         trusted: mpsc::Sender<TrustedL1Block>,
+        finalized: watch::Sender<Option<BeaconCheckpoint>>,
     ) -> Self {
         let now = Instant::now();
         Self {
             spec,
-            checkpoint,
+            configured: bootstrap.origin,
+            bootstrap,
+            fallback,
             network,
             gossip,
             trusted,
+            finalized,
             store: None,
             refused: HashSet::new(),
             next_poll: now,
@@ -130,9 +164,8 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Returns [`BeaconError::CheckpointUnavailable`] if peers do not hold the bootstrap of
-    /// the configured checkpoint, and [`BeaconError::Verification`] if the verification task
-    /// panics.
+    /// Returns [`BeaconError::CheckpointUnavailable`] if peers hold the bootstrap of neither
+    /// root, and [`BeaconError::Verification`] if the verification task panics.
     pub(super) async fn run(mut self, cancel: CancellationToken) -> Result<(), BeaconError> {
         let mut tick = interval(TICK);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -173,7 +206,7 @@ impl Client {
                     continue;
                 }
             };
-            let (spec, checkpoint, store) = (self.spec, self.checkpoint, self.store.clone());
+            let (spec, checkpoint, store) = (self.spec, self.bootstrap.root, self.store.clone());
             let now_slot = self.spec.now_slot();
             let verifying = tokio::task::spawn_blocking(move || {
                 verify(spec, checkpoint, store, kind, &payloads, now_slot)
@@ -245,19 +278,31 @@ impl Client {
     fn due(&mut self) -> Result<Option<(Kind, Request)>, BeaconError> {
         let Some(store) = &self.store else {
             if self.refused.len() >= BOOTSTRAP_REFUSALS {
-                return Err(BeaconError::CheckpointUnavailable {
-                    checkpoint: self.checkpoint,
-                    peers: self.refused.len(),
-                });
+                let Some(fallback) = self.fallback.take() else {
+                    return Err(BeaconError::CheckpointUnavailable {
+                        checkpoint: self.configured,
+                        peers: self.refused.len(),
+                    });
+                };
+                warn!(
+                    given_up = %self.bootstrap.root,
+                    peers = self.refused.len(),
+                    next = %fallback.root,
+                    "beacon peers do not hold the bootstrap of this checkpoint; trying the other one"
+                );
+                self.bootstrap = fallback;
+                self.refused.clear();
             }
-            return Ok(Some((Kind::Bootstrap, Request::Bootstrap(self.checkpoint))));
+            return Ok(Some((
+                Kind::Bootstrap,
+                Request::Bootstrap(self.bootstrap.root),
+            )));
         };
         let now = Instant::now();
         let now_slot = self.spec.now_slot();
-        let (period, clock_period) = (store.period(), now_slot / SLOTS_PER_PERIOD);
         // With the next committee known, updates signed in the next period verify and the
         // store rotates by itself when one of them finalizes a block there.
-        let stuck = clock_period > store.last_known_period();
+        let stuck = self.behind(store);
         if (stuck || !store.knows_next_committee()) && now >= self.next_committee_attempt {
             let retry = if stuck {
                 CATCH_UP_RETRY
@@ -265,10 +310,10 @@ impl Client {
                 COMMITTEE_RETRY
             };
             self.next_committee_attempt = now + retry;
-            // The network asks for no more than a peer may send at once.
+            // The update of that period is signed by its committee and carries the next one;
+            // applied, it rotates the store into it when it finalizes there.
             let request = Request::UpdatesByRange {
-                start_period: period,
-                count: clock_period.saturating_sub(period).saturating_add(1),
+                period: store.last_known_period(),
             };
             return Ok(Some((Kind::Update, request)));
         }
@@ -282,6 +327,12 @@ impl Client {
         }
         self.finality_epoch = epoch;
         Ok(Some((Kind::Finality, Request::FinalityUpdate)))
+    }
+
+    /// Whether the clock is past the last period whose committee `store` knows: updates
+    /// signed now cannot be verified until the catch-up brings the next committees.
+    fn behind(&self, store: &Store) -> bool {
+        self.spec.now_slot() / SLOTS_PER_PERIOD > store.last_known_period()
     }
 
     /// The data of an answer under a fork digest this build reads, with who sent it; `None`
@@ -344,8 +395,11 @@ impl Client {
             .map(|old| (old.period(), old.knows_next_committee()));
         let after = (store.period(), store.knows_next_committee());
         if kind == Kind::Bootstrap {
+            let (root, slot) = store.finalized();
             info!(
-                checkpoint = %self.checkpoint,
+                checkpoint = %root,
+                saved = root != self.configured,
+                slot,
                 l1_block = accepted.finalized.map(|block| block.number),
                 period = after.0,
                 "light client bootstrapped from the checkpoint"
@@ -356,6 +410,19 @@ impl Client {
                 knows_next = after.1,
                 "sync committees updated"
             );
+        }
+        // A newer finalized block (the bootstrap's own first): the one to restart from.
+        if accepted.finalized.is_some() {
+            let (root, slot) = store.finalized();
+            self.finalized.send_replace(Some(BeaconCheckpoint {
+                origin: self.bootstrap.origin,
+                root,
+                slot,
+            }));
+        }
+        // Still behind the clock after a step of the catch-up: the next period at once.
+        if kind == Kind::Update && self.behind(&store) {
+            self.next_committee_attempt = Instant::now();
         }
         self.store = Some(store);
         for block in [accepted.finalized, accepted.head].into_iter().flatten() {

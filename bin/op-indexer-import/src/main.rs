@@ -1,8 +1,8 @@
-//! Imports a block range from an external archive and exports it to object storage, where
-//! servers read history from.
+//! Imports a block range from an external archive into object storage, where servers read
+//! history from.
 //!
 //! ```text
-//! archive service ─▶ download ─▶ <state>/raw ─▶ verify ─▶ <state>/verified ─▶ export ─▶ R2
+//! archive service ─▶ download ─▶ <state>/raw ─▶ verify ─▶ R2 (sealed chunks, manifest, index)
 //! ```
 //!
 //! - `download` ([`mod@download`]) decides the range, records it, fetches it in chunks from
@@ -10,23 +10,21 @@
 //!   window is spent on the transfer only. It then checks the downloaded rows for fields the
 //!   service left out and fetches the ones it can from the chain's RPC ([`mod@fill`], [`rpc`]).
 //! - `verify` ([`mod@verify`]) rebuilds every block's consensus encoding from the downloaded rows
-//!   and checks it: header hash, parent links up to a trusted anchor, transactions root and
-//!   receipts root (senders are checked later, by `export`). What passes is written as the exact
-//!   verified bytes ([`chunk`]).
-//! - `export` ([`mod@export`]) recovers every sender from its signature, checks it against the
-//!   one the service reported, and seals the verified blocks into chunks, uploaded to R2 with
-//!   their manifest and hash index (`crates/chunks`).
+//!   and checks it: header hash, parent links up to a trusted anchor, transactions root,
+//!   receipts root, and every sender recovered from its signature. It seals the blocks into
+//!   chunks and uploads them (`crates/chunks`), deleting each downloaded chunk once the sealed
+//!   chunks covering it are uploaded, and lists them in the manifest, with the hash index, once
+//!   the last block matches the anchor.
 //!
-//! Every step is resumable: a chunk's file exists only when the chunk is complete, and the
-//! manifest lists only chunks fully uploaded. The indexer never links this binary and never
+//! Every step is resumable: a downloaded chunk's file exists only when it is complete, a
+//! sealed chunk is recorded in the state directory once uploaded, and the manifest lists only
+//! chunks of a range proven up to its anchor. The indexer never links this binary and never
 //! talks to the archive service. See `docs/import.md`.
 
 mod backoff;
-mod chunk;
 mod cli;
 mod download;
 mod env_file;
-mod export;
 mod fill;
 mod game;
 mod progress;
@@ -46,7 +44,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::time::ChronoUtc;
 
-use crate::cli::{Cli, Command, DownloadArgs, Secret, VerifyArgs};
+use crate::cli::{Cli, Command, DownloadArgs, Secret};
 use crate::rpc::Rpc;
 use crate::source::HyperSync;
 use crate::state::{Anchor, Plan, State};
@@ -91,16 +89,11 @@ async fn run(cli: Cli, env_file: Option<PathBuf>) -> eyre::Result<()> {
     let signal = tokio::spawn(cancel_on_signal(cancel.clone()));
     let result = match cli.command {
         Command::Download(args) => download(&args, &state, &cancel).await.map(|_plan| ()),
-        Command::Verify(args) => {
-            let plan = recorded_plan(&state)?;
-            verify(&args.verify, args.from_block, &state, &plan, &cancel).await
-        }
-        Command::Export(args) => export::run(&args, &state, &recorded_plan(&state)?, &cancel).await,
+        Command::Verify(args) => verify::run(&args, &state, &recorded_plan(&state)?, &cancel).await,
         Command::Run(args) => {
             let steps = async {
                 let plan = download(&args.download, &state, &cancel).await?;
-                verify(&args.verify, None, &state, &plan, &cancel).await?;
-                export::run(&args.export, &state, &plan, &cancel).await
+                verify::run(&args.verify, &state, &plan, &cancel).await
             };
             steps.await
         }
@@ -109,7 +102,7 @@ async fn run(cli: Cli, env_file: Option<PathBuf>) -> eyre::Result<()> {
     result
 }
 
-/// The plan `download` recorded, which `verify` and `load` work from.
+/// The plan `download` recorded, which `verify` works from.
 fn recorded_plan(state: &State) -> eyre::Result<Plan> {
     state.read_plan()?.ok_or_else(|| {
         eyre::eyre!(
@@ -268,23 +261,6 @@ async fn download(
     let rpc = rpc_endpoint.map(Rpc::new).transpose()?;
     fill::run(state, &plan, rpc.as_ref(), threads(None), cancel).await?;
     Ok(plan)
-}
-
-async fn verify(
-    args: &VerifyArgs,
-    from_block: Option<u64>,
-    state: &State,
-    plan: &Plan,
-    cancel: &CancellationToken,
-) -> eyre::Result<()> {
-    verify::run(
-        state,
-        plan,
-        threads(args.verify_threads),
-        from_block,
-        cancel,
-    )
-    .await
 }
 
 /// Threads for the CPU-bound work: `asked`, else one per CPU.

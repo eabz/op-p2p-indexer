@@ -220,6 +220,17 @@ pub struct L1Heads {
     pub finalized: Option<BlockRef>,
 }
 
+/// A span of the unsafe chain that gossip missed, sent to whoever fetches blocks from peers:
+/// the blocks from `first` up to `top`, where `top` is the parent of a stored canonical block,
+/// so its hash is trusted and the span is verified by the hash chain down from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FillRequest {
+    /// The highest missing block: number, and the hash its stored child names as parent.
+    pub top: BlockRef,
+    /// The lowest missing block's number.
+    pub first: BlockNumber,
+}
+
 /// A stored block whose receipts are wanted, sent to whoever fetches them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReceiptsRequest {
@@ -267,6 +278,20 @@ pub struct ExecutionPeer {
     pub addr: SocketAddr,
     /// When it last served a request, in seconds since the Unix epoch.
     pub last_served_secs: u64,
+}
+
+/// The newest finalized beacon block the L1 light client has verified, kept so a restart
+/// bootstraps from it instead of from the configured checkpoint, which in time grows too old
+/// for peers to serve. It adds no trust: it was verified, step by step, from `origin`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BeaconCheckpoint {
+    /// The configured checkpoint (the root of a finalized beacon block the operator trusts)
+    /// the light client verified this block from.
+    pub origin: B256,
+    /// The block's root.
+    pub root: B256,
+    /// The block's slot.
+    pub slot: u64,
 }
 
 /// A range of blocks to fetch from execution peers: from `from` up to the anchor, a block
