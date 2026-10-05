@@ -10,9 +10,10 @@
 //! - The base fee follows from the parent's by EIP-1559 with the chain's parameters
 //!   ([`op_indexer_chainspec::Eip1559`]: the denominator changes at Canyon), and from Holocene
 //!   on with the parameters in the parent's `extraData` (both zero: the chain's own); alloy's
-//!   and op-alloy's code computes and decodes them. Computed in block order, across chunks and
-//!   runs ([`Parent`] is kept in the state directory); not from Jovian on (its minimum base fee
-//!   and data footprint are not rebuilt here).
+//!   and op-alloy's code computes and decodes them. Computed in block order across chunks; a
+//!   run starts from the last block of the chunk before its first, as downloaded and filled
+//!   ([`Parent`]). Not from Jovian on (its minimum base fee and data footprint are not rebuilt
+//!   here).
 //! - The withdrawals root from Canyon is the empty trie's root until Isthmus (from Isthmus it
 //!   is the message passer's storage root, which cannot be rebuilt); the blob gas used and the
 //!   excess blob gas from Ecotone are zero (the blob gas used until Jovian, which makes it the

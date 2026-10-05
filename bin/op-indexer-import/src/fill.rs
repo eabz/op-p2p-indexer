@@ -346,7 +346,7 @@ pub(crate) async fn run(
     let mut in_flight_bytes = 0_u64;
     let mut aborted = false;
     loop {
-        let go_on = work.failure.is_none() && !cancel.is_cancelled();
+        let go_on = !work.failed() && !cancel.is_cancelled();
         while go_on
             && scans.len().saturating_add(checks.len()) < threads
             && work.to_fetch.len() < backlog
@@ -407,7 +407,7 @@ pub(crate) async fn run(
                 })?;
                 ready.insert(chunk.from, (chunk, bytes, found));
                 // Not after a stop or a failure: the run is ending.
-                if work.failure.is_none() && !cancel.is_cancelled() {
+                if !work.failed() && !cancel.is_cancelled() {
                     let mut ordered = Ordered {
                         order: &mut order,
                         ready: &mut ready,
@@ -542,9 +542,10 @@ impl<'a> Rebuilding<'a> {
                 && let (Some(rpc), Some(first)) = (self.rpc, rows.first())
             {
                 let parent = BlockNumHash::new(first.number.saturating_sub(1), first.parent_hash);
-                let headers = rpc.headers(&[parent]).await.wrap_err(
-                    "failed to read the parent of the run's first block from the RPC",
-                )?;
+                let headers = rpc
+                    .headers(&[parent])
+                    .await
+                    .wrap_err("failed to read the parent of the run's first block from the RPC")?;
                 self.parent = headers.first().and_then(Parent::of);
             }
         }
@@ -692,6 +693,11 @@ impl Work {
             failure: None,
             unhashing: None,
         }
+    }
+
+    /// Whether the run is ending on a failure.
+    const fn failed(&self) -> bool {
+        self.failure.is_some() || self.unhashing.is_some()
     }
 
     fn scanned(&mut self, chunk: Chunk, found: Scanned) {
