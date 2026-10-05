@@ -17,7 +17,7 @@ Apache Arrow Flight. The running node needs no L1 or L2 RPC.
 Ubuntu 22.04 or newer, x86-64, from a sudo-enabled account:
 
 ```bash
-curl -fsSL https://eabz.github.io/op-p2p-indexer/install.sh | sudo bash
+curl -fsSL https://eabz.github.io/op-p2p-indexer/install.sh | bash
 ```
 
 The installer takes no options. It shows the programs, with ↑/↓ to move, Space to tick

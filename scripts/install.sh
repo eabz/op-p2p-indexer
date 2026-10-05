@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Installs, updates and removes the op-p2p-indexer binaries and their systemd services.
 #
-#   curl -fsSL https://eabz.github.io/op-p2p-indexer/install.sh | sudo bash
+#   curl -fsSL https://eabz.github.io/op-p2p-indexer/install.sh | bash
+#
+# Not piped into sudo: it runs itself under sudo, with the terminal as sudo's input, so the
+# keyboard reaches the menu (piped into sudo, a sudo using a pseudo-terminal passes no keys).
 #
 # It asks which programs this machine runs (arrow keys, Space, Enter), downloads the latest
 # release, checks its checksum, and installs them to /usr/local/bin. Each service (server,
@@ -14,6 +17,7 @@ main() (
     umask 022
 
     local repo="https://github.com/eabz/op-p2p-indexer"
+    local script_url="https://eabz.github.io/op-p2p-indexer/install.sh"
     local bin_dir="/usr/local/bin" share_dir="/usr/local/share/op-p2p-indexer"
     local unit_dir="/etc/systemd/system"
     # name|kind|what it is
@@ -78,7 +82,22 @@ main() (
     if ! [[ "$libc" =~ ^glibc\ 2\.([0-9]+)$ ]] || (( BASH_REMATCH[1] < 35 )); then
         die "glibc 2.35 or newer is required (Ubuntu 22.04 or newer); found $libc"
     fi
-    (( EUID == 0 )) || die "run it with sudo: curl -fsSL https://eabz.github.io/op-p2p-indexer/install.sh | sudo bash"
+    if (( EUID != 0 )); then
+        command -v sudo >/dev/null || die "run it as root: curl -fsSL $script_url | bash"
+        # Piped into bash, the script is no file to run again: download it.
+        local self status=0
+        self=$(mktemp)
+        if [[ -f "${BASH_SOURCE[0]:-}" ]]; then
+            cp -- "${BASH_SOURCE[0]}" "$self"
+        else
+            curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 15 --max-time 60 \
+                -o "$self" "$script_url" || die "cannot download the installer"
+        fi
+        # shellcheck disable=SC2024 # the terminal is sudo's own input, on purpose
+        sudo bash "$self" </dev/tty || status=$?
+        rm -f -- "$self"
+        exit "$status"
+    fi
     command -v systemctl >/dev/null || die "systemd is required"
     local tool missing=()
     for tool in curl tar sha256sum; do
@@ -148,6 +167,10 @@ main() (
         printf '%s  installed %s · latest %s%s\n' "$dim" "$installed_version" "$latest" "$reset" >&3
     else
         printf '%s  latest release %s%s\n' "$dim" "$latest" "$reset" >&3
+    fi
+    if [[ -n "${SUDO_USER:-}" && ! -t 0 ]]; then
+        printf '\n%s  Keys not working? Run it without sudo: curl -fsSL %s | bash%s\n' \
+            "$yellow" "$script_url" "$reset" >&3
     fi
     printf '\n  Which programs run on this machine?\n\n' >&3
     printf '\e[?25l' >&3
