@@ -657,23 +657,98 @@ MB/s on 48 streams (about 43 MB/s a server), `transactions` 406 MB/s, `logs` wit
 **Running it.** `scripts/bench.py` reads a range of one table through the balancer, as a
 Flight client would: it asks the balancer to plan the range (`GetFlightInfo`), then runs the
 jobs across `--processes` processes with `--threads` threads each (default 4), so one Python
-process is not the limit. A job tries its locations in turn: on `UNAVAILABLE` it moves to the
-next at once; after a round in which one answered `RESOURCE_EXHAUSTED` it backs off, 200 ms
-doubling to 5 s with jitter, and it keeps going for `--retry-for` seconds (default 120). The
-range is capped at the finalized head by default (`--cap`). It prints progress, then jobs
-planned, done and failed, MB/s and rows/s (Arrow bytes received, decoded), retries and the time
-spent backing off, time to first batch (median and p95), and per server its jobs and MB/s. It
-needs pyarrow and an API key in `KEY`:
+process is not the limit. `--per-server` (default 8) limits concurrent reads to each server
+across all processes and threads of this run, including fallback attempts. Extra work waits
+locally; a free fallback can take a job while its first server is busy. This is a client limit,
+not discovered server capacity or a reservation against other clients. Set it no higher than
+the smallest participating server's available Flight capacity, leaving room for other users.
+Effective server limits are logged at startup; they are sized from the machine unless
+overridden ([configuration.md](configuration.md)).
+
+A job tries its locations in turn: on `UNAVAILABLE` or a read timeout it moves to the next;
+after a round in which one answered `RESOURCE_EXHAUSTED` it backs off, 200 ms doubling to 5 s
+with jitter. `--retry-for` (default 120 seconds) bounds a started job, including local slot
+waits and retries. Jobs still in the work queue have not started that budget.
+`--rpc-timeout` (default 120 seconds) bounds each complete read RPC, shortened to the job's
+remaining budget; raise it for legitimately longer streams. `--plan-timeout` (default 30
+seconds) bounds planning. A worker process crash aborts the run, since its shared permits
+cannot safely be recovered. The client checks that plan tickets cover exactly the requested
+range with no gaps or overlaps; a head-clipped plan fails before any reads start.
+
+It needs pyarrow and an API key in `KEY`. Release archives also include the script as
+`bench.py`:
 
 ```bash
-KEY=<api key> scripts/bench.py --balancer grpc://<balancer>:50060 --table logs --from 120000000 --to 120100000 --processes 4 --threads 8 --compression zstd
+python3 scripts/bench.py --balancer grpc://balancer.example:50060 --table blocks --from 40000000 --to 45000000 --processes 4 --threads 6 --per-server 8
 ```
 
-- **Client or server limit?** Run the same command from two machines at once. If the two
-  runs' MB/s add up to about twice one run's, the client was the limit; if they share the
-  same total, the servers (or R2 behind them) are.
-- Vary `--threads` (jobs in flight per process) and `--processes` (client cores); compare
-  `--compression none`, `lz4` and `zstd` for bytes on the wire against server CPU.
+Replace `balancer.example` with the deployment's balancer and set `KEY` in the environment
+first.
+
+**What the numbers mean.** Progress counts decoded Arrow bytes as batches arrive, including
+bytes from attempts that subsequently fail. Final useful MB/s and rows/s count only
+successful jobs; failed-attempt decoded bytes are reported separately. Neither is wire or
+R2 traffic. Failed attempts are counted by status (exhausted, unavailable, timeout, other),
+and an expired job reports its last error. An incomplete run exits unsuccessfully and labels
+its throughput as a successful subset, not a full-range result. First-batch time and job latency start when work is enqueued,
+so they include client startup, queueing, slot waits and retries before the first batch.
+These times are observed in the parent and include inter-process message delivery. Empty
+streams have no first-batch sample. Planning time is separate and included in the end-to-end
+useful rate.
+Per-stream rates describe successful attempts only. Compared with older script versions,
+TTFB and progress therefore have different meanings.
+
+**Local client to the live Unichain fleet, 2026-10-05.** These are checks of the new
+benchmark from a macOS client (Python 3.9, PyArrow 21), not the earlier importer-hosted
+benchmark. Server revision, resource utilization and cache state were not verified. Times
+below are the reported read phase, including client startup and completion, excluding
+planning (about 0.32–0.36 seconds). All runs completed with zero failed jobs and zero retries.
+
+| Blocks, inclusive | Compression | Processes × threads | Per-server cap | Runs | Read seconds | Decoded MB/s |
+|---|---|---|---|---|---|---|
+| 50,000,000–50,300,000 | none | 2 × 4 | 4 | 2 | 32.2–55.4 | 3.6–6.1 |
+| 50,000,000–50,300,000 | lz4 | 2 × 4 | 4 | 1 | 18.4 | 10.7 |
+| 50,000,000–50,300,000 | zstd | 2 × 4 | 4 | 1 | 17.5 | 11.3 |
+| 40,000,000–41,000,000 | zstd | 4 × 6 | 4 | 2 | 13.8–17.5 | 37.7–47.5 |
+| 40,000,000–41,000,000 | zstd | 4 × 6 | 8 | 2 | 17.4–17.7 | 37.3–37.9 |
+
+The small range returned 300,001 rows and 197.4 MB in every run; the large range returned
+1,000,001 rows and 658.1 MB across 33 jobs. The large-range cap order was 4, 8, 8, 4. Compression
+helped in these observations; doubling the cap did not consistently improve completion time.
+The samples and uncontrolled network/cache conditions do not establish a fleet throughput
+ceiling or a universal compression/concurrency default.
+
+A logs check over 48,000,000–48,100,000 with Zstd returned 968,312 rows (314.3 decoded MB)
+in 11.4 seconds with no failures or retries. Transactions over the same range, with a
+90-second RPC deadline and 120-second job budget, completed only one of three jobs: four
+timeout attempts consumed 830.4 MB of failed/incomplete decoded data. That run is invalid
+as a throughput comparison. Deadlines must accommodate the client's transfer rate; short
+deadlines can turn a slow but healthy stream into repeated work. The script's default read
+deadline is 120 seconds; longer streams need both `--rpc-timeout` and `--retry-for` raised.
+A smaller transaction check over 48,000,000–48,020,000, with a 120-second RPC deadline and
+150-second job budget, completed its one job in 60.6 seconds: 179,890 rows, 158.6 decoded MB,
+no failures or retries. This is a single-stream transfer check, not a fleet saturation run.
+
+**Next measurements, after the CPU changes of 5.8:**
+
+1. Record the server commit, benchmark revision, effective server limits, importer activity
+   and CPU/RAM/network usage on the client and all three servers. Keep the range and table
+   fixed. Check that all requested jobs succeed before comparing rates.
+2. Keep four client processes and sweep 3, 6, 9 and 12 threads (12/24/36/48 workers), repeating
+   each configuration five times. With `--per-server 8`, three servers admit at most 24 reads
+   from this run; more workers test queueing, not higher server concurrency. Raise the cap
+   only after checking available server capacity and resource usage.
+3. Compare `--compression none`, `lz4` and `zstd` separately for each table. Measure NIC bytes
+   alongside decoded output and CPU. Separate cold-index-cache and warmed runs; do not restart
+   live nodes merely to clear caches.
+4. Compare one, two and three serving nodes using equivalent covered ranges. A second client
+   with disjoint ranges helps investigate an importer/client bottleneck, but improved aggregate
+   throughput alone can also reflect more server concurrency or different cache behavior.
+
+Larger Flight batches, work-weighted job scheduling and R2 read tuning remain experiments.
+Measure batch sizes, per-job durations and GET latency/bytes first; existing adaptive reads,
+prefetch and index caching should not be duplicated. No before/after fleet speedup attributable
+to the new scheduler has been established.
 
 **Not measured yet**: the exporter's lag from finalization to a listed chunk; failover after
 killing a server mid-`DoGet` and mid-subscription; subscription catch-up from R2; R2

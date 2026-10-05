@@ -64,6 +64,7 @@ jobs:
             cp "target/release/$bin" "dist/$name/"
           done
           cp .env.example README.md LICENSE "dist/$name/"
+          cp scripts/bench.py "dist/$name/bench.py"
           cd dist
           tar -czf "$name.tar.gz" "$name"
           sha256sum "$name.tar.gz" >"$name.tar.gz.sha256"
