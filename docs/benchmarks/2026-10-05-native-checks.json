@@ -1,0 +1,238 @@
+{
+  "context": "Live CLI verification on 2026-10-05; exact PyArrow row/byte parity for each table and codec, two native repetitions.",
+  "parity": [
+    {
+      "table": "blocks",
+      "compression": "lz4",
+      "from": 48000000,
+      "to": 48000050,
+      "complete": true,
+      "rows": 51,
+      "bytes": 33565
+    },
+    {
+      "table": "transactions",
+      "compression": "lz4",
+      "from": 48000000,
+      "to": 48000050,
+      "complete": true,
+      "rows": 410,
+      "bytes": 348673
+    },
+    {
+      "table": "receipts",
+      "compression": "lz4",
+      "from": 48000000,
+      "to": 48000050,
+      "complete": true,
+      "rows": 410,
+      "bytes": 49356
+    },
+    {
+      "table": "logs",
+      "compression": "lz4",
+      "from": 48000000,
+      "to": 48000050,
+      "complete": true,
+      "rows": 331,
+      "bytes": 104110
+    },
+    {
+      "table": "blocks",
+      "compression": "lz4",
+      "from": 48000000,
+      "to": 48000050,
+      "complete": true,
+      "rows": 51,
+      "bytes": 33565
+    },
+    {
+      "table": "transactions",
+      "compression": "lz4",
+      "from": 48000000,
+      "to": 48000050,
+      "complete": true,
+      "rows": 410,
+      "bytes": 348673
+    },
+    {
+      "table": "receipts",
+      "compression": "lz4",
+      "from": 48000000,
+      "to": 48000050,
+      "complete": true,
+      "rows": 410,
+      "bytes": 49356
+    },
+    {
+      "table": "logs",
+      "compression": "lz4",
+      "from": 48000000,
+      "to": 48000050,
+      "complete": true,
+      "rows": 331,
+      "bytes": 104110
+    },
+    {
+      "table": "blocks",
+      "compression": "none",
+      "from": 48000000,
+      "to": 48000050,
+      "complete": true,
+      "rows": 51,
+      "bytes": 33565
+    },
+    {
+      "table": "transactions",
+      "compression": "none",
+      "from": 48000000,
+      "to": 48000050,
+      "complete": true,
+      "rows": 410,
+      "bytes": 348673
+    },
+    {
+      "table": "receipts",
+      "compression": "none",
+      "from": 48000000,
+      "to": 48000050,
+      "complete": true,
+      "rows": 410,
+      "bytes": 49356
+    },
+    {
+      "table": "logs",
+      "compression": "none",
+      "from": 48000000,
+      "to": 48000050,
+      "complete": true,
+      "rows": 331,
+      "bytes": 104110
+    },
+    {
+      "table": "blocks",
+      "compression": "none",
+      "from": 48000000,
+      "to": 48000050,
+      "complete": true,
+      "rows": 51,
+      "bytes": 33565
+    },
+    {
+      "table": "transactions",
+      "compression": "none",
+      "from": 48000000,
+      "to": 48000050,
+      "complete": true,
+      "rows": 410,
+      "bytes": 348673
+    },
+    {
+      "table": "receipts",
+      "compression": "none",
+      "from": 48000000,
+      "to": 48000050,
+      "complete": true,
+      "rows": 410,
+      "bytes": 49356
+    },
+    {
+      "table": "logs",
+      "compression": "none",
+      "from": 48000000,
+      "to": 48000050,
+      "complete": true,
+      "rows": 331,
+      "bytes": 104110
+    },
+    {
+      "table": "blocks",
+      "compression": "zstd",
+      "from": 48000000,
+      "to": 48000050,
+      "complete": true,
+      "rows": 51,
+      "bytes": 33565
+    },
+    {
+      "table": "transactions",
+      "compression": "zstd",
+      "from": 48000000,
+      "to": 48000050,
+      "complete": true,
+      "rows": 410,
+      "bytes": 348673
+    },
+    {
+      "table": "receipts",
+      "compression": "zstd",
+      "from": 48000000,
+      "to": 48000050,
+      "complete": true,
+      "rows": 410,
+      "bytes": 49356
+    },
+    {
+      "table": "logs",
+      "compression": "zstd",
+      "from": 48000000,
+      "to": 48000050,
+      "complete": true,
+      "rows": 331,
+      "bytes": 104110
+    },
+    {
+      "table": "blocks",
+      "compression": "zstd",
+      "from": 48000000,
+      "to": 48000050,
+      "complete": true,
+      "rows": 51,
+      "bytes": 33565
+    },
+    {
+      "table": "transactions",
+      "compression": "zstd",
+      "from": 48000000,
+      "to": 48000050,
+      "complete": true,
+      "rows": 410,
+      "bytes": 348673
+    },
+    {
+      "table": "receipts",
+      "compression": "zstd",
+      "from": 48000000,
+      "to": 48000050,
+      "complete": true,
+      "rows": 410,
+      "bytes": 49356
+    },
+    {
+      "table": "logs",
+      "compression": "zstd",
+      "from": 48000000,
+      "to": 48000050,
+      "complete": true,
+      "rows": 331,
+      "bytes": 104110
+    }
+  ],
+  "timeout": {
+    "exit": "nonzero",
+    "complete": false,
+    "received": 5031835,
+    "failed_bytes": 5031835,
+    "useful_bytes": 0,
+    "retries": 3
+  },
+  "cancellation": {
+    "exit": "nonzero",
+    "planned_jobs": 130,
+    "complete": false,
+    "received": 4114598,
+    "useful_bytes": 787118,
+    "failed_bytes": 3327480
+  },
+  "planning_timeout": "nonzero before reading"
+}

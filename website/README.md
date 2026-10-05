@@ -18,7 +18,11 @@ Open http://localhost:4173. The hero is a labeled simulation, not a connection t
 - `dist/style.css`: brand colors, typography, responsive layout and motion preferences.
 - `dist/app.js`: chain and pipeline selection, simulation controls, protocol examples and clipboard action.
 
-The quick start currently builds from source. When an installer is released and its usage documented, replace the commands in `#install-code` and update the requirements beside them. The copy button reads the displayed commands automatically. Keep the instructions consistent with the root README; do not advertise an unreleased download URL.
+The quick start installs the latest published Linux release through `scripts/install.sh`.
+It uses `--binaries-only` so it also works with older releases that predate guided TOML setup;
+the adjacent guide covers chain configuration and systemd services. The one-liner includes
+Ubuntu's curl/CA prerequisites. The copy button reads the displayed command automatically.
+Keep the instructions consistent with the root README; no Rust build is required.
 
 ## Publish
 

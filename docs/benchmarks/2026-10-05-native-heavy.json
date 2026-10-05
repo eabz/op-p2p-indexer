@@ -1,0 +1,514 @@
+{
+  "version": "0.1.10",
+  "client": "rust-arrow-flight",
+  "heavy": true,
+  "repetitions": 1,
+  "rpc_timeout_seconds": 600.0,
+  "retry_for_seconds": 1800.0,
+  "max_message_bytes": 67108864,
+  "runs": [
+    {
+      "complete": true,
+      "table": "blocks",
+      "from": 48000000,
+      "to": 48100000,
+      "cap": "finalized",
+      "compression": "zstd",
+      "concurrency": 24,
+      "per_server": 8,
+      "planning_seconds": 0.215561792,
+      "reading_seconds": 4.03951,
+      "end_to_end_seconds": 4.255072042,
+      "done": 3,
+      "failed": 0,
+      "rows": 100001,
+      "bytes": 65813160,
+      "received": 65813160,
+      "failed_bytes": 0,
+      "retries": 0,
+      "wait_seconds": 0.0,
+      "mb_per_second": 16.292362192444134,
+      "end_to_end_mb_per_second": 15.466990770164731,
+      "ttfb": {
+        "median": 0.7918385,
+        "p95": 0.819606208
+      },
+      "latency": {
+        "median": 3.6854795830000002,
+        "p95": 4.039487458
+      },
+      "queue": {
+        "median": 0.000841917,
+        "p95": 0.000881542
+      },
+      "servers": {
+        "http://147.182.143.85:50051": {
+          "jobs": 1,
+          "bytes": 5334762,
+          "stream_seconds": 1.875195666,
+          "mb_per_second": 1.3206458209040204,
+          "mb_per_stream_second": 2.8449095188981732
+        },
+        "http://157.245.140.110:50051": {
+          "jobs": 1,
+          "bytes": 28606720,
+          "stream_seconds": 3.684046792,
+          "mb_per_second": 7.081730209852185,
+          "mb_per_stream_second": 7.765026237484336
+        },
+        "http://204.48.27.189:50051": {
+          "jobs": 1,
+          "bytes": 31871678,
+          "stream_seconds": 4.038211625,
+          "mb_per_second": 7.889986161687927,
+          "mb_per_stream_second": 7.892522968010623
+        }
+      },
+      "jobs": [
+        {
+          "index": 0,
+          "from": 48000000,
+          "to": 48043466,
+          "server": "http://157.245.140.110:50051",
+          "rows": 43467,
+          "bytes": 28606720,
+          "received": 28606720,
+          "failed_bytes": 0,
+          "retries": 0,
+          "failures": {
+            "exhausted": 0,
+            "unavailable": 0,
+            "timeout": 0,
+            "other": 0
+          },
+          "queue_seconds": 0.000740875,
+          "wait_seconds": 0.0,
+          "ttfb_seconds": 0.819606208,
+          "latency_seconds": 3.6854795830000002,
+          "read_seconds": 3.684046792,
+          "error": null
+        },
+        {
+          "index": 1,
+          "from": 48043467,
+          "to": 48091894,
+          "server": "http://204.48.27.189:50051",
+          "rows": 48428,
+          "bytes": 31871678,
+          "received": 31871678,
+          "failed_bytes": 0,
+          "retries": 0,
+          "failures": {
+            "exhausted": 0,
+            "unavailable": 0,
+            "timeout": 0,
+            "other": 0
+          },
+          "queue_seconds": 0.000841917,
+          "wait_seconds": 0.0,
+          "ttfb_seconds": 0.747910792,
+          "latency_seconds": 4.039487458,
+          "read_seconds": 4.038211625,
+          "error": null
+        },
+        {
+          "index": 2,
+          "from": 48091895,
+          "to": 48100000,
+          "server": "http://147.182.143.85:50051",
+          "rows": 8106,
+          "bytes": 5334762,
+          "received": 5334762,
+          "failed_bytes": 0,
+          "retries": 0,
+          "failures": {
+            "exhausted": 0,
+            "unavailable": 0,
+            "timeout": 0,
+            "other": 0
+          },
+          "queue_seconds": 0.000881542,
+          "wait_seconds": 0.0,
+          "ttfb_seconds": 0.7918385,
+          "latency_seconds": 1.876586125,
+          "read_seconds": 1.875195666,
+          "error": null
+        }
+      ]
+    },
+    {
+      "complete": true,
+      "table": "transactions",
+      "from": 48000000,
+      "to": 48100000,
+      "cap": "finalized",
+      "compression": "zstd",
+      "concurrency": 24,
+      "per_server": 8,
+      "planning_seconds": 0.22091625,
+      "reading_seconds": 116.65357525,
+      "end_to_end_seconds": 116.874491583,
+      "done": 3,
+      "failed": 0,
+      "rows": 903658,
+      "bytes": 800691622,
+      "received": 800691622,
+      "failed_bytes": 0,
+      "retries": 0,
+      "wait_seconds": 0.0,
+      "mb_per_second": 6.86384125204941,
+      "end_to_end_mb_per_second": 6.850867209389126,
+      "ttfb": {
+        "median": 1.092794209,
+        "p95": 1.173695667
+      },
+      "latency": {
+        "median": 61.533668292,
+        "p95": 116.653533875
+      },
+      "queue": {
+        "median": 0.0011665,
+        "p95": 0.001166917
+      },
+      "servers": {
+        "http://147.182.143.85:50051": {
+          "jobs": 2,
+          "bytes": 452008304,
+          "stream_seconds": 123.93827875,
+          "mb_per_second": 3.8747916901072434,
+          "mb_per_stream_second": 3.6470435813600486
+        },
+        "http://157.245.140.110:50051": {
+          "jobs": 1,
+          "bytes": 348683318,
+          "stream_seconds": 61.532453958,
+          "mb_per_second": 2.9890495619421658,
+          "mb_per_stream_second": 5.666657114601664
+        }
+      },
+      "jobs": [
+        {
+          "index": 0,
+          "from": 48000000,
+          "to": 48043466,
+          "server": "http://157.245.140.110:50051",
+          "rows": 391740,
+          "bytes": 348683318,
+          "received": 348683318,
+          "failed_bytes": 0,
+          "retries": 0,
+          "failures": {
+            "exhausted": 0,
+            "unavailable": 0,
+            "timeout": 0,
+            "other": 0
+          },
+          "queue_seconds": 0.001161042,
+          "wait_seconds": 0.0,
+          "ttfb_seconds": 1.173695667,
+          "latency_seconds": 61.533668292,
+          "read_seconds": 61.532453958,
+          "error": null
+        },
+        {
+          "index": 1,
+          "from": 48043467,
+          "to": 48091894,
+          "server": "http://147.182.143.85:50051",
+          "rows": 443353,
+          "bytes": 391953317,
+          "received": 391953317,
+          "failed_bytes": 0,
+          "retries": 0,
+          "failures": {
+            "exhausted": 0,
+            "unavailable": 0,
+            "timeout": 0,
+            "other": 0
+          },
+          "queue_seconds": 0.0011665,
+          "wait_seconds": 0.0,
+          "ttfb_seconds": 1.092767584,
+          "latency_seconds": 116.653533875,
+          "read_seconds": 116.65232625,
+          "error": null
+        },
+        {
+          "index": 2,
+          "from": 48091895,
+          "to": 48100000,
+          "server": "http://147.182.143.85:50051",
+          "rows": 68565,
+          "bytes": 60054987,
+          "received": 60054987,
+          "failed_bytes": 0,
+          "retries": 0,
+          "failures": {
+            "exhausted": 0,
+            "unavailable": 0,
+            "timeout": 0,
+            "other": 0
+          },
+          "queue_seconds": 0.001166917,
+          "wait_seconds": 0.0,
+          "ttfb_seconds": 1.092794209,
+          "latency_seconds": 7.287620709,
+          "read_seconds": 7.2859525,
+          "error": null
+        }
+      ]
+    },
+    {
+      "complete": true,
+      "table": "receipts",
+      "from": 48000000,
+      "to": 48100000,
+      "cap": "finalized",
+      "compression": "zstd",
+      "concurrency": 24,
+      "per_server": 8,
+      "planning_seconds": 0.215529375,
+      "reading_seconds": 20.141875667,
+      "end_to_end_seconds": 20.357405125,
+      "done": 3,
+      "failed": 0,
+      "rows": 903658,
+      "bytes": 108779883,
+      "received": 108779883,
+      "failed_bytes": 0,
+      "retries": 0,
+      "wait_seconds": 0.0,
+      "mb_per_second": 5.400682875737463,
+      "end_to_end_mb_per_second": 5.34350435785219,
+      "ttfb": {
+        "median": 0.765539,
+        "p95": 1.017628334
+      },
+      "latency": {
+        "median": 5.265635125,
+        "p95": 20.141695125
+      },
+      "queue": {
+        "median": 0.001253417,
+        "p95": 0.001256209
+      },
+      "servers": {
+        "http://147.182.143.85:50051": {
+          "jobs": 1,
+          "bytes": 8253675,
+          "stream_seconds": 2.147580292,
+          "mb_per_second": 0.4097768815802312,
+          "mb_per_stream_second": 3.843243966591588
+        },
+        "http://157.245.140.110:50051": {
+          "jobs": 1,
+          "bytes": 47156598,
+          "stream_seconds": 5.264241834,
+          "mb_per_second": 2.3412217799189534,
+          "mb_per_stream_second": 8.957908752487604
+        },
+        "http://204.48.27.189:50051": {
+          "jobs": 1,
+          "bytes": 53369610,
+          "stream_seconds": 20.140332542,
+          "mb_per_second": 2.649684214238279,
+          "mb_per_stream_second": 2.6498872294538702
+        }
+      },
+      "jobs": [
+        {
+          "index": 0,
+          "from": 48000000,
+          "to": 48043466,
+          "server": "http://157.245.140.110:50051",
+          "rows": 391740,
+          "bytes": 47156598,
+          "received": 47156598,
+          "failed_bytes": 0,
+          "retries": 0,
+          "failures": {
+            "exhausted": 0,
+            "unavailable": 0,
+            "timeout": 0,
+            "other": 0
+          },
+          "queue_seconds": 0.001248459,
+          "wait_seconds": 0.0,
+          "ttfb_seconds": 0.755638334,
+          "latency_seconds": 5.265635125,
+          "read_seconds": 5.264241834,
+          "error": null
+        },
+        {
+          "index": 1,
+          "from": 48043467,
+          "to": 48091894,
+          "server": "http://204.48.27.189:50051",
+          "rows": 443353,
+          "bytes": 53369610,
+          "received": 53369610,
+          "failed_bytes": 0,
+          "retries": 0,
+          "failures": {
+            "exhausted": 0,
+            "unavailable": 0,
+            "timeout": 0,
+            "other": 0
+          },
+          "queue_seconds": 0.001253417,
+          "wait_seconds": 0.0,
+          "ttfb_seconds": 1.017628334,
+          "latency_seconds": 20.141695125,
+          "read_seconds": 20.140332542,
+          "error": null
+        },
+        {
+          "index": 2,
+          "from": 48091895,
+          "to": 48100000,
+          "server": "http://147.182.143.85:50051",
+          "rows": 68565,
+          "bytes": 8253675,
+          "received": 8253675,
+          "failed_bytes": 0,
+          "retries": 0,
+          "failures": {
+            "exhausted": 0,
+            "unavailable": 0,
+            "timeout": 0,
+            "other": 0
+          },
+          "queue_seconds": 0.001256209,
+          "wait_seconds": 0.0,
+          "ttfb_seconds": 0.765539,
+          "latency_seconds": 2.148980667,
+          "read_seconds": 2.147580292,
+          "error": null
+        }
+      ]
+    },
+    {
+      "complete": true,
+      "table": "logs",
+      "from": 48000000,
+      "to": 48100000,
+      "cap": "finalized",
+      "compression": "zstd",
+      "concurrency": 24,
+      "per_server": 8,
+      "planning_seconds": 0.2086315,
+      "reading_seconds": 14.984262167,
+      "end_to_end_seconds": 15.192893667,
+      "done": 3,
+      "failed": 0,
+      "rows": 968312,
+      "bytes": 314338120,
+      "received": 314338120,
+      "failed_bytes": 0,
+      "retries": 0,
+      "wait_seconds": 0.0,
+      "mb_per_second": 20.97788442945627,
+      "end_to_end_mb_per_second": 20.68981241425811,
+      "ttfb": {
+        "median": 0.902249,
+        "p95": 1.020749209
+      },
+      "latency": {
+        "median": 5.394239959,
+        "p95": 14.98385075
+      },
+      "queue": {
+        "median": 0.001223417,
+        "p95": 0.001234459
+      },
+      "servers": {
+        "http://147.182.143.85:50051": {
+          "jobs": 2,
+          "bytes": 170039317,
+          "stream_seconds": 7.417481333,
+          "mb_per_second": 11.3478605155801,
+          "mb_per_stream_second": 22.92413143576158
+        },
+        "http://157.245.140.110:50051": {
+          "jobs": 1,
+          "bytes": 144298803,
+          "stream_seconds": 14.982555875,
+          "mb_per_second": 9.630023913876173,
+          "mb_per_stream_second": 9.63112063147904
+        }
+      },
+      "jobs": [
+        {
+          "index": 0,
+          "from": 48000000,
+          "to": 48043466,
+          "server": "http://157.245.140.110:50051",
+          "rows": 444675,
+          "bytes": 144298803,
+          "received": 144298803,
+          "failed_bytes": 0,
+          "retries": 0,
+          "failures": {
+            "exhausted": 0,
+            "unavailable": 0,
+            "timeout": 0,
+            "other": 0
+          },
+          "queue_seconds": 0.001219334,
+          "wait_seconds": 0.0,
+          "ttfb_seconds": 1.020749209,
+          "latency_seconds": 14.98385075,
+          "read_seconds": 14.982555875,
+          "error": null
+        },
+        {
+          "index": 1,
+          "from": 48043467,
+          "to": 48091894,
+          "server": "http://147.182.143.85:50051",
+          "rows": 458936,
+          "bytes": 149312277,
+          "received": 149312277,
+          "failed_bytes": 0,
+          "retries": 0,
+          "failures": {
+            "exhausted": 0,
+            "unavailable": 0,
+            "timeout": 0,
+            "other": 0
+          },
+          "queue_seconds": 0.001223417,
+          "wait_seconds": 0.0,
+          "ttfb_seconds": 0.902249,
+          "latency_seconds": 5.394239959,
+          "read_seconds": 5.39293875,
+          "error": null
+        },
+        {
+          "index": 2,
+          "from": 48091895,
+          "to": 48100000,
+          "server": "http://147.182.143.85:50051",
+          "rows": 64701,
+          "bytes": 20727040,
+          "received": 20727040,
+          "failed_bytes": 0,
+          "retries": 0,
+          "failures": {
+            "exhausted": 0,
+            "unavailable": 0,
+            "timeout": 0,
+            "other": 0
+          },
+          "queue_seconds": 0.001234459,
+          "wait_seconds": 0.0,
+          "ttfb_seconds": 0.693148959,
+          "latency_seconds": 2.025888875,
+          "read_seconds": 2.024542583,
+          "error": null
+        }
+      ]
+    }
+  ],
+  "validation_context": "Live macOS release client; 2026-10-05. Development build before console formatting refinements. Server revision/utilization and cache state unverified; not a controlled throughput comparison."
+}

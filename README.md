@@ -94,7 +94,7 @@ stay in place during migration; moving a configuration does not move a database.
 ## Install on a server
 
 Each release has prebuilt Linux binaries (x86-64, glibc 2.35: Ubuntu 22.04 and newer) of
-`indexer`, `server`, `import` and `balancer`. No Rust toolchain or repository clone is needed.
+`indexer`, `server`, `import`, `balancer` and `bench`. No Rust toolchain or repository clone is needed.
 The guided installer selects the chain, roles, owning account, ports and required credentials,
 then offers systemd registration and startup. From a sudo-enabled account on Ubuntu:
 

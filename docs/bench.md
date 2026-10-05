@@ -87,3 +87,26 @@ runtime startup, connection reuse and decoding differ even when exact rows and b
 Do not infer available server capacity from `--per-server`; observe server utilization and
 competing traffic before increasing it. Repeated reads do not establish a controlled cold
 cache measurement, and the benchmark never restarts servers.
+
+## Live validation, 2026-10-05
+
+A macOS release build completed `--heavy --from 48000000 --to 48100000` with Zstd,
+24 concurrent jobs and cap 8. All 12 jobs across four tables completed, with no failures or
+retries and 1,289,622,785 decoded bytes in total. [Full report](benchmarks/2026-10-05-native-heavy.json):
+
+| Table | Rows | Decoded bytes | End-to-end seconds |
+|---|---:|---:|---:|
+| blocks | 100,001 | 65,813,160 | 4.255 |
+| transactions | 903,658 | 800,691,622 | 116.874 |
+| receipts | 903,658 | 108,779,883 | 20.357 |
+| logs | 968,312 | 314,338,120 | 15.193 |
+
+Over blocks 48,000,000–48,000,050, both native repetitions returned exactly the same rows
+and decoded bytes as PyArrow for **all four tables under none, LZ4 and Zstd**. A deliberately
+short read deadline discarded 5,031,835 decoded bytes, reported zero useful bytes and exited
+nonzero. A planning deadline exited before reading. SIGINT during a 130-job run drained
+readers, recorded every planned job, balanced useful/discarded byte accounting and exited
+nonzero. [Verification summary](benchmarks/2026-10-05-native-checks.json).
+
+These are client correctness checks on an uncontrolled live fleet, not evidence of a server
+speedup. Server revision, resource use and cache state were not verified.

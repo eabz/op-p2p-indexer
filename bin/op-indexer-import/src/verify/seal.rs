@@ -259,7 +259,7 @@ impl<'a> Sealing<'a> {
         // not record them or delete their input: the next run must resume at the gap.
         for (_, handle) in run.uploads.drain(..) {
             if let Some(handle) = handle {
-                let _ = handle.await;
+                drop(handle.await);
             }
         }
         run.progress.summary();
@@ -710,7 +710,7 @@ mod tests {
     use clap::Parser as _;
 
     #[tokio::test]
-    async fn upload_retries_transport_failure_but_not_permanent_failure() {
+    async fn upload_retries_transport_failure_but_not_permanent_failure() -> eyre::Result<()> {
         let entry = ChunkEntry {
             first: 0,
             last: 1,
@@ -741,8 +741,7 @@ mod tests {
             },
             entry,
         )
-        .await
-        .expect("retry should succeed");
+        .await?;
         assert_eq!(attempts, 2);
         attempts = 0;
         let result = retry_upload(
@@ -757,6 +756,7 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert_eq!(attempts, 1);
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread")]

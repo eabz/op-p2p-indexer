@@ -124,6 +124,10 @@ except ImportError:
     fi
     local binary item
     local binaries=(indexer server import balancer) companions=() members=()
+    # Native benchmarking is optional in older releases.
+    if grep -Fxq "$name/bench" "$download_dir/members"; then
+        binaries+=(bench)
+    fi
     for binary in "${binaries[@]}"; do
         grep -Fxq "$name/$binary" "$download_dir/members" || die "archive missing $binary"
         members+=("$name/$binary")

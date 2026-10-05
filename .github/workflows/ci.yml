@@ -47,6 +47,9 @@ jobs:
           for binary in indexer server import balancer; do
             test "$("$prefix/bin/$binary" --version)" = "$binary $version"
           done
+          if [ -x "$prefix/bin/bench" ]; then
+            test "$("$prefix/bin/bench" --version)" = "bench $version"
+          fi
           test "$(cat "$prefix/.env")" = 'keep configuration'
           test "$(cat "$prefix/data/sentinel")" = 'keep data'
 
