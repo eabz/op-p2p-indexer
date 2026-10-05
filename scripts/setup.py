@@ -15,9 +15,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
-import select
-import termios
-import tty
+import shutil
 from urllib.parse import urlsplit
 try:
     import tomllib
@@ -80,68 +78,47 @@ def choose_numbered(title, options, default, multiple=False):
 
 
 def choose(title, options, default, multiple=False):
-    if os.environ.get("TERM") == "dumb":
+    dialog = shutil.which("dialog")
+    if os.environ.get("TERM", "dumb") == "dumb" or not dialog:
+        print("Using numbered choices (dialog or an interactive terminal is unavailable).", flush=True)
         return choose_numbered(title, options, default, multiple)
     names = [name for name, _ in options]
-    selected = set()
+    selected = []
     for item in default.split(","):
         if item.isdecimal() and 1 <= int(item) <= len(options):
-            selected.add(int(item) - 1)
+            selected.append(names[int(item) - 1])
         elif item in names:
-            selected.add(names.index(item))
-    cursor = min(selected) if selected else 0
-    fd = os.open("/dev/tty", os.O_RDWR)
-    original = termios.tcgetattr(fd)
-    rows = len(options) + 3
-    drawn = False
-    note = ""
-    def write(text):
-        os.write(fd, text.encode())
-    def read_key():
-        key = os.read(fd, 1)
-        if key == b"\x1b" and select.select([fd], [], [], 0.15)[0]:
-            key += os.read(fd, 1)
-            if key in (b"\x1b[", b"\x1bO") and select.select([fd], [], [], 0.15)[0]:
-                key += os.read(fd, 1)
-        return key
-    try:
-        tty.setcbreak(fd)
-        write("\x1b[?25l")
+            selected.append(item)
+    args = [dialog, "--clear", "--title", title, "--output-fd", "1"]
+    if selected:
+        args.extend(["--default-item", selected[0]])
+    if multiple:
+        args.extend(["--separate-output", "--checklist",
+                     "Use arrows to move, Space to select roles, and Enter to confirm.", "0", "0", str(len(options))])
+        for name, description in options:
+            args.extend([name, description, "on" if name in selected else "off"])
+    else:
+        args.extend(["--menu", "Use arrows to move and Enter to select.", "0", "0", str(len(options))])
+        for name, description in options:
+            args.extend([name, description])
+    # dialog owns terminal input/rendering; only its selected tags go to the pipe.
+    environment = {key: value for key, value in os.environ.items()
+                   if key != "DIALOGOPTS" and not key.startswith("DIALOG_")}
+    with open("/dev/tty", "rb", buffering=0) as source, open("/dev/tty", "wb", buffering=0) as screen:
         while True:
-            if drawn:
-                write("\x1b[" + str(rows) + "A")
-            lines = [title]
-            for index, (name, description) in enumerate(options):
-                pointer = "> " if index == cursor else "  "
-                marker = ("[x] " if index in selected else "[ ] ") if multiple else ""
-                lines.append(pointer + marker + name + " — " + description)
-            lines.append("↑/↓ move · Space toggles · Enter confirms" if multiple else "↑/↓ move · Enter selects")
-            lines.append(note or "Ctrl-C cancels")
-            for line in lines:
-                write("\r\x1b[2K" + line + "\n")
-            drawn = True
-            key = read_key()
-            if key in (b"\x1b[A", b"\x1bOA", b"k"):
-                cursor = (cursor - 1) % len(options)
-            elif key in (b"\x1b[B", b"\x1bOB", b"j"):
-                cursor = (cursor + 1) % len(options)
-            elif key == b" " and multiple:
-                selected.symmetric_difference_update({cursor})
-                note = ""
-            elif key in (b"\n", b"\r"):
-                if not multiple:
-                    return names[cursor]
-                if selected:
-                    return ",".join(names[index] for index in sorted(selected))
-                note = "Select at least one role with Space."
-            elif not key or key == b"\x04":
-                fail("terminal input ended; setup cancelled")
-            elif key in (b"\x03", b"\x1b"):
-                raise KeyboardInterrupt
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, original)
-        write("\x1b[?25h")
-        os.close(fd)
+            result = subprocess.run(args, stdin=source, stdout=subprocess.PIPE,
+                                    stderr=screen, text=True, env=environment)
+            if result.returncode in (1, 255):
+                fail("selection cancelled; no changes applied")
+            if result.returncode != 0:
+                fail("dialog could not display the selection; use TERM=dumb for numbered choices")
+            chosen = result.stdout.splitlines()
+            if not chosen and multiple:
+                screen.write(b"Select at least one role.\n")
+                continue
+            if not chosen or any(name not in names for name in chosen) or (not multiple and len(chosen) != 1):
+                fail("dialog returned an invalid selection")
+            return ",".join(dict.fromkeys(chosen))
 
 
 def stage(number, title):

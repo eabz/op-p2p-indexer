@@ -21,7 +21,9 @@ curl -fsSL https://eabz.github.io/op-p2p-indexer/install.sh | sudo bash
 ```
 
 On a fresh box without curl, first run `sudo apt-get update && sudo apt-get install -y curl ca-certificates`.
-The installer handles its remaining Ubuntu prerequisites.
+The installer handles its remaining Ubuntu prerequisites, including `dialog` for terminal menus.
+Prompts use `/dev/tty`, so the piped command works over an interactive SSH session.
+For automation, use `--non-interactive`; `TERM=dumb` selects numbered prompts.
 
 Use ↑/↓ to move, Space to toggle services, and Enter to confirm. The wizard reuses shared TOML settings and
 shows the selected paths and ports before saving. Downloads display progress and stalled
@@ -31,9 +33,9 @@ configuration and data are retained. Downloads use the latest published release 
 its checksum before replacing binaries atomically. An update takes effect when a process
 restarts. Shared binaries live in `/usr/local/bin`.
 
-**Release status:** the TOML-only configuration described here is a breaking change pending
-publication. The installer downloads published artifacts, not the current source tree.
-Old releases can be installed with `--binaries-only`; guided setup requires compatible binaries.
+The installer downloads published artifacts, not the current source tree. The complete
+`dialog` wizard requires v0.1.12 or newer. Older releases can be installed with
+`--binaries-only`; updating the hosted script alone does not update an older setup helper.
 
 For unattended setup, download the script and specify the chain and roles:
 

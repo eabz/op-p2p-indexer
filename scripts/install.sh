@@ -62,6 +62,7 @@ main() (
     (( 10#$major > 2 || (10#$major == 2 && 10#$minor >= 35) )) || die 'glibc >= 2.35 is required (Ubuntu 22.04 or newer)'
 
 
+    step "OP Indexer installer — dialog setup"
     # The installer itself is the bootstrap: fresh Ubuntu needs no Python/pip preparation.
     # Only known distro packages are installed, and only when a required tool is missing.
     step "Checking this machine and prerequisites"
@@ -75,6 +76,9 @@ main() (
     done
     [[ -s /etc/ssl/certs/ca-certificates.crt ]] || packages+=(ca-certificates)
     if (( ! binaries_only )); then
+        if (( ! non_interactive )) && [[ "${TERM:-dumb}" != dumb ]] && ! command -v dialog >/dev/null 2>&1; then
+            packages+=(dialog)
+        fi
         if ! command -v python3 >/dev/null 2>&1; then
             packages+=(python3 python3-tomli)
         elif ! python3 -c 'try:
@@ -104,39 +108,17 @@ except ImportError:
         if [[ -z "$action" && "$non_interactive" == 0 ]]; then
             local tty_fd
             { exec {tty_fd}<>/dev/tty; } 2>/dev/null || die 'no terminal; use --non-interactive or --binaries-only'
-            local labels=("Install and configure" "Add a service" "Update binaries" "Restart services" "Remove services (keep data)")
-            local actions=(install add-service update restart remove)
-            local selected=0 index key sequence
-            printf '\nOP Indexer setup\n' >&"$tty_fd"
-            if [[ "${TERM:-dumb}" != dumb && -t "$tty_fd" ]]; then
-                printf 'Use ↑/↓ to move, Enter to select, or q to cancel.\n\n' >&"$tty_fd"
-                while :; do
-                    for index in "${!labels[@]}"; do
-                        if (( index == selected )); then
-                            printf '\r\033[2K  > \033[7m%s\033[0m\n' "${labels[index]}" >&"$tty_fd"
-                        else
-                            printf '\r\033[2K    %s\n' "${labels[index]}" >&"$tty_fd"
-                        fi
-                    done
-                    IFS= read -rsn1 key <&"$tty_fd" || die 'terminal closed; nothing selected'
-                    case "$key" in
-                        "") action="${actions[selected]}"; break ;;
-                        q|Q) die 'cancelled' ;;
-                        1|2|3|4|5) selected=$((key - 1)) ;;
-                        $'\033')
-                            sequence=""
-                            IFS= read -rsn2 -t 0.2 sequence <&"$tty_fd" || true
-                            case "$sequence" in
-                                '[A'|'OA') selected=$(((selected + 4) % 5)) ;;
-                                '[B'|'OB') selected=$(((selected + 1) % 5)) ;;
-                            esac ;;
-                    esac
-                    printf '\033[5A' >&"$tty_fd"
-                done
+            if [[ "${TERM:-dumb}" != dumb ]]; then
+                action=$(dialog --clear --title 'OP Indexer setup' --output-fd 3 \
+                    --menu 'Choose an action. Arrow keys move; Enter selects.' 0 0 5 \
+                    install 'Install and configure' \
+                    add-service 'Add a service' \
+                    update 'Update binaries' \
+                    restart 'Restart services' \
+                    remove 'Remove services (keep data)' \
+                    3>&1 1>&"$tty_fd" 2>&"$tty_fd" <&"$tty_fd") || die 'selection cancelled or terminal unavailable'
             else
-                for index in "${!labels[@]}"; do
-                    printf '  %s) %s\n' "$((index + 1))" "${labels[index]}" >&"$tty_fd"
-                done
+                printf '\nOP Indexer setup\n  1) Install and configure\n  2) Add a service\n  3) Update binaries\n  4) Restart services\n  5) Remove services (keep data)\n' >&"$tty_fd"
                 while :; do
                     printf '\nChoose an action [1]: ' >&"$tty_fd"
                     IFS= read -r action <&"$tty_fd" || die 'terminal closed; nothing selected'
@@ -267,7 +249,7 @@ except ImportError:
     printf 'Installed %s to %s/bin\n' "$version" "$prefix"
     printf 'Companion files: %s/share/op-p2p-indexer\n' "$prefix"
     if (( ! binaries_only )); then
-        step "Configuring chains and services"
+        step "Configuring chains and services with the helper from $version"
         python3 "$prefix/share/op-p2p-indexer/setup.py" --prefix "$prefix" --action "$action" "${setup_args[@]}"
     else
         printf 'Configuration and state are unchanged. Restart services explicitly when ready.\n'
