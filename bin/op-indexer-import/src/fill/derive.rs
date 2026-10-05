@@ -47,8 +47,8 @@ use op_alloy_consensus::{
 };
 use op_indexer_chainspec::{ChainSpec, Hardfork};
 
-use crate::rpc::RpcHeader;
 use self::user::UserDeposit;
+use crate::rpc::RpcHeader;
 use crate::source::{DepositLog, HyperSync, L1Header, SourceError};
 
 /// L1 blocks read per request, at least: about 33 hours of L1, so of L2 (about 60,000 Base
@@ -244,7 +244,11 @@ type DepositOf = (B256, Derivation, Option<U128>);
 /// portal's logs in its L1 origin (if the epoch starts here; each checked against its row)
 /// and the upgrades of the fork it is the first block of. Else the field that cannot be
 /// rebuilt, or the user deposit's that is not its log's.
-fn deposits(chain: &ChainSpec, row: &HeaderRow, l1: &L1Data) -> Result<Vec<DepositOf>, &'static str> {
+fn deposits(
+    chain: &ChainSpec,
+    row: &HeaderRow,
+    l1: &L1Data,
+) -> Result<Vec<DepositOf>, &'static str> {
     const UNKNOWN: &str = "source_hash";
     let info = row.l1_info.ok_or(UNKNOWN)?;
     let mut rebuilt = Vec::with_capacity(row.deposits.len());
@@ -258,7 +262,8 @@ fn deposits(chain: &ChainSpec, row: &HeaderRow, l1: &L1Data) -> Result<Vec<Depos
     ));
     if info.sequence == 0 && row.deposits.len() > 1 {
         for log in l1.logs(info).ok_or(UNKNOWN)? {
-            let deposit = UserDeposit::of(log).ok_or("user deposit (its L1 log does not decode)")?;
+            let deposit =
+                UserDeposit::of(log).ok_or("user deposit (its L1 log does not decode)")?;
             // More logs than deposits leaves the count to fail below.
             if let Some(row) = row.deposits.get(rebuilt.len())
                 && let Some(field) = deposit.differs(row)
@@ -275,7 +280,11 @@ fn deposits(chain: &ChainSpec, row: &HeaderRow, l1: &L1Data) -> Result<Vec<Depos
             ));
         }
     }
-    let upgrades = row.deposits.len().checked_sub(rebuilt.len()).ok_or(UNKNOWN)?;
+    let upgrades = row
+        .deposits
+        .len()
+        .checked_sub(rebuilt.len())
+        .ok_or(UNKNOWN)?;
     if upgrades > 0 {
         // The fork whose first block this is.
         let starts = |fork: Hardfork| {
@@ -336,10 +345,7 @@ impl L1Data {
                 .map(|header| (header.number, header)),
         );
         for log in span.deposits {
-            self.logs
-                .entry(log.block_number)
-                .or_default()
-                .push(log);
+            self.logs.entry(log.block_number).or_default().push(log);
         }
         (self.from, self.to) = (first, to);
         Ok(())
@@ -511,7 +517,7 @@ pub(super) fn rebuild(
         }
         let mut sources = Vec::new();
         if row.lacks_deposit_fields() {
-            match self::deposits(chain, row, l1) {
+            match deposits(chain, row, l1) {
                 Ok(deposits) => {
                     for (deposit, &(hash, from, mint)) in row.deposits.iter().zip(&deposits) {
                         let source = Source {

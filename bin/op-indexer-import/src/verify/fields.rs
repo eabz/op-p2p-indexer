@@ -164,6 +164,9 @@ fn transaction(tx: &TransactionRow, canyon: bool, mut found: impl FnMut(Row, &'s
             "deposit",
             &[
                 ("source_hash", tx.source_hash.is_none()),
+                // After the L1-attributes deposit, a user deposit mints what it says; an
+                // upgrade's mints nothing, and is listed too.
+                ("mint", tx.transaction_index > 0 && tx.mint.is_none()),
                 from,
                 ("deposit_nonce", canyon && tx.deposit_nonce.is_none()),
                 (

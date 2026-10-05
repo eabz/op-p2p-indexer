@@ -43,7 +43,7 @@ impl UserDeposit {
             } else {
                 Some(address(log.topic2)?)
             },
-            mint: U128::try_from(U256::from_be_slice(opaque.get(..32)?)).ok()?,
+            mint: U128::from(u128::try_from(U256::from_be_slice(opaque.get(..32)?)).ok()?),
             value: U256::from_be_slice(opaque.get(32..64)?),
             gas: u64::from_be_bytes(opaque.get(64..72)?.try_into().ok()?),
             input: Bytes::copy_from_slice(opaque.get(73..)?),
