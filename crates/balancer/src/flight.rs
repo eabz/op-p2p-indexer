@@ -27,8 +27,8 @@ use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo,
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
 };
+use op_indexer_api::ticket::{self, Cap, Query};
 use op_indexer_chunks::ChunkEntry;
-use op_indexer_stream::ticket::{self, Cap, Query};
 use tokio::sync::watch;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status, Streaming};
@@ -135,7 +135,7 @@ impl Flight {
         jobs: &[Job],
         descriptor: FlightDescriptor,
     ) -> Result<FlightInfo, Status> {
-        let schema = table.schema().map_err(Status::from)?;
+        let schema = table.schema();
         let endpoints = jobs
             .iter()
             .map(|job| {

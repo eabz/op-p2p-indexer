@@ -28,7 +28,7 @@ const DEPRECATED_API_TOKEN_VAR: &str = "ENVIO_API_TOKEN";
 /// the last block known to be committed to L1: the block of the newest dispute game. Blocks
 /// come from Envio `HyperSync`.
 #[derive(Debug, Parser)]
-#[command(name = "import", version, arg = crate::env_file::arg())]
+#[command(name = "import", version, arg = env_file_arg())]
 pub(crate) struct Cli {
     /// Directory for the plan, the downloaded chunks and the record of the sealed ones. Use
     /// the same one for every step.
@@ -279,4 +279,18 @@ impl FromStr for Secret {
         }
         Ok(Self(secret.to_owned()))
     }
+}
+
+/// Declares the startup file flag for clap; loading happens before argument parsing.
+fn env_file_arg() -> clap::Arg {
+    clap::Arg::new("env_file")
+        .long(op_indexer_runtime::env_file::FLAG.trim_start_matches('-'))
+        .env("OP_INDEXER_ENV_FILE")
+        .global(true)
+        .value_name("PATH")
+        .value_parser(clap::value_parser!(PathBuf))
+        .help(
+            "File of NAME=value lines loaded into the environment first; variables already set \
+             win [default: .env, if it exists]",
+        )
 }

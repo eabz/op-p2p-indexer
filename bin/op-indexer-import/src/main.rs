@@ -24,7 +24,7 @@
 mod backoff;
 mod cli;
 mod download;
-mod env_file;
+use op_indexer_runtime::env_file;
 mod fill;
 mod game;
 mod progress;
@@ -41,16 +41,11 @@ use eyre::WrapErr;
 use op_indexer_chainspec::{ChainSpec, OP_MAINNET};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
-use tracing_subscriber::EnvFilter;
-use tracing_subscriber::fmt::time::ChronoUtc;
 
 use crate::cli::{Cli, Command, DownloadArgs, FillFrom, Secret};
 use crate::rpc::Rpc;
 use crate::source::HyperSync;
 use crate::state::{Anchor, Plan, State};
-
-/// Log timestamp: UTC time of day with milliseconds, as the indexer's.
-const LOG_TIME_FORMAT: &str = "%H:%M:%S%.3f";
 
 /// Blocks per chunk unless the first `download` says otherwise.
 const DEFAULT_CHUNK_BLOCKS: u64 = 1000;
@@ -72,15 +67,7 @@ fn main() -> eyre::Result<()> {
 }
 
 async fn run(cli: Cli, env_file: Option<PathBuf>) -> eyre::Result<()> {
-    tracing_subscriber::fmt()
-        .with_timer(ChronoUtc::new(LOG_TIME_FORMAT.to_owned()))
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
-    if let Some(path) = env_file {
-        info!(path = %path.display(), "loaded env file");
-    }
+    op_indexer_runtime::init_tracing(env_file.as_deref());
 
     // Startup-only blocking I/O, before any task runs.
     let state = State::open(&cli.state_dir).wrap_err("failed to open the state directory")?;
@@ -296,22 +283,12 @@ fn threads(asked: Option<usize>) -> usize {
 
 /// Cancels `cancel` on Ctrl-C or, on Unix, SIGTERM, so the running step stops between chunks.
 async fn cancel_on_signal(cancel: CancellationToken) {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        if let Ok(mut terminate) = signal(SignalKind::terminate()) {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = terminate.recv() => {}
-            }
-        } else {
-            let _signal = tokio::signal::ctrl_c().await;
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _signal = tokio::signal::ctrl_c().await;
-    }
+    // Preserve the importer policy: Ctrl-C remains usable without a SIGTERM handler,
+    // and a signal error still cancels the current step before it starts more work.
+    let _signal = op_indexer_runtime::shutdown_signal_with_policy(
+        op_indexer_runtime::SignalPolicy::CtrlCFallback,
+    )
+    .await;
     info!("stopping; finished chunks are kept");
     cancel.cancel();
 }

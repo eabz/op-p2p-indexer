@@ -7,7 +7,8 @@ use eyre::{WrapErr, eyre};
 use op_indexer_balancer::BalancerConfig;
 use op_indexer_chainspec::{ChainSpec, OP_MAINNET};
 use op_indexer_chunks::{R2Config, ReadOptions};
-use op_indexer_node::env_file;
+use op_indexer_runtime::env_file;
+use op_indexer_runtime::env_var as var;
 
 /// Clear of the stream's default port (50051).
 const DEFAULT_LISTEN_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 50060);
@@ -79,15 +80,7 @@ impl BalancerSettings {
         if server_keys.is_empty() {
             return Err(eyre!("OP_INDEXER_BALANCER_SERVER_KEYS is required"));
         }
-        let r2 = R2Config {
-            account_id: required("OP_INDEXER_R2_ACCOUNT_ID")?,
-            bucket: var("OP_INDEXER_R2_BUCKET")
-                .unwrap_or_else(|| format!("{}-snapshot", chain.name)),
-            prefix: var("OP_INDEXER_R2_PREFIX").unwrap_or_else(|| "archive".to_owned()),
-            access_key_id: required("OP_INDEXER_R2_ACCESS_KEY_ID")?,
-            secret_access_key: required("OP_INDEXER_R2_SECRET_ACCESS_KEY")?,
-            endpoint: var("OP_INDEXER_R2_ENDPOINT"),
-        };
+        let r2 = R2Config::from_env(chain)?;
         Ok(Self {
             chain,
             balancer: BalancerConfig {
@@ -99,14 +92,6 @@ impl BalancerSettings {
             read: ReadOptions::default(),
         })
     }
-}
-
-fn var(name: &str) -> Option<String> {
-    env::var(name).ok().filter(|value| !value.is_empty())
-}
-
-fn required(name: &str) -> eyre::Result<String> {
-    var(name).ok_or_else(|| eyre!("{name} is required"))
 }
 
 /// A comma-separated list, without empty items.

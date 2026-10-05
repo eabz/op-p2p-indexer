@@ -43,6 +43,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 pub use error::PipelineError;
+pub use fill::FillReach;
 use promote::Promoter;
 pub use receipts::ReceiptsChannels;
 
@@ -59,7 +60,11 @@ pub struct Pipeline<U, A> {
     range: Option<mpsc::Receiver<Vec<EncodedBlock>>>,
     head: Option<watch::Sender<Option<BlockRef>>>,
     /// Where missed spans are asked for, and the blocks fetched for them.
-    fills: Option<(mpsc::Sender<FillRequest>, mpsc::Receiver<Vec<EncodedBlock>>)>,
+    fills: Option<(
+        mpsc::Sender<FillRequest>,
+        mpsc::Receiver<Vec<EncodedBlock>>,
+        FillReach,
+    )>,
     /// The dispute games, the chain's Isthmus time, and where the heads they give go.
     games: Option<(watch::Receiver<L1Games>, u64, watch::Sender<L1Heads>)>,
 }
@@ -91,7 +96,7 @@ impl Task {
 impl<U, A> Pipeline<U, A>
 where
     U: UnsafeStore + Clone + Send + Sync + 'static,
-    A: ArchiveStore + Clone + Send + Sync + 'static,
+    A: ArchiveStore,
 {
     /// Creates a pipeline over the two stores.
     ///
@@ -157,17 +162,18 @@ where
         self
     }
 
-    /// Fills what gossip missed: when the unsafe head moves past heights it does not hold, the
-    /// span (within 1,024 blocks of the head) is asked for on `requests`, and the blocks
-    /// received on `filled` (each batch consecutive, ascending, verified by the fetcher) are
-    /// stored in the unsafe store, closing the gap.
+    /// Fills holes in the unsafe chain above the archive's last block: the lowest one `reach`
+    /// leaves to the fill is asked for on `requests` every few seconds, and the blocks received
+    /// on `filled` (each batch consecutive, ascending, verified by the fetcher) are stored in the
+    /// unsafe store, closing it. Nothing is asked for while the archive is empty.
     #[must_use]
     pub fn with_fills(
         mut self,
         requests: mpsc::Sender<FillRequest>,
         filled: mpsc::Receiver<Vec<EncodedBlock>>,
+        reach: FillReach,
     ) -> Self {
-        self.fills = Some((requests, filled));
+        self.fills = Some((requests, filled, reach));
         self
     }
 
@@ -220,9 +226,9 @@ where
             self.head,
             stop.clone(),
         );
-        if let Some((requests, filled)) = self.fills {
+        if let Some(fills) = self.fills {
             let (store, archive) = (self.unsafe_store.clone(), self.archive.clone());
-            let fill = fill::run(store, archive, requests, filled, stop.clone());
+            let fill = fill::run(store, archive, fills, stop.clone());
             tasks.spawn(async move { (Task::Fill, fill.await) });
         }
         tasks.spawn(async move { (Task::Ingest, ingest.await) });

@@ -1,58 +1,35 @@
-//! Read-ahead for consumers' sequential reads of sealed history (D4, `docs/serving.md` 5.2).
+//! Caller-owned read-ahead for sealed history.
 //!
-//! A consumer (a subscription catching up, a Flight `DoGet`) reads the committed chain with
-//! repeated [`ArchiveStore::blocks`](op_indexer_storage::ArchiveStore::blocks) calls, each
-//! from the block after the last one it got. The first call starts a *feed*: a task that
-//! streams the sealed chunks one after the other from that block, verified and decompressed,
-//! into a buffer the next calls take from. The feed runs ahead of its reader by at most
-//! [`MAX_FEED_KIB`], and all feeds together by half the read budget, so the next chunk's
-//! GET starts while the reader is still in this one. Nothing is written to disk and nothing is
-//! kept once read: this is read-ahead, not a cache.
-//!
-//! **Memory.** The read budget bounds what all feeds hold, whatever the number of readers:
-//! half of it for decoded blocks waiting in feeds, half for the chunk streams open at once
-//! (each holds its ranges in flight and a decoded batch, about [`STREAM_BYTES`] with the
-//! server's read options); a feed past either waits, so its reader waits, instead of the
-//! process growing.
-//!
-//! A feed is found again by the block its reader asks for next. Feeds not read for
-//! [`FEED_IDLE`] are dropped, which drops their GETs; at most [`MAX_FEEDS`] run at once.
+//! Each range reader owns its producer and bounded buffer. Dropping the reader aborts
+//! remote reads immediately. Readers share memory and open-stream budgets, never cursors.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
 
 use alloy_primitives::BlockNumber;
 use futures_util::StreamExt;
 use op_indexer_primitives::{ArchivedBlock, ReadLimits};
 use op_indexer_storage::StorageError;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
-use tokio::task::JoinHandle;
+use tokio::task::JoinSet;
 
 use crate::archive::{Sealed, remote, size};
-use crate::source::{ChunkRange, ChunkSource};
+use crate::source::ChunkSource;
 
 /// KiB one feed holds ahead of its reader (16 MiB): a couple of hundred blocks, longer to
 /// serve than R2's time to the first byte. KiB are the unit of the permits.
 const MAX_FEED_KIB: u32 = 16 * 1024;
 /// What one open chunk stream holds, with the server's read options (two ranges of about a
 /// segment in flight, each compressed and decoded, and the decoded batch handed on).
-pub(crate) const STREAM_BYTES: u64 = 32 << 20;
-/// Feeds at once; past it the one read longest ago is dropped.
-const MAX_FEEDS: usize = 64;
-/// A feed not read for this long is dropped, with what it read ahead.
-const FEED_IDLE: Duration = Duration::from_secs(10);
+const STREAM_BYTES: u64 = 32 << 20;
 /// Blocks queued in one feed, whatever their size.
 const FEED_BLOCKS: usize = 4096;
 
 /// A block and the read-ahead places it holds until it is taken.
 type Fed = Result<(ArchivedBlock, [OwnedSemaphorePermit; 2]), StorageError>;
 
-/// The feeds of every reader.
+/// Shared read-ahead and open-stream budgets for independently owned reader feeds.
 #[derive(Debug, Clone)]
 pub(crate) struct Feeds {
-    /// The feeds waiting for their reader, by the block it reads next.
-    waiting: Arc<Mutex<HashMap<BlockNumber, Feed>>>,
     /// KiB of decoded blocks all feeds may hold.
     read_ahead: Arc<Semaphore>,
     /// Chunk streams open at once.
@@ -61,17 +38,9 @@ pub(crate) struct Feeds {
 
 /// One reader's feed.
 #[derive(Debug)]
-struct Feed {
+pub(crate) struct Feed {
     blocks: mpsc::Receiver<Fed>,
-    task: JoinHandle<()>,
-    used: Instant,
-}
-
-impl Drop for Feed {
-    fn drop(&mut self) {
-        // Its GETs go with it.
-        self.task.abort();
-    }
+    tasks: JoinSet<()>,
 }
 
 impl Feeds {
@@ -81,7 +50,6 @@ impl Feeds {
         let kib = usize::try_from(half / 1024).unwrap_or(usize::MAX);
         let streams = usize::try_from(half / STREAM_BYTES).unwrap_or(usize::MAX);
         Self {
-            waiting: Arc::default(),
             read_ahead: Arc::new(Semaphore::new(
                 kib.clamp(MAX_FEED_KIB as usize, Semaphore::MAX_PERMITS),
             )),
@@ -89,70 +57,27 @@ impl Feeds {
         }
     }
 
-    /// Reads sealed blocks from `from` up to `limits`, from the feed that waits at `from` or
-    /// a new one. The run ends at the end of the sealed range.
-    pub(crate) async fn read<S: ChunkSource>(
+    /// Starts a feed of the sealed chunks from `from` to the last one listed now.
+    pub(crate) fn start<S: ChunkSource>(
         &self,
         source: &S,
         sealed: &Sealed,
         from: BlockNumber,
-        limits: ReadLimits,
-    ) -> Result<Vec<ArchivedBlock>, StorageError> {
-        let found = self
-            .waiting
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&from);
-        let mut feed = match found {
-            Some(feed) => feed,
-            None => self.start(source, sealed, from),
-        };
-        let mut blocks = Vec::new();
-        let mut bytes: usize = 0;
-        let mut ended = false;
-        while blocks.len() < limits.items && bytes < limits.bytes {
-            match feed.blocks.recv().await {
-                Some(Ok((block, _places))) => {
-                    bytes =
-                        bytes.saturating_add(usize::try_from(size(&block)).unwrap_or(usize::MAX));
-                    blocks.push(block);
-                }
-                // The feed is dropped with its error: the next read starts over.
-                Some(Err(err)) => return Err(err),
-                None => {
-                    ended = true;
-                    break;
-                }
-            }
-        }
-        if !ended {
-            let next = from.saturating_add(u64::try_from(blocks.len()).unwrap_or(u64::MAX));
-            feed.used = Instant::now();
-            self.keep(next, feed);
-        }
-        Ok(blocks)
-    }
-
-    /// Starts a feed of the sealed chunks from `from` to the last one listed now.
-    fn start<S: ChunkSource>(&self, source: &S, sealed: &Sealed, from: BlockNumber) -> Feed {
-        let chunks: Vec<ChunkRange> = sealed
-            .chunks
-            .iter()
-            .filter(|chunk| chunk.last >= from)
-            .copied()
-            .collect();
+    ) -> Feed {
+        let chunks = Arc::clone(&sealed.chunks);
         let (sender, blocks) = mpsc::channel(FEED_BLOCKS);
         let source = source.clone();
         let read_ahead = Arc::clone(&self.read_ahead);
         let streams = Arc::clone(&self.streams);
         let own = Arc::new(Semaphore::new(MAX_FEED_KIB as usize));
-        let task = tokio::spawn(async move {
-            for chunk in chunks {
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
+            for chunk in chunks.iter().filter(|chunk| chunk.last >= from) {
                 // Held while this chunk's stream is open.
                 let Ok(_open) = Arc::clone(&streams).acquire_owned().await else {
                     return;
                 };
-                let mut stream = source.stream(&chunk, from.max(chunk.first));
+                let mut stream = source.stream(chunk, from.max(chunk.first));
                 // Each chunk's stream yields its blocks in order from the one asked for.
                 while let Some(block) = stream.next().await {
                     let fed = match block.map_err(remote("chunk read")) {
@@ -182,25 +107,29 @@ impl Feeds {
                 }
             }
         });
-        Feed {
-            blocks,
-            task,
-            used: Instant::now(),
-        }
+        Feed { blocks, tasks }
     }
+}
 
-    /// Keeps `feed` for its reader's next read, at `next`.
-    fn keep(&self, next: BlockNumber, feed: Feed) {
-        let mut feeds = self.waiting.lock().unwrap_or_else(PoisonError::into_inner);
-        feeds.retain(|_, feed| feed.used.elapsed() < FEED_IDLE);
-        if feeds.len() >= MAX_FEEDS
-            && let Some(oldest) = feeds
-                .iter()
-                .min_by_key(|(_, feed)| feed.used)
-                .map(|(next, _)| *next)
-        {
-            feeds.remove(&oldest);
+impl Feed {
+    /// Takes the next bounded batch, releasing each block's read-ahead permits.
+    pub(crate) async fn read(
+        &mut self,
+        limits: ReadLimits,
+    ) -> Result<Vec<ArchivedBlock>, StorageError> {
+        let mut blocks = Vec::new();
+        let mut bytes = 0_usize;
+        while blocks.len() < limits.items && bytes < limits.bytes {
+            let Some(block) = self.blocks.recv().await else {
+                if let Some(Err(err)) = self.tasks.join_next().await {
+                    return Err(remote("range reader task")(std::io::Error::other(err)));
+                }
+                break;
+            };
+            let (block, _places) = block?;
+            bytes = bytes.saturating_add(usize::try_from(size(&block)).unwrap_or(usize::MAX));
+            blocks.push(block);
         }
-        feeds.insert(next, feed);
+        Ok(blocks)
     }
 }

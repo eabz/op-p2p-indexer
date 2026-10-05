@@ -141,7 +141,7 @@ enum Stop {
 impl<U, A> Promoter<U, A>
 where
     U: UnsafeStore + Clone + Send + Sync + 'static,
-    A: ArchiveStore + Clone + Send + Sync + 'static,
+    A: ArchiveStore,
 {
     /// Creates the task. Makes no store call: [`Self::reconcile`] must run before
     /// [`Self::run`].

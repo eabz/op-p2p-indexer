@@ -1,6 +1,5 @@
 //! Configuration from `OP_INDEXER_*` environment variables.
 
-use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -11,6 +10,7 @@ use op_indexer_chainspec::{ChainSpec, OP_MAINNET};
 use op_indexer_el::{ElConfig, PeerConfig};
 use op_indexer_p2p::{Bootnode, NetworkConfig};
 use op_indexer_primitives::{ChainIdentity, ExecutionPeer};
+use op_indexer_runtime::env_var as var;
 use op_indexer_storage::{ArchiveConfig, StorageConfig, UnsafeConfig};
 use op_indexer_stream::StreamConfig;
 
@@ -37,7 +37,7 @@ const DEFAULT_L1_BEACON_LISTEN_ADDR: SocketAddr =
 /// The port next to the execution network's.
 const DEFAULT_L1_LISTEN_ADDR: SocketAddr =
     SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 30304);
-/// Local only: the stream has no authentication. Clear of the p2p (9222), execution (30303),
+/// Local by default; API keys are optional. Clear of the p2p (9222), execution (30303),
 /// and L1 (30304, 9001) ports.
 const DEFAULT_STREAM_LISTEN_ADDR: SocketAddr =
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50051);
@@ -82,9 +82,50 @@ pub(crate) struct L1Settings {
     pub(crate) checkpoint: B256,
 }
 
+/// Defaults for the node's intended role. Explicit capability variables override these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Profile {
+    /// Gossip and verified execution receipts, without historical range sync or L1 tracking.
+    Live,
+    /// Execution receipts, historical range sync and checkpoint-based L1 tracking.
+    Archive,
+    /// Archive capabilities using the server binary's object-store-backed history.
+    Fleet,
+}
+
+impl Profile {
+    fn from_env() -> eyre::Result<Option<Self>> {
+        match var("OP_INDEXER_PROFILE").as_deref() {
+            None => Ok(None),
+            Some("live") => Ok(Some(Self::Live)),
+            Some("archive") => Ok(Some(Self::Archive)),
+            Some("fleet") => Ok(Some(Self::Fleet)),
+            Some(value) => Err(eyre!(
+                "invalid OP_INDEXER_PROFILE: {value}; expected live, archive or fleet"
+            )),
+        }
+    }
+
+    /// Returns the name used in configuration and startup logs.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Archive => "archive",
+            Self::Fleet => "fleet",
+        }
+    }
+
+    const fn history(self) -> bool {
+        matches!(self, Self::Archive | Self::Fleet)
+    }
+}
+
 /// Process configuration.
 #[derive(Debug)]
 pub struct Config {
+    profile: Option<Profile>,
     pub(crate) network: NetworkConfig,
     /// The execution network, which fetches receipts; `None` when it is disabled.
     pub(crate) el: Option<ElSettings>,
@@ -106,6 +147,11 @@ pub struct Config {
 impl Config {
     /// Reads the configuration:
     ///
+    /// - `OP_INDEXER_PROFILE`: optional `live` (execution receipts), `archive` (receipts,
+    ///   range sync and L1 tracking), or `fleet` (archive defaults, requires the server binary
+    ///   and its object storage). Archive and fleet need `OP_INDEXER_L1_CHECKPOINT` while L1
+    ///   is enabled. Explicit capability variables override profile defaults; dependency
+    ///   validation still applies. Unset preserves the legacy defaults (all three off).
     /// - `OP_INDEXER_CHAIN_ID`: L2 chain id, one of [`ChainSpec::ALL`] (default 10, OP
     ///   Mainnet).
     /// - `OP_INDEXER_P2P_LISTEN_ADDR`: p2p listen socket, TCP and UDP (default `0.0.0.0:9222`).
@@ -171,7 +217,7 @@ impl Config {
     ///   on a server with a public address: L1 peers have few free slots, and a node they
     ///   can dial gets sessions it would not get by dialing.
     /// - `OP_INDEXER_STREAM_LISTEN_ADDR`: gRPC listen socket of the stream (default
-    ///   `127.0.0.1:50051`, local only: the stream has no authentication).
+    ///   `127.0.0.1:50051`, local only; API keys are configured separately).
     /// - `OP_INDEXER_STREAM_MAX_SUBSCRIPTIONS`: stream subscriptions at once (default 64).
     /// - `OP_INDEXER_STREAM_MAX_FLIGHTS`: Arrow Flight `DoGet` streams at once, on the same
     ///   listener (default 8).
@@ -183,6 +229,8 @@ impl Config {
     ///
     /// Returns an error if a variable is invalid or the settings contradict each other.
     pub fn from_env() -> eyre::Result<Self> {
+        let profile = Profile::from_env()?;
+        let history = profile.is_some_and(Profile::history);
         let chain_id = parse_var("OP_INDEXER_CHAIN_ID")?.unwrap_or(DEFAULT_CHAIN_ID);
         let chain = ChainSpec::by_chain_id(chain_id)
             .ok_or_else(|| eyre!("unsupported chain id {chain_id}"))?;
@@ -202,13 +250,13 @@ impl Config {
             path: data_dir.join(ARCHIVE_DIR),
         };
 
-        let el = el_settings(chain)?;
-        let sync = parse_var(SYNC_VAR)?.unwrap_or(false);
+        let el = el_settings(chain, profile.is_some())?;
+        let sync = parse_var(SYNC_VAR)?.unwrap_or(history);
         ensure!(
             !sync || el.is_some(),
             "{SYNC_VAR} needs the execution network: set OP_INDEXER_EL_ENABLED=true"
         );
-        let l1 = l1_settings()?;
+        let l1 = l1_settings(history)?;
         // Promotion records only what the archive holds; with the L1 side, range sync is what
         // fills a gap gossip left, so without it the committed chain would stop at the first.
         ensure!(
@@ -232,6 +280,7 @@ impl Config {
                 .unwrap_or_default(),
         };
         Ok(Self {
+            profile,
             l1,
             stream,
             el,
@@ -263,6 +312,24 @@ impl Config {
 }
 
 impl Config {
+    /// Returns the selected profile, or `None` for legacy environment-only defaults.
+    #[must_use]
+    pub const fn profile(&self) -> Option<Profile> {
+        self.profile
+    }
+
+    pub(crate) fn log_capabilities(&self) {
+        tracing::info!(
+            profile = self.profile.map_or("legacy", Profile::as_str),
+            chain_id = self.network.chain.chain_id,
+            execution_receipts = self.el.is_some(),
+            range_sync = self.sync,
+            l1_tracking = self.l1.is_some(),
+            stream = %self.stream.listen_addr,
+            "node capabilities"
+        );
+    }
+
     /// The chain the node runs.
     #[must_use]
     pub const fn chain(&self) -> &'static ChainSpec {
@@ -311,8 +378,11 @@ fn default_data_dir(chain: &ChainSpec) -> eyre::Result<PathBuf> {
 }
 
 /// Reads the execution network's settings; `None` unless it is enabled.
-fn el_settings(chain: &'static ChainSpec) -> eyre::Result<Option<ElSettings>> {
-    if !parse_var("OP_INDEXER_EL_ENABLED")?.unwrap_or(false) {
+fn el_settings(
+    chain: &'static ChainSpec,
+    enabled_by_default: bool,
+) -> eyre::Result<Option<ElSettings>> {
+    if !parse_var("OP_INDEXER_EL_ENABLED")?.unwrap_or(enabled_by_default) {
         return Ok(None);
     }
     Ok(Some(ElSettings {
@@ -346,8 +416,8 @@ fn max_sessions() -> eyre::Result<usize> {
 }
 
 /// Reads the L1 side's settings; `None` unless it is enabled.
-fn l1_settings() -> eyre::Result<Option<L1Settings>> {
-    if !parse_var(L1_ENABLED_VAR)?.unwrap_or(false) {
+fn l1_settings(enabled_by_default: bool) -> eyre::Result<Option<L1Settings>> {
+    if !parse_var(L1_ENABLED_VAR)?.unwrap_or(enabled_by_default) {
         return Ok(None);
     }
     let checkpoint = parse_var(L1_CHECKPOINT_VAR)?.ok_or_else(|| {
@@ -360,10 +430,6 @@ fn l1_settings() -> eyre::Result<Option<L1Settings>> {
         advertised_addr: parse_var("OP_INDEXER_L1_ADVERTISED_ADDR")?,
         checkpoint,
     }))
-}
-
-fn var(name: &str) -> Option<String> {
-    env::var(name).ok().filter(|value| !value.is_empty())
 }
 
 fn parse_bootnode(bootnode: &str) -> eyre::Result<Bootnode> {

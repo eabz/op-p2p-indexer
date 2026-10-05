@@ -17,11 +17,13 @@
 //!
 //! This is the one crate that talks to an external service besides the importer (`CLAUDE.md`).
 
+mod config;
 mod format;
 mod hash_index;
 mod manifest;
 mod store;
 
+pub use config::R2ConfigError;
 pub use format::{ChunkIndex, ChunkRecord, ChunkWriter, SealedChunk};
 pub use hash_index::{IndexBuilder, IndexGeneration};
 pub use manifest::{ChunkEntry, Manifest};

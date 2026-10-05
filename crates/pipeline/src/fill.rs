@@ -31,6 +31,9 @@ use crate::retry::{RetryError, retry};
 /// Heights below the unsafe head a hole may reach to be filled: about 12 hours of a 1 s
 /// chain, a few hundred MB at most of unsafe blocks. Older holes are left to range sync.
 const MAX_FILL_SPAN: u64 = 32_768;
+/// With range sync and no L1 side: how far below the head a hole is still the fill's. Range
+/// sync plans a round once the archive is this far behind, so deeper holes are its.
+const RECENT_SPAN: u64 = 1024;
 /// How often the unsafe chain is looked at for holes.
 const CHECK_INTERVAL: Duration = Duration::from_secs(10);
 /// How long a span asked for is not asked for again while it is being fetched.
@@ -42,12 +45,24 @@ const ASK_AGAIN: Duration = Duration::from_mins(2);
 async fn lowest_hole<U: UnsafeStore, A: ArchiveStore>(
     store: &U,
     archive: &A,
+    reach: FillReach,
 ) -> Option<FillRequest> {
     let head = store.head().await.ok()??;
-    let tip = archive.range().await.ok()?.map(|(_, tip)| tip.number);
-    let floor = tip
-        .map_or(0, |tip| tip.saturating_add(1))
+    // An empty archive is range sync's (or the importer's) to fill.
+    let (_, tip) = archive.range().await.ok()??;
+    let mut floor = tip
+        .number
+        .saturating_add(1)
         .max(head.number.saturating_sub(MAX_FILL_SPAN));
+    match reach {
+        FillReach::Any => {}
+        // Range sync fetches up to the safe head; above it is the fill's.
+        FillReach::AboveSafe => {
+            let safe = archive.heads().await.ok()?.safe?;
+            floor = floor.max(safe.number.saturating_add(1));
+        }
+        FillReach::Recent => floor = floor.max(head.number.saturating_sub(RECENT_SPAN)),
+    }
     let span = usize::try_from(head.number.saturating_sub(floor))
         .ok()?
         .saturating_add(1);
@@ -71,6 +86,18 @@ async fn lowest_hole<U: UnsafeStore, A: ArchiveStore>(
     None
 }
 
+/// Which holes the fill closes, given what range sync closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FillReach {
+    /// Every hole within 32,768 blocks of the head: no range sync runs.
+    Any,
+    /// Holes above the committed safe head: range sync with the L1 side fetches up to it.
+    AboveSafe,
+    /// Holes within 1,024 blocks of the head: range sync without the L1 side fetches the
+    /// archive up to near the head once it is further behind.
+    Recent,
+}
+
 /// Asks for the lowest hole on `requests` every [`CHECK_INTERVAL`], and stores the blocks
 /// received on `filled` (each batch a consecutive span, ascending, verified by the fetcher),
 /// until the channel closes or `cancel` fires.
@@ -82,8 +109,11 @@ async fn lowest_hole<U: UnsafeStore, A: ArchiveStore>(
 pub(crate) async fn run<U: UnsafeStore, A: ArchiveStore>(
     store: U,
     archive: A,
-    requests: mpsc::Sender<FillRequest>,
-    mut filled: mpsc::Receiver<Vec<EncodedBlock>>,
+    (requests, mut filled, reach): (
+        mpsc::Sender<FillRequest>,
+        mpsc::Receiver<Vec<EncodedBlock>>,
+        FillReach,
+    ),
     cancel: CancellationToken,
 ) -> Result<(), PipelineError> {
     let mut check = interval(CHECK_INTERVAL);
@@ -95,7 +125,7 @@ pub(crate) async fn run<U: UnsafeStore, A: ArchiveStore>(
             biased;
             () = cancel.cancelled() => return Ok(()),
             _ = check.tick() => {
-                if let Some(request) = lowest_hole(&store, &archive).await
+                if let Some(request) = lowest_hole(&store, &archive, reach).await
                     && asked.is_none_or(|(first, at)| first != request.first || at.elapsed() >= ASK_AGAIN)
                     && requests.try_send(request).is_ok()
                 {

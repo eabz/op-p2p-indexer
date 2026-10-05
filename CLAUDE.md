@@ -6,7 +6,8 @@ validates and decodes payloads with alloy / op-alloy types, and indexes them. It
 node. Receipts and logs come from L2 execution peers, verified against the block header. The
 node is a source of data: consumers subscribe to it over gRPC (the `stream` crate).
 
-Scope, decisions and the order of work are in [`docs/roadmap.md`](docs/roadmap.md); each crate's
+Current architecture is in [`docs/architecture.md`](docs/architecture.md), remaining work in
+[`docs/roadmap.md`](docs/roadmap.md), and historical decisions in [`docs/decisions.md`](docs/decisions.md); each crate's
 spec is linked from there (storage: [`docs/storage.md`](docs/storage.md)). Read the roadmap
 before proposing a design, and record new decisions there.
 
@@ -18,10 +19,12 @@ before proposing a design, and record new decisions there.
 | `bin/server` | `server` | The full node for serving at scale: thin binary over `crates/node` with history read from R2 (`crates/server`); `--export` (or `OP_INDEXER_EXPORT=true`) makes it the deployment's single exporter | node, server, chunks, storage, chainspec |
 | `crates/node` | `op-indexer-node` | Shared node wiring for `indexer` and `server`: config (`Config::from_env`), `.env` loading, tracing, startup, shutdown | chainspec, p2p, el, l1, storage, pipeline, stream, primitives |
 | `crates/server` | `op-indexer-server` | The server's committed store: R2-backed `ArchiveStore` (sealed chunks through `crates/chunks` plus a local fjall tail) and the exporter | chainspec, chunks, primitives, storage |
-| `bin/balancer` | `balancer` | The directory for a fleet of servers: thin binary over `crates/balancer` | balancer, chainspec, chunks, node |
-| `crates/balancer` | `op-indexer-balancer` | Servers register and heartbeat (health, heads, load); Arrow Flight `GetFlightInfo` splits a range into per-chunk jobs on the least-loaded servers; `Locate` for subscriptions; the registration client the server uses. No block data passes through it | chainspec, chunks, stream |
+| `bin/balancer` | `balancer` | The directory for a fleet of servers: thin binary over `crates/balancer` | balancer, chainspec, chunks, runtime |
+| `crates/balancer` | `op-indexer-balancer` | Servers register and heartbeat (health, heads, load); Arrow Flight `GetFlightInfo` splits a range into per-chunk jobs on the least-loaded servers; `Locate` for subscriptions; the registration client the server uses. No block data passes through it | api, chainspec, chunks |
 | `bin/op-indexer-import` | `op-indexer-import` (binary `import`) | Command-line importer, a separate process: downloads a block range from an external archive (Envio HyperSync), then `verify` checks every block (hashes, roots, senders), seals it into chunks and uploads them to R2, deleting each downloaded chunk once uploaded; the chunks are listed in the manifest only when the range matches its anchor | chainspec, primitives, chunks |
 | `crates/chunks` | `op-indexer-chunks` | Sealed block chunks in object storage (Cloudflare R2 through `object_store`'s S3 API): chunk format (zstd segments, index, footer), the hash-chained manifest, the global hash index, and the client; written by `import verify` and the server's exporter, read by `server` | primitives, chainspec |
+| `crates/runtime` | `op-indexer-runtime` | Shared environment loading, tracing and shutdown signals, without node dependencies | none |
+| `crates/api` | `op-indexer-api` | Shared API keys and Flight tickets, without storage dependencies | none |
 | `crates/primitives` | `op-indexer-primitives` | Shared domain types (alloy and op-alloy only) | none |
 | `crates/chainspec` | `op-indexer-chainspec` | Every per-chain value, for each supported chain (OP Mainnet, Unichain, Base): chain id, sequencer signer, consensus and execution bootnodes, execution discovery identity, genesis, fork blocks and the per-chain list of time forks, block time, dispute game factory and its game types. The one exception is the importer's HyperSync endpoint, which stays in the importer | none |
 | `crates/p2p` | `op-indexer-p2p` | discv5 discovery, gossipsub block gossip (scoring, connection limits), unsafe-block validation, fjall node state (identity, saved peers and sync progress, for `el` and `l1` too) | primitives, chainspec |
@@ -49,7 +52,7 @@ before proposing a design, and record new decisions there.
   history: there is no retention window), in its consensus encoding, with its transaction senders
   and the committed L1 heads. It is what the node serves to peers and streams to consumers. Embedded; needs no service.
 
-There is no Redis and no ClickHouse: the binary needs no other service. At startup it opens the archive and the unsafe chain's journal (replaying it), and exits if either belongs to another chain. Settings are `OP_INDEXER_*` environment variables, which every binary also reads from `.env` in the current directory (or `--env-file <path>`); the process environment wins. `.env.example` lists every variable of every binary, and the node's are documented on `Config::from_env` in `crates/node/src/config.rs`. There is no Docker setup for now.
+There is no Redis and no ClickHouse: the binary needs no other service. At startup it opens the archive and the unsafe chain's journal (replaying it), and exits if either belongs to another chain. Optional `OP_INDEXER_PROFILE=live|archive|fleet` selects capability defaults; explicit environment values override them, and unset preserves legacy defaults. Settings are `OP_INDEXER_*` environment variables, which every binary also reads from `.env` in the current directory (or `--env-file <path>`); the process environment wins. `.env.example` lists every variable of every binary, and the node's are documented on `Config::from_env` in `crates/node/src/config.rs`. There is no Docker setup for now.
 
 ## Project skills
 

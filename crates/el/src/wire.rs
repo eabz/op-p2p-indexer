@@ -40,12 +40,14 @@ pub(crate) const BLOCK_RANGE_UPDATE: u8 = 0x11;
 #[derive(Debug)]
 pub(crate) enum Request {
     /// `GetBlockHeaders`: up to `limit` headers going down from the block with hash `start`,
-    /// inclusive.
+    /// inclusive, `skip` blocks between two.
     Headers {
         /// Hash of the highest header wanted.
         start: B256,
         /// Most headers wanted.
         limit: u64,
+        /// Blocks left out between two headers: 0 for consecutive ones.
+        skip: u32,
     },
     /// `GetBlockBodies` for these block hashes.
     Bodies(Vec<B256>),
@@ -66,13 +68,13 @@ impl Request {
     /// Encodes the request as a message: its id byte, then the request id and the request.
     pub(crate) fn encode(&self, request_id: u64) -> Bytes {
         match self {
-            Self::Headers { start, limit } => encode(
+            Self::Headers { start, limit, skip } => encode(
                 GET_BLOCK_HEADERS,
                 request_id,
                 &GetBlockHeaders {
                     start_block: (*start).into(),
                     limit: *limit,
-                    skip: 0,
+                    skip: *skip,
                     direction: HeadersDirection::Falling,
                 },
             ),

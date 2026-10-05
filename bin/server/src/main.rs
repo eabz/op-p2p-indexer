@@ -6,7 +6,7 @@
 //! With `--export` (or `OP_INDEXER_EXPORT=true`) it is also the deployment's exporter, which seals full chunks from its tail
 //! into R2 (section 4). Exactly one server per deployment runs it, with the only R2 write key.
 //!
-//! Loads the `.env` file ([`op_indexer_node::env_file`]), sets up tracing, reads the
+//! Loads the `.env` file ([`op_indexer_runtime::env_file`]), sets up tracing, reads the
 //! configuration (the node's, then the server's own), opens the
 //! tail and the chunk store, and runs the node ([`op_indexer_node::run`]) with the manifest
 //! follower and, when exporting, the exporter next to it.
@@ -26,14 +26,9 @@ use op_indexer_server::{ChunkSource, Exporter, R2Archive, R2Chunks};
 use op_indexer_storage::ArchiveStore;
 use op_indexer_storage::archive_store::FjallArchive;
 use tokio::sync::watch;
-use tracing::info;
-use tracing_subscriber::EnvFilter;
-use tracing_subscriber::fmt::time::ChronoUtc;
 
 use crate::config::{Chunks, ServerConfig};
 
-/// Log timestamp: UTC time of day with milliseconds, e.g. `13:04:12.345`.
-const LOG_TIME_FORMAT: &str = "%H:%M:%S%.3f";
 /// Directory of the hash-index builder's spill files, inside the data directory.
 const INDEX_DIR: &str = "index-build";
 /// Directory of the tail, inside the data directory. Not the indexer's `archive`: the tail
@@ -42,7 +37,7 @@ const TAIL_DIR: &str = "tail";
 
 fn main() -> eyre::Result<()> {
     // Before the runtime starts any thread: loading sets environment variables.
-    let env_file = op_indexer_node::env_file::load(std::env::args_os().skip(1))?;
+    let env_file = op_indexer_runtime::env_file::load(std::env::args_os().skip(1))?;
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -51,15 +46,7 @@ fn main() -> eyre::Result<()> {
 }
 
 async fn run(env_file: Option<PathBuf>) -> eyre::Result<()> {
-    tracing_subscriber::fmt()
-        .with_timer(ChronoUtc::new(LOG_TIME_FORMAT.to_owned()))
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
-    if let Some(path) = env_file {
-        info!(path = %path.display(), "loaded env file");
-    }
+    op_indexer_runtime::init_tracing(env_file.as_deref());
 
     let config = Config::from_env()?;
     let chain = config.chain();

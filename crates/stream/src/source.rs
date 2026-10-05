@@ -9,7 +9,10 @@ use std::future::Future;
 
 use alloy_primitives::{B256, BlockNumber};
 use op_indexer_primitives::{BlockRef, L1Heads, ReadLimits};
-use op_indexer_storage::{ArchiveStore, RetryError, StorageError, Store, UnsafeStore, retry};
+use op_indexer_storage::{
+    ArchiveRange, ArchiveStore, RetryError, StorageError, Store, UnsafeStore, retry,
+};
+use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::convert::{ConvertError, Prepared, StoredBlock};
@@ -72,6 +75,24 @@ pub(crate) struct Source<U, A> {
     /// Whether range sync fills the archive from its tip up, so the heights between it and the
     /// unsafe store will be held.
     pub(crate) fills_gaps: bool,
+}
+
+/// A request's archive position and owned read-ahead. Rewinds replace the stream.
+#[derive(Default)]
+pub(crate) struct History {
+    tip: Option<BlockNumber>,
+    next: Option<BlockNumber>,
+    stream: Option<ArchiveRange>,
+}
+
+impl std::fmt::Debug for History {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("History")
+            .field("tip", &self.tip)
+            .field("next", &self.next)
+            .finish_non_exhaustive()
+    }
 }
 
 /// What the stores hold, as [`Source::holdings`] read it.
@@ -147,21 +168,21 @@ impl<U: UnsafeStore, A: ArchiveStore> Source<U, A> {
 
     /// The canonical blocks from `from` upwards, oldest first: from the archive while `from`
     /// is in it, else from the unsafe store, up to its head. Empty when no canonical block is
-    /// held at `from` (above the head, or in a gap). `tip` remembers where the archive was
+    /// held at `from` (above the head, or in a gap). `history` remembers where the archive was
     /// found to end between calls, so a read above it does not ask the archive first. A batch
-    /// the archive returns ends at its limits, not at the archive's end, so `tip` is set only
+    /// the archive returns ends at its limits, not at the archive's end, so its tip is set only
     /// when the archive holds nothing at `from`.
     pub(crate) async fn blocks_from(
         &self,
         from: BlockNumber,
-        tip: &mut Option<BlockNumber>,
+        history: &mut History,
     ) -> Result<Vec<Prepared>, ReadError> {
-        if tip.is_none_or(|tip| from <= tip) {
-            let archived = self.archived(from, HISTORY_BATCH).await?;
+        if history.tip.is_none_or(|tip| from <= tip) {
+            let archived = self.history_batch(from, history).await?;
             if !archived.is_empty() {
                 return Ok(archived);
             }
-            *tip = Some(from.saturating_sub(1));
+            history.tip = Some(from.saturating_sub(1));
         }
         match self.unsafe_from(from).await? {
             // Above the head: nothing is there yet.
@@ -170,11 +191,43 @@ impl<U: UnsafeStore, A: ArchiveStore> Source<U, A> {
             Some(_) => {}
         }
         // Promoted meanwhile: archived, then pruned from the unsafe store.
-        let archived = self.archived(from, HISTORY_BATCH).await?;
+        let archived = self.history_batch(from, history).await?;
         if !archived.is_empty() {
-            *tip = None;
+            history.tip = None;
         }
         Ok(archived)
+    }
+
+    /// Reads the next owned batch; transient failures reopen at the undelivered height.
+    async fn history_batch(
+        &self,
+        from: BlockNumber,
+        history: &mut History,
+    ) -> Result<Vec<Prepared>, ReadError> {
+        let mut current = history.stream.take().filter(|_| history.next == Some(from));
+        let (blocks, stream) = self
+            .call(Store::Archive, "archive range", || {
+                let mut stream = current
+                    .take()
+                    .unwrap_or_else(|| self.archive.read_range(from, HISTORY_BATCH));
+                async move {
+                    let blocks = stream.next().await.transpose()?.unwrap_or_default();
+                    Ok((blocks, stream))
+                }
+            })
+            .await?;
+        if blocks.is_empty() {
+            history.next = None;
+        } else {
+            history.next = u64::try_from(blocks.len())
+                .ok()
+                .and_then(|len| from.checked_add(len));
+            history.stream = Some(stream);
+        }
+        blocks
+            .into_iter()
+            .map(|block| Ok(Prepared::new(StoredBlock::Archived(block))?))
+            .collect()
     }
 
     /// The unsafe store's canonical blocks from `from`, at most a batch: the block a batch

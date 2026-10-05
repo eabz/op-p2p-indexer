@@ -1,8 +1,7 @@
-//! The four Arrow tables Flight serves: blocks into record batches, and their schemas.
+//! Converts blocks into record batches for the four Arrow tables Flight serves.
 //!
-//! Each table is one list of columns, each a name, its values and whether it may be null, so
-//! a column's place, type and values are written once; the schema is that list built from no
-//! blocks. Hashes are `FixedSizeBinary(32)`, addresses `FixedSizeBinary(20)`, wei amounts
+//! Each table builds a list of columns and checks it against the shared API schema.
+//! Hashes are `FixedSizeBinary(32)`, addresses `FixedSizeBinary(20)`, wei amounts
 //! `FixedSizeBinary(32)` big-endian (a 256-bit value does not fit `Decimal256`, whose 76 digits
 //! stop short of 2^256), timestamps `Timestamp(Second, UTC)`.
 //!
@@ -20,71 +19,41 @@ use arrow_array::{
     TimestampSecondArray, UInt8Array, UInt32Array, UInt64Array,
 };
 use arrow_flight::error::FlightError;
-use arrow_schema::{ArrowError, SchemaRef};
+use arrow_schema::ArrowError;
 use op_alloy_consensus::{OpReceiptEnvelope, OpTxEnvelope};
+use op_indexer_api::ticket::Table;
 use op_indexer_primitives::{DecodedBlock, L1Heads};
 
 use crate::convert::{Prepared, encoded, max_fee_per_gas, nonce, status};
 use crate::proto;
 
-/// A table Flight serves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Table {
-    /// One row per block: the header.
-    Blocks,
-    /// One row per transaction.
-    Transactions,
-    /// One row per receipt.
-    Receipts,
-    /// One row per log.
-    Logs,
-}
-
 /// A column: its name, its values, and whether it may be null.
 type Column = (&'static str, ArrayRef, bool);
 
-impl Table {
-    /// Every table, in the order they are listed.
-    pub const ALL: [Self; 4] = [Self::Blocks, Self::Transactions, Self::Receipts, Self::Logs];
-
-    /// The table's name, in descriptors and tickets.
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Blocks => "blocks",
-            Self::Transactions => "transactions",
-            Self::Receipts => "receipts",
-            Self::Logs => "logs",
-        }
-    }
-
-    /// The table named `name`.
-    pub fn parse(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|table| table.name() == name)
-    }
-
-    /// The table's schema: its columns for no blocks.
-    ///
-    /// # Errors
-    ///
-    /// Returns the Arrow error if the empty batch cannot be built, which would be a bug.
-    pub fn schema(self) -> Result<SchemaRef, FlightError> {
-        Ok(self.batch(&[], &L1Heads::default())?.schema())
-    }
-
+/// Converts shared table identifiers into this server's Arrow rows.
+pub(super) trait TableRows {
+    fn batch(self, blocks: &[Prepared], heads: &L1Heads) -> Result<RecordBatch, FlightError>;
+}
+impl TableRows for Table {
     /// The table's rows for `blocks`, as one record batch, with each block's status under
     /// `heads`. Blocks without receipts add no rows to `receipts` and `logs`.
-    pub(crate) fn batch(
-        self,
-        blocks: &[Prepared],
-        heads: &L1Heads,
-    ) -> Result<RecordBatch, FlightError> {
+    fn batch(self, blocks: &[Prepared], heads: &L1Heads) -> Result<RecordBatch, FlightError> {
         let columns = match self {
             Self::Blocks => blocks_columns(blocks, heads)?,
             Self::Transactions => transactions_columns(&decode(blocks)?)?,
             Self::Receipts => receipts_columns(&decode(blocks)?)?,
             Self::Logs => logs_columns(&decode(blocks)?)?,
         };
-        Ok(RecordBatch::try_from_iter_with_nullable(columns)?)
+        // Check every batch against the same contract advertised by the directory.
+        let batch = RecordBatch::try_from_iter_with_nullable(columns)?;
+        if batch.schema() != self.schema() {
+            return Err(ArrowError::SchemaError(format!(
+                "{} columns do not match the shared API schema",
+                self.name()
+            ))
+            .into());
+        }
+        Ok(batch)
     }
 }
 

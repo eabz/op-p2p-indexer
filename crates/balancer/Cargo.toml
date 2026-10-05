@@ -13,7 +13,7 @@ fastrand.workspace = true
 futures-util.workspace = true
 op-indexer-chainspec.workspace = true
 op-indexer-chunks.workspace = true
-op-indexer-stream.workspace = true
+op-indexer-api.workspace = true
 prost.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }

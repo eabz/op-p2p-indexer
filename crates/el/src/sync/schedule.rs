@@ -1,7 +1,7 @@
 //! Which peers the range sync may ask now, and how long a peer is left alone after it failed.
 //!
-//! One job at a time per session and the usual pause between two (`pacing`), plus a longer
-//! rest after a failure. Does not choose what a peer fetches (the syncer does) and does not
+//! A few jobs at a time per session, the usual pause between two starts (`pacing`), plus a
+//! longer rest after a failure. Does not choose what a peer fetches (the syncer does) and does not
 //! drop peers: it says what to report to the peer set.
 
 use std::collections::HashMap;
@@ -15,6 +15,10 @@ use crate::pacing::Pacing;
 use crate::peers::Report;
 use crate::session::SessionHandle;
 
+/// Range sync requests in flight to one peer at once: a peer answers several concurrently, so a
+/// round trip does not bound the rate. Peers' own serving limits (reth answers 1,024 headers or
+/// 2 MiB per request) bound what each holds.
+const IN_FLIGHT_PER_PEER: u32 = 4;
 /// How long a peer is left alone after it did not hold what was asked.
 const NOT_HELD_REST: Duration = Duration::from_mins(1);
 /// How long a peer is left alone after a timeout.
@@ -31,6 +35,8 @@ struct PeerState {
     pacing: Pacing,
     /// Not asked before this, after a failure.
     rest_until: Instant,
+    /// Blocks per second its verified jobs delivered, smoothed: faster peers are asked first.
+    rate: f64,
 }
 
 impl PeerState {
@@ -44,10 +50,30 @@ impl Schedule {
     /// Whether `peer` may be given a job now.
     pub(super) fn is_free(&mut self, peer: PeerId, now: Instant) -> bool {
         let state = self.peers.entry(peer).or_insert(PeerState {
-            pacing: Pacing::new(now),
+            pacing: Pacing::with_limit(now, IN_FLIGHT_PER_PEER),
             rest_until: now,
+            rate: 0.0,
         });
         state.free_at().is_some_and(|at| at <= now)
+    }
+
+    /// Records that `peer` delivered `blocks` verified blocks in `took`.
+    pub(super) fn measured(&mut self, peer: PeerId, blocks: usize, took: Duration) {
+        if let Some(state) = self.peers.get_mut(&peer) {
+            let blocks = f64::from(u32::try_from(blocks).unwrap_or(u32::MAX));
+            let rate = blocks / took.as_secs_f64().max(0.001);
+            // A smoothed rate: a quarter of the new job, three quarters of the past.
+            state.rate = if state.rate > 0.0 {
+                state.rate.mul_add(0.75, rate * 0.25)
+            } else {
+                rate
+            };
+        }
+    }
+
+    /// Blocks per second `peer`'s jobs delivered, smoothed; 0 before its first.
+    pub(super) fn rate(&self, peer: &PeerId) -> f64 {
+        self.peers.get(peer).map_or(0.0, |state| state.rate)
     }
 
     /// Marks `peer` as working on a job.

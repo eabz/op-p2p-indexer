@@ -38,6 +38,10 @@ pub use config::{ArchiveConfig, StorageConfig, UnsafeConfig};
 pub use error::{InvalidBlockReason, ParseError, Severity, StorageError};
 pub use retry::{RetryError, retry};
 
+/// Caller-owned stream of bounded archive batches. Dropping it cancels read-ahead.
+pub type ArchiveRange =
+    futures_util::stream::BoxStream<'static, Result<Vec<ArchivedBlock>, StorageError>>;
+
 /// One of the two stores, for errors and logs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -336,7 +340,7 @@ pub trait UnsafeStore {
 /// contiguous. Nothing is retried. Each call runs on a blocking thread, so dropping its future
 /// does not stop it: `append_batch` and `set_receipts` still run to completion.
 /// The returned futures are `Send`, so a store can be driven from any task.
-pub trait ArchiveStore {
+pub trait ArchiveStore: Clone + Send + Sync + 'static {
     /// Appends consecutive blocks, oldest first, in their original encoding with their
     /// senders. The bytes are stored unchanged, so they must be bytes the caller has verified
     /// (range sync) or encoded from a verified block that survives the round trip (promoted
@@ -417,6 +421,30 @@ pub trait ArchiveStore {
         from: BlockNumber,
         limits: ReadLimits,
     ) -> impl Future<Output = Result<Vec<ArchivedBlock>, StorageError>> + Send;
+
+    /// Streams consecutive blocks in bounded batches until the first missing block.
+    ///
+    /// The caller owns read-ahead and cancels it by dropping the stream. Each batch obeys
+    /// `limits`; batches may observe newer archive snapshots. An error ends the stream,
+    /// and callers may resume at the first block they have not consumed.
+    fn read_range(&self, from: BlockNumber, limits: ReadLimits) -> ArchiveRange {
+        let archive = self.clone();
+        Box::pin(futures_util::stream::unfold(
+            (archive, Some(from)),
+            move |(archive, next)| async move {
+                let from = next?;
+                let blocks = archive.blocks(from, limits).await;
+                if blocks.as_ref().is_ok_and(Vec::is_empty) {
+                    return None;
+                }
+                let next = blocks
+                    .as_ref()
+                    .ok()
+                    .and_then(|blocks| from.checked_add(u64::try_from(blocks.len()).ok()?));
+                Some((blocks, (archive, next)))
+            },
+        ))
+    }
 
     /// Returns the committed L1 safe and finalized heads, as [`Self::set_heads`] recorded
     /// them; `None` for a head never recorded.

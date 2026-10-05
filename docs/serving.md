@@ -5,7 +5,7 @@ Status: **built.** The storage core (`crates/chunks`, sections 1, 2 and 2.4) and
 against a local directory. The stateless `server` (`crates/server`, `bin/server`: history from
 R2 with no cache, section 5; the exporter, `server --export`, section 4) is built and not yet
 run against R2 (5.5). The `balancer` (section 6) is built and checked locally (6.7); the bench
-comes next. Decision: [roadmap.md](roadmap.md), 2026-10-04, "Four binaries". Decisions are
+comes next. Decision: [decisions.md](decisions.md), 2026-10-04, "Four binaries". Decisions are
 marked **D**; the user's answers of 2026-10-04 settled the open questions (they are recorded in
 the decisions). Measurements are from 2026-10-04.
 
@@ -360,9 +360,9 @@ Flight and promotion are unchanged:
 
 ### 5.2 Reads
 
-- **Streaming**: a range read (`blocks(from, limits)`, Flight, a subscription catching up, an
-  eth range) is a pipeline: GET the chunk (or the part of it the range needs, by its segment
-  offsets), decompress segment by segment, check (D5), hand the records out.
+- **Streaming**: Flight and subscription catch-up own an archive range stream. Each stream
+  owns its read-ahead task, and dropping it cancels remote reads. The read path is a pipeline: GET the chunk
+  (or the part of it the range needs, by its segment offsets), decompress segment by segment, check (D5), hand the records out.
   - The next chunk is fetched while this one is served (D4's rule).
   - Read-ahead is bounded: at most two chunks per reader and a global byte budget in memory.
   - Nothing is written to disk and nothing is kept after the reader moves on: this is
@@ -396,7 +396,7 @@ Unchanged code over `R2Archive`:
 - **Flight `DoGet`** streams a ticket's range from R2. A ticket the balancer clipped to one
   chunk (section 6.4) is one GET.
 
-### 5.5 As built (2026-10-04, not run)
+### 5.5 Implementation and recorded local checks
 
 - `crates/node` (`op-indexer-node`) holds the node's wiring, generic over the committed
   store: `indexer` runs it on its fjall archive, `server` on an `R2Archive`. A binary adds
@@ -414,8 +414,9 @@ Unchanged code over `R2Archive`:
   - Its `heads()` raise the finalized (and safe) head to the last sealed block: a chunk is
     sealed only once finalized, so blocks served from R2 report `FINALIZED` in `GetBlock`,
     subscriptions and Flight caps even with the L1 side off.
-  - Read-ahead (5.2): a consumer's `blocks` calls are served by a feed that streams chunk after
-    chunk ahead of it, at most 16 MiB per reader, dropped after 10 s unread; no disk, no cache.
+  - Read-ahead (5.2): each consumer owns a range stream that reads chunk after chunk ahead
+    of it, at most 16 MiB per reader; dropping the reader cancels its producer. No shared
+    next-block lookup, idle expiry, disk writes or chunk cache.
     The read budget (`OP_INDEXER_SERVER_READ_BUDGET_MB`, default 1024) bounds them all,
     whatever the number of readers: half for decoded blocks read ahead, half for the chunk
     streams open at once (about 32 MiB each, with the server's reads of about a segment, two
@@ -618,13 +619,11 @@ environment and are never logged. TLS is not part of this design.
   backend, fake servers): the order by load, a server behind the tip kept out of tip jobs but
   given sealed ones, an unhealthy server given nothing, both kinds of key, another chain, a
   server leaving (removed at once) and a server stalling (removed after 15.0 s).
-- **Not built**: CPU in the load; servers report `bytes_per_second` as 0 for now.
-- **Follow-up** (shipped as is for v0.1.1; [roadmap.md](roadmap.md), "Follow-ups"): the
-  balancer builds two stacks it never runs. It builds storage (fjall) through
-  `op-indexer-stream`, for the ticket types and `ApiKeys`: a light crate for those removes it.
-  It builds the node through `op-indexer-node`, for `env_file` and `shutdown_signal`: a tiny
-  crate for those removes it, and the importer's copy of `env_file` with it. The binaries also
-  repeat their env helpers, R2 settings and tracing setup, which could go in the same crate.
+- **Load reporting**: servers report measured `bytes_per_second` from the change in encoded
+  response bytes over each heartbeat interval. CPU is not part of the load score.
+- **Shared dependencies**: process setup and API utilities live in lightweight crates. The
+  balancer uses those directly instead of depending on the full node and stream server.
+  See [architecture.md](architecture.md) for current boundaries and verification status.
 
 ## 7. The bench (3 to 4 small droplets, one R2 bucket)
 

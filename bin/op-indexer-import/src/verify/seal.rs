@@ -45,31 +45,23 @@ pub(super) fn open_store(args: &VerifyArgs, plan: &Plan) -> eyre::Result<ChunkSt
         return ChunkStore::local(dir, &args.r2_prefix, plan.chain, ReadOptions::default())
             .wrap_err_with(|| format!("failed to use {}", dir.display()));
     }
-    let missing = |name: &str| eyre!("{name} is not set (or pass --to-dir)");
-    let config = R2Config {
-        account_id: args
-            .r2_account_id
-            .clone()
-            .ok_or_else(|| missing("OP_INDEXER_R2_ACCOUNT_ID"))?,
-        bucket: args
-            .r2_bucket
-            .clone()
-            .unwrap_or_else(|| format!("{}-snapshot", plan.chain.name)),
-        prefix: args.r2_prefix.clone(),
-        access_key_id: args
+    let mut config = R2Config::from_lookup(plan.chain, |name| match name {
+        "OP_INDEXER_R2_ACCOUNT_ID" => args.r2_account_id.clone(),
+        "OP_INDEXER_R2_BUCKET" => args.r2_bucket.clone(),
+        "OP_INDEXER_R2_PREFIX" => Some(args.r2_prefix.clone()),
+        "OP_INDEXER_R2_ACCESS_KEY_ID" => args
             .r2_access_key_id
             .as_ref()
-            .ok_or_else(|| missing("OP_INDEXER_R2_ACCESS_KEY_ID"))?
-            .expose()
-            .to_owned(),
-        secret_access_key: args
+            .map(|key| key.expose().to_owned()),
+        "OP_INDEXER_R2_SECRET_ACCESS_KEY" => args
             .r2_secret_access_key
             .as_ref()
-            .ok_or_else(|| missing("OP_INDEXER_R2_SECRET_ACCESS_KEY"))?
-            .expose()
-            .to_owned(),
-        endpoint: args.r2_endpoint.clone(),
-    };
+            .map(|key| key.expose().to_owned()),
+        "OP_INDEXER_R2_ENDPOINT" => args.r2_endpoint.clone(),
+        _ => None,
+    })
+    .wrap_err("R2 configuration is incomplete (or pass --to-dir)")?;
+    config.prefix.clone_from(&args.r2_prefix);
     info!(
         bucket = config.bucket,
         prefix = config.prefix,

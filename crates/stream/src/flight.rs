@@ -10,7 +10,7 @@
 //! with reorgs, is the gRPC subscription's: Flight serves ranges.
 //!
 //! `ListFlights`, `GetFlightInfo` and `GetSchema` describe the four tables
-//! ([`tables::Table`]) and the range each ticket covers; everything else is `UNIMPLEMENTED`.
+//! ([`Table`]) and the range each ticket covers; everything else is `UNIMPLEMENTED`.
 
 mod tables;
 
@@ -36,147 +36,19 @@ use tokio_util::task::TaskTracker;
 use tonic::metadata::MetadataValue;
 use tonic::{Request, Response, Status, Streaming};
 
-pub use self::tables::Table;
+use self::tables::TableRows;
 use crate::Sent;
 use crate::convert::Prepared;
 use crate::sink::Sink;
 use crate::source::{Source, read_status};
+use op_indexer_api::ticket::{Cap, MAX_FLIGHT_BLOCKS, Query, Table};
 
 /// Record batches a `DoGet` producer may hold ready ahead of the consumer: with the one being
 /// built and the one being read, about 50 MiB per stream at most.
 const BATCHES_AHEAD: usize = 1;
-/// The most blocks one `DoGet` covers; a longer range is cut, so one stream does not hold a
-/// permit for days.
-pub const MAX_FLIGHT_BLOCKS: u64 = 100_000;
 
 /// A response stream.
 type Responses<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
-
-/// How far a range may reach.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Cap {
-    /// Up to the finalized head.
-    Finalized,
-    /// Up to the safe head.
-    Safe,
-    /// Up to the unsafe head: blocks above the archive come from the unsafe store, and may
-    /// still be reorged.
-    Any,
-}
-
-impl Cap {
-    const ALL: [Self; 3] = [Self::Finalized, Self::Safe, Self::Any];
-
-    /// The cap's name in a ticket.
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Finalized => "finalized",
-            Self::Safe => "safe",
-            Self::Any => "any",
-        }
-    }
-}
-
-/// What a ticket or a descriptor asks for: a table, an inclusive block range and a cap.
-#[derive(Debug, Clone, Copy)]
-pub struct Query {
-    /// The table.
-    pub table: Table,
-    /// `None` for the lowest block held.
-    pub from: Option<BlockNumber>,
-    /// The last block, inclusive.
-    pub to: BlockNumber,
-    /// How far the range may reach.
-    pub cap: Cap,
-}
-
-/// A request that names something not served.
-fn not_served(what: &str, all: impl Iterator<Item = &'static str>) -> Status {
-    Status::invalid_argument(format!("{what}: {}", all.collect::<Vec<_>>().join(", ")))
-}
-
-impl Query {
-    /// The whole of `table`, at any status.
-    pub const fn whole(table: Table) -> Self {
-        Self {
-            table,
-            from: None,
-            to: BlockNumber::MAX,
-            cap: Cap::Any,
-        }
-    }
-
-    /// Reads `table:from:to[:cap]`.
-    ///
-    /// # Errors
-    ///
-    /// `INVALID_ARGUMENT` if the text is not a ticket, or names a table or cap not served.
-    pub fn parse(text: &[u8]) -> Result<Self, Status> {
-        let invalid = || Status::invalid_argument("a ticket is `table:from:to[:cap]`");
-        let text = std::str::from_utf8(text).map_err(|_not_text| invalid())?;
-        let mut parts = text.split(':');
-        let table = parts
-            .next()
-            .and_then(Table::parse)
-            .ok_or_else(|| not_served("tables", Table::ALL.into_iter().map(Table::name)))?;
-        let mut number = || {
-            parts
-                .next()
-                .and_then(|part| part.parse::<BlockNumber>().ok())
-                .ok_or_else(invalid)
-        };
-        let (from, to) = (number()?, number()?);
-        if to < from {
-            return Err(Status::invalid_argument("`to` is below `from`"));
-        }
-        let cap = match parts.next() {
-            None => Cap::Any,
-            Some(name) => Cap::ALL
-                .into_iter()
-                .find(|cap| cap.name() == name)
-                .ok_or_else(|| not_served("caps", Cap::ALL.into_iter().map(Cap::name)))?,
-        };
-        if parts.next().is_some() {
-            return Err(invalid());
-        }
-        Ok(Self {
-            table,
-            from: Some(from),
-            to,
-            cap,
-        })
-    }
-
-    /// The ticket of the query: `table:from:to:cap`, `from` 0 when it names none.
-    #[must_use]
-    pub fn ticket(self) -> Ticket {
-        let text = format!(
-            "{}:{}:{}:{}",
-            self.table.name(),
-            self.from.unwrap_or(0),
-            self.to,
-            self.cap.name()
-        );
-        Ticket {
-            ticket: text.into(),
-        }
-    }
-}
-
-impl TryFrom<&FlightDescriptor> for Query {
-    type Error = Status;
-
-    /// A path of one table (all of it), or a ticket's text as the command.
-    fn try_from(descriptor: &FlightDescriptor) -> Result<Self, Status> {
-        match descriptor.path.as_slice() {
-            [table] => Table::parse(table)
-                .map(Self::whole)
-                .ok_or_else(|| not_served("tables", Table::ALL.into_iter().map(Table::name))),
-            [] => Self::parse(&descriptor.cmd),
-            _ => Err(Status::invalid_argument("a path names one table")),
-        }
-    }
-}
 
 /// The Flight service.
 #[derive(Debug)]
@@ -192,7 +64,7 @@ pub(crate) struct Flight<U, A> {
 impl<U, A> Flight<U, A>
 where
     U: UnsafeStore + Clone + Send + Sync + 'static,
-    A: ArchiveStore + Clone + Send + Sync + 'static,
+    A: ArchiveStore,
 {
     /// The range `query` covers now: `from` the lowest block held when it names none, `to`
     /// lowered to what its cap allows, below a gap above `from`, and to [`MAX_FLIGHT_BLOCKS`]
@@ -254,7 +126,7 @@ where
 
     /// The `FlightInfo` of `query`, resolved.
     fn info(query: Query, descriptor: FlightDescriptor) -> Result<FlightInfo, Status> {
-        let schema = query.table.schema().map_err(Status::from)?;
+        let schema = query.table.schema();
         let info = FlightInfo::new()
             .try_with_schema(&schema)
             .map_err(|err| Status::from(FlightError::Arrow(err)))?;
@@ -299,7 +171,8 @@ async fn read_range<U: UnsafeStore, A: ArchiveStore>(
     query: Query,
     batches: &mut Batches,
 ) -> Result<(), FlightError> {
-    let (mut next, mut archive_tip) = (query.from.unwrap_or(0), None);
+    let mut next = query.from.unwrap_or(0);
+    let mut history = crate::source::History::default();
     let mut parent: Option<B256> = None;
     // The previous batch, built while the next one is read.
     let mut building: Option<Building> = None;
@@ -309,7 +182,7 @@ async fn read_range<U: UnsafeStore, A: ArchiveStore>(
             .await
             .map_err(|err| read_status(&err))?;
         let mut blocks: Vec<Prepared> = source
-            .blocks_from(next, &mut archive_tip)
+            .blocks_from(next, &mut history)
             .await
             .map_err(|err| read_status(&err))?;
         blocks.retain(|block| block.at.number <= query.to);
@@ -363,7 +236,7 @@ fn unimplemented<T>() -> Result<T, Status> {
 impl<U, A> FlightService for Flight<U, A>
 where
     U: UnsafeStore + Clone + Send + Sync + 'static,
-    A: ArchiveStore + Clone + Send + Sync + 'static,
+    A: ArchiveStore,
 {
     type HandshakeStream = Responses<HandshakeResponse>;
     type ListFlightsStream = Responses<FlightInfo>;
@@ -419,7 +292,7 @@ where
         request: Request<FlightDescriptor>,
     ) -> Result<Response<SchemaResult>, Status> {
         let query = Query::try_from(&request.into_inner())?;
-        let schema = query.table.schema().map_err(Status::from)?;
+        let schema = query.table.schema();
         SchemaResult::try_from(SchemaAsIpc::new(&schema, &IpcWriteOptions::default()))
             .map(Response::new)
             .map_err(|err| Status::from(FlightError::Arrow(err)))
@@ -434,7 +307,7 @@ where
             .try_acquire_owned()
             .map_err(|_full| Status::resource_exhausted("too many Flight streams at once"))?;
         let query = self.resolve(query).await?;
-        let schema = query.table.schema().map_err(Status::from)?;
+        let schema = query.table.schema();
         let (batches, rx) = Sink::channel(BATCHES_AHEAD);
         self.tasks
             .spawn(produce(self.source.clone(), query, batches, permit));

@@ -135,7 +135,7 @@ devp2p as above.
 ## Among op-p2p-indexers
 
 Pre-Bedrock blocks are shared only between nodes that carry the indexer entry in their node
-record ([roadmap](roadmap.md), 2026-10-04).
+record ([decisions](decisions.md), 2026-10-04).
 
 | Duty | Status | Notes |
 |---|---|---|

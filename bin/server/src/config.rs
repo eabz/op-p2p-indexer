@@ -8,7 +8,8 @@ use eyre::eyre;
 use op_indexer_balancer::register::{Registration, is_valid_address};
 use op_indexer_chainspec::ChainSpec;
 use op_indexer_chunks::{R2Config, ReadOptions};
-use op_indexer_node::env_file;
+use op_indexer_runtime::env_file;
+use op_indexer_runtime::env_var as var;
 /// Bytes of one ranged chunk read: about a segment (1 MiB compressed).
 const RANGE_BYTES: u64 = 1 << 20;
 /// Ranged reads of one chunk stream in flight at once.
@@ -111,15 +112,7 @@ impl ServerConfig {
                 dir: PathBuf::from(dir),
                 prefix,
             },
-            None => Chunks::R2(R2Config {
-                account_id: required("OP_INDEXER_R2_ACCOUNT_ID")?,
-                bucket: var("OP_INDEXER_R2_BUCKET")
-                    .unwrap_or_else(|| format!("{}-snapshot", chain.name)),
-                prefix,
-                access_key_id: required("OP_INDEXER_R2_ACCESS_KEY_ID")?,
-                secret_access_key: required("OP_INDEXER_R2_SECRET_ACCESS_KEY")?,
-                endpoint: var("OP_INDEXER_R2_ENDPOINT"),
-            }),
+            None => Chunks::R2(R2Config::from_env(chain)?),
         };
         let balancer = var("OP_INDEXER_BALANCER_URL")
             .map(|balancer| {
@@ -153,10 +146,6 @@ impl ServerConfig {
             }),
         })
     }
-}
-
-fn var(name: &str) -> Option<String> {
-    env::var(name).ok().filter(|value| !value.is_empty())
 }
 
 fn required(name: &str) -> eyre::Result<String> {

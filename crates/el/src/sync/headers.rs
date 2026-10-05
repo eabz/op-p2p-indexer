@@ -61,6 +61,48 @@ pub(super) async fn walk(
     Ok((checkpoints, below.filter(|_| reached)))
 }
 
+/// Fetches one page of the skeleton going down from `from`: the hashes of every
+/// [`HEADERS_PER_REQUEST`]-th block below it, as far as one request reaches and not below
+/// `first`, highest first. They are claims: each is trusted only once the walk below the one
+/// above it names it as parent (`Syncer::link`). Only their shape is checked here: each header
+/// hashes to what it is taken to be and has the number it should.
+pub(super) async fn skeleton(
+    session: &SessionHandle,
+    from: BlockRef,
+    first: BlockNumber,
+) -> Result<Vec<BlockRef>, Failure> {
+    let count = (from.number.saturating_sub(first) / HEADERS_PER_REQUEST)
+        .saturating_add(1)
+        .min(HEADERS_PER_REQUEST);
+    let skip = u32::try_from(HEADERS_PER_REQUEST - 1).unwrap_or(u32::MAX);
+    let raw = session.headers_skipping(from.hash, count, skip).await?;
+    if raw.first().is_none_or(|top| keccak256(top) != from.hash) {
+        return Err(Failure::NotHeld);
+    }
+    raw.iter()
+        .enumerate()
+        .skip(1)
+        .map(|(index, bytes)| {
+            let header: Header = alloy_rlp::decode_exact(bytes)
+                .map_err(|err| Failure::Malformed(format!("skeleton header: {err}")))?;
+            let steps = u64::try_from(index).unwrap_or(u64::MAX);
+            let expected = from
+                .number
+                .saturating_sub(steps.saturating_mul(HEADERS_PER_REQUEST));
+            if header.number != expected {
+                return Err(Failure::Invalid(format!(
+                    "skeleton header {} where {expected} was asked for",
+                    header.number
+                )));
+            }
+            Ok(BlockRef {
+                number: expected,
+                hash: keccak256(bytes),
+            })
+        })
+        .collect()
+}
+
 /// Checks that `raw` are consecutive headers going down from `top`: the first hashes to
 /// `top.hash`, each next one to the parent hash of the one before. Returns them as received,
 /// highest first.

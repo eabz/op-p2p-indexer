@@ -12,6 +12,7 @@ name = "import"
 path = "src/main.rs"
 
 [dependencies]
+op-indexer-runtime.workspace = true
 op-indexer-chainspec.workspace = true
 op-indexer-chunks.workspace = true
 op-indexer-primitives.workspace = true
@@ -31,7 +32,6 @@ op-alloy-consensus = { workspace = true, features = ["k256"] }
 
 bytes.workspace = true
 clap.workspace = true
-dotenvy.workspace = true
 eyre.workspace = true
 fastrand.workspace = true
 flate2.workspace = true
@@ -44,7 +44,6 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
 tokio-util.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 mimalloc.workspace = true
 zstd.workspace = true
 

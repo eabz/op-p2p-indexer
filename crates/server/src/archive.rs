@@ -12,8 +12,7 @@
 //!   (from the block's segment) when they do not;
 //! - a peer's read (`read`) that needs R2 takes a place in the [`PeerBudget`] first, and is
 //!   answered empty without one;
-//! - a consumer's read (`blocks`: the stream, Flight) goes through the read-ahead
-//!   ([`Feeds`]).
+//! - a consumer owns its [`ArchiveStore::read_range`] and bounded read-ahead.
 
 use std::io;
 use std::sync::Arc;
@@ -30,7 +29,7 @@ use op_indexer_primitives::{
     ArchivedBlock, BlockRead, BlockRef, BlockStart, ItemConvert, L1Heads, ReadLimits,
 };
 use op_indexer_storage::archive_store::FjallArchive;
-use op_indexer_storage::{ArchiveStore, StorageError, Store};
+use op_indexer_storage::{ArchiveRange, ArchiveStore, StorageError, Store};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -380,7 +379,42 @@ impl<S: ChunkSource> ArchiveStore for R2Archive<S> {
         if from < limits.lowest || !sealed.holds(from) {
             return self.tail.blocks(from, limits).await;
         }
-        self.feeds.read(&self.source, &sealed, from, limits).await
+        self.feeds
+            .start(&self.source, &sealed, from)
+            .read(limits)
+            .await
+    }
+
+    fn read_range(&self, from: BlockNumber, limits: ReadLimits) -> ArchiveRange {
+        let archive = self.clone();
+        let sealed = self.sealed();
+        let feed = (from >= limits.lowest && sealed.holds(from))
+            .then(|| self.feeds.start(&self.source, &sealed, from));
+        Box::pin(futures_util::stream::unfold(
+            (archive, feed, Some(from)),
+            move |(archive, mut feed, next)| async move {
+                let from = next?;
+                let blocks = if let Some(reader) = feed.as_mut() {
+                    match reader.read(limits).await {
+                        Ok(blocks) if blocks.is_empty() => {
+                            feed = None;
+                            archive.blocks(from, limits).await
+                        }
+                        result => result,
+                    }
+                } else {
+                    archive.blocks(from, limits).await
+                };
+                if blocks.as_ref().is_ok_and(Vec::is_empty) {
+                    return None;
+                }
+                let next = blocks
+                    .as_ref()
+                    .ok()
+                    .and_then(|blocks| from.checked_add(u64::try_from(blocks.len()).ok()?));
+                Some((blocks, (archive, feed, next)))
+            },
+        ))
     }
 
     /// The L1 heads the tail records, raised to the last sealed block: a chunk is sealed only

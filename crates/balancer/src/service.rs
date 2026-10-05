@@ -10,9 +10,9 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use op_indexer_api::ApiKeys;
+use op_indexer_api::ticket::Cap;
 use op_indexer_chainspec::ChainSpec;
-use op_indexer_stream::ApiKeys;
-use op_indexer_stream::ticket::Cap;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt as _};

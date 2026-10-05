@@ -301,11 +301,24 @@ The node fetches a range of blocks from peers and verifies it, so that a node wi
 history can get it from one that has it.
 
 - Input: a target range and a trusted anchor (a block hash at the top of the range).
-- Headers are walked in pages down from the anchor and verified by the hash chain; the walk's
-  checkpoints are saved, so a restart continues it. Then, from the bottom up, bodies are
+- Headers are walked down from the anchor and verified by the hash chain, in parallel: a
+  *skeleton* (the hash of every 1,024th block, a thousand per `GetBlockHeaders` with a skip of
+  1,023) is fetched first, one page at a time; the 1,024-block gaps below each skeleton hash
+  are fetched on every session at once (up to 256 ahead), each as a hash chain from its claimed
+  top, and linked from the top down: a gap counts only once its top is the hash the gap above
+  names as parent, so the trust still comes from the anchor alone; a gap fetched from a wrong
+  claim is fetched again from the trusted hash. The walk's checkpoints are saved as they are
+  linked, so a restart continues it. Measured on OP Mainnet from a laptop: 720 headers/s one
+  page at a time before, 6–7k/s on 3 sessions with the skeleton. Then, from the bottom up,
+  bodies are
   checked against each header's transactions root and receipts against its receipts root, with
   the rules of the block's era: plain legacy receipts before Bedrock, the deposit nonce left
   out of the hash before Canyon, the consensus encoding after.
+- Each session takes up to 4 requests of the sync at once (one start per 200 ms), the fastest
+  peers (verified blocks per second, smoothed) first; up to 32 segments of 256 blocks are
+  fetched or waiting at once, within 256 MiB of verified blocks waiting to be handed on. While a
+  round runs the peer set dials for twice `OP_INDEXER_EL_MAX_SESSIONS` outbound sessions and
+  releases none for being unused.
 - Items in an answer are matched by what verifies: leading items that belong to their blocks
   are kept and the rest asked for again; an item of a later block means "not held from here";
   an item of no block asked for is bad data and bans the peer.
