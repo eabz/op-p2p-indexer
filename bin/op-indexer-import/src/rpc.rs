@@ -354,7 +354,7 @@ impl Rpc {
     pub(crate) async fn deposit_sources(
         &self,
         blocks: &[Wanted],
-    ) -> Result<Vec<(RpcHeader, Vec<B256>)>, RpcError> {
+    ) -> Result<Vec<(RpcHeader, Vec<(B256, Option<U128>)>)>, RpcError> {
         let calls: Vec<_> = blocks
             .iter()
             .map(|block| block_call(block.number))
@@ -374,7 +374,7 @@ impl Rpc {
                     usize::try_from(index)
                         .ok()
                         .and_then(|at| block.transactions.get(at))
-                        .and_then(|transaction| transaction.source_hash)
+                        .and_then(|transaction| Some((transaction.source_hash?, transaction.mint)))
                         .ok_or(RpcError::NoSource { number, index })
                 })
                 .collect::<Result<_, _>>()?;
@@ -648,6 +648,7 @@ struct Block<T> {
 #[serde(rename_all = "camelCase")]
 struct SourcedTransaction {
     source_hash: Option<B256>,
+    mint: Option<U128>,
 }
 
 /// The part of a transaction an authorization list is read from.

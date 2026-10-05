@@ -41,7 +41,7 @@ use std::time::Instant;
 
 use alloy_eips::BlockNumHash;
 use alloy_eips::eip7702::SignedAuthorization;
-use alloy_primitives::B256;
+use alloy_primitives::{B256, U128};
 use eyre::WrapErr;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
@@ -49,7 +49,7 @@ use tokio::time::{MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use self::derive::{HeaderRow, L1Data, L1Info, Parent};
+use self::derive::{DepositRow, HeaderRow, L1Data, L1Info, Parent};
 use crate::progress::{self, Rate};
 use crate::rows::{self, LogRow, Rows, TransactionRow};
 use crate::rpc::{FilledBlock, Rpc, RpcHeader, Wanted};
@@ -86,6 +86,7 @@ impl Fill {
                     block_number: source.number,
                     transaction_index: source.index,
                     source_hash: source.hash,
+                    mint: source.mint,
                 })
                 .collect(),
             ..Self::default()
@@ -115,12 +116,15 @@ impl Fill {
     }
 }
 
-/// One deposit's source hash.
+/// What a deposit's row lacks of its source hash and its mint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FilledSource {
     block_number: u64,
     transaction_index: u64,
-    source_hash: B256,
+    #[serde(default)]
+    source_hash: Option<B256>,
+    #[serde(default)]
+    mint: Option<U128>,
 }
 
 /// One transaction's authorization list, in the RPC's form.
@@ -180,9 +184,10 @@ pub(crate) fn apply(rows: &mut Rows, fill: Fill) -> u64 {
             .binary_search_by_key(&key, |row| (row.block_number, row.transaction_index));
         // Only into a row that lacks it: what the service sent is kept.
         if let Some(row) = at.ok().and_then(|at| rows.transactions.get_mut(at))
-            && row.source_hash.is_none()
+            && (row.source_hash.is_none() || row.mint.is_none())
         {
-            row.source_hash = Some(source.source_hash);
+            row.source_hash = row.source_hash.or(source.source_hash);
+            row.mint = row.mint.or(source.mint);
             filled = filled.saturating_add(1);
         }
     }
@@ -425,7 +430,7 @@ fn take_check(state: &State, work: &mut Work, check: Check) -> eyre::Result<u64>
         // Every block hashes: only now are the fields written.
         None => {
             let path = state.fill_path(chunk);
-            work.rebuilt(rebuilt.headers.len(), rebuilt.sources.len());
+            work.rebuilt(&rebuilt);
             tokio::task::block_in_place(|| add_rebuilt(&path, rebuilt))
                 .wrap_err_with(|| format!("failed to write {}", path.display()))?;
         }
@@ -573,11 +578,16 @@ fn rpc_fetch(rows: &[HeaderRow]) -> Fetch {
     let mut fetch = Fetch::default();
     for row in rows {
         let block = BlockNumHash::new(row.number, row.hash);
-        if !row.lacking_sources.is_empty() {
+        if row.lacks_deposit_fields() {
             fetch.sources.push(Wanted {
                 number: row.number,
                 hash: row.hash,
-                indexes: row.lacking_sources.clone(),
+                indexes: row
+                    .deposits
+                    .iter()
+                    .filter(|deposit| deposit.lacks())
+                    .map(|deposit| deposit.index)
+                    .collect(),
             });
         } else if !row.lacks.is_empty() {
             fetch.headers.push(block);
@@ -613,6 +623,7 @@ struct Work {
     /// Header rows rebuilt from L1, and those of them that did not hash, fetched instead.
     rebuilt_headers: u64,
     rebuilt_sources: u64,
+    rebuilt_mints: u64,
     unrebuilt_blocks: u64,
     /// The fields that cannot be rebuilt from L1: how many blocks, and the first.
     unrebuildable: BTreeMap<&'static str, (u64, u64)>,
@@ -638,6 +649,7 @@ impl Work {
             filled_headers: 0,
             rebuilt_headers: 0,
             rebuilt_sources: 0,
+            rebuilt_mints: 0,
             unrebuilt_blocks: 0,
             unrebuildable: BTreeMap::new(),
             scan_rate: Rate::new(),
@@ -660,11 +672,20 @@ impl Work {
         }
     }
 
-    /// Counts headers and source hashes rebuilt from L1, checked and written.
-    fn rebuilt(&mut self, headers: usize, sources: usize) {
+    /// Counts the headers, source hashes and mints of `fill`, rebuilt from L1, checked and
+    /// written.
+    fn rebuilt(&mut self, fill: &Fill) {
         let count = |count: usize| u64::try_from(count).unwrap_or(u64::MAX);
-        self.rebuilt_headers = self.rebuilt_headers.saturating_add(count(headers));
-        self.rebuilt_sources = self.rebuilt_sources.saturating_add(count(sources));
+        let sources = fill.sources.iter();
+        let hashes = sources
+            .clone()
+            .filter(|source| source.source_hash.is_some());
+        let mints = sources.filter(|source| source.mint.is_some());
+        self.rebuilt_headers = self
+            .rebuilt_headers
+            .saturating_add(count(fill.headers.len()));
+        self.rebuilt_sources = self.rebuilt_sources.saturating_add(count(hashes.count()));
+        self.rebuilt_mints = self.rebuilt_mints.saturating_add(count(mints.count()));
     }
 
     /// Counts a block whose `field` cannot be rebuilt from L1.
@@ -803,6 +824,7 @@ impl Work {
             rpc_filled_headers = self.filled_headers,
             l1_rebuilt_headers = self.rebuilt_headers,
             l1_rebuilt_sources = self.rebuilt_sources,
+            l1_rebuilt_mints = self.rebuilt_mints,
             l1_rebuilt_not_hashing = self.unrebuilt_blocks,
             "downloaded rows checked"
         );
@@ -862,12 +884,20 @@ fn header_rows(rows: &Rows, lacking: Vec<(u64, Vec<&'static str>)>) -> Vec<Heade
                 .iter()
                 .take_while(|tx| tx.kind == Some(op_alloy_consensus::DEPOSIT_TX_TYPE_ID))
                 .collect();
-            let lacking_sources: Vec<u64> = deposits
+            let deposits: Vec<DepositRow> = deposits
                 .iter()
-                .filter(|tx| tx.source_hash.is_none())
-                .map(|tx| tx.transaction_index)
+                .map(|tx| DepositRow {
+                    index: tx.transaction_index,
+                    has_source: tx.source_hash.is_some(),
+                    from: tx.from,
+                    to: tx.to,
+                    mint: tx.mint,
+                    value: tx.value,
+                    gas: tx.gas.to(),
+                    input: tx.input.clone(),
+                })
                 .collect();
-            let from_l1 = !lacking_sources.is_empty()
+            let from_l1 = deposits.iter().any(DepositRow::lacks)
                 || lacks
                     .iter()
                     .any(|field| matches!(*field, "mix_hash" | "parent_beacon_block_root"));
@@ -885,8 +915,7 @@ fn header_rows(rows: &Rows, lacking: Vec<(u64, Vec<&'static str>)>) -> Vec<Heade
                 extra_data: block.extra_data.clone(),
                 lacks,
                 l1_info,
-                deposits: u64::try_from(deposits.len()).unwrap_or(u64::MAX),
-                lacking_sources,
+                deposits,
             }
         })
         .collect()
@@ -930,8 +959,10 @@ fn scan(forks: &Forks, raw: &Path, fill: &Path, rebuild: bool) -> eyre::Result<S
     scanned.fetch.wanted = wanted(&rows, TransactionRow::lacks_authorization_list);
     // With the rebuild from L1, it decides what the RPC is asked for.
     if !rebuild {
+        // A deposit after the L1-attributes one lacking its mint may be a user's.
         scanned.fetch.sources = wanted(&rows, |tx| {
-            tx.kind == Some(op_alloy_consensus::DEPOSIT_TX_TYPE_ID) && tx.source_hash.is_none()
+            tx.kind == Some(op_alloy_consensus::DEPOSIT_TX_TYPE_ID)
+                && (tx.source_hash.is_none() || (tx.transaction_index > 0 && tx.mint.is_none()))
         });
     }
     // A block read with its transactions for its deposits brings its header fields too.
@@ -1012,19 +1043,17 @@ async fn fill_chunk(rpc: &Rpc, fetch: &Fetch, path: PathBuf) -> eyre::Result<Fet
     }
     let mut sources = Vec::new();
     for batch in fetch.sources.chunks(rpc.batch_calls()) {
-        for (block, (header, hashes)) in batch.iter().zip(rpc.deposit_sources(batch).await?) {
+        for (block, (header, deposits)) in batch.iter().zip(rpc.deposit_sources(batch).await?) {
             headers.push(header);
-            sources.extend(
-                block
-                    .indexes
-                    .iter()
-                    .zip(hashes)
-                    .map(|(&index, hash)| FilledSource {
-                        block_number: block.number,
-                        transaction_index: index,
-                        source_hash: hash,
-                    }),
-            );
+            sources.extend(block.indexes.iter().zip(deposits).map(
+                |(&index, (source_hash, mint))| FilledSource {
+                    block_number: block.number,
+                    transaction_index: index,
+                    source_hash: Some(source_hash),
+                    // The RPC leaves out a mint of zero.
+                    mint: Some(mint.unwrap_or_default()),
+                },
+            ));
         }
     }
     let added: usize = blocks.iter().map(|block| block.transactions.len()).sum();
