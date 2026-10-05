@@ -9,7 +9,7 @@ use alloy_primitives::BlockNumber;
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
 use op_indexer_chunks::{Lend, StreamReads};
-use op_indexer_primitives::{ArchivedBlock, ReadLimits};
+use op_indexer_primitives::{ArchivedBlock, ReadLimits, ReadParts};
 use op_indexer_storage::StorageError;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinSet;
@@ -84,12 +84,14 @@ impl Feeds {
         }
     }
 
-    /// Starts a feed of the sealed chunks from `from` to the last one listed now.
+    /// Starts a feed of the `parts` of the sealed chunks' blocks from `from` to the last one
+    /// listed now.
     pub(crate) fn start<S: ChunkSource>(
         &self,
         source: &S,
         sealed: &Sealed,
         from: BlockNumber,
+        parts: ReadParts,
     ) -> Feed {
         let chunks = Arc::clone(&sealed.chunks);
         let (sender, blocks) = mpsc::channel(FEED_BLOCKS);
@@ -106,6 +108,7 @@ impl Feeds {
                 per_get: RANGE_MIB,
                 max_in_flight: MAX_IN_FLIGHT,
             }),
+            parts,
         };
         let mut tasks = JoinSet::new();
         tasks.spawn(async move {

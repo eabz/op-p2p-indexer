@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 
 use alloy_primitives::{B256, BlockNumber};
-use op_indexer_primitives::{BlockRef, L1Heads, ReadLimits};
+use op_indexer_primitives::{BlockRef, L1Heads, ReadLimits, ReadParts};
 use op_indexer_storage::{
     ArchiveRange, ArchiveStore, RetryError, StorageError, Store, UnsafeStore, retry,
 };
@@ -83,6 +83,18 @@ pub(crate) struct History {
     tip: Option<BlockNumber>,
     next: Option<BlockNumber>,
     stream: Option<ArchiveRange>,
+    /// What of each block the request reads.
+    parts: ReadParts,
+}
+
+impl History {
+    /// A history read of the `parts` of each block.
+    pub(crate) fn of(parts: ReadParts) -> Self {
+        Self {
+            parts,
+            ..Self::default()
+        }
+    }
 }
 
 impl std::fmt::Debug for History {
@@ -209,7 +221,7 @@ impl<U: UnsafeStore, A: ArchiveStore> Source<U, A> {
             .call(Store::Archive, "archive range", || {
                 let mut stream = current
                     .take()
-                    .unwrap_or_else(|| self.archive.read_range(from, HISTORY_BATCH));
+                    .unwrap_or_else(|| self.archive.read_range(from, HISTORY_BATCH, history.parts));
                 async move {
                     let blocks = stream.next().await.transpose()?.unwrap_or_default();
                     Ok((blocks, stream))

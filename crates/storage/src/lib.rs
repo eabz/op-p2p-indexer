@@ -31,7 +31,7 @@ use alloy_primitives::{BlockHash, BlockNumber, Bytes};
 use op_alloy_consensus::OpReceiptEnvelope;
 use op_indexer_primitives::{
     ArchivedBlock, BlockRead, BlockRef, DecodedBlock, InsertOutcome, ItemConvert, L1Heads,
-    ReadLimits, UnsafeEvent,
+    ReadLimits, ReadParts, UnsafeEvent,
 };
 
 pub use config::{ArchiveConfig, StorageConfig, UnsafeConfig};
@@ -422,12 +422,14 @@ pub trait ArchiveStore: Clone + Send + Sync + 'static {
         limits: ReadLimits,
     ) -> impl Future<Output = Result<Vec<ArchivedBlock>, StorageError>> + Send;
 
-    /// Streams consecutive blocks in bounded batches until the first missing block.
+    /// Streams consecutive blocks in bounded batches until the first missing block, of the
+    /// `parts` of each block the reader needs: a store may give more (this one gives whole
+    /// blocks), never less.
     ///
     /// The caller owns read-ahead and cancels it by dropping the stream. Each batch obeys
     /// `limits`; batches may observe newer archive snapshots. An error ends the stream,
     /// and callers may resume at the first block they have not consumed.
-    fn read_range(&self, from: BlockNumber, limits: ReadLimits) -> ArchiveRange {
+    fn read_range(&self, from: BlockNumber, limits: ReadLimits, _parts: ReadParts) -> ArchiveRange {
         let archive = self.clone();
         Box::pin(futures_util::stream::unfold(
             (archive, Some(from)),

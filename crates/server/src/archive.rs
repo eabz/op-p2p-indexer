@@ -25,8 +25,9 @@ use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
 use op_alloy_consensus::OpReceiptEnvelope;
 use op_indexer_chainspec::ChainSpec;
+use op_indexer_chunks::StreamReads;
 use op_indexer_primitives::{
-    ArchivedBlock, BlockRead, BlockRef, BlockStart, ItemConvert, L1Heads, ReadLimits,
+    ArchivedBlock, BlockRead, BlockRef, BlockStart, ItemConvert, L1Heads, ReadLimits, ReadParts,
 };
 use op_indexer_storage::archive_store::FjallArchive;
 use op_indexer_storage::{ArchiveRange, ArchiveStore, StorageError, Store};
@@ -40,6 +41,15 @@ use crate::source::{ChunkRange, ChunkSource};
 
 /// How often the manifest is read again for chunks the exporter sealed.
 const MANIFEST_REFRESH: Duration = Duration::from_secs(30);
+
+/// Headers a spaced read (a skeleton: every n-th header) answers from R2, and how many of them
+/// are read at once. Each is in its own segment, often its own chunk: one index GET and one
+/// segment GET apiece, so a full page of 1,024 would take minutes; a peer takes a shorter page
+/// and asks again from its end.
+const MAX_SPACED_HEADERS: usize = 64;
+const SPACED_READS: usize = 16;
+/// How a spaced header is read: its own segment and nothing more.
+const ONE_SEGMENT: StreamReads = StreamReads::fixed(1, 1);
 
 /// One item, of any size.
 const ONE: ReadLimits = ReadLimits {
@@ -83,6 +93,11 @@ impl Sealed {
             .first()
             .zip(self.chunks.last())
             .is_some_and(|(first, last)| first.first <= number && number <= last.last)
+    }
+
+    /// The first sealed block's number.
+    fn first_number(&self) -> Option<BlockNumber> {
+        self.chunks.first().map(|chunk| chunk.first)
     }
 
     /// The chunk holding `number`.
@@ -226,6 +241,45 @@ impl<S: ChunkSource> R2Archive<S> {
         }
     }
 
+    /// The headers of a spaced read from `start` (every `step`-th block), with the bytes read
+    /// for each: at most [`MAX_SPACED_HEADERS`], read [`SPACED_READS`] at once, up to the first
+    /// that is not sealed.
+    async fn spaced_headers(
+        &self,
+        sealed: &Sealed,
+        start: Option<BlockNumber>,
+        step: u64,
+        rising: bool,
+        limits: ReadLimits,
+    ) -> Result<Vec<(Bytes, u64)>, StorageError> {
+        let numbers = std::iter::successors(start, |number| {
+            if rising {
+                number.checked_add(step)
+            } else {
+                number.checked_sub(step)
+            }
+        })
+        .take_while(|number| *number >= limits.lowest && sealed.holds(*number))
+        .take(limits.items.min(MAX_SPACED_HEADERS));
+        let chunks: Vec<(BlockNumber, ChunkRange)> = numbers
+            .filter_map(|number| Some((number, *sealed.find(number)?)))
+            .collect();
+        let reads = futures_util::stream::iter(chunks).map(|(number, chunk)| async move {
+            let block = self.source.stream(&chunk, number, ONE_SEGMENT).next().await;
+            block
+                .transpose()
+                .map_err(remote("chunk read"))
+                .map(|block| block.map(|block| (block.encoded.header.clone(), size(&block))))
+        });
+        let mut headers = Vec::new();
+        let mut read = reads.buffered(SPACED_READS);
+        while let Some(header) = read.next().await {
+            let Some(header) = header? else { break };
+            headers.push(header);
+        }
+        Ok(headers)
+    }
+
     /// Reads a run through a [`Cursor`], for a read that needs R2.
     async fn read_through(
         &self,
@@ -251,48 +305,123 @@ impl<S: ChunkSource> R2Archive<S> {
                     BlockStart::Number(number) => Some(*number),
                     BlockStart::Hash(hash) => self.find(*hash).await?,
                 };
-                let mut next = start.filter(|start| *start >= limits.lowest);
-                while let Some(number) = next {
-                    let Some(block) = cursor.get(number).await? else {
-                        break;
-                    };
-                    if !run.push(&block.encoded.header) {
-                        break;
+                let start = start.filter(|start| *start >= limits.lowest);
+                match (*step, *rising) {
+                    (2.., _) => {
+                        let headers = self
+                            .spaced_headers(&cursor.sealed, start, *step, *rising, limits)
+                            .await?;
+                        for (header, bytes) in &headers {
+                            cursor.bytes = cursor.bytes.saturating_add(*bytes);
+                            if !run.push(header) {
+                                break;
+                            }
+                        }
                     }
-                    next = if *rising {
-                        number.checked_add(*step)
-                    } else {
-                        number.checked_sub(*step)
+                    (_, false) => Self::headers_down(&mut cursor, &mut run, start).await?,
+                    (_, true) => {
+                        let mut next = start;
+                        while let Some(number) = next {
+                            let Some(block) = cursor.get(number).await? else {
+                                break;
+                            };
+                            if !run.push(&block.encoded.header) {
+                                break;
+                            }
+                            next = number.checked_add(1);
+                        }
                     }
-                    .filter(|number| *number >= limits.lowest);
                 }
             }
             BlockRead::Bodies(hashes) | BlockRead::Receipts(hashes) => {
                 let bodies = matches!(read, BlockRead::Bodies(_));
-                for hash in hashes {
-                    let Some(number) = self
-                        .find(*hash)
-                        .await?
-                        .filter(|number| *number >= limits.lowest)
-                    else {
-                        break;
-                    };
-                    let Some(block) = cursor.get(number).await? else {
-                        break;
-                    };
-                    let item = if bodies {
-                        Some(&block.encoded.body)
-                    } else {
-                        block.encoded.receipts.as_ref()
-                    };
-                    if !item.is_some_and(|item| run.push(item)) {
-                        break;
-                    }
-                }
+                self.by_hash(&mut cursor, &mut run, hashes, bodies).await?;
             }
         }
         self.budget.spent(cursor.bytes);
         Ok(run.items)
+    }
+
+    /// Consecutive headers down from `top` (a peer walking the chain from a hash): read
+    /// upwards, the way a chunk stream goes, and answered from the top. Read one by one
+    /// downwards, each block would open a stream of its own.
+    async fn headers_down(
+        cursor: &mut Cursor<'_, S>,
+        run: &mut Run,
+        top: Option<BlockNumber>,
+    ) -> Result<(), StorageError> {
+        let Some(top) = top else { return Ok(()) };
+        let wanted = u64::try_from(run.limits.items).unwrap_or(u64::MAX);
+        let low = top
+            .saturating_sub(wanted.saturating_sub(1))
+            .max(run.limits.lowest)
+            .max(cursor.sealed.first_number().unwrap_or(0));
+        let mut headers = Vec::new();
+        for number in low..=top {
+            let Some(block) = cursor.get(number).await? else {
+                break;
+            };
+            headers.push(block.encoded.header);
+        }
+        // A run starts at the top: without it nothing is answered.
+        let reached = top
+            .checked_sub(low)
+            .is_some_and(|span| u64::try_from(headers.len()).ok() == Some(span + 1));
+        for header in headers.iter().rev().take_while(|_| reached) {
+            if !run.push(header) {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// The bodies (or receipts) of the blocks with `hashes`, up to the first not held. A
+    /// syncing peer asks for consecutive blocks, so the block after the previous one is tried
+    /// before the hash index, which costs GETs of its own.
+    async fn by_hash(
+        &self,
+        cursor: &mut Cursor<'_, S>,
+        run: &mut Run,
+        hashes: &[BlockHash],
+        bodies: bool,
+    ) -> Result<(), StorageError> {
+        let mut after: Option<BlockNumber> = None;
+        for hash in hashes {
+            let next = match after {
+                Some(number) => cursor
+                    .get(number)
+                    .await?
+                    .filter(|block| block.encoded.hash == *hash)
+                    .map(|block| (number, block)),
+                None => None,
+            };
+            let found = if let Some(found) = next {
+                found
+            } else {
+                let Some(number) = self
+                    .find(*hash)
+                    .await?
+                    .filter(|number| *number >= run.limits.lowest)
+                else {
+                    break;
+                };
+                let Some(block) = cursor.get(number).await? else {
+                    break;
+                };
+                (number, block)
+            };
+            let (number, block) = found;
+            after = number.checked_add(1);
+            let item = if bodies {
+                Some(&block.encoded.body)
+            } else {
+                block.encoded.receipts.as_ref()
+            };
+            if !item.is_some_and(|item| run.push(item)) {
+                break;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -380,16 +509,18 @@ impl<S: ChunkSource> ArchiveStore for R2Archive<S> {
             return self.tail.blocks(from, limits).await;
         }
         self.feeds
-            .start(&self.source, &sealed, from)
+            .start(&self.source, &sealed, from, ReadParts::Whole)
             .read(limits)
             .await
     }
 
-    fn read_range(&self, from: BlockNumber, limits: ReadLimits) -> ArchiveRange {
+    /// The sealed range from a feed of the `parts` asked for (sealed receipts are not rebuilt
+    /// for a reader without them), above it the tail's whole blocks.
+    fn read_range(&self, from: BlockNumber, limits: ReadLimits, parts: ReadParts) -> ArchiveRange {
         let archive = self.clone();
         let sealed = self.sealed();
         let feed = (from >= limits.lowest && sealed.holds(from))
-            .then(|| self.feeds.start(&self.source, &sealed, from));
+            .then(|| self.feeds.start(&self.source, &sealed, from, parts));
         Box::pin(futures_util::stream::unfold(
             (archive, feed, Some(from)),
             move |(archive, mut feed, next)| async move {
@@ -483,20 +614,28 @@ impl<'a, S: ChunkSource> Cursor<'a, S> {
             self.open = None;
             return Ok(self.archive.tail.blocks(number, ONE).await?.pop());
         }
-        let mut stream = match self.open.take() {
-            Some((next, stream)) if next == number => stream,
-            _ => {
-                let Some(chunk) = self.sealed.find(number) else {
-                    return Ok(None);
-                };
-                self.archive
-                    .source
-                    .stream(chunk, number, crate::feed::PEER_READS)
+        // A chunk's stream yields its blocks in order from the one asked for, and ends with the
+        // chunk: the next block is then the first of another stream.
+        let continued = match self.open.take() {
+            Some((next, mut stream)) if next == number => {
+                stream.next().await.map(|block| (block, stream))
             }
+            _ => None,
         };
-        // A chunk's stream yields its blocks in order from the one asked for.
-        let Some(block) = stream.next().await else {
-            return Ok(None);
+        let (block, stream) = if let Some(read) = continued {
+            read
+        } else {
+            let Some(chunk) = self.sealed.find(number) else {
+                return Ok(None);
+            };
+            let mut stream = self
+                .archive
+                .source
+                .stream(chunk, number, crate::feed::PEER_READS);
+            let Some(block) = stream.next().await else {
+                return Ok(None);
+            };
+            (block, stream)
         };
         let block = block.map_err(remote("chunk read"))?;
         self.bytes = self.bytes.saturating_add(size(&block));

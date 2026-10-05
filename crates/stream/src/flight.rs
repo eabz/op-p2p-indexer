@@ -51,8 +51,21 @@ use op_indexer_api::ticket::{Cap, MAX_FLIGHT_BLOCKS, Query, Table};
 
 /// Reads of one `DoGet` built at once, each on a blocking thread: the cores one stream may
 /// use. A build runs to its end even while the consumer is slow, so each holds up to a read
-/// (16 MiB), its record batch and its encoded messages: about 100 MiB per stream at most.
+/// (16 MiB), its record batch and its encoded messages, about 100 MiB, until they are sent;
+/// across streams, [`max_builds`] bounds them.
 const PARALLEL_BUILDS: usize = 2;
+
+/// Builds of all `DoGet`s at once, server-wide, per core. A build is CPU work, so more than
+/// a couple per core only holds memory: each holds up to about 100 MiB until its messages are
+/// sent, so the builds of any number of streams hold at most this many times that.
+const BUILDS_PER_CORE: usize = 2;
+
+/// The builds the server runs at once ([`BUILDS_PER_CORE`]).
+pub(crate) fn max_builds() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        .saturating_mul(BUILDS_PER_CORE)
+}
 
 /// Encoded Flight messages (about 2 MiB each) queued ahead of the consumer.
 const MESSAGES_AHEAD: usize = 4;
@@ -70,6 +83,8 @@ pub(crate) struct Flight<U, A> {
     pub(crate) source: Source<U, A>,
     /// One permit per `DoGet` at once.
     pub(crate) streams: Arc<Semaphore>,
+    /// One permit per build at once, of every `DoGet` ([`max_builds`]).
+    pub(crate) builds: Arc<Semaphore>,
     pub(crate) tasks: TaskTracker,
     /// The bytes sent, which each `FlightData` adds to as it leaves.
     pub(crate) sent: Sent,
@@ -163,6 +178,7 @@ async fn produce<U: UnsafeStore, A: ArchiveStore>(
     query: Query,
     options: IpcWriteOptions,
     mut messages: Messages,
+    builds: Arc<Semaphore>,
     _permit: OwnedSemaphorePermit,
 ) {
     // A consumer that leaves ends it at once, even while a store call is being retried.
@@ -171,24 +187,29 @@ async fn produce<U: UnsafeStore, A: ArchiveStore>(
         biased;
         () = source.cancel.cancelled() => Err(Status::unavailable("the node is shutting down").into()),
         () = left => Ok(()),
-        read = read_range(&source, query, &options, &mut messages) => read,
+        read = read_range(&source, query, &options, &builds, &mut messages) => read,
     };
     if let Err(err) = read {
         messages.end(err);
     }
 }
 
-/// A read being converted and encoded off the runtime.
-type Building = JoinHandle<Result<Vec<FlightData>, FlightError>>;
+/// A read being converted and encoded off the runtime, with its place among the server's
+/// builds, held until its messages are sent.
+type Building = (
+    JoinHandle<Result<Vec<FlightData>, FlightError>>,
+    OwnedSemaphorePermit,
+);
 
 async fn read_range<U: UnsafeStore, A: ArchiveStore>(
     source: &Source<U, A>,
     query: Query,
     options: &IpcWriteOptions,
+    builds: &Arc<Semaphore>,
     messages: &mut Messages,
 ) -> Result<(), FlightError> {
     let mut next = query.from.unwrap_or(0);
-    let mut history = crate::source::History::default();
+    let mut history = crate::source::History::of(query.table.parts());
     let mut parent: Option<B256> = None;
     // The reads being built, oldest first, each sent once it is built and those before it are.
     let mut building: VecDeque<Building> = VecDeque::with_capacity(PARALLEL_BUILDS);
@@ -219,9 +240,24 @@ async fn read_range<U: UnsafeStore, A: ArchiveStore>(
             parent = Some(block.at.hash);
         }
         let (table, options) = (query.table, options.clone());
-        building.push_back(tokio::task::spawn_blocking(move || {
-            encode(table.batch(&blocks, &heads)?, options)
-        }));
+        // A place among the server's builds. Without one free, the reads built so far are
+        // sent first, giving their places back: a stream never waits holding one, so streams
+        // cannot wait on each other.
+        let place = if let Ok(place) = Arc::clone(builds).try_acquire_owned() {
+            place
+        } else {
+            if !flush(&mut building, 0, messages).await? {
+                return Ok(());
+            }
+            // Never closed: the service holds it.
+            Arc::clone(builds)
+                .acquire_owned()
+                .await
+                .map_err(|_closed| Status::unavailable("the node is shutting down"))?
+        };
+        let built =
+            tokio::task::spawn_blocking(move || encode(table.batch(&blocks, &heads)?, options));
+        building.push_back((built, place));
         if !flush(&mut building, PARALLEL_BUILDS - 1, messages).await? {
             return Ok(());
         }
@@ -239,7 +275,8 @@ async fn flush(
     messages: &mut Messages,
 ) -> Result<bool, FlightError> {
     while building.len() > keep {
-        let Some(oldest) = building.pop_front() else {
+        // The place is given back once the messages are sent.
+        let Some((oldest, _place)) = building.pop_front() else {
             break;
         };
         let built = oldest
@@ -373,6 +410,7 @@ where
             query,
             options,
             messages,
+            Arc::clone(&self.builds),
             permit,
         ));
         let sent = self.sent.clone();

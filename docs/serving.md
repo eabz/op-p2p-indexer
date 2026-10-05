@@ -424,8 +424,15 @@ Unchanged code over `R2Archive`:
     1/8/16/32/64 concurrent Flight `DoGet`s of the whole chunk: 100/420/717/790/878 MB at the
     default, about 300 MB at 64 with a 256 MiB budget; before, 430 MB/2.6/3.4/5.8 GB for
     1/8/16/32.
-  - Peers (5.3): a read that needs R2 takes one of 4 places and counts against 512 MiB a
-    minute; without one the peer gets the empty answer.
+  - Peers (5.3): a read that needs R2 takes one of 16 places and counts against 4 GiB a
+    minute; without one the peer gets the empty answer. (Until 2026-10-05: 4 places and
+    512 MiB, which one syncing peer used up.)
+    - Read in runs, never a GET per block: a downward header request (a peer walking the
+      chain from a hash) is read upwards as one stream and answered from the top; bodies and
+      receipts by hash try the block after the previous one before the hash index, so a
+      run of hashes costs one index lookup; a stream continues into the next chunk; a
+      spaced header request (a skeleton) answers at most 64 headers, read 16 at once, one
+      segment each.
   - `Exporter` (section 4): adds a block to the chunk being written once it is finalized and
     has its receipts, and publishes the chunk when the writer ends it.
 - `bin/server`: `OP_INDEXER_CHUNKS_DIR` reads the chunks from a local directory instead of R2 (local runs, the bench); `--export` or `OP_INDEXER_EXPORT=true`; `OP_INDEXER_R2_ACCOUNT_ID`, `_BUCKET`, `_ACCESS_KEY_ID`,
@@ -453,6 +460,30 @@ peers, by range sync, as today). Design:
   the archive only grows upwards.
 - **Gap**: blocks between the last sealed chunk and the archive's first come from range sync,
   as they do now.
+
+### 5.7 Memory
+
+What a `server` holds, each part bounded (2026-10-05). The sum must stay well under the
+droplet's memory: on an 8 GB droplet about 5 GB with the defaults, the rest for the system,
+the allocator's slack and the parts below that are not counted exactly.
+
+| Part | Bound | Set by |
+|---|---|---|
+| Unsafe chain | its blocks' encoded bytes, 2 GiB by default | `OP_INDEXER_UNSAFE_MAX_BYTES` |
+| Reads of sealed history (feeds) | half the budget for decoded blocks read ahead, half for open chunk streams (their GETs and decoded ranges); 1 GiB by default | `OP_INDEXER_SERVER_READ_BUDGET_MB` |
+| Flight builds (converting and encoding reads to Arrow) | two per core server-wide, each up to about 100 MiB until its messages are sent: 800 MiB on 4 cores, whatever the number of `DoGet`s | `crates/stream/src/flight.rs` (`BUILDS_PER_CORE`) |
+| Flight messages queued per `DoGet` | 5 × about 2 MiB, × the `DoGet`s at once (8 by default; 16: 160 MiB) | `OP_INDEXER_STREAM_MAX_FLIGHTS` |
+| Subscriptions catching up | one history batch each (64 blocks or 16 MiB) and their messages, × the subscriptions | `OP_INDEXER_STREAM_MAX_SUBSCRIPTIONS` |
+| Exporter (one server per deployment) | the chunk being sealed (at most 256 MiB compressed) and one read of 64 MiB | `crates/chunks` (`CHUNK_BYTES`), `crates/server/src/export.rs` |
+| fjall tail and the unsafe chain's journal | caches of 64 and 8 MiB, memtables of at most 7 × 16 and 8 MiB | `crates/storage` |
+| Peer reads from R2 | `MAX_PEER_READS` reads in flight, each one answer | `crates/server/src/budget.rs` |
+
+Before the build cap a `DoGet` built two reads at once with no limit across streams: 16
+streams could hold about 3.2 GiB of builds, which with the rest (2 GiB of unsafe chain, 1 GiB
+of read budget) is how the L1 and exporter server of the v0.1.7 bench reached 5.9 GB of 7.75.
+A build now takes a place among the server's builds before it starts and keeps it until its
+messages are sent; a stream without a free place sends what it has built first, so streams
+never wait on each other's places.
 
 ## 6. The balancer
 

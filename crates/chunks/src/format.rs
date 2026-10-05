@@ -20,12 +20,12 @@
 //! holds, except for the receipts' blooms, rebuilt from the logs when read: a block read back
 //! is byte for byte the [`ArchivedBlock`] that was written.
 
-use alloy_consensus::{Header, TxReceipt as _};
-use alloy_primitives::{Address, B256, Bytes, keccak256, logs_bloom};
+use alloy_consensus::{Header, ReceiptWithBloom, TxReceipt as _};
+use alloy_primitives::{Address, B256, Bloom, Bytes, keccak256, logs_bloom};
 use alloy_rlp::Decodable;
 use op_alloy_consensus::{OpReceipt, OpReceiptEnvelope};
 use op_indexer_chainspec::ChainSpec;
-use op_indexer_primitives::{ArchivedBlock, EncodedBlock, encode_receipts};
+use op_indexer_primitives::{ArchivedBlock, EncodedBlock, ReadParts, encode_receipts};
 use sha2::{Digest, Sha256};
 use std::io::Write as _;
 
@@ -471,6 +471,7 @@ pub(crate) fn decode_segment(
     bytes: &[u8],
     mut parent: B256,
     wanted: std::ops::Range<u64>,
+    parts: ReadParts,
 ) -> Result<Vec<ArchivedBlock>, ChunksError> {
     let integrity = |check| ChunksError::Integrity {
         key: entry.key(),
@@ -504,7 +505,7 @@ pub(crate) fn decode_segment(
         if wanted.contains(&number) {
             blocks.push(
                 record
-                    .build(&records)
+                    .build(&records, parts)
                     .ok_or_else(|| malformed("a record's receipts do not decode"))?,
             );
         }
@@ -549,20 +550,32 @@ impl<'a> Record<'a> {
     }
 
     /// The block, its header and body sliced out of `records` (the segment they lie in), its
-    /// receipts' blooms rebuilt from their logs.
-    fn build(&self, records: &bytes::Bytes) -> Option<ArchivedBlock> {
-        let receipts = Vec::<OpReceipt>::decode(&mut &self.receipts[..]).ok()?;
-        let receipts: Vec<OpReceiptEnvelope> = receipts
-            .into_iter()
-            .map(|receipt| receipt.into_with_bloom().into())
-            .collect();
+    /// receipts' blooms rebuilt from their logs (zero for [`ReadParts::WithoutBlooms`]), unless
+    /// `parts` leaves the receipts out: then they are an empty value, known and not loaded
+    /// ([`ReadParts::WithoutReceipts`]).
+    fn build(&self, records: &bytes::Bytes, parts: ReadParts) -> Option<ArchivedBlock> {
+        let receipts = match parts {
+            ReadParts::Whole | ReadParts::WithoutBlooms => {
+                let blooms = parts == ReadParts::Whole;
+                let receipts = Vec::<OpReceipt>::decode(&mut &self.receipts[..]).ok()?;
+                let receipts: Vec<OpReceiptEnvelope> = receipts
+                    .into_iter()
+                    .map(|receipt| {
+                        let bloom = if blooms { receipt.bloom() } else { Bloom::ZERO };
+                        ReceiptWithBloom::new(receipt, bloom).into()
+                    })
+                    .collect();
+                encode_receipts(&receipts)
+            }
+            ReadParts::WithoutReceipts => Bytes::new(),
+        };
         let (senders, _rest) = self.senders.as_chunks::<20>();
         Some(ArchivedBlock {
             encoded: EncodedBlock {
                 hash: self.hash,
                 header: Bytes::from(records.slice_ref(self.header)),
                 body: Bytes::from(records.slice_ref(self.body)),
-                receipts: Some(encode_receipts(&receipts)),
+                receipts: Some(receipts),
             },
             senders: senders
                 .iter()

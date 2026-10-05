@@ -22,7 +22,7 @@ use arrow_flight::error::FlightError;
 use arrow_schema::ArrowError;
 use op_alloy_consensus::{OpReceiptEnvelope, OpTxEnvelope};
 use op_indexer_api::ticket::Table;
-use op_indexer_primitives::{DecodedBlock, L1Heads};
+use op_indexer_primitives::{DecodedBlock, L1Heads, ReadParts};
 
 use crate::convert::{Prepared, encoded, max_fee_per_gas, nonce, status};
 use crate::proto;
@@ -33,8 +33,19 @@ type Column = (&'static str, ArrayRef, bool);
 /// Converts shared table identifiers into this server's Arrow rows.
 pub(super) trait TableRows {
     fn batch(self, blocks: &[Prepared], heads: &L1Heads) -> Result<RecordBatch, FlightError>;
+    fn parts(self) -> ReadParts;
 }
 impl TableRows for Table {
+    /// What of each block the table's columns read: the headers and the transactions need no
+    /// receipts, the receipts and the logs no blooms. Rebuilding them is most of what reading a
+    /// sealed block costs.
+    fn parts(self) -> ReadParts {
+        match self {
+            Self::Blocks | Self::Transactions => ReadParts::WithoutReceipts,
+            Self::Receipts | Self::Logs => ReadParts::WithoutBlooms,
+        }
+    }
+
     /// The table's rows for `blocks`, as one record batch, with each block's status under
     /// `heads`. Blocks without receipts add no rows to `receipts` and `logs`.
     fn batch(self, blocks: &[Prepared], heads: &L1Heads) -> Result<RecordBatch, FlightError> {

@@ -23,7 +23,7 @@ use object_store::{
     PutPayload, RetryConfig, WriteMultipart,
 };
 use op_indexer_chainspec::ChainSpec;
-use op_indexer_primitives::ArchivedBlock;
+use op_indexer_primitives::{ArchivedBlock, ReadParts};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tracing::debug;
@@ -101,6 +101,8 @@ pub struct StreamReads {
     /// More GETs a budget shared with other streams lends while it has room, so a stream
     /// reads wider when few others do; none lends nothing.
     pub lend: Option<Lend>,
+    /// What of each block the reader needs: without receipts, they are not rebuilt.
+    pub parts: ReadParts,
 }
 
 impl StreamReads {
@@ -111,6 +113,7 @@ impl StreamReads {
             range_bytes,
             in_flight,
             lend: None,
+            parts: ReadParts::Whole,
         }
     }
 }
@@ -453,6 +456,7 @@ impl ChunkStore {
                     &bytes,
                     parent,
                     number..number.saturating_add(1),
+                    ReadParts::Whole,
                 )
             }
         })
@@ -500,6 +504,7 @@ impl ChunkStore {
         let mut ranges = ranges(&index, start, reads.range_bytes)
             .into_iter()
             .peekable();
+        let parts = reads.parts;
         let base = reads.in_flight.max(1);
         let most = reads
             .lend
@@ -544,7 +549,7 @@ impl ChunkStore {
             let bytes = got.await??;
             let index = Arc::clone(&index);
             let decode = Aborting(tokio::task::spawn_blocking(move || {
-                decode_range(&entry, &index, segments, &bytes, from)
+                decode_range(&entry, &index, segments, &bytes, from, parts)
             }));
             decoding.push_back((decode, lent));
         }
@@ -601,20 +606,21 @@ impl<T> Drop for Aborting<T> {
 }
 
 /// Decodes the blocks from `from` on of `segments` of a chunk, read with one GET from the
-/// first one's offset as `bytes`. Blocking, CPU-bound.
+/// first one's offset as `bytes`, with the `parts` of each block. Blocking, CPU-bound.
 fn decode_range(
     entry: &ChunkEntry,
     index: &ChunkIndex,
     segments: Range<usize>,
     bytes: &Bytes,
     from: u64,
+    parts: ReadParts,
 ) -> Result<Vec<ArchivedBlock>, ChunksError> {
-    let parts = index.segments.get(segments).unwrap_or_default();
-    let Some(start) = parts.first().map(|segment| segment.offset) else {
+    let read = index.segments.get(segments).unwrap_or_default();
+    let Some(start) = read.first().map(|segment| segment.offset) else {
         return Ok(Vec::new());
     };
     let mut blocks = Vec::new();
-    for segment in parts {
+    for segment in read {
         let range = segment.range();
         let at = usize::try_from(range.start.saturating_sub(start)).unwrap_or(usize::MAX);
         let end = usize::try_from(range.end.saturating_sub(start)).unwrap_or(usize::MAX);
@@ -629,6 +635,7 @@ fn decode_range(
             part,
             parent,
             from..u64::MAX,
+            parts,
         )?);
     }
     Ok(blocks)

@@ -386,6 +386,24 @@ pub enum BlockStart {
 /// cannot be converted.
 pub type ItemConvert = fn(&[u8]) -> Option<alloy_primitives::Bytes>;
 
+/// What of each block a read of the archive needs. Rebuilding a sealed block's receipts (their
+/// blooms, a keccak per log address and topic) is most of what reading it costs, and a reader
+/// of headers or transactions does not need them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReadParts {
+    /// Header, body, senders and receipts.
+    #[default]
+    Whole,
+    /// Whole, but a store may give the receipts with empty (zero) blooms, not rebuilding them:
+    /// for a reader of the receipts' fields and logs, never of their blooms.
+    WithoutBlooms,
+    /// Header, body and senders. A store may still give the receipts; one that does not gives
+    /// a block whose receipts are known an empty `receipts` value (known, not loaded: never a
+    /// receipts encoding, which is at least an RLP list header), and `None` as ever for
+    /// receipts not known.
+    WithoutReceipts,
+}
+
 /// Where the answer to a read of the archive ends even if more is held.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadLimits {

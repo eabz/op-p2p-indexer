@@ -10,7 +10,7 @@ use std::time::Duration;
 use object_store::aws::AmazonS3;
 use object_store::path::Path;
 use object_store::signer::{Method, Signer as _, Url};
-use op_indexer_primitives::ArchivedBlock;
+use op_indexer_primitives::{ArchivedBlock, ReadParts};
 
 use crate::format::{ChunkIndex, decode_segment};
 use crate::{ChunkEntry, ChunksError, R2Config};
@@ -93,7 +93,14 @@ pub fn decode_chunk(entry: &ChunkEntry, bytes: &[u8]) -> Result<Vec<ArchivedBloc
             .zip(usize::try_from(segment.range().end).ok())
             .and_then(|(start, end)| segments.get(start..end))
             .ok_or_else(|| malformed("a segment lies outside the chunk"))?;
-        let decoded = decode_segment(entry, segment, part, parent, segment.first..u64::MAX)?;
+        let decoded = decode_segment(
+            entry,
+            segment,
+            part,
+            parent,
+            segment.first..u64::MAX,
+            ReadParts::Whole,
+        )?;
         parent = decoded.last().map_or(parent, |block| block.encoded.hash);
         next = segment.first.saturating_add(u64::from(segment.blocks));
         blocks.extend(decoded);

@@ -280,6 +280,7 @@ where
         let flight = Flight {
             source: source.clone(),
             streams: Arc::clone(&load.flights.free),
+            builds: Arc::new(Semaphore::new(flight::max_builds())),
             tasks: tasks.clone(),
             sent: load.sent.clone(),
         };

@@ -95,9 +95,11 @@ pub fn decode_block(
         .iter()
         .map(|transaction| decode_transaction(transaction))
         .collect::<Eip2718Result<_>>()?;
+    // An empty value: known, not loaded (`ReadParts::WithoutReceipts`).
     let receipts = encoded
         .receipts
         .as_ref()
+        .filter(|receipts| !receipts.is_empty())
         .map(alloy_rlp::decode_exact)
         .transpose()?;
     let block = OpBlock {
