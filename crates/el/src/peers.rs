@@ -490,7 +490,7 @@ impl PeerSet {
     fn refuse(&mut self, driver: SessionDriver, reason: DisconnectReason) {
         self.tasks.spawn(
             async move {
-                driver.reject(reason).await;
+                Box::pin(driver.reject(reason)).await;
                 None
             }
             .in_current_span(),
